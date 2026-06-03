@@ -14,10 +14,10 @@ type CDCLSolver struct {
 	watches       [][][]int
 	vsids         *VSIDS
 	conflicts     int
-	learned       []cnf.Clause
 	analyzer      *ConflictAnalyzer
 	implication   []int // implication[var] = clause that implied it
 	restarts      *LubyRestarts
+	db            *ClauseDatabase
 }
 
 // NewCDCLSolver creates a new CDCL solver with clause learning
@@ -38,9 +38,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		watches:     watches,
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
-		learned:     make([]cnf.Clause, 0),
 		implication: make([]int, formula.NumVars),
 		restarts:    NewLubyRestarts(100),
+		db:          NewClauseDatabase(10000),
 	}
 
 	// Initialize watches
@@ -198,17 +198,22 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	)
 
 	if len(learnedClause.Literals) > 0 {
-		s.learned = append(s.learned, *learnedClause)
+		s.db.Add(*learnedClause)
 		s.cnf.Clauses = append(s.cnf.Clauses, *learnedClause)
 		
 		// Add watches for learned clause
-		clauseIdx := len(s.cnf.Clauses) - 1
+		watchIdx := len(s.cnf.Clauses) - 1
 		for i := 0; i < 2 && i < len(learnedClause.Literals); i++ {
-			s.addWatch(clauseIdx, i)
+			s.addWatch(watchIdx, i)
 		}
 		
 		// Update analyzer with new clause
 		s.analyzer = NewConflictAnalyzer(s.cnf, s.assignments)
+		
+		// Cleanup database if needed
+		if s.db.Len() > 10000 {
+			s.db.Cleanup()
+		}
 	}
 
 	// Decay activity periodically
