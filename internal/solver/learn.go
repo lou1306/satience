@@ -28,7 +28,7 @@ func (ca *ConflictAnalyzer) SetImplication(varIdx uint32, clauseIdx int, level i
 
 // Analyze performs conflict analysis using the 1-UIP (First Unique Implication Point) scheme
 // Returns the learned clause and the backtrack level
-func (ca *ConflictAnalyzer) Analyze(conflictClause *cnf.Clause, trail []int, trailHead []int, level int) (*cnf.Clause, int) {
+func (ca *ConflictAnalyzer) Analyze(conflictClause *cnf.Clause, trail []int, trailHead []int, level int, implication []int) (*cnf.Clause, int) {
 	// Start with the conflict clause
 	learned := make([]cnf.Literal, 0)
 	
@@ -59,9 +59,18 @@ func (ca *ConflictAnalyzer) Analyze(conflictClause *cnf.Clause, trail []int, tra
 		inConflict[varIdx] = false
 
 		if assign.Level == level {
-			if literalsAtLevel > 1 {
+			// Check if there are any other variables at this level still in conflict
+			hasOtherAtLevel := false
+			for v, inConf := range inConflict {
+				if inConf && ca.assignments[v].Level == level {
+					hasOtherAtLevel = true
+					break
+				}
+			}
+			
+			if literalsAtLevel > 1 && hasOtherAtLevel {
 				// Not the UIP yet - resolve with implication clause
-				implClause := ca.implication[varIdx]
+				implClause := implication[varIdx]
 				if implClause >= 0 && implClause < len(ca.cnf.Clauses) {
 					clause := &ca.cnf.Clauses[implClause]
 					for _, lit := range clause.Literals {

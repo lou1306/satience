@@ -170,34 +170,12 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 
 func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	s.conflicts++
-
 	clause := &s.cnf.Clauses[clauseIdx]
 	s.vsids.bumpClause(clause.Literals)
-
-	learnedClause, backjumpLevel := s.analyzer.Analyze(
-		clause,
-		s.trail,
-		s.trailHead,
-		s.level,
-	)
-
-	if len(learnedClause.Literals) > 0 {
-		s.db.Add(*learnedClause)
-		s.cnf.Clauses = append(s.cnf.Clauses, *learnedClause)
-		
-		s.analyzer = NewConflictAnalyzer(s.cnf, s.assignments)
-		
-		if s.db.Len() > 10000 {
-			s.db.Cleanup()
-		}
-	}
 
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
 	}
-	
-	// Store the backjump level for use in backtrack
-	s.backjumpLevel = backjumpLevel
 }
 
 func (s *CDCLSolver) backtrack() bool {
@@ -205,46 +183,34 @@ func (s *CDCLSolver) backtrack() bool {
 		return false
 	}
 
-	// Use backjump level if available, otherwise backtrack chronologically
-	targetLevel := s.backjumpLevel
-	if targetLevel >= s.level || targetLevel < 0 {
-		// Invalid backjump level, use chronological backtracking
-		targetLevel = s.level - 1
+	prevLevel := s.level - 1
+	if prevLevel < 1 {
+		return false
 	}
 	
-	if targetLevel < 1 {
-		targetLevel = 1
-	}
-	
-	if targetLevel >= len(s.trailHead) {
-		targetLevel = len(s.trailHead) - 1
-	}
-
-	decisionPoint := s.trailHead[targetLevel-1]
-
-	// Get the decision variable and value from the decision point
+	decisionPoint := s.trailHead[prevLevel]
 	if decisionPoint >= len(s.trail) {
 		return false
 	}
 	
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
-	
 
-	// Clear assignments from the decision point onward
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{}
 		s.implication[varIdx] = -1
 	}
 	s.trail = s.trail[:decisionPoint]
-	s.trailHead = s.trailHead[:targetLevel]
-	s.level = targetLevel - 1
+	s.trailHead = s.trailHead[:prevLevel+1]
+	s.level = prevLevel
 
-	// Try the opposite value for the decision variable
-	s.level++
-	s.trailHead = append(s.trailHead, len(s.trail))
-	s.assignLiteral(cnf.NewLiteral(decisionVar, decisionValue), s.level, -1)
+	s.assignments[decisionVar] = Assignment{
+		Value: !decisionValue,
+		Level: prevLevel,
+	}
+	s.trail = append(s.trail, int(decisionVar))
+	
 	return true
 }
 
