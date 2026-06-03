@@ -17,6 +17,7 @@ type CDCLSolver struct {
 	learned       []cnf.Clause
 	analyzer      *ConflictAnalyzer
 	implication   []int // implication[var] = clause that implied it
+	restarts      *LubyRestarts
 }
 
 // NewCDCLSolver creates a new CDCL solver with clause learning
@@ -39,6 +40,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		conflicts:   0,
 		learned:     make([]cnf.Clause, 0),
 		implication: make([]int, formula.NumVars),
+		restarts:    NewLubyRestarts(100),
 	}
 
 	// Initialize watches
@@ -70,6 +72,9 @@ func (s *CDCLSolver) Solve() bool {
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
+			if s.restarts.AddConflict() {
+				s.restart()
+			}
 			if !s.backtrack() {
 				return false
 			}
@@ -246,6 +251,18 @@ func (s *CDCLSolver) backtrack() bool {
 		s.assignLiteral(cnf.NewLiteral(decisionVar, !decisionValue), s.level, -1)
 		return true
 	}
+}
+
+// restart clears the trail but keeps learned clauses and activity scores
+func (s *CDCLSolver) restart() {
+	for i := 0; i < len(s.trail); i++ {
+		varIdx := uint32(s.trail[i])
+		s.assignments[varIdx] = Assignment{}
+		s.implication[varIdx] = -1
+	}
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.level = 0
 }
 
 // GetModel returns the satisfying assignment (true=positive, false=negative)
