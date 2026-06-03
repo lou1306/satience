@@ -74,12 +74,12 @@ func (ca *ConflictAnalyzer) Analyze(conflictClause *cnf.Clause, trail []int, tra
 					}
 				}
 				// Add negation of this literal to learned clause
-				negatedLit := cnf.NewLiteral(varIdx, !assign.Value)
+				negatedLit := cnf.NewLiteral(varIdx, assign.Value)
 				learned = append(learned, negatedLit)
 				literalsAtLevel--
 			} else {
 				// This is the UIP
-				negatedLit := cnf.NewLiteral(varIdx, !assign.Value)
+				negatedLit := cnf.NewLiteral(varIdx, assign.Value)
 				learned = append(learned, negatedLit)
 				
 				// Calculate backtrack level
@@ -94,7 +94,7 @@ func (ca *ConflictAnalyzer) Analyze(conflictClause *cnf.Clause, trail []int, tra
 			}
 		} else {
 			// Literal from lower level - add to learned clause
-			negatedLit := cnf.NewLiteral(varIdx, !assign.Value)
+			negatedLit := cnf.NewLiteral(varIdx, assign.Value)
 			learned = append(learned, negatedLit)
 		}
 	}

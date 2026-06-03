@@ -85,8 +85,6 @@ func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
 	for trailIndex < len(s.trail) {
-		trailIndex++
-
 		// Check all clauses for conflicts and unit propagation
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
@@ -123,9 +121,11 @@ func (s *CDCLSolver) propagate() (bool, int) {
 				s.assignLiteral(unassignedLit, s.level, clauseIdx)
 				// After assigning, restart clause checking from the beginning
 				// to catch any new unit clauses or conflicts
+				trailIndex = s.trailHead[s.level]
 				break
 			}
 		}
+		trailIndex++
 	}
 
 	return false, -1
@@ -244,7 +244,7 @@ func (s *CDCLSolver) backtrack() bool {
 	// Try the opposite value for the decision variable
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
-	s.assignLiteral(cnf.NewLiteral(decisionVar, !decisionValue), s.level, -1)
+	s.assignLiteral(cnf.NewLiteral(decisionVar, decisionValue), s.level, -1)
 	return true
 }
 
