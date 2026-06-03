@@ -4,8 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-
-	"satience/internal/cnf"
 	"satience/internal/parser"
 	"satience/internal/solver"
 )
@@ -21,16 +19,14 @@ func main() {
 		os.Exit(2)
 	}
 
-	filename := args[0]
-	
-	file, err := os.Open(filename)
+	f, err := os.Open(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
 		os.Exit(2)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	cnf, err := parser.Parse(file)
+	cnf, err := parser.Parse(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing CNF: %v\n", err)
 		os.Exit(2)
@@ -59,11 +55,12 @@ func main() {
 	}
 }
 
-func printModel(s *solver.CDCLSolver, cnf *cnf.CNF) {
+func printModel(s *solver.CDCLSolver, cnf interface{}) {
 	assignments := s.GetAssignments()
 	fmt.Println("Model:")
-	for i := uint32(0); i < cnf.NumVars; i++ {
-		varStr := fmt.Sprintf("x%d", i+1)
-		fmt.Printf("  %s = %v\n", varStr, assignments[i].Value)
+	for i, a := range assignments {
+		if a.Level > 0 {
+			fmt.Printf("  x%d = %v\n", i+1, a.Value)
+		}
 	}
 }

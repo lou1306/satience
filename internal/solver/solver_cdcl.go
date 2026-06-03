@@ -13,18 +13,19 @@ const (
 	UNKNOWN
 )
 
-// CDCLSolver implements a CDCL solver (DPLL with VSIDS)
+// CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
 type CDCLSolver struct {
-	cnf         *cnf.CNF
-	assignments []Assignment
-	trail       []int
-	trailHead   []int
-	level       int
-	vsids       *VSIDS
-	conflicts   int
-	implication []int
-	iterations  int
-	maxIter     int
+	cnf          *cnf.CNF
+	assignments  []Assignment
+	trail        []int
+	trailHead    []int
+	level        int
+	vsids        *VSIDS
+	conflicts    int
+	implication  []int
+	iterations   int
+	maxIter      int
+	learnedClauses []cnf.Clause
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -97,7 +98,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
 	for trailIndex < len(s.trail) {
-		// Check all clauses for conflicts and unit propagation
+		// Check original clauses for conflicts and unit propagation
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
 			
@@ -137,6 +138,48 @@ func (s *CDCLSolver) propagate() (bool, int) {
 				break
 			}
 		}
+		
+		// Check learned clauses for conflicts and unit propagation
+		for learnedIdx := range s.learnedClauses {
+			clause := &s.learnedClauses[learnedIdx]
+			
+			// Count satisfied, false, and unassigned literals
+			satisfiedCount := 0
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for _, lit := range clause.Literals {
+				litLevel := s.assignments[lit.Var()].Level
+				if litLevel == 0 {
+					unassignedCount++
+					unassignedLit = lit
+				} else if s.literalIsTrue(lit) {
+					satisfiedCount++
+				} else {
+					falseCount++
+				}
+			}
+			
+			if satisfiedCount > 0 {
+				continue // Clause is satisfied
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				// All literals are false - conflict!
+				return true, -learnedIdx - 1 // negative to distinguish from original clauses
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				// Unit clause - propagate the unassigned literal
+				s.assignLiteral(unassignedLit, s.level, -learnedIdx-1)
+				// After assigning, restart clause checking from the beginning
+				// to catch any new unit clauses or conflicts
+				trailIndex = s.trailHead[s.level]
+				break
+			}
+		}
+		
 		trailIndex++
 	}
 
@@ -182,11 +225,111 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 
 func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	s.conflicts++
-	clause := &s.cnf.Clauses[clauseIdx]
-	s.vsids.bumpClause(clause.Literals)
+	
+	// Get the conflicting clause
+	var conflictLits []cnf.Literal
+	if clauseIdx >= 0 {
+		conflictLits = s.cnf.Clauses[clauseIdx].Literals
+	} else {
+		// Learned clause (encoded as negative index)
+		learnedIdx := -clauseIdx - 1
+		conflictLits = s.learnedClauses[learnedIdx].Literals
+	}
+	
+	s.vsids.bumpClause(conflictLits)
+	
+	// Learn clause using 1-UIP analysis
+	s.learnClause(conflictLits)
 
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
+	}
+}
+
+func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) {
+	// 1-UIP clause learning
+	// Start with the conflicting clause and resolve with reason clauses
+	// until we have exactly one literal at the current decision level
+	
+	// Track which literals are in the learned clause
+	literalInClause := make([]bool, s.cnf.NumVars)
+	literalIsNegated := make([]bool, s.cnf.NumVars)
+	
+	// Count literals at each level
+	levelCount := make([]int, s.level+1)
+	
+	// Add all literals from the conflicting clause
+	for _, lit := range conflictLits {
+		varIdx := lit.Var()
+		if !literalInClause[varIdx] {
+			literalInClause[varIdx] = true
+			literalIsNegated[varIdx] = lit.IsNegated()
+			lvl := s.assignments[varIdx].Level
+			if lvl <= s.level {
+				levelCount[lvl]++
+			}
+		}
+	}
+	
+	// Resolve with reason clauses for literals at current level
+	// Work backwards through the trail at current level
+	for i := len(s.trail) - 1; i >= s.trailHead[s.level] && levelCount[s.level] > 1; i-- {
+		varIdx := uint32(s.trail[i])
+		
+		if !literalInClause[varIdx] {
+			continue // This variable is not in our learned clause
+		}
+		
+		// Get the reason clause for this literal
+		reasonIdx := s.implication[varIdx]
+		if reasonIdx < 0 {
+			continue // Decision variable, no reason clause
+		}
+		
+		// Get the reason clause literals
+		var reasonLits []cnf.Literal
+		if reasonIdx >= 0 {
+			reasonLits = s.cnf.Clauses[reasonIdx].Literals
+		} else {
+			learnedIdx := -reasonIdx - 1
+			reasonLits = s.learnedClauses[learnedIdx].Literals
+		}
+		
+		// Remove this literal from the learned clause (resolution)
+		literalInClause[varIdx] = false
+		levelCount[s.assignments[varIdx].Level]--
+		
+		// Add all other literals from the reason clause
+		for _, lit := range reasonLits {
+			v := lit.Var()
+			if v == varIdx {
+				continue // Skip the literal we're resolving on
+			}
+			if !literalInClause[v] {
+				literalInClause[v] = true
+				literalIsNegated[v] = lit.IsNegated()
+				lvl := s.assignments[v].Level
+				if lvl <= s.level {
+					levelCount[lvl]++
+				}
+			}
+		}
+	}
+	
+	// Build the learned clause from remaining literals
+	learnedLits := make([]cnf.Literal, 0)
+	for varIdx, inClause := range literalInClause {
+		if inClause {
+			learnedLits = append(learnedLits, cnf.NewLiteral(uint32(varIdx), literalIsNegated[varIdx]))
+		}
+	}
+	
+	// Only learn non-empty clauses
+	if len(learnedLits) > 0 {
+		s.learnedClauses = append(s.learnedClauses, cnf.Clause{
+			Literals: learnedLits,
+			Learned:  true,
+		})
 	}
 }
 
