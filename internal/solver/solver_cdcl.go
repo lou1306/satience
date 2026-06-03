@@ -97,7 +97,11 @@ func (s *CDCLSolver) allAssigned() bool {
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
-	for trailIndex < len(s.trail) {
+	// For initial unit propagation at level 0, we need to check all clauses even with empty trail
+	// Use a do-while pattern: always check at least once per level
+	firstPass := true
+	for firstPass || trailIndex < len(s.trail) {
+		firstPass = false
 		unitPropagated := false
 		
 		// Check original clauses for conflicts and unit propagation
@@ -133,7 +137,12 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			
 			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
 				// Unit clause - propagate the unassigned literal
-				s.assignLiteral(unassignedLit, s.level, clauseIdx)
+				// Use max(1, s.level) to ensure we never assign at level 0
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
 				unitPropagated = true
 				break
 			}
