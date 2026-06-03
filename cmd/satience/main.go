@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"satience/internal/cnf"
 	"satience/internal/parser"
 	"satience/internal/solver"
 )
@@ -39,7 +40,7 @@ func main() {
 	if s.Solve() {
 		fmt.Println("SAT")
 		if *showModel {
-			printModel(s)
+			printModel(s, cnf)
 		}
 		os.Exit(0)
 	} else {
@@ -48,19 +49,11 @@ func main() {
 	}
 }
 
-func printModel(s *solver.CDCLSolver) {
-	model := s.GetModel()
-	if model == nil {
-		return
-	}
-	
+func printModel(s *solver.CDCLSolver, cnf *cnf.CNF) {
+	assignments := s.GetAssignments()
 	fmt.Println("Model:")
-	for i, val := range model {
+	for i := uint32(0); i < cnf.NumVars; i++ {
 		varStr := fmt.Sprintf("x%d", i+1)
-		if val {
-			fmt.Printf("  %s = true\n", varStr)
-		} else {
-			fmt.Printf("  %s = false\n", varStr)
-		}
+		fmt.Printf("  %s = %v\n", varStr, assignments[i].Value)
 	}
 }

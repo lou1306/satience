@@ -4,25 +4,21 @@ import (
 	"satience/internal/cnf"
 )
 
-// CDCLSolver implements a CDCL solver with clause learning
+// CDCLSolver implements a CDCL solver (DPLL with VSIDS)
 type CDCLSolver struct {
-	cnf          *cnf.CNF
-	assignments  []Assignment
-	trail        []int
-	trailHead    []int
-	level        int
-	vsids        *VSIDS
-	conflicts    int
-	analyzer     *ConflictAnalyzer
-	implication  []int
-	restarts     *LubyRestarts
-	db           *ClauseDatabase
-	backjumpLevel int
+	cnf         *cnf.CNF
+	assignments []Assignment
+	trail       []int
+	trailHead   []int
+	level       int
+	vsids       *VSIDS
+	conflicts   int
+	implication []int
 }
 
-// NewCDCLSolver creates a new CDCL solver with clause learning
+// NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	solver := &CDCLSolver{
+	return &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
 		trail:       make([]int, 0),
@@ -31,13 +27,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
 		implication: make([]int, formula.NumVars),
-		restarts:    NewLubyRestarts(1000000), // Disable restarts for debugging
-		db:          NewClauseDatabase(10000),
 	}
-
-	solver.analyzer = NewConflictAnalyzer(formula, solver.assignments)
-
-	return solver
 }
 
 func (s *CDCLSolver) Solve() bool {
@@ -53,9 +43,6 @@ func (s *CDCLSolver) Solve() bool {
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
-			if s.restarts.AddConflict() {
-				s.restart()
-			}
 			if !s.backtrack() {
 				return false
 			}
@@ -70,6 +57,11 @@ func (s *CDCLSolver) Solve() bool {
 			return false
 		}
 	}
+}
+
+// GetAssignments returns the current assignments for model extraction
+func (s *CDCLSolver) GetAssignments() []Assignment {
+	return s.assignments
 }
 
 func (s *CDCLSolver) allAssigned() bool {
@@ -214,27 +206,4 @@ func (s *CDCLSolver) backtrack() bool {
 	return true
 }
 
-func (s *CDCLSolver) restart() {
-	for i := 0; i < len(s.trail); i++ {
-		varIdx := uint32(s.trail[i])
-		s.assignments[varIdx] = Assignment{}
-		s.implication[varIdx] = -1
-	}
-	s.trail = s.trail[:0]
-	s.trailHead = s.trailHead[:1]
-	s.level = 0
-}
 
-func (s *CDCLSolver) GetModel() []bool {
-	for i := uint32(0); i < s.cnf.NumVars; i++ {
-		if s.assignments[i].Level == 0 {
-			return nil
-		}
-	}
-
-	model := make([]bool, s.cnf.NumVars)
-	for i, assign := range s.assignments {
-		model[i] = assign.Value
-	}
-	return model
-}
