@@ -4,51 +4,35 @@ import (
 	"satience/internal/cnf"
 )
 
-// CDCLSolver implements a full CDCL solver with clause learning
+// CDCLSolver implements a CDCL solver with clause learning
 type CDCLSolver struct {
-	cnf           *cnf.CNF
-	assignments   []Assignment
-	trail         []int
-	trailHead     []int
-	level         int
-	watches       [][][]int
-	vsids         *VSIDS
-	conflicts     int
-	analyzer      *ConflictAnalyzer
-	implication   []int // implication[var] = clause that implied it
-	restarts      *LubyRestarts
-	db            *ClauseDatabase
+	cnf          *cnf.CNF
+	assignments  []Assignment
+	trail        []int
+	trailHead    []int
+	level        int
+	vsids        *VSIDS
+	conflicts    int
+	analyzer     *ConflictAnalyzer
+	implication  []int
+	restarts     *LubyRestarts
+	db           *ClauseDatabase
+	backjumpLevel int
 }
 
 // NewCDCLSolver creates a new CDCL solver with clause learning
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	watches := make([][][]int, formula.NumVars)
-	for i := range watches {
-		watches[i] = make([][]int, 2)
-		watches[i][0] = make([]int, 0)
-		watches[i][1] = make([]int, 0)
-	}
-
 	solver := &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
 		trail:       make([]int, 0),
 		trailHead:   make([]int, 1),
 		level:       0,
-		watches:     watches,
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
 		implication: make([]int, formula.NumVars),
-		restarts:    NewLubyRestarts(100),
+		restarts:    NewLubyRestarts(1000000), // Disable restarts for debugging
 		db:          NewClauseDatabase(10000),
-	}
-
-	// Initialize watches
-	for clauseIdx := range formula.Clauses {
-		clause := &formula.Clauses[clauseIdx]
-		for i := 0; i < 2 && i < len(clause.Literals); i++ {
-			solver.addWatch(clauseIdx, i)
-		}
 	}
 
 	solver.analyzer = NewConflictAnalyzer(formula, solver.assignments)
@@ -56,19 +40,16 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	return solver
 }
 
-func (s *CDCLSolver) addWatch(clauseIdx int, litIdx int) {
-	clause := &s.cnf.Clauses[clauseIdx]
-	lit := clause.Literals[litIdx]
-	varIdx := lit.Var()
-	polarity := 0
-	if lit.IsNegated() {
-		polarity = 1
-	}
-	s.watches[varIdx][polarity] = append(s.watches[varIdx][polarity], clauseIdx)
-}
-
 func (s *CDCLSolver) Solve() bool {
+	iterations := 0
 	for {
+		iterations++
+		if iterations % 1000 == 0 {
+		}
+		if iterations > 10000 {
+			return false
+		}
+		
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
@@ -81,7 +62,7 @@ func (s *CDCLSolver) Solve() bool {
 			continue
 		}
 
-		if len(s.trail) == int(s.cnf.NumVars) {
+		if s.allAssigned() {
 			return true
 		}
 
@@ -91,53 +72,58 @@ func (s *CDCLSolver) Solve() bool {
 	}
 }
 
+func (s *CDCLSolver) allAssigned() bool {
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
 	for trailIndex < len(s.trail) {
-		varIdx := uint32(s.trail[trailIndex])
-		value := s.assignments[varIdx].Value
 		trailIndex++
 
-		polarity := 1
-		if !value {
-			polarity = 0
-		}
-
-		clauses := s.watches[varIdx][polarity]
-
-		for _, clauseIdx := range clauses {
+		// Check all clauses for conflicts and unit propagation
+		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
-
-			// Check if clause is satisfied
-			satisfied := false
-			for _, lit := range clause.Literals {
-				if s.assignments[lit.Var()].Level > 0 && s.literalIsTrue(lit) {
-					satisfied = true
-					break
-				}
-			}
-			if satisfied {
-				continue
-			}
-
-			// Count unassigned and find potential unit
+			
+			// Count satisfied, false, and unassigned literals
+			satisfiedCount := 0
+			falseCount := 0
 			unassignedCount := 0
 			var unassignedLit cnf.Literal
-
+			
 			for _, lit := range clause.Literals {
-				if s.assignments[lit.Var()].Level == 0 {
+				litLevel := s.assignments[lit.Var()].Level
+				if litLevel == 0 {
 					unassignedCount++
 					unassignedLit = lit
+				} else if s.literalIsTrue(lit) {
+					satisfiedCount++
+				} else {
+					falseCount++
 				}
 			}
-
-			if unassignedCount == 0 {
-				return true, clauseIdx // Conflict
+			
+			if satisfiedCount > 0 {
+				continue // Clause is satisfied
 			}
-
-			if unassignedCount == 1 {
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				// All literals are false - conflict!
+				return true, clauseIdx
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				// Unit clause - propagate the unassigned literal
 				s.assignLiteral(unassignedLit, s.level, clauseIdx)
+				// After assigning, restart clause checking from the beginning
+				// to catch any new unit clauses or conflicts
+				break
 			}
 		}
 	}
@@ -161,7 +147,7 @@ func (s *CDCLSolver) decide() bool {
 func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	varIdx := lit.Var()
 
-	if s.assignments[varIdx].Level > 0 {
+	if s.assignments[varIdx].Level != 0 {
 		return
 	}
 
@@ -185,12 +171,10 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	s.conflicts++
 
-	// Bump activity for variables involved in conflict
 	clause := &s.cnf.Clauses[clauseIdx]
 	s.vsids.bumpClause(clause.Literals)
 
-	// Perform conflict analysis and learn clause
-	learnedClause, _ := s.analyzer.Analyze(
+	learnedClause, backjumpLevel := s.analyzer.Analyze(
 		clause,
 		s.trail,
 		s.trailHead,
@@ -201,64 +185,69 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		s.db.Add(*learnedClause)
 		s.cnf.Clauses = append(s.cnf.Clauses, *learnedClause)
 		
-		// Add watches for learned clause
-		watchIdx := len(s.cnf.Clauses) - 1
-		for i := 0; i < 2 && i < len(learnedClause.Literals); i++ {
-			s.addWatch(watchIdx, i)
-		}
-		
-		// Update analyzer with new clause
 		s.analyzer = NewConflictAnalyzer(s.cnf, s.assignments)
 		
-		// Cleanup database if needed
 		if s.db.Len() > 10000 {
 			s.db.Cleanup()
 		}
 	}
 
-	// Decay activity periodically
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
 	}
+	
+	// Store the backjump level for use in backtrack
+	s.backjumpLevel = backjumpLevel
 }
 
 func (s *CDCLSolver) backtrack() bool {
-	for {
-		if len(s.trailHead) <= 1 {
-			return false
-		}
-
-		s.trailHead = s.trailHead[:len(s.trailHead)-1]
-		decisionPoint := s.trailHead[len(s.trailHead)-1]
-
-		var decisionVar uint32 = 0
-		var decisionValue bool = false
-
-		if decisionPoint < len(s.trail) {
-			decisionVar = uint32(s.trail[decisionPoint])
-			decisionValue = s.assignments[decisionVar].Value
-		}
-
-		for i := decisionPoint; i < len(s.trail); i++ {
-			varIdx := uint32(s.trail[i])
-			s.assignments[varIdx] = Assignment{}
-			s.implication[varIdx] = -1
-		}
-		s.trail = s.trail[:decisionPoint]
-		s.level--
-
-		if decisionPoint >= len(s.trail) {
-			continue
-		}
-
-		s.level++
-		s.trailHead = append(s.trailHead, len(s.trail))
-		s.assignLiteral(cnf.NewLiteral(decisionVar, !decisionValue), s.level, -1)
-		return true
+	if len(s.trailHead) <= 1 {
+		return false
 	}
+
+	// Use backjump level if available, otherwise backtrack chronologically
+	targetLevel := s.backjumpLevel
+	if targetLevel >= s.level || targetLevel < 0 {
+		// Invalid backjump level, use chronological backtracking
+		targetLevel = s.level - 1
+	}
+	
+	if targetLevel < 1 {
+		targetLevel = 1
+	}
+	
+	if targetLevel >= len(s.trailHead) {
+		targetLevel = len(s.trailHead) - 1
+	}
+
+	decisionPoint := s.trailHead[targetLevel-1]
+
+	// Get the decision variable and value from the decision point
+	if decisionPoint >= len(s.trail) {
+		return false
+	}
+	
+	decisionVar := uint32(s.trail[decisionPoint])
+	decisionValue := s.assignments[decisionVar].Value
+	
+
+	// Clear assignments from the decision point onward
+	for i := decisionPoint; i < len(s.trail); i++ {
+		varIdx := uint32(s.trail[i])
+		s.assignments[varIdx] = Assignment{}
+		s.implication[varIdx] = -1
+	}
+	s.trail = s.trail[:decisionPoint]
+	s.trailHead = s.trailHead[:targetLevel]
+	s.level = targetLevel - 1
+
+	// Try the opposite value for the decision variable
+	s.level++
+	s.trailHead = append(s.trailHead, len(s.trail))
+	s.assignLiteral(cnf.NewLiteral(decisionVar, !decisionValue), s.level, -1)
+	return true
 }
 
-// restart clears the trail but keeps learned clauses and activity scores
 func (s *CDCLSolver) restart() {
 	for i := 0; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
@@ -270,11 +259,11 @@ func (s *CDCLSolver) restart() {
 	s.level = 0
 }
 
-// GetModel returns the satisfying assignment (true=positive, false=negative)
-// Returns nil if no satisfying assignment exists
 func (s *CDCLSolver) GetModel() []bool {
-	if len(s.trail) != int(s.cnf.NumVars) {
-		return nil
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level == 0 {
+			return nil
+		}
 	}
 
 	model := make([]bool, s.cnf.NumVars)
