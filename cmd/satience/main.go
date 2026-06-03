@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -9,12 +10,16 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <input.cnf>\n", os.Args[0])
+	showModel := flag.Bool("model", false, "Show satisfying assignment if SAT")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [-model] <input.cnf>\n", os.Args[0])
 		os.Exit(2)
 	}
 
-	filename := os.Args[1]
+	filename := args[0]
 	
 	file, err := os.Open(filename)
 	if err != nil {
@@ -29,13 +34,33 @@ func main() {
 		os.Exit(2)
 	}
 
-	s := solver.NewSolver(cnf)
+	s := solver.NewCDCLSolver(cnf)
 	
 	if s.Solve() {
 		fmt.Println("SAT")
+		if *showModel {
+			printModel(s)
+		}
 		os.Exit(0)
 	} else {
 		fmt.Println("UNSAT")
 		os.Exit(1)
+	}
+}
+
+func printModel(s *solver.CDCLSolver) {
+	model := s.GetModel()
+	if model == nil {
+		return
+	}
+	
+	fmt.Println("Model:")
+	for i, val := range model {
+		varStr := fmt.Sprintf("x%d", i+1)
+		if val {
+			fmt.Printf("  %s = true\n", varStr)
+		} else {
+			fmt.Printf("  %s = false\n", varStr)
+		}
 	}
 }

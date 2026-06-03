@@ -122,3 +122,75 @@ func TestSolveUnsat3SAT(t *testing.T) {
 		t.Error("Expected UNSAT (all combinations covered)")
 	}
 }
+
+func TestCDCLSolveUnsat(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 1,
+		Clauses: []cnf.Clause{
+			newClause(1),
+			newClause(-1),
+		},
+		NumClauses: 2,
+	}
+
+	s := NewCDCLSolver(&c)
+	if s.Solve() {
+		t.Error("Expected UNSAT")
+	}
+}
+
+func TestCDCLSolveSat(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			newClause(1, 2),
+			newClause(-1, 3),
+		},
+		NumClauses: 2,
+	}
+
+	s := NewCDCLSolver(&c)
+	if !s.Solve() {
+		t.Error("Expected SAT")
+	}
+}
+
+func TestCDCLSolve3SAT(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 4,
+		Clauses: []cnf.Clause{
+			newClause(1, 2, 3),
+			newClause(1, -2, 4),
+			newClause(-1, 2, -4),
+			newClause(-1, -2, -3),
+		},
+		NumClauses: 4,
+	}
+
+	s := NewCDCLSolver(&c)
+	if !s.Solve() {
+		t.Error("Expected SAT")
+	}
+}
+
+func TestCDCLSolveUnsat3SAT(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			newClause(1, 2, 3),
+			newClause(1, 2, -3),
+			newClause(1, -2, 3),
+			newClause(1, -2, -3),
+			newClause(-1, 2, 3),
+			newClause(-1, 2, -3),
+			newClause(-1, -2, 3),
+			newClause(-1, -2, -3),
+		},
+		NumClauses: 8,
+	}
+
+	s := NewCDCLSolver(&c)
+	if s.Solve() {
+		t.Error("Expected UNSAT (all combinations covered)")
+	}
+}
