@@ -1,0 +1,5 @@
+c Simple SAT instance
+c This should be SATISFIABLE
+p cnf 3 2
+1 2 0
+-1 3 0

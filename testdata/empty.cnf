@@ -1,0 +1,2 @@
+c Empty clause list - should be SAT (trivially satisfiable)
+p cnf 3 0
