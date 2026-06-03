@@ -12,11 +12,12 @@ import (
 
 func main() {
 	showModel := flag.Bool("model", false, "Show satisfying assignment if SAT")
+	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0 = unlimited)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-model] <input.cnf>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-model] [-max-iter N] <input.cnf>\n", os.Args[0])
 		os.Exit(2)
 	}
 
@@ -36,16 +37,25 @@ func main() {
 	}
 
 	s := solver.NewCDCLSolver(cnf)
+	if *maxIter > 0 {
+		s.SetMaxIter(*maxIter)
+	}
 	
-	if s.Solve() {
+	result := s.SolveWithResult()
+	
+	switch result {
+	case solver.SAT:
 		fmt.Println("SAT")
 		if *showModel {
 			printModel(s, cnf)
 		}
 		os.Exit(0)
-	} else {
+	case solver.UNSAT:
 		fmt.Println("UNSAT")
 		os.Exit(1)
+	case solver.UNKNOWN:
+		fmt.Println("UNKNOWN")
+		os.Exit(2)
 	}
 }
 

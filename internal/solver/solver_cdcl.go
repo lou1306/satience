@@ -4,6 +4,15 @@ import (
 	"satience/internal/cnf"
 )
 
+// SolveResult represents the result of solving
+type SolveResult int
+
+const (
+	SAT SolveResult = iota
+	UNSAT
+	UNKNOWN
+)
+
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS)
 type CDCLSolver struct {
 	cnf         *cnf.CNF
@@ -14,6 +23,8 @@ type CDCLSolver struct {
 	vsids       *VSIDS
 	conflicts   int
 	implication []int
+	iterations  int
+	maxIter     int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -27,34 +38,43 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
 		implication: make([]int, formula.NumVars),
+		iterations:  0,
+		maxIter:     0, // disabled by default
 	}
 }
 
+// SetMaxIter sets the maximum iteration limit (0 = unlimited)
+func (s *CDCLSolver) SetMaxIter(limit int) {
+	s.maxIter = limit
+}
+
 func (s *CDCLSolver) Solve() bool {
-	iterations := 0
+	result := s.SolveWithResult()
+	return result == SAT
+}
+
+func (s *CDCLSolver) SolveWithResult() SolveResult {
 	for {
-		iterations++
-		if iterations % 1000 == 0 {
-		}
-		if iterations > 10000 {
-			return false
+		s.iterations++
+		if s.maxIter > 0 && s.iterations > s.maxIter {
+			return UNKNOWN
 		}
 		
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
 			if !s.backtrack() {
-				return false
+				return UNSAT
 			}
 			continue
 		}
 
 		if s.allAssigned() {
-			return true
+			return SAT
 		}
 
 		if !s.decide() {
-			return false
+			return UNSAT
 		}
 	}
 }
