@@ -1,1 +1,6 @@
 opencode.json
+benchmark/benchmark_results.csv
+benchmark/gbd_instances/
+benchmark/gbd_downloads/
+benchmark/gbd-data-temp/
+benchmark/meta.db
