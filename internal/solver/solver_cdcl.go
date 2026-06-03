@@ -1,6 +1,7 @@
 package solver
 
 import (
+	"fmt"
 	"satience/internal/cnf"
 )
 
@@ -26,6 +27,8 @@ type CDCLSolver struct {
 	iterations   int
 	maxIter      int
 	learnedClauses []cnf.Clause
+	verbose      bool
+	decisions    int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -41,12 +44,43 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		implication: make([]int, formula.NumVars),
 		iterations:  0,
 		maxIter:     0, // disabled by default
+		verbose:     false,
+		decisions:   0,
 	}
 }
 
 // SetMaxIter sets the maximum iteration limit (0 = unlimited)
 func (s *CDCLSolver) SetMaxIter(limit int) {
 	s.maxIter = limit
+}
+
+// SetVerbose enables/disables verbose output
+func (s *CDCLSolver) SetVerbose(v bool) {
+	s.verbose = v
+}
+
+// GetStats returns solving statistics
+func (s *CDCLSolver) GetStats() map[string]int {
+	return map[string]int{
+		"conflicts":     s.conflicts,
+		"decisions":     s.decisions,
+		"iterations":    s.iterations,
+		"learned":       len(s.learnedClauses),
+		"level":         s.level,
+	}
+}
+
+func (s *CDCLSolver) printStats() {
+	fmt.Printf("c \n")
+	fmt.Printf("c === Solving Statistics ===\n")
+	fmt.Printf("c Variables:     %d\n", s.cnf.NumVars)
+	fmt.Printf("c Clauses:       %d\n", s.cnf.NumClauses)
+	fmt.Printf("c Conflicts:     %d\n", s.conflicts)
+	fmt.Printf("c Decisions:     %d\n", s.decisions)
+	fmt.Printf("c Iterations:    %d\n", s.iterations)
+	fmt.Printf("c Learned:       %d\n", len(s.learnedClauses))
+	fmt.Printf("c Max Level:     %d\n", s.level)
+	fmt.Printf("c \n")
 }
 
 func (s *CDCLSolver) Solve() bool {
@@ -58,6 +92,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	for {
 		s.iterations++
 		if s.maxIter > 0 && s.iterations > s.maxIter {
+			if s.verbose {
+				fmt.Printf("c [verbose] Iteration limit reached (%d)\n", s.maxIter)
+				s.printStats()
+			}
 			return UNKNOWN
 		}
 		
@@ -65,16 +103,25 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		if conflict {
 			s.handleConflict(clauseIdx)
 			if !s.backtrack() {
+				if s.verbose {
+					s.printStats()
+				}
 				return UNSAT
 			}
 			continue
 		}
 
 		if s.allAssigned() {
+			if s.verbose {
+				s.printStats()
+			}
 			return SAT
 		}
 
 		if !s.decide() {
+			if s.verbose {
+				s.printStats()
+			}
 			return UNSAT
 		}
 	}
@@ -215,6 +262,7 @@ func (s *CDCLSolver) decide() bool {
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
 	s.assignLiteral(cnf.NewLiteral(varIdx, false), s.level, -1)
+	s.decisions++
 	return true
 }
 
