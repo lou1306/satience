@@ -132,6 +132,12 @@ func (s *CDCLSolver) preprocess() SolveResult {
 		return veResult
 	}
 	
+	// Apply blocked clause elimination
+	bceResult := s.blockedClauseElimination()
+	if bceResult != UNKNOWN {
+		return bceResult
+	}
+	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
@@ -655,6 +661,170 @@ func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
 		key += fmt.Sprintf("%d,", lit)
 	}
 	return key
+}
+
+// blockedClauseElimination removes clauses that are "blocked" by a literal
+// A clause C is blocked by literal L ∈ C if all resolvents of C with clauses
+// containing ¬L are tautologies. Blocked clauses can be safely removed.
+// This is a powerful preprocessing technique that can reduce formula size.
+// Returns UNSAT if empty clause detected, SAT if all clauses satisfied, UNKNOWN otherwise
+func (s *CDCLSolver) blockedClauseElimination() SolveResult {
+	// Skip BCE on large formulas to avoid excessive preprocessing time
+	// O(n²) complexity makes it expensive for large instances
+	if s.cnf.NumClauses > 5000 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Blocked clause elimination: skipped (%d clauses, limit 5000)\n", s.cnf.NumClauses)
+		}
+		return UNKNOWN
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Blocked clause elimination: checking %d clauses\n", s.cnf.NumClauses)
+	}
+
+	removedCount := 0
+	changed := true
+
+	for changed {
+		changed = false
+		blocked := make([]bool, len(s.cnf.Clauses))
+
+		// Check each clause for blocking
+		for clauseIdx, clause := range s.cnf.Clauses {
+			if len(clause.Literals) == 0 {
+				// Empty clause - UNSAT
+				return UNSAT
+			}
+
+			// Check if clause is blocked by any of its literals
+			for _, blockingLit := range clause.Literals {
+				if s.isClauseBlockedBy(clause, blockingLit) {
+					blocked[clauseIdx] = true
+					removedCount++
+					changed = true
+					break
+				}
+			}
+		}
+
+		// Remove blocked clauses
+		if changed {
+			remaining := make([]cnf.Clause, 0)
+			for i, clause := range s.cnf.Clauses {
+				if !blocked[i] {
+					remaining = append(remaining, clause)
+				}
+			}
+			s.cnf.Clauses = remaining
+			s.cnf.NumClauses = len(remaining)
+		}
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Blocked clause elimination: removed %d clauses\n", removedCount)
+	}
+
+	return UNKNOWN
+}
+
+// isClauseBlockedBy checks if a clause is blocked by a specific literal
+// A clause C is blocked by L ∈ C if all resolvents with clauses containing ¬L are tautologies
+func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Literal) bool {
+	opposite := blockingLit.Negate()
+
+	// Find all clauses containing the opposite literal
+	for _, other := range s.cnf.Clauses {
+		// Check if 'other' contains the opposite literal
+		containsOpposite := false
+		for _, lit := range other.Literals {
+			if lit == opposite {
+				containsOpposite = true
+				break
+			}
+		}
+
+		if !containsOpposite {
+			continue
+		}
+
+		// Compute resolvent on blockingLit's variable
+		resolvent := s.resolveOnVar(clause, other, blockingLit.Var())
+
+		// If resolvent is not a tautology, clause is not blocked by this literal
+		if resolvent != nil && !s.isTautology(resolvent) {
+			return false
+		}
+	}
+
+	// All resolvents are tautologies (or no resolvents exist)
+	return true
+}
+
+// resolveOnVar computes the resolvent of two clauses on a specific variable
+// Returns nil if resolution is not possible (variable not in both clauses with opposite polarity)
+// Returns empty clause if resolvent is empty (conflict)
+func (s *CDCLSolver) resolveOnVar(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
+	// Check if clause1 has positive literal and clause2 has negative (or vice versa)
+	hasPosX := false
+	hasNegX := false
+
+	for _, lit := range clause1.Literals {
+		if lit.Var() == varIdx && !lit.IsNegated() {
+			hasPosX = true
+			break
+		}
+	}
+
+	for _, lit := range clause2.Literals {
+		if lit.Var() == varIdx && lit.IsNegated() {
+			hasNegX = true
+			break
+		}
+	}
+
+	// Try opposite polarity
+	if !hasPosX || !hasNegX {
+		hasPosX = false
+		hasNegX = false
+		for _, lit := range clause1.Literals {
+			if lit.Var() == varIdx && lit.IsNegated() {
+				hasNegX = true
+				break
+			}
+		}
+		for _, lit := range clause2.Literals {
+			if lit.Var() == varIdx && !lit.IsNegated() {
+				hasPosX = true
+				break
+			}
+		}
+	}
+
+	if !hasPosX || !hasNegX {
+		return nil
+	}
+
+	// Build resolvent: all literals except x and ¬x
+	resolventLits := make([]cnf.Literal, 0, len(clause1.Literals)+len(clause2.Literals)-2)
+
+	for _, lit := range clause1.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+
+	for _, lit := range clause2.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+
+	if len(resolventLits) == 0 {
+		// Empty clause
+		return &cnf.Clause{Literals: make([]cnf.Literal, 0), Learned: false}
+	}
+
+	return &cnf.Clause{Literals: resolventLits, Learned: false}
 }
 
 func (s *CDCLSolver) Solve() bool {

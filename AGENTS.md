@@ -66,6 +66,11 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
   - Only eliminates if resolvents are fewer than original clauses (beneficial)
   - Detects UNSAT from empty clause created during elimination
   - Successfully eliminates hundreds of variables on structured instances
+- **Implemented blocked clause elimination (BCE)**: Removes clauses blocked by a literal
+  - A clause C is blocked by literal L ∈ C if all resolvents with clauses containing ¬L are tautologies
+  - Blocked clauses can be safely removed without affecting satisfiability
+  - Added safeguard: skips BCE on large formulas (>5000 clauses) to avoid excessive preprocessing time
+  - Successfully removes blocked clauses on crafted instances
 - **Comprehensive evaluation**: 20/20 correct results on random instances ≤200 vars, all models verified
 - **Committed recent work**: 
   - 59b915e - Add subsumption elimination preprocessing
@@ -130,8 +135,8 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - ~~**Unit propagation preprocessing**: Simplify formula before solving~~ (DONE)
 - ~~**Pure literal elimination**: Assign and remove pure literals upfront~~ (DONE)
 - ~~**Subsumption elimination**: Remove clauses subsumed by shorter clauses~~ (DONE)
-- **Variable elimination**: Resolution-based elimination of variables before/during solving
-- **Blocked clause elimination**: Remove clauses blocked by a literal
+- ~~**Variable elimination**: Resolution-based elimination of variables before/during solving~~ (DONE)
+- ~~**Blocked clause elimination**: Remove clauses blocked by a literal~~ (DONE)
 - **Inprocessing**: Apply preprocessing techniques periodically during search
 
 ### Testing & Validation
