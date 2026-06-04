@@ -29,6 +29,7 @@ type CDCLSolver struct {
 	learnedClauses []cnf.Clause
 	verbose      bool
 	decisions    int
+	backjumpLevel int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -46,6 +47,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		maxIter:     0, // disabled by default
 		verbose:     false,
 		decisions:   0,
+		backjumpLevel: 0,
 	}
 }
 
@@ -108,6 +110,8 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				}
 				return UNSAT
 			}
+			// Reset backjump level for next conflict
+			s.backjumpLevel = 0
 			continue
 		}
 
@@ -305,15 +309,16 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	
 	s.vsids.bumpClause(conflictLits)
 	
-	// Learn clause using 1-UIP analysis
-	s.learnClause(conflictLits)
+	// Learn clause using 1-UIP analysis and get backjump level
+	bjLevel := s.learnClause(conflictLits)
+	s.backjumpLevel = bjLevel
 
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
 	}
 }
 
-func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) {
+func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// 1-UIP clause learning
 	// Start with the conflicting clause and resolve with reason clauses
 	// until we have exactly one literal at the current decision level
@@ -398,6 +403,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) {
 			Learned:  true,
 		})
 	}
+	
+	// Calculate backjump level: second-highest level in learned clause
+	// The 1-UIP clause has exactly one literal at current level
+	// Backjump to the highest level among the other literals
+	backjumpLevel := 0
+	for varIdx, inClause := range literalInClause {
+		if inClause {
+			lvl := s.assignments[varIdx].Level
+			if lvl > backjumpLevel && lvl < s.level {
+				backjumpLevel = lvl
+			}
+		}
+	}
+	
+	// If no other level found, backjump to level 0 (but we'll use level 1 minimum)
+	if backjumpLevel == 0 {
+		backjumpLevel = 1
+	}
+	
+	return backjumpLevel
 }
 
 func (s *CDCLSolver) backtrack() bool {
@@ -405,12 +430,17 @@ func (s *CDCLSolver) backtrack() bool {
 		return false
 	}
 
-	prevLevel := s.level - 1
-	if prevLevel < 1 {
+	// Use backjump level if available, otherwise backtrack one level
+	bjLevel := s.backjumpLevel
+	if bjLevel <= 0 || bjLevel >= s.level {
+		bjLevel = s.level - 1
+	}
+	if bjLevel < 1 {
 		return false
 	}
 	
-	decisionPoint := s.trailHead[prevLevel]
+	// Find the decision point at the backjump level
+	decisionPoint := s.trailHead[bjLevel]
 	if decisionPoint >= len(s.trail) {
 		return false
 	}
@@ -418,18 +448,20 @@ func (s *CDCLSolver) backtrack() bool {
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
 
+	// Clear all assignments from decisionPoint onwards
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{}
 		s.implication[varIdx] = -1
 	}
 	s.trail = s.trail[:decisionPoint]
-	s.trailHead = s.trailHead[:prevLevel+1]
-	s.level = prevLevel
+	s.trailHead = s.trailHead[:bjLevel+1]
+	s.level = bjLevel
 
+	// Flip the decision at the backjump level
 	s.assignments[decisionVar] = Assignment{
 		Value: !decisionValue,
-		Level: prevLevel,
+		Level: bjLevel,
 	}
 	s.trail = append(s.trail, int(decisionVar))
 	
