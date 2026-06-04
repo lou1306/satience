@@ -152,9 +152,9 @@ func (c *CNF) RebuildShortClauses() {
 	}
 }
 
-// litToIndex converts a literal to a watch list index
+// LitToIndex converts a literal to a watch list index
 // varIdx * 2 + (0 for positive, 1 for negated)
-func litToIndex(lit Literal) int {
+func LitToIndex(lit Literal) int {
 	varIdx := lit.Var()
 	if lit.IsNegated() {
 		return int(varIdx)*2 + 1
@@ -188,8 +188,8 @@ func (c *CNF) InitializeWatches() {
 		lit1 := Literal(c.BinaryClauses[binIdx].Lit1)
 		lit2 := Literal(c.BinaryClauses[binIdx].Lit2)
 		
-		idx1 := litToIndex(lit1)
-		idx2 := litToIndex(lit2)
+		idx1 := LitToIndex(lit1)
+		idx2 := LitToIndex(lit2)
 		
 		c.BinaryWatchA[binIdx] = idx1
 		c.BinaryWatchB[binIdx] = idx2
