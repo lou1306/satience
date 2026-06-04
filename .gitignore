@@ -4,3 +4,4 @@ benchmark/gbd_instances/
 benchmark/gbd_downloads/
 benchmark/gbd-data-temp/
 benchmark/meta.db
+benchmark/test_instances/

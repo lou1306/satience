@@ -123,6 +123,9 @@ func (s *CDCLSolver) preprocess() SolveResult {
 		return pureResult
 	}
 	
+	// Apply subsumption elimination
+	s.subsumptionElimination()
+	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
@@ -326,6 +329,82 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 	}
 	
 	return UNKNOWN
+}
+
+// subsumptionElimination removes clauses that are subsumed by other clauses
+// A clause C1 subsumes clause C2 if all literals in C1 are also in C2
+// Example: clause [1, 2] subsumes clause [1, 2, 3] - we can remove [1, 2, 3]
+// This is safe because if C1 is satisfied, C2 is automatically satisfied
+func (s *CDCLSolver) subsumptionElimination() {
+	if s.verbose {
+		fmt.Printf("c [verbose] Subsumption elimination: checking %d clauses\n", len(s.cnf.Clauses))
+	}
+	
+	removedCount := 0
+	changed := true
+	
+	for changed {
+		changed = false
+		remainingClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+		
+		for i, clause := range s.cnf.Clauses {
+			isSubsumed := false
+			
+			// Check if this clause is subsumed by any other clause
+			for j, otherClause := range s.cnf.Clauses {
+				if i == j {
+					continue
+				}
+				
+				// Skip if other clause is longer or equal length (can't subsume)
+				if len(otherClause.Literals) >= len(clause.Literals) {
+					continue
+				}
+				
+				// Check if all literals in otherClause are in clause
+				if s.isSubsumedBy(clause, otherClause) {
+					isSubsumed = true
+					if s.verbose {
+						fmt.Printf("c [verbose] Clause %v subsumed by %v\n", clause.Literals, otherClause.Literals)
+					}
+					break
+				}
+			}
+			
+			if !isSubsumed {
+				remainingClauses = append(remainingClauses, clause)
+			} else {
+				removedCount++
+				changed = true
+			}
+		}
+		
+		s.cnf.Clauses = remainingClauses
+		s.cnf.NumClauses = len(remainingClauses)
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Subsumption elimination: removed %d clauses\n", removedCount)
+	}
+}
+
+// isSubsumedBy checks if clause is subsumed by other clause
+// Returns true if all literals in 'other' appear in 'clause'
+func (s *CDCLSolver) isSubsumedBy(clause, other cnf.Clause) bool {
+	// Build a set of literals in the clause
+	literalSet := make(map[cnf.Literal]bool, len(clause.Literals))
+	for _, lit := range clause.Literals {
+		literalSet[lit] = true
+	}
+	
+	// Check if all literals in 'other' are in the set
+	for _, lit := range other.Literals {
+		if !literalSet[lit] {
+			return false
+		}
+	}
+	
+	return true
 }
 
 func (s *CDCLSolver) Solve() bool {
