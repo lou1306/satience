@@ -53,7 +53,10 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Optimized propagate()**: Inlined literalIsTrue check, cached varIdx, added bit operation constants for 15-20% speedup
 - **Evaluated on 20+ labeled instances ≤200 vars**: 0 wrong results, all SAT/UNSAT results correct
 - **Tested instance types**: algebra_xor (20-40 vars), arg_chain (50-150 vars), random_k3 (50-100 vars), tseitin_grid (40-133 vars), php (30-56 vars), sudoku (729 vars)
+- **Implemented phase saving heuristic**: Remembers last satisfying polarity for each variable, uses it in decision heuristic
+- **Evaluated on 20 random small instances (≤200 vars)**: 13 correct, 0 wrong, 7 timeout (PHP expected hard)
 - **Committed recent work**: 
+  - 803c973 - Implement phase saving heuristic
   - e7227f6 - LBD-based clause database management
   - 81066e6 - Profile solver and optimize hot path in propagate()
   - 3ae7dfb - Remove test binaries from git
@@ -81,14 +84,52 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Test detection**: Check 'UNSAT' before 'SAT' to avoid substring matching errors
 - **Inlining for performance**: literalIsTrue() inlined in propagate() hot path to reduce function call overhead
 - **Bit operation constants**: litVarMask=0x7FFFFFFF, litNegatedMask=0x80000000 for cleaner/faster bit ops
+- **Phase saving**: Save satisfying polarity in assignLiteral(), reuse in decide() via selectVariableWithPhase()
 
 ## Next Steps
+### Core Algorithm Improvements
 - **Implement watched literals scheme**: Replace linear clause scanning with O(1) watched literal pointers (major optimization)
 - **Add restart policy**: Implement Luby or Glucose-style restarts to escape unproductive search
-- **Implement phase saving**: Remember last satisfying polarity for decision heuristic
 - **Add clause minimization**: Reduce learned clause size via self-subsumption after 1-UIP analysis
-- **Test on larger instances**: Test on php_8p_7h_unsat and larger with current optimizations
+- **Implement LRB (Learning Rate Based)**: Alternative to VSIDS, picks variables that generate conflicts
+- **Implement CHB (Conflict History Based)**: Exponential decay based on conflict history
+
+### Preprocessing & Inprocessing
+- **Unit propagation preprocessing**: Simplify formula before solving
+- **Pure literal elimination**: Assign and remove pure literals upfront
+- **Variable elimination**: Resolution-based elimination of variables before/during solving
+- **Subsumption elimination**: Remove clauses subsumed by shorter clauses
+- **Blocked clause elimination**: Remove clauses blocked by a literal
+- **Inprocessing**: Apply preprocessing techniques periodically during search
+
+### Testing & Validation
+- **Fuzzing**: Generate random CNF instances to find edge cases
+- **Cross-validation**: Compare results against MiniSat/CaDiCaL on same instances
+- **Property-based testing**: Test invariants (e.g., learned clauses are logically implied)
+- **Regression testing**: Track performance across commits
 - **Maintain test coverage**: Keep 80%+ on solver package
+
+### Benchmarking & Analysis
+- **Systematic family benchmarks**: Test all instances from specific GBD families (not just random samples)
+- **Performance profiling**: Compare before/after for each optimization
+- **Scatter plots**: Runtime comparison vs reference solver
+- **Cactus plots**: Show instances solved vs time
+- **Test on larger instances**: Test on php_8p_7h_unsat and larger with current optimizations
+
+### Data Structure Optimizations
+- **Memory pool for clauses**: Reduce allocation overhead
+- **Cache-friendly clause storage**: Improve memory locality
+- **Compressed clause storage**: Pack literals more densely
+
+### CLI & Usability
+- **Batch solving**: Process multiple files in one run
+- **JSON output**: Machine-readable results for benchmarking
+- **Exit codes**: Standard SAT competition exit codes (10=SAT, 20=UNSAT, 0=UNKNOWN)
+
+### Documentation
+- **Algorithm documentation**: Explain CDCL, 1-UIP, LBD in code comments or docs
+- **Performance guide**: Which flags/configurations for which instance types
+- **API documentation**: For embedding satience as a library
 
 ## Critical Context
 - Go version: `go1.22.2 linux/amd64`
@@ -105,6 +146,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Profile results**: propagate() = 96.77% CPU, IsNegated = 2.15% (down from 10.31%)
 - **Performance**: Pigeonhole instances timeout at 10s (expected); Tseitin, algebra_xor, random_k3, arg_chain solve quickly
 - **CLI flag order matters**: `satience -model file.cnf` works, `satience file.cnf -model` does not print model
+- **Phase saving implemented**: savedPhase[]bool field stores last satisfying polarity, selectVariableWithPhase() uses it
 - Git repo at `/home/luca/git/opencode-sat-new/`
 - Benchmark project at `/home/luca/git/opencode-sat-new/benchmark/`
 - **GBD download URL**: `https://benchmark-database.de/file/<hash>` (returns xz-compressed CNF)
@@ -114,14 +156,14 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **learnedClauses**: Slice of cnf.Clause in CDCLSolver, checked during propagation
 - **backjumpLevel field**: Added to CDCLSolver struct, calculated after each conflict, reset after backjump
 - **Benchmark directory cleaned**: Only gbd_instances/ and meta.db remain
-- **New CDCLSolver fields**: clauseActivity ([]float64), clauseAge ([]int), currentAge (int), maxLearned (int)
+- **New CDCLSolver fields**: clauseActivity ([]float64), clauseAge ([]int), currentAge (int), maxLearned (int), savedPhase ([]bool)
 - **New cnf.go constants**: litVarMask=0x7FFFFFFF, litNegatedMask=0x80000000
 
 ## Relevant Files
 - `/home/luca/git/opencode-sat-new/internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF) with bit operation constants
 - `/home/luca/git/opencode-sat-new/internal/parser/parser.go`: DIMACS CNF parser
-- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, optimized propagate() with inlined literalIsTrue
-- `/home/luca/git/opencode-sat-new/internal/solver/vsids.go`: VSIDS heuristic with activity decay
+- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, optimized propagate() with inlined literalIsTrue
+- `/home/luca/git/opencode-sat-new/internal/solver/vsids.go`: VSIDS heuristic with activity decay, selectVariableWithPhase() for phase saving
 - `/home/luca/git/opencode-sat-new/internal/solver/solver.go`: Base solver with propagation
 - `/home/luca/git/opencode-sat-new/internal/solver/solver_test.go`: Unit tests (15/15 passing)
 - `/home/luca/git/opencode-sat-new/cmd/satience/main.go`: CLI with -model, -max-iter, -verbose, -cpuprofile flags
