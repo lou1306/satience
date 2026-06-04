@@ -27,13 +27,18 @@ type CDCLSolver struct {
 	iterations   int
 	maxIter      int
 	learnedClauses []cnf.Clause
+	clauseActivity []float64
+	clauseAge    []int
+	currentAge   int
 	verbose      bool
 	decisions    int
 	backjumpLevel int
+	maxLearned   int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
+	maxLearned := 10000 // Initial limit on learned clauses
 	return &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
@@ -45,9 +50,14 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		implication: make([]int, formula.NumVars),
 		iterations:  0,
 		maxIter:     0, // disabled by default
+		learnedClauses: make([]cnf.Clause, 0),
+		clauseActivity: make([]float64, 0),
+		clauseAge:    make([]int, 0),
+		currentAge:   0,
 		verbose:     false,
 		decisions:   0,
 		backjumpLevel: 0,
+		maxLearned:   maxLearned,
 	}
 }
 
@@ -398,10 +408,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {
+		// Check if we need to delete clauses
+		if len(s.learnedClauses) >= s.maxLearned {
+			s.deleteLearnedClauses()
+		}
+		
 		s.learnedClauses = append(s.learnedClauses, cnf.Clause{
 			Literals: learnedLits,
 			Learned:  true,
 		})
+		s.clauseActivity = append(s.clauseActivity, 0.0) // Initial activity
+		s.clauseAge = append(s.clauseAge, s.currentAge)
+		s.currentAge++
 	}
 	
 	// Calculate backjump level: second-highest level in learned clause
@@ -423,6 +441,85 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	return backjumpLevel
+}
+
+func (s *CDCLSolver) deleteLearnedClauses() {
+	// LBD-based clause deletion
+	// Keep clauses with high activity or low LBD (learned block distance)
+	// Delete clauses with low activity and high LBD
+	
+	// Calculate LBD for each learned clause
+	type clauseInfo struct {
+		idx   int
+		lbd   int
+		age   int
+	}
+	
+	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
+	for i, clause := range s.learnedClauses {
+		// Count unique decision levels in the clause
+		levelSet := make(map[int]bool)
+		for _, lit := range clause.Literals {
+			lvl := s.assignments[lit.Var()].Level
+			if lvl > 0 {
+				levelSet[lvl] = true
+			}
+		}
+		lbd := len(levelSet)
+		
+		clauses = append(clauses, clauseInfo{
+			idx: i,
+			lbd: lbd,
+			age: s.currentAge - s.clauseAge[i],
+		})
+	}
+	
+	// Sort by LBD (primary) and age (secondary)
+	// Lower LBD = more useful, keep it
+	// Higher age = older, more likely to delete
+	for i := 0; i < len(clauses); i++ {
+		for j := i + 1; j < len(clauses); j++ {
+			// Higher LBD and older age = delete first
+			scoreI := clauses[i].lbd*100 + clauses[i].age
+			scoreJ := clauses[j].lbd*100 + clauses[j].age
+			if scoreI < scoreJ {
+				clauses[i], clauses[j] = clauses[j], clauses[i]
+			}
+		}
+	}
+	
+	// Delete bottom 50% of clauses (highest LBD + oldest)
+	toDelete := len(s.learnedClauses) / 2
+	if toDelete == 0 {
+		toDelete = 1
+	}
+	
+	// Mark clauses to delete
+	keep := make([]bool, len(s.learnedClauses))
+	for i := range keep {
+		keep[i] = true
+	}
+	
+	for i := 0; i < toDelete && i < len(clauses); i++ {
+		keep[clauses[i].idx] = false
+	}
+	
+	// Compact the slices
+	newClauses := make([]cnf.Clause, 0, len(s.learnedClauses)-toDelete)
+	newActivity := make([]float64, 0, len(s.learnedClauses)-toDelete)
+	newAge := make([]int, 0, len(s.learnedClauses)-toDelete)
+	
+	for i := range s.learnedClauses {
+		if keep[i] {
+			newClauses = append(newClauses, s.learnedClauses[i])
+			newActivity = append(newActivity, s.clauseActivity[i])
+			newAge = append(newAge, s.clauseAge[i])
+		}
+	}
+	
+	s.learnedClauses = newClauses
+	s.clauseActivity = newActivity
+	s.clauseAge = newAge
 }
 
 func (s *CDCLSolver) backtrack() bool {
