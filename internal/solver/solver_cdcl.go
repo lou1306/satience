@@ -435,6 +435,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
+	// Minimize learned clause via self-subsumption
+	learnedLits = s.minimizeLearnedClause(learnedLits)
+	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {
 		// Check if we need to delete clauses
@@ -470,6 +473,79 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	return backjumpLevel
+}
+
+// minimizeLearnedClause reduces the size of a learned clause via self-subsumption
+// A literal can be removed if there exists a learned clause that subsumes it
+// Example: if we learned (a \/ b \/ c) and we already have (a \/ b), then c can be removed
+func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Literal {
+	if len(learnedLits) <= 2 {
+		return learnedLits // No point minimizing small clauses
+	}
+	
+	// Mark which literals are in the learned clause
+	literalInLearned := make([]bool, s.cnf.NumVars)
+	literalIsNegated := make([]bool, s.cnf.NumVars)
+	for _, lit := range learnedLits {
+		varIdx := lit.Var()
+		literalInLearned[varIdx] = true
+		literalIsNegated[varIdx] = lit.IsNegated()
+	}
+	
+	// Check each learned clause for self-subsumption opportunities
+	// A clause (l1 \/ l2 \/ ... \/ ln) can subsume literal li if all other literals are in our learned clause
+	toRemove := make([]bool, len(learnedLits))
+	
+	for _, existingClause := range s.learnedClauses {
+		if len(existingClause.Literals) >= len(learnedLits) {
+			continue // Can't subsume with a longer or equal clause
+		}
+		
+		// Check if all but one literal of existingClause are in learnedLits
+		matchingCount := 0
+		mismatchIdx := -1
+		
+		for _, lit := range existingClause.Literals {
+			varIdx := lit.Var()
+			if literalInLearned[varIdx] && literalIsNegated[varIdx] == lit.IsNegated() {
+				matchingCount++
+			} else {
+				// Check if this literal's negation is in learnedLits (for self-subsumption)
+				if literalInLearned[varIdx] && literalIsNegated[varIdx] != lit.IsNegated() {
+					// Found a potential self-subsumption candidate
+					// existingClause has lit, learnedLits has !lit
+					// This means we can potentially remove !lit from learnedLits
+					mismatchIdx = -1 // Mark as valid mismatch for self-subsumption
+				} else {
+					mismatchIdx = -2 // This clause doesn't help
+					break
+				}
+			}
+		}
+		
+		// If all but one literal match, we can potentially remove one literal
+		if mismatchIdx == -1 && matchingCount == len(existingClause.Literals)-1 {
+			// Self-subsumption: remove the mismatched literal from learnedLits
+			for i, lit := range learnedLits {
+				varIdx := lit.Var()
+				if literalInLearned[varIdx] && literalIsNegated[varIdx] != existingClause.Literals[0].IsNegated() {
+					// Found the literal to remove (simplified check)
+					toRemove[i] = true
+					break
+				}
+			}
+		}
+	}
+	
+	// Build minimized clause
+	minimized := make([]cnf.Literal, 0, len(learnedLits))
+	for i, lit := range learnedLits {
+		if !toRemove[i] {
+			minimized = append(minimized, lit)
+		}
+	}
+	
+	return minimized
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
