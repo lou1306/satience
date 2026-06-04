@@ -52,6 +52,28 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 	return bestVar
 }
 
+// selectVariableWithPhase returns the unassigned variable with highest activity
+// and the phase to assign (true=positive, false=negative) based on saved phase
+func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
+	bestVar := uint32(0)
+	bestActivity := -1.0
+
+	for i, act := range v.activity {
+		if assignments[i].Level == 0 && act > bestActivity {
+			bestActivity = act
+			bestVar = uint32(i)
+		}
+	}
+
+	// Use saved phase if available, otherwise default to true (positive literal)
+	phase := true
+	if savedPhase != nil {
+		phase = savedPhase[bestVar]
+	}
+
+	return bestVar, phase
+}
+
 // hasUnassigned checks if there are unassigned variables
 func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
 	for i := uint32(0); i < numVars; i++ {

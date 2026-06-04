@@ -34,6 +34,7 @@ type CDCLSolver struct {
 	decisions    int
 	backjumpLevel int
 	maxLearned   int
+	savedPhase   []bool
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -58,6 +59,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decisions:   0,
 		backjumpLevel: 0,
 		maxLearned:   maxLearned,
+		savedPhase:  make([]bool, formula.NumVars),
 	}
 }
 
@@ -283,11 +285,11 @@ func (s *CDCLSolver) decide() bool {
 		return false
 	}
 
-	varIdx := s.vsids.selectVariable(s.assignments)
+	varIdx, phase := s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
 
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
-	s.assignLiteral(cnf.NewLiteral(varIdx, false), s.level, -1)
+	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1)
 	s.decisions++
 	return true
 }
@@ -306,6 +308,9 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	}
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
+	
+	// Save the phase (polarity) that satisfied this variable
+	s.savedPhase[varIdx] = value
 }
 
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
