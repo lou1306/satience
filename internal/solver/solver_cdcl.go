@@ -104,12 +104,242 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c \n")
 }
 
+// preprocess applies preprocessing techniques to simplify the formula
+// Returns SAT if formula is trivially satisfiable, UNSAT if unsatisfiable, UNKNOWN otherwise
+func (s *CDCLSolver) preprocess() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+	
+	// Apply unit propagation preprocessing
+	unitResult := s.unitPropagationPreprocess()
+	if unitResult != UNKNOWN {
+		return unitResult
+	}
+	
+	// Apply pure literal elimination
+	pureResult := s.pureLiteralElimination()
+	if pureResult != UNKNOWN {
+		return pureResult
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+	
+	return UNKNOWN
+}
+
+// unitPropagationPreprocess performs unit propagation before search
+// Assigns all unit clauses and simplifies the formula
+func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
+	changed := true
+	for changed {
+		changed = false
+		
+		// Find unit clauses in original formula
+		clauseCount := len(s.cnf.Clauses)
+		for clauseIdx := 0; clauseIdx < clauseCount; clauseIdx++ {
+			clause := s.cnf.Clauses[clauseIdx]
+			
+			// Skip if clause already satisfied
+			satisfied := false
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if s.assignments[varIdx].Level != 0 {
+					// Already assigned
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfied = true
+						break
+					}
+					falseCount++
+				} else {
+					unassignedCount++
+					unassignedLit = lit
+				}
+			}
+			
+			if satisfied {
+				continue
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				// Conflict found during preprocessing
+				if s.verbose {
+					fmt.Printf("c [verbose] Preprocessing: conflict in unit propagation\n")
+				}
+				return UNSAT
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				// Unit clause - propagate (direct assignment without trail)
+				varIdx := unassignedLit.Var()
+				value := !unassignedLit.IsNegated()
+				s.assignments[varIdx] = Assignment{
+					Value: value,
+					Level: 1,
+				}
+				changed = true
+				
+				// Simplify clauses by removing satisfied clauses and false literals
+				conflict := s.simplifyAfterAssignment(varIdx, value)
+				if conflict {
+					if s.verbose {
+						fmt.Printf("c [verbose] Preprocessing: empty clause created\n")
+					}
+					return UNSAT
+				}
+				
+				// Update clause count since simplifyAfterAssignment modifies it
+				clauseCount = len(s.cnf.Clauses)
+				if clauseIdx >= clauseCount {
+					clauseIdx = clauseCount - 1
+				}
+			}
+		}
+	}
+	
+	return UNKNOWN
+}
+
+// simplifyAfterAssignment removes satisfied clauses and false literals after an assignment
+// Returns true if an empty clause was created (conflict)
+func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
+	// Remove satisfied clauses and false literals from original clauses
+	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	for _, clause := range s.cnf.Clauses {
+		// Check if clause is satisfied or contains false literals
+		satisfied := false
+		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
+		
+		for _, lit := range clause.Literals {
+			if lit.Var() == varIdx {
+				// This literal involves the assigned variable
+				litValue := !lit.IsNegated()
+				if litValue == value {
+					// Literal is true, clause is satisfied
+					satisfied = true
+					break
+				}
+				// Literal is false, skip it
+			} else {
+				newLiterals = append(newLiterals, lit)
+			}
+		}
+		
+		if satisfied {
+			// Clause is satisfied, remove it
+			continue
+		}
+		
+		if len(newLiterals) == 0 {
+			// Empty clause created - conflict!
+			return true
+		}
+		
+		newClauses = append(newClauses, cnf.Clause{Literals: newLiterals, Learned: false})
+	}
+	s.cnf.Clauses = newClauses
+	s.cnf.NumClauses = len(newClauses)
+	return false
+}
+
+// pureLiteralElimination finds and assigns pure literals
+// A literal is pure if it appears with only one polarity in all clauses
+func (s *CDCLSolver) pureLiteralElimination() SolveResult {
+	changed := true
+	for changed {
+		changed = false
+		
+		// Track which variables appear as positive/negative
+		hasPositive := make([]bool, s.cnf.NumVars)
+		hasNegative := make([]bool, s.cnf.NumVars)
+		
+		// Scan all clauses
+		for _, clause := range s.cnf.Clauses {
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if s.assignments[varIdx].Level != 0 {
+					continue // Already assigned
+				}
+				if lit.IsNegated() {
+					hasNegative[varIdx] = true
+				} else {
+					hasPositive[varIdx] = true
+				}
+			}
+		}
+		
+		// Find pure literals and assign them
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if s.assignments[varIdx].Level != 0 {
+				continue // Already assigned
+			}
+			
+			isPure := false
+			pureValue := false
+			
+			if hasPositive[varIdx] && !hasNegative[varIdx] {
+				isPure = true
+				pureValue = true
+			} else if hasNegative[varIdx] && !hasPositive[varIdx] {
+				isPure = true
+				pureValue = false
+			}
+			
+			if isPure {
+				// Assign the pure literal (direct assignment without trail)
+				s.assignments[varIdx] = Assignment{
+					Value: pureValue,
+					Level: 1,
+				}
+				changed = true
+				
+				// Simplify
+				conflict := s.simplifyAfterAssignment(varIdx, pureValue)
+				if conflict {
+					if s.verbose {
+						fmt.Printf("c [verbose] Pure literal elimination: empty clause created\n")
+					}
+					return UNSAT
+				}
+				
+				if s.verbose {
+					fmt.Printf("c [verbose] Pure literal elimination: assigned var %d = %v\n", varIdx, pureValue)
+				}
+			}
+		}
+	}
+	
+	// Check if all clauses are satisfied (formula is empty = SAT)
+	if len(s.cnf.Clauses) == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
+		}
+		return SAT
+	}
+	
+	return UNKNOWN
+}
+
 func (s *CDCLSolver) Solve() bool {
 	result := s.SolveWithResult()
 	return result == SAT
 }
 
 func (s *CDCLSolver) SolveWithResult() SolveResult {
+	// Preprocessing: simplify formula before solving
+	preprocessingResult := s.preprocess()
+	if preprocessingResult != UNKNOWN {
+		return preprocessingResult
+	}
+	
 	for {
 		s.iterations++
 		if s.maxIter > 0 && s.iterations > s.maxIter {
