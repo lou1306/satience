@@ -68,16 +68,30 @@ type CNF struct {
 	NumClauses     int
 	BinaryClauses  []BinaryClause  // Binary clauses stored separately for fast propagation
 	TernaryClauses []TernaryClause // Ternary clauses stored separately
+	
+	// Watched literals for binary clauses
+	// watchList[lit] contains indices of binary clauses watching that literal
+	// Literal index: varIdx * 2 + (0 for positive, 1 for negated)
+	WatchList [][]int
+	// binaryWatchA and binaryWatchB store which literals each binary clause watches
+	// Each is an index into the literal space: varIdx * 2 + (0 for positive, 1 for negated)
+	BinaryWatchA []int
+	BinaryWatchB []int
 }
 
 // NewCNF creates a new CNF formula
 func NewCNF(numVars uint32, numClauses int) *CNF {
+	// Watch list has 2 entries per variable (positive and negative literal)
+	watchListSize := int(numVars) * 2
 	return &CNF{
 		NumVars:        numVars,
 		Clauses:        make([]Clause, 0, numClauses),
 		NumClauses:     0,
 		BinaryClauses:  make([]BinaryClause, 0, numClauses/2),
 		TernaryClauses: make([]TernaryClause, 0, numClauses/3),
+		WatchList:      make([][]int, watchListSize),
+		BinaryWatchA:   nil, // Will be initialized after preprocessing
+		BinaryWatchB:   nil,
 	}
 }
 
@@ -135,5 +149,53 @@ func (c *CNF) RebuildShortClauses() {
 				Lit3: uint32(clause.Literals[2]),
 			})
 		}
+	}
+}
+
+// litToIndex converts a literal to a watch list index
+// varIdx * 2 + (0 for positive, 1 for negated)
+func litToIndex(lit Literal) int {
+	varIdx := lit.Var()
+	if lit.IsNegated() {
+		return int(varIdx)*2 + 1
+	}
+	return int(varIdx) * 2
+}
+
+// IndexToLit converts a watch list index back to a literal
+func IndexToLit(idx int) Literal {
+	varIdx := uint32(idx / 2)
+	isNegated := (idx % 2) == 1
+	return NewLiteral(varIdx, isNegated)
+}
+
+// InitializeWatches initializes the watched literals scheme for binary clauses
+// Should be called AFTER preprocessing, before search starts
+func (c *CNF) InitializeWatches() {
+	// Clear watch lists
+	watchListSize := int(c.NumVars) * 2
+	c.WatchList = make([][]int, watchListSize)
+	for i := range c.WatchList {
+		c.WatchList[i] = make([]int, 0)
+	}
+	
+	// Initialize watch arrays for binary clauses
+	c.BinaryWatchA = make([]int, len(c.BinaryClauses))
+	c.BinaryWatchB = make([]int, len(c.BinaryClauses))
+	
+	// For each binary clause, watch both literals
+	for binIdx := range c.BinaryClauses {
+		lit1 := Literal(c.BinaryClauses[binIdx].Lit1)
+		lit2 := Literal(c.BinaryClauses[binIdx].Lit2)
+		
+		idx1 := litToIndex(lit1)
+		idx2 := litToIndex(lit2)
+		
+		c.BinaryWatchA[binIdx] = idx1
+		c.BinaryWatchB[binIdx] = idx2
+		
+		// Add clause to both watch lists
+		c.WatchList[idx1] = append(c.WatchList[idx1], binIdx)
+		c.WatchList[idx2] = append(c.WatchList[idx2], binIdx)
 	}
 }
