@@ -60,8 +60,11 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Implemented clause minimization**: Self-subsumption after 1-UIP analysis reduces learned clause size
 - **Implemented preprocessing**: Unit propagation preprocessing + pure literal elimination before search
 - **Preprocessing verified**: Detects UNSAT immediately on tseitin_grid_4x4 (empty clause created), all 15 unit tests pass
+- **Implemented subsumption elimination**: Removes redundant clauses subsumed by shorter clauses
 - **Comprehensive evaluation**: 20/20 correct results on random instances ≤200 vars, all models verified
 - **Committed recent work**: 
+  - 59b915e - Add subsumption elimination preprocessing
+  - d71f035 - Document watched literals implementation attempt
   - 5ff3b44 - Add preprocessing (unit propagation + pure literal elimination)
   - 7c5ac2d - Implement Luby restart policy
   - ea2302f - Update AGENTS.md with recent progress
@@ -119,10 +122,10 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Implement CHB (Conflict History Based)**: Exponential decay based on conflict history
 
 ### Preprocessing & Inprocessing
-- **Unit propagation preprocessing**: Simplify formula before solving
-- **Pure literal elimination**: Assign and remove pure literals upfront
+- ~~**Unit propagation preprocessing**: Simplify formula before solving~~ (DONE)
+- ~~**Pure literal elimination**: Assign and remove pure literals upfront~~ (DONE)
+- ~~**Subsumption elimination**: Remove clauses subsumed by shorter clauses~~ (DONE)
 - **Variable elimination**: Resolution-based elimination of variables before/during solving
-- **Subsumption elimination**: Remove clauses subsumed by shorter clauses
 - **Blocked clause elimination**: Remove clauses blocked by a literal
 - **Inprocessing**: Apply preprocessing techniques periodically during search
 
