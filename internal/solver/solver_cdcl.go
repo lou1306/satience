@@ -176,14 +176,20 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			var unassignedLit cnf.Literal
 			
 			for _, lit := range clause.Literals {
-				litLevel := s.assignments[lit.Var()].Level
+				varIdx := lit.Var()
+				litLevel := s.assignments[varIdx].Level
 				if litLevel == 0 {
 					unassignedCount++
 					unassignedLit = lit
-				} else if s.literalIsTrue(lit) {
-					satisfiedCount++
 				} else {
-					falseCount++
+					// Inline literalIsTrue check for performance
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfiedCount++
+					} else {
+						falseCount++
+					}
 				}
 			}
 			
@@ -226,14 +232,20 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			var unassignedLit cnf.Literal
 			
 			for _, lit := range clause.Literals {
-				litLevel := s.assignments[lit.Var()].Level
+				varIdx := lit.Var()
+				litLevel := s.assignments[varIdx].Level
 				if litLevel == 0 {
 					unassignedCount++
 					unassignedLit = lit
-				} else if s.literalIsTrue(lit) {
-					satisfiedCount++
 				} else {
-					falseCount++
+					// Inline literalIsTrue check for performance
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfiedCount++
+					} else {
+						falseCount++
+					}
 				}
 			}
 			
