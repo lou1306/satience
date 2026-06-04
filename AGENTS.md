@@ -76,6 +76,14 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 ### In Progress
 - (none)
 
+### In Progress
+- **Watched literals implementation**: Attempted but reverted due to soundness bugs. Requires careful handling of:
+  - Clause simplification during preprocessing (watch indices become stale)
+  - Lazy removal from watched lists
+  - Watch list rebuilding after backtrack
+  - Interaction with learned clause database management
+  This is a complex optimization that needs incremental implementation and thorough testing.
+
 ### Blocked
 - **Performance limitation**: Pigeonhole instances (php_6p_5h_unsat, php_6p_7h_sat, php_7p_6h_unsat, php_7p_8h_sat, php_8p_7h_unsat) timeout at 10s despite backjumping and clause management (expected - PHP is exponentially hard for CDCL)
 - **Dense random instances**: Some uniform-random instances (dddd886bd187eabd, 0038cea06eae4c32) timeout due to high clause/variable ratio
@@ -100,7 +108,13 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 
 ## Next Steps
 ### Core Algorithm Improvements
-- **Implement watched literals scheme**: Replace linear clause scanning with O(1) watched literal pointers (major optimization)
+- **Re-implement watched literals scheme**: Replace linear clause scanning with O(1) watched literal pointers (major optimization). Previous attempt identified key challenges:
+  - Must initialize watches AFTER preprocessing (preprocessing modifies clauses)
+  - Need proper lazy removal from watched lists to avoid O(n) operations
+  - Watch indices must be validated before accessing clause literals
+  - Backtracking may require watch list rebuilding or trail-based restoration
+  - Learned clause database management interacts with watched literals
+  Recommendation: Implement incrementally with extensive testing after each change
 - **Implement LRB (Learning Rate Based)**: Alternative to VSIDS, picks variables that generate conflicts
 - **Implement CHB (Conflict History Based)**: Exponential decay based on conflict history
 
