@@ -126,6 +126,12 @@ func (s *CDCLSolver) preprocess() SolveResult {
 	// Apply subsumption elimination
 	s.subsumptionElimination()
 	
+	// Apply variable elimination
+	veResult := s.variableElimination()
+	if veResult != UNKNOWN {
+		return veResult
+	}
+	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
@@ -405,6 +411,250 @@ func (s *CDCLSolver) isSubsumedBy(clause, other cnf.Clause) bool {
 	}
 	
 	return true
+}
+
+// variableElimination eliminates variables via resolution when it reduces formula size
+// For each variable x, compute all resolvents of clauses containing x and ¬x
+// If the resolvents are fewer than the original clauses, replace them
+// This is a powerful preprocessing technique that can dramatically reduce formula size
+// Returns UNSAT if empty clause is created, SAT if all clauses satisfied, UNKNOWN otherwise
+func (s *CDCLSolver) variableElimination() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
+	}
+	
+	eliminatedCount := 0
+	resolventCount := 0
+	
+	changed := true
+	for changed {
+		changed = false
+		
+		// Track which variables are eliminated in this pass
+		eliminated := make([]bool, s.cnf.NumVars)
+		
+		// Try to eliminate each variable
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if eliminated[varIdx] {
+				continue
+			}
+			
+			// Find clauses containing x (positive) and ¬x (negative)
+			posClauses := make([]int, 0)
+			negClauses := make([]int, 0)
+			
+			for i, clause := range s.cnf.Clauses {
+				// Check if clause contains x or ¬x
+				hasPos := false
+				hasNeg := false
+				for _, lit := range clause.Literals {
+					if lit.Var() == varIdx {
+						if !lit.IsNegated() {
+							hasPos = true
+						} else {
+							hasNeg = true
+						}
+					}
+				}
+				
+				if hasPos {
+					posClauses = append(posClauses, i)
+				}
+				if hasNeg {
+					negClauses = append(negClauses, i)
+				}
+			}
+			
+			// Skip if variable doesn't appear in both polarities (already pure/eliminated)
+			if len(posClauses) == 0 || len(negClauses) == 0 {
+				continue
+			}
+			
+			// Compute all resolvents
+			resolvents := make([]cnf.Clause, 0)
+			resolventSet := make(map[string]bool)
+			
+			for _, posIdx := range posClauses {
+				posClause := s.cnf.Clauses[posIdx]
+				
+				for _, negIdx := range negClauses {
+					negClause := s.cnf.Clauses[negIdx]
+					
+					// Resolve posClause and negClause on varIdx
+					resolvent := s.resolve(posClause, negClause, varIdx)
+					if resolvent != nil {
+						// Check for tautology (contains both x and ¬x for some x)
+						if !s.isTautology(resolvent) {
+							// Use a canonical representation to avoid duplicates
+							key := s.clauseKey(resolvent)
+							if !resolventSet[key] {
+								resolventSet[key] = true
+								resolvents = append(resolvents, *resolvent)
+							}
+						}
+					}
+				}
+			}
+			
+			// Check if elimination is beneficial
+			// Only eliminate if resolvents are fewer than original clauses
+			originalCount := len(posClauses) + len(negClauses)
+			if len(resolvents) < originalCount {
+				// Variable elimination is beneficial
+				if s.verbose {
+					fmt.Printf("c [verbose] Eliminating var %d: %d clauses -> %d resolvents\n", 
+						varIdx, originalCount, len(resolvents))
+				}
+				
+				// Check if any resolvent is empty (UNSAT!)
+				for _, resolvent := range resolvents {
+					if len(resolvent.Literals) == 0 {
+						if s.verbose {
+							fmt.Printf("c [verbose] Variable elimination: empty clause created (UNSAT)\n")
+						}
+						return UNSAT
+					}
+				}
+				
+				// Remove original clauses containing x or ¬x
+				keepClauses := make([]cnf.Clause, 0)
+				for _, clause := range s.cnf.Clauses {
+					keep := true
+					for _, lit := range clause.Literals {
+						if lit.Var() == varIdx {
+							keep = false
+							break
+						}
+					}
+					if keep {
+						keepClauses = append(keepClauses, clause)
+					}
+				}
+				
+				// Add resolvents
+				for _, resolvent := range resolvents {
+					keepClauses = append(keepClauses, resolvent)
+				}
+				
+				s.cnf.Clauses = keepClauses
+				s.cnf.NumClauses = len(keepClauses)
+				
+				eliminated[varIdx] = true
+				eliminatedCount++
+				resolventCount += len(resolvents)
+				changed = true
+			}
+		}
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: eliminated %d variables, added %d resolvents\n", 
+			eliminatedCount, resolventCount)
+	}
+	
+	// Check if all clauses are satisfied (formula is empty = SAT)
+	if len(s.cnf.Clauses) == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Variable elimination: all clauses satisfied\n")
+		}
+		return SAT
+	}
+	
+	return UNKNOWN
+}
+
+// resolve computes the resolvent of two clauses on a given variable
+// Returns nil if resolution is not possible or produces a tautology
+func (s *CDCLSolver) resolve(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
+	// clause1 must contain x (positive), clause2 must contain ¬x (negative)
+	hasPosX := false
+	hasNegX := false
+	
+	for _, lit := range clause1.Literals {
+		if lit.Var() == varIdx && !lit.IsNegated() {
+			hasPosX = true
+			break
+		}
+	}
+	
+	for _, lit := range clause2.Literals {
+		if lit.Var() == varIdx && lit.IsNegated() {
+			hasNegX = true
+			break
+		}
+	}
+	
+	if !hasPosX || !hasNegX {
+		return nil
+	}
+	
+	// Build resolvent: all literals except x and ¬x
+	resolventLits := make([]cnf.Literal, 0, len(clause1.Literals)+len(clause2.Literals)-2)
+	
+	for _, lit := range clause1.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+	
+	for _, lit := range clause2.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+	
+	if len(resolventLits) == 0 {
+		// Empty clause - this means the original formula is UNSAT
+		return &cnf.Clause{Literals: make([]cnf.Literal, 0), Learned: false}
+	}
+	
+	return &cnf.Clause{Literals: resolventLits, Learned: false}
+}
+
+// isTautology checks if a clause contains both x and ¬x for some variable x
+func (s *CDCLSolver) isTautology(clause *cnf.Clause) bool {
+	seen := make(map[uint32]bool)
+	
+	for _, lit := range clause.Literals {
+		varIdx := lit.Var()
+		isNeg := lit.IsNegated()
+		
+		if prevNeg, exists := seen[varIdx]; exists {
+			// Variable already seen - check if opposite polarity
+			if prevNeg != isNeg {
+				return true // Tautology!
+			}
+		} else {
+			seen[varIdx] = isNeg
+		}
+	}
+	
+	return false
+}
+
+// clauseKey returns a canonical string representation of a clause for deduplication
+func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
+	// Sort literals for canonical representation
+	lits := make([]uint64, len(clause.Literals))
+	for i, lit := range clause.Literals {
+		lits[i] = uint64(lit)
+	}
+	
+	// Simple bubble sort (clauses are typically small)
+	for i := 0; i < len(lits)-1; i++ {
+		for j := i + 1; j < len(lits); j++ {
+			if lits[i] > lits[j] {
+				lits[i], lits[j] = lits[j], lits[i]
+			}
+		}
+	}
+	
+	// Build string key
+	key := ""
+	for _, lit := range lits {
+		key += fmt.Sprintf("%d,", lit)
+	}
+	return key
 }
 
 func (s *CDCLSolver) Solve() bool {

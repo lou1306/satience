@@ -61,6 +61,11 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Implemented preprocessing**: Unit propagation preprocessing + pure literal elimination before search
 - **Preprocessing verified**: Detects UNSAT immediately on tseitin_grid_4x4 (empty clause created), all 15 unit tests pass
 - **Implemented subsumption elimination**: Removes redundant clauses subsumed by shorter clauses
+- **Implemented variable elimination**: Resolution-based variable elimination when it reduces formula size
+  - Computes resolvents of clauses containing x and ¬x
+  - Only eliminates if resolvents are fewer than original clauses (beneficial)
+  - Detects UNSAT from empty clause created during elimination
+  - Successfully eliminates hundreds of variables on structured instances
 - **Comprehensive evaluation**: 20/20 correct results on random instances ≤200 vars, all models verified
 - **Committed recent work**: 
   - 59b915e - Add subsumption elimination preprocessing
@@ -192,13 +197,16 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **New cnf.go constants**: litVarMask=0x7FFFFFFF, litNegatedMask=0x80000000
 - **luby() function**: Generates 1, 1, 2, 1, 1, 2, 4, 1, 1, 2... sequence recursively
 - **minimizeLearnedClause()**: New method in solver_cdcl.go for clause self-subsumption
-- **preprocess()**: New method applying unitPropagationPreprocess() and pureLiteralElimination() before search
+- **preprocess()**: New method applying preprocessing pipeline (unit propagation, pure literal elimination, subsumption elimination, variable elimination)
 - **simplifyAfterAssignment()**: Returns bool indicating if empty clause was created (conflict)
+- **variableElimination()**: Resolution-based variable elimination that removes variables when beneficial
+  - Returns UNSAT if empty clause created, SAT if all clauses satisfied
+  - Uses resolve(), isTautology(), clauseKey() helper methods
 
 ## Relevant Files
 - `/home/luca/git/opencode-sat-new/internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF) with bit operation constants
 - `/home/luca/git/opencode-sat-new/internal/parser/parser.go`: DIMACS CNF parser
-- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, Luby restart policy, optimized propagate(), clause minimization via self-subsumption, preprocessing (unit propagation + pure literal elimination)
+- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, Luby restart policy, optimized propagate(), clause minimization via self-subsumption, preprocessing (unit propagation + pure literal elimination + subsumption elimination + variable elimination)
 - `/home/luca/git/opencode-sat-new/internal/solver/vsids.go`: VSIDS heuristic with activity decay, selectVariableWithPhase() for phase saving
 - `/home/luca/git/opencode-sat-new/internal/solver/solver.go`: Base solver with propagation
 - `/home/luca/git/opencode-sat-new/internal/solver/solver_test.go`: Unit tests (15/15 passing)
