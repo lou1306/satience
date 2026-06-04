@@ -1,5 +1,0 @@
-file,family,expected,result,time,correct
-747955bb7addf0fb6fe4d465a9cbd035.cnf,perfect-matching,unsat,unsat,0.7154736518859863,True
-b5c3e33e90f4c95502754c7e2e92a6d2.cnf,perfect-matching,unsat,unsat,0.8241701126098633,True
-e8c79a0ee6be39b6b2211c9a527c192a.cnf,perfect-matching,unsat,unsat,0.4115896224975586,True
-912b89dd471295d3c72c66d0192dff72.cnf,perfect-matching,unsat,unsat,1.1892130374908447,True
