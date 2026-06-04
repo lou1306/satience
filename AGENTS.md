@@ -47,21 +47,22 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Added -max-iter CLI flag**: Optional iteration limit (default 0 = unlimited)
 - **Fixed CLI flag order**: -model flag must come before filename
 - **Added verbose mode**: -verbose flag shows solving statistics (conflicts, decisions, iterations, learned clauses, max level)
+- **Implemented backjumping**: Replaced chronological backtracking with intelligent backjumping based on 1-UIP learned clause analysis
+- **Performance improvement**: Backjumping reduces conflicts and decisions on structured instances (sudoku: 6 conflicts, 51 decisions vs previous higher counts)
 
 ### In Progress
 - (none)
 
 ### Blocked
-- **Performance limitation**: Most GBD instances (even small 140-500 var) exceed 30s timeout despite clause learning
-- **Backjumping not implemented**: Current implementation uses chronological backtracking (one level at a time)
-- **Instance 888d18d640cbb6b06a68f2afa1f2c9fe**: Now solver runs (doesn't immediately return UNSAT), but times out after 120s - this is a genuinely hard prime-factoring instance (3073v, 19785c)
+- **Performance limitation**: Most GBD instances (even small 140-500 var) still exceed 30s timeout
+- **Instance 888d18d640cbb6b06a68f2afa1f2c9fe**: Genuinely hard prime-factoring instance (3073v, 19785c) - solver runs but times out (expected for this difficulty)
 
 ## Key Decisions
 - Name: **satience** (SAT + science/patience/essence)
 - Literal: `uint32` bit 31=sign, bits 0-30=variable index
 - Variables: 0-based internally, 1-based in DIMACS
 - **1-UIP clause learning**: Implemented proper conflict analysis for sound clause learning
-- **Chronological backtracking**: Simple one-level backtrack (backjumping deferred)
+- **Backjumping**: Calculate backjump level from 1-UIP learned clause (second-highest level)
 - **Learned clause database**: Stored in CDCLSolver.learnedClauses slice
 - **Real GBD instances only**: Download from benchmark-database.de, no generated instances
 - **UNKNOWN on limit exceeded**: Return UNKNOWN (not UNSAT) when iteration limit reached
@@ -71,11 +72,9 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Test suite expansion**: Added real-world inspired instances (Tseitin, pigeonhole, argumentation chains) to ensure soundness
 
 ## Next Steps
-- **Implement backjumping**: Calculate backjump level from learned clause instead of single-level backtrack
 - **Add clause database management**: Limit learned clauses or delete inactive ones
 - **Profile solver**: Identify bottlenecks in propagation/decision
 - **Test on larger instances**: Once backjumping works, test on php_8p_7h_unsat and larger
-- **Add verbose mode**: Show solving statistics (conflicts, learned clauses, decisions) for debugging
 - **Maintain test coverage**: Keep 80%+ on solver package
 
 ## Critical Context
@@ -117,6 +116,49 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 
 ## Recent Commit
 ```
+commit 090ce96
+Author: satience team
+Date: Thu Jun 04 2026
+
+Implement backjumping for CDCL solver
+
+Replace chronological backtracking with intelligent backjumping:
+
+Backjumping calculates the correct backjump level from the learned
+clause instead of always backtracking one level. This is a critical
+CDCL optimization that can provide 10-100x speedup on hard instances.
+
+Changes:
+- Added backjumpLevel field to CDCLSolver struct
+- Modified learnClause() to return the calculated backjump level
+  - Finds second-highest decision level in the 1-UIP learned clause
+  - Backjumps to the highest level among non-UIP literals
+- Updated backtrack() to use calculated backjump level
+  - Jumps directly to the backjump level instead of level-1
+  - Properly clears trail and flips decision at backjump level
+- Reset backjumpLevel after each backjump for next conflict
+
+Algorithm:
+1. After 1-UIP conflict analysis, the learned clause has exactly one
+   literal at the current decision level (the UIP)
+2. The backjump level is the second-highest level in the learned clause
+3. Backtrack directly to that level, skipping unnecessary levels
+4. This avoids re-exploring the same conflict at intermediate levels
+
+Benefits:
+- Avoids redundant conflicts at intermediate decision levels
+- Dramatically reduces search space on structured instances
+- Essential for competitive CDCL performance
+- Particularly effective on Tseitin, pigeonhole, and combinatorial instances
+
+Verified:
+- All 15 unit tests pass
+- Correctly solves tseitin_grid_4x4_unsat.cnf (1 conflict)
+- Correctly solves php_5p_6h_sat.cnf (10 conflicts, 17 decisions)
+- Correctly solves sudoku_3x3_empty_sat.cnf (729 vars, 6 conflicts)
+- go vet and go test pass
+```
+
 commit 8f8e278
 Author: satience team
 Date: Thu Jun 04 2026
