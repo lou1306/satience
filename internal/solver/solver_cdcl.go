@@ -138,8 +138,13 @@ func (s *CDCLSolver) preprocess() SolveResult {
 		return bceResult
 	}
 	
+	// Rebuild binary and ternary clause indices after preprocessing
+	// Preprocessing modifies clauses, so the cached indices are stale
+	s.cnf.RebuildShortClauses()
+	
 	if s.verbose {
-		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses (%d binary, %d ternary)\n", 
+			s.cnf.NumVars, s.cnf.NumClauses, len(s.cnf.BinaryClauses), len(s.cnf.TernaryClauses))
 	}
 	
 	return UNKNOWN
@@ -908,9 +913,166 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// Check original clauses for conflicts and unit propagation
+		// OPTIMIZATION 1: Propagate binary clauses first (O(1) per clause)
+		// Binary clause (a ∨ b): if ¬a then propagate b, if ¬b then propagate a
+		for binIdx, binClause := range s.cnf.BinaryClauses {
+			lit1 := cnf.Literal(binClause.Lit1)
+			lit2 := cnf.Literal(binClause.Lit2)
+			
+			var1 := lit1.Var()
+			var2 := lit2.Var()
+			assign1 := s.assignments[var1]
+			assign2 := s.assignments[var2]
+			
+			// Check if lit1 is false
+			if assign1.Level != 0 {
+				lit1False := (!lit1.IsNegated() && !assign1.Value) || (lit1.IsNegated() && assign1.Value)
+				if lit1False {
+					// lit1 is false, check lit2
+					if assign2.Level != 0 {
+						// lit2 is also assigned - check for conflict
+						lit2False := (!lit2.IsNegated() && !assign2.Value) || (lit2.IsNegated() && assign2.Value)
+						if lit2False {
+							// Both literals false - conflict!
+							// Find the clause index for error reporting
+							for clauseIdx, clause := range s.cnf.Clauses {
+								if len(clause.Literals) == 2 && 
+								   clause.Literals[0] == lit1 && 
+								   clause.Literals[1] == lit2 {
+									return true, clauseIdx
+								}
+							}
+							return true, 0 // Fallback
+						}
+					} else {
+						// lit2 is unassigned - propagate it
+						assignLevel := s.level
+						if assignLevel == 0 {
+							assignLevel = 1
+						}
+						s.assignLiteral(lit2, assignLevel, -binIdx-1)
+						unitPropagated = true
+						break
+					}
+				}
+			}
+			
+			// Check if lit2 is false (symmetric)
+			if assign2.Level != 0 {
+				lit2False := (!lit2.IsNegated() && !assign2.Value) || (lit2.IsNegated() && assign2.Value)
+				if lit2False {
+					if assign1.Level != 0 {
+						lit1False := (!lit1.IsNegated() && !assign1.Value) || (lit1.IsNegated() && assign1.Value)
+						if lit1False {
+							// Both literals false - conflict!
+							for clauseIdx, clause := range s.cnf.Clauses {
+								if len(clause.Literals) == 2 && 
+								   clause.Literals[0] == lit1 && 
+								   clause.Literals[1] == lit2 {
+									return true, clauseIdx
+								}
+							}
+							return true, 0
+						}
+					} else {
+						assignLevel := s.level
+						if assignLevel == 0 {
+							assignLevel = 1
+						}
+						s.assignLiteral(lit1, assignLevel, -binIdx-1)
+						unitPropagated = true
+						break
+					}
+				}
+			}
+		}
+		
+		if unitPropagated {
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
+		// OPTIMIZATION 2: Propagate ternary clauses (still faster than general case)
+		for ternIdx, ternClause := range s.cnf.TernaryClauses {
+			lit1 := cnf.Literal(ternClause.Lit1)
+			lit2 := cnf.Literal(ternClause.Lit2)
+			lit3 := cnf.Literal(ternClause.Lit3)
+			
+			var1 := lit1.Var()
+			var2 := lit2.Var()
+			var3 := lit3.Var()
+			assign1 := s.assignments[var1]
+			assign2 := s.assignments[var2]
+			assign3 := s.assignments[var3]
+			
+			// Count false and unassigned
+			falseCount := 0
+			unassignedCount := 3
+			var unassignedLit cnf.Literal
+			
+			if assign1.Level != 0 {
+				unassignedCount--
+				if (!lit1.IsNegated() && !assign1.Value) || (lit1.IsNegated() && assign1.Value) {
+					falseCount++
+				}
+			}
+			if assign2.Level != 0 {
+				unassignedCount--
+				if (!lit2.IsNegated() && !assign2.Value) || (lit2.IsNegated() && assign2.Value) {
+					falseCount++
+				}
+			}
+			if assign3.Level != 0 {
+				unassignedCount--
+				if (!lit3.IsNegated() && !assign3.Value) || (lit3.IsNegated() && assign3.Value) {
+					falseCount++
+				}
+			} else {
+				unassignedLit = lit3
+			}
+			
+			if falseCount == 0 {
+				continue // Not yet unit or conflicting
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				// Conflict - all three false
+				for clauseIdx, clause := range s.cnf.Clauses {
+					if len(clause.Literals) == 3 && 
+					   clause.Literals[0] == lit1 && 
+					   clause.Literals[1] == lit2 &&
+					   clause.Literals[2] == lit3 {
+						return true, clauseIdx
+					}
+				}
+				return true, 0
+			}
+			
+			if unassignedCount == 1 && falseCount == 2 {
+				// Unit - propagate the unassigned literal
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(unassignedLit, assignLevel, -ternIdx-1)
+				unitPropagated = true
+				break
+			}
+		}
+		
+		if unitPropagated {
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
+		// FALLBACK: Check long clauses (>3 literals) with general algorithm
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
+			
+			// Skip binary and ternary clauses (already handled)
+			if len(clause.Literals) <= 3 {
+				continue
+			}
 			
 			// Count satisfied, false, and unassigned literals
 			satisfiedCount := 0
@@ -947,7 +1109,6 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			
 			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
 				// Unit clause - propagate the unassigned literal
-				// Use max(1, s.level) to ensure we never assign at level 0
 				assignLevel := s.level
 				if assignLevel == 0 {
 					assignLevel = 1
@@ -958,7 +1119,6 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			}
 		}
 		
-		// If we propagated a unit, restart from beginning
 		if unitPropagated {
 			trailIndex = s.trailHead[s.level]
 			continue
