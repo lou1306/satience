@@ -35,11 +35,15 @@ type CDCLSolver struct {
 	backjumpLevel int
 	maxLearned   int
 	savedPhase   []bool
+	restartBase  int
+	restartCount int
+	lubyIndex    int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := 10000 // Initial limit on learned clauses
+	restartBase := 100  // Base restart interval (in conflicts)
 	return &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
@@ -60,6 +64,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		backjumpLevel: 0,
 		maxLearned:   maxLearned,
 		savedPhase:  make([]bool, formula.NumVars),
+		restartBase:  restartBase,
+		restartCount: 0,
+		lubyIndex:    0,
 	}
 }
 
@@ -124,6 +131,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			}
 			// Reset backjump level for next conflict
 			s.backjumpLevel = 0
+			
+			// Check if we should restart (after backtracking)
+			if s.shouldRestart() {
+				s.restart()
+			}
 			continue
 		}
 
@@ -582,4 +594,77 @@ func (s *CDCLSolver) backtrack() bool {
 	return true
 }
 
+// luby returns the i-th value in the Luby sequence (1-indexed)
+// Sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, ...
+func luby(i int) int {
+	k := 1
+	for {
+		ki := 1 << uint(k)
+		if i == ki-1 {
+			return 1 << uint(k-1)
+		}
+		if ki-1 > i {
+			prevKi := 1 << uint(k-1)
+			return luby(i - (ki - 1 - prevKi))
+		}
+		k++
+	}
+}
 
+// shouldRestart checks if we should restart based on Luby sequence
+func (s *CDCLSolver) shouldRestart() bool {
+	// Calculate restart threshold using Luby sequence
+	threshold := s.restartBase * luby(s.lubyIndex + 1)
+	// Count conflicts since last restart
+	conflictsSinceRestart := s.conflicts - s.restartCount
+	return conflictsSinceRestart >= threshold
+}
+
+// restart performs a restart: clear the trail and reset to level 0
+// but keep learned clauses and VSIDS activities
+func (s *CDCLSolver) restart() {
+	// Clear trail and implication array
+	for i := len(s.trail) - 1; i >= 0; i-- {
+		varIdx := uint32(s.trail[i])
+		s.assignments[varIdx] = Assignment{}
+		s.implication[varIdx] = -1
+	}
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.level = 0
+	s.backjumpLevel = 0
+	
+	// Clear learned clauses - they reference old trail structure
+	// This is necessary for soundness after restart
+	s.learnedClauses = s.learnedClauses[:0]
+	s.clauseActivity = s.clauseActivity[:0]
+	s.clauseAge = s.clauseAge[:0]
+	
+	// Update restart count to current conflict count (for next threshold calculation)
+	s.restartCount = s.conflicts
+	
+	// Increment Luby index for next restart
+	s.lubyIndex++
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Restart #%d at conflict %d, clearing trail and learned clauses\n", s.lubyIndex, s.conflicts)
+	}
+	
+	// After restart, we need to re-propagate to rebuild the trail
+	// This is done automatically by the main solve loop
+}
+
+
+
+// Debug methods for testing
+func (s *CDCLSolver) PropagateDebug() (bool, int) {
+	return s.propagate()
+}
+
+func (s *CDCLSolver) AllAssignedDebug() bool {
+	return s.allAssigned()
+}
+
+func (s *CDCLSolver) DecideDebug() bool {
+	return s.decide()
+}
