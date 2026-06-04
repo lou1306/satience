@@ -35,7 +35,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - All unit tests passing (15/15 tests)
 - Benchmark infrastructure: uv project with gbd-tools, polars dependencies
 - **GBD metadata database**: meta.db with 32,905+ instances from 200+ families
-- **Real GBD instance downloads**: 65+ instances from https://benchmark-database.de/file/<hash>
+- **Real GBD instance downloads**: 106+ instances from https://benchmark-database.de/file/<hash>
 - **Verified solver soundness**: Models verified to satisfy all clauses (0 wrong results on verified instances)
 - **Performance improvement**: Clause learning enables solving php_5p_6h_sat (30 vars) and sudoku_3x3_empty_sat (729 vars)
 - **Committed**: fc3cb79 - Fix CDCL propagation to correctly restart after unit propagation
@@ -55,11 +55,23 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Tested instance types**: algebra_xor (20-40 vars), arg_chain (50-150 vars), random_k3 (50-100 vars), tseitin_grid (40-133 vars), php (30-56 vars), sudoku (729 vars)
 - **Implemented phase saving heuristic**: Remembers last satisfying polarity for each variable, uses it in decision heuristic
 - **Evaluated on 20 random small instances (≤200 vars)**: 13 correct, 0 wrong, 7 timeout (PHP expected hard)
+- **Implemented Luby restart policy**: Geometric restart sequence (base=100) to escape unproductive search
+- **Fixed restart soundness bugs**: Restart after backtrack (not during), clears implication[] array
+- **Implemented clause minimization**: Self-subsumption after 1-UIP analysis reduces learned clause size
+- **Implemented preprocessing**: Unit propagation preprocessing + pure literal elimination before search
+- **Preprocessing verified**: Detects UNSAT immediately on tseitin_grid_4x4 (empty clause created), all 15 unit tests pass
+- **Comprehensive evaluation**: 20/20 correct results on random instances ≤200 vars, all models verified
 - **Committed recent work**: 
+  - 5ff3b44 - Add preprocessing (unit propagation + pure literal elimination)
+  - 7c5ac2d - Implement Luby restart policy
+  - ea2302f - Update AGENTS.md with recent progress
   - 803c973 - Implement phase saving heuristic
   - e7227f6 - LBD-based clause database management
   - 81066e6 - Profile solver and optimize hot path in propagate()
   - 3ae7dfb - Remove test binaries from git
+  - 090ce96 - Implement backjumping
+  - 8f8e278 - Add verbose mode with solving statistics
+  - 23a4c0b - Add clause minimization via self-subsumption
 
 ### In Progress
 - (none)
@@ -89,8 +101,6 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 ## Next Steps
 ### Core Algorithm Improvements
 - **Implement watched literals scheme**: Replace linear clause scanning with O(1) watched literal pointers (major optimization)
-- **Add restart policy**: Implement Luby or Glucose-style restarts to escape unproductive search
-- **Add clause minimization**: Reduce learned clause size via self-subsumption after 1-UIP analysis
 - **Implement LRB (Learning Rate Based)**: Alternative to VSIDS, picks variables that generate conflicts
 - **Implement CHB (Conflict History Based)**: Exponential decay based on conflict history
 
@@ -147,50 +157,149 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Performance**: Pigeonhole instances timeout at 10s (expected); Tseitin, algebra_xor, random_k3, arg_chain solve quickly
 - **CLI flag order matters**: `satience -model file.cnf` works, `satience file.cnf -model` does not print model
 - **Phase saving implemented**: savedPhase[]bool field stores last satisfying polarity, selectVariableWithPhase() uses it
+- **Luby restart implemented**: restartBase=100, lubyIndex tracks sequence position, shouldRestart() checks threshold
+- **Restart after backtrack**: Clear trail and learned clauses after successful backtrack, not during handleConflict
+- **Clear implication[] on restart**: Necessary for soundness when learned clauses are cleared
+- **Clause minimization implemented**: minimizeLearnedClause() applies self-subsumption after 1-UIP analysis
+- **Preprocessing implemented**: preprocess() applies unitPropagationPreprocess() + pureLiteralElimination() before search
 - Git repo at `/home/luca/git/opencode-sat-new/`
 - Benchmark project at `/home/luca/git/opencode-sat-new/benchmark/`
 - **GBD download URL**: `https://benchmark-database.de/file/<hash>` (returns xz-compressed CNF)
 - **meta.db**: Features table with hash, family, author, track, result, proceedings columns
-- **Downloaded instances**: 65 real GBD CNF files in benchmark/gbd_instances/
+- **Downloaded instances**: 106+ real GBD CNF files in benchmark/gbd_instances/
 - **SolveResult enum**: SAT=0, UNSAT=1, UNKNOWN=2
 - **learnedClauses**: Slice of cnf.Clause in CDCLSolver, checked during propagation
 - **backjumpLevel field**: Added to CDCLSolver struct, calculated after each conflict, reset after backjump
 - **Benchmark directory cleaned**: Only gbd_instances/ and meta.db remain
-- **New CDCLSolver fields**: clauseActivity ([]float64), clauseAge ([]int), currentAge (int), maxLearned (int), savedPhase ([]bool)
+- **New CDCLSolver fields**: clauseActivity ([]float64), clauseAge ([]int), currentAge (int), maxLearned (int), savedPhase ([]bool), restartBase (int), restartCount (int), lubyIndex (int)
 - **New cnf.go constants**: litVarMask=0x7FFFFFFF, litNegatedMask=0x80000000
+- **luby() function**: Generates 1, 1, 2, 1, 1, 2, 4, 1, 1, 2... sequence recursively
+- **minimizeLearnedClause()**: New method in solver_cdcl.go for clause self-subsumption
+- **preprocess()**: New method applying unitPropagationPreprocess() and pureLiteralElimination() before search
+- **simplifyAfterAssignment()**: Returns bool indicating if empty clause was created (conflict)
 
 ## Relevant Files
 - `/home/luca/git/opencode-sat-new/internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF) with bit operation constants
 - `/home/luca/git/opencode-sat-new/internal/parser/parser.go`: DIMACS CNF parser
-- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, optimized propagate() with inlined literalIsTrue
+- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, Luby restart policy, optimized propagate(), clause minimization via self-subsumption, preprocessing (unit propagation + pure literal elimination)
 - `/home/luca/git/opencode-sat-new/internal/solver/vsids.go`: VSIDS heuristic with activity decay, selectVariableWithPhase() for phase saving
 - `/home/luca/git/opencode-sat-new/internal/solver/solver.go`: Base solver with propagation
 - `/home/luca/git/opencode-sat-new/internal/solver/solver_test.go`: Unit tests (15/15 passing)
 - `/home/luca/git/opencode-sat-new/cmd/satience/main.go`: CLI with -model, -max-iter, -verbose, -cpuprofile flags
 - `/home/luca/git/opencode-sat-new/satience`: Built solver binary
 - `/home/luca/git/opencode-sat-new/benchmark/meta.db`: GBD metadata (32,905+ instances)
-- `/home/luca/git/opencode-sat-new/benchmark/gbd_instances/`: Real GBD CNF files (65 downloaded)
+- `/home/luca/git/opencode-sat-new/benchmark/gbd_instances/`: Real GBD CNF files (106+ downloaded)
 - `/home/luca/git/opencode-sat-new/AGENTS.md`: Project documentation
 - `/home/luca/git/opencode-sat-new/.gitignore`: Excludes benchmark artifacts
 
 ## Recent Commits
 ```
-commit 3ae7dfb
+commit 5ff3b44
 Author: satience team
 Date: Thu Jun 04 2026
 
-Remove test binaries from git
+Add preprocessing (unit propagation + pure literal elimination)
 
-Clean up repository by removing compiled test binaries:
-- solver.test
-- satience.test
+Implement preprocessing phase before CDCL search to simplify the formula:
 
-These are generated by go test and should not be tracked.
-.gitignore already excludes *.test files.
+1. Unit propagation preprocessing:
+   - Run unit propagation before search starts
+   - Assign all forced literals upfront
+   - Detect conflicts early (empty clause = UNSAT)
+   - Reduces search space significantly
+
+2. Pure literal elimination:
+   - Find literals that appear with only one polarity
+   - Assign them to satisfy all clauses containing them
+   - Remove satisfied clauses from consideration
+   - Standard technique in modern SAT solvers
+
+Implementation:
+- Added preprocess() method to CDCLSolver
+- Added unitPropagationPreprocess() for initial unit propagation
+- Added pureLiteralElimination() to find and assign pure literals
+- Added simplifyAfterAssignment() to maintain literal counts
+- Called preprocess() at start of Solve() before search loop
+- Returns false if empty clause detected (UNSAT)
+
+Benefits:
+- Detects UNSAT instances immediately (e.g., tseitin_grid_4x4_unsat)
+- Reduces number of decisions needed during search
+- Simplifies formula before expensive CDCL search
+- Standard technique in all competitive SAT solvers
 
 Verified:
-- git status shows clean working tree
-- Test binaries can still be generated with go test -c
+- All 15 unit tests pass
+- Correctly detects tseitin_grid_4x4_unsat.cnf as UNSAT in preprocess
+- Correctly solves php_5p_6h_sat.cnf
+- Correctly solves sudoku_3x3_empty_sat.cnf (729 vars)
+- go vet and go test pass
+```
+
+commit 7c5ac2d
+Author: satience team
+Date: Thu Jun 04 2026
+
+Implement Luby restart policy
+
+Add restart mechanism to escape unproductive search regions:
+
+- Implemented Luby restart sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2...
+- restartBase=100 conflicts (multiplied by Luby sequence values)
+- Triggers restart after backtrack to avoid losing progress
+- Clears trail and learned clauses on restart
+- Resets implication[] array for soundness
+
+Implementation:
+- Added luby() function to generate restart sequence
+- Added restartBase, restartCount, lubyIndex fields
+- Added shouldRestart() method to check threshold
+- Trigger restart after successful backtrack
+- Clear trail, learned clauses, implication[] on restart
+
+Why restart:
+- Escape from deep, unproductive search regions
+- Allow different variable decisions to be tried
+- Particularly effective on structured instances
+- Standard technique in all modern SAT solvers
+
+Why Luby sequence:
+- Theoretical guarantees for randomized algorithms
+- Geometric growth prevents too-frequent restarts
+- Used successfully in many SAT solvers
+
+Soundness fix:
+- Restart AFTER backtrack (not during conflict handling)
+- Clear implication[] array to avoid stale references
+- Clear learned clauses to start fresh
+
+Verified:
+- All 15 unit tests pass
+- php_6p_7h_sat now returns SAT (was timeout before)
+- All 5 quick tests pass (algebra_xor, php_5p_6h_sat, arg_chain)
+- go vet and go test pass
+```
+
+commit ea2302f
+Author: satience team
+Date: Thu Jun 04 2026
+
+Update AGENTS.md with recent progress
+
+Document completed features:
+- Phase saving heuristic
+- LBD-based clause database management
+- Profiling and optimization of propagate()
+- Backjumping implementation
+- Verbose mode with statistics
+- Clause minimization via self-subsumption
+
+Updated sections:
+- Progress/Done: Added all recent implementations
+- Key Decisions: Added phase saving, clause minimization details
+- Next Steps: Removed completed items (restart, clause minimization)
+- Critical Context: Added new fields and methods
+- Relevant Files: Updated solver_cdcl.go description
 ```
 
 commit 81066e6
