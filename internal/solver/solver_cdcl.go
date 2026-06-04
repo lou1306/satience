@@ -38,6 +38,10 @@ type CDCLSolver struct {
 	restartBase  int
 	restartCount int
 	lubyIndex    int
+	// Adaptive restart fields (Glucose-style)
+	lbdSum        int    // Sum of LBDs for recent conflicts
+	lbdCount      int    // Number of conflicts tracked
+	lastConflictLBD int  // LBD of last learned clause
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -67,6 +71,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartBase:  restartBase,
 		restartCount: 0,
 		lubyIndex:    0,
+		lbdSum:       0,
+		lbdCount:     0,
+		lastConflictLBD: 0,
 	}
 }
 
@@ -1361,7 +1368,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		backjumpLevel = 1
 	}
 	
+	// Calculate LBD (Literal Block Distance) for adaptive restarts
+	// LBD = number of distinct decision levels in the learned clause
+	lbd := s.calculateLBD(learnedLits)
+	
+	// Update LBD statistics for adaptive restarts
+	s.lastConflictLBD = lbd
+	s.lbdSum += lbd
+	s.lbdCount++
+	
 	return backjumpLevel
+}
+
+// calculateLBD calculates the Literal Block Distance (LBD) of a clause
+// LBD = number of distinct decision levels among the literals in the clause
+// Lower LBD = better clause (fewer decision levels involved)
+// Clauses with LBD=2 are called "glue clauses" and are very valuable
+func (s *CDCLSolver) calculateLBD(literals []cnf.Literal) int {
+	levelSeen := make(map[int]bool)
+	for _, lit := range literals {
+		varIdx := lit.Var()
+		lvl := s.assignments[varIdx].Level
+		levelSeen[lvl] = true
+	}
+	return len(levelSeen)
 }
 
 // minimizeLearnedClause reduces the size of a learned clause via self-subsumption
@@ -1576,13 +1606,26 @@ func luby(i int) int {
 	}
 }
 
-// shouldRestart checks if we should restart based on Luby sequence
+// shouldRestart checks if we should restart using adaptive strategy (Glucose-style)
+// combined with Luby sequence as fallback
 func (s *CDCLSolver) shouldRestart() bool {
-	// Calculate restart threshold using Luby sequence
-	threshold := s.restartBase * luby(s.lubyIndex + 1)
-	// Count conflicts since last restart
-	conflictsSinceRestart := s.conflicts - s.restartCount
-	return conflictsSinceRestart >= threshold
+	// Need enough data for adaptive restarts
+	if s.lbdCount < 100 {
+		// Fall back to Luby sequence until we have enough statistics
+		threshold := s.restartBase * luby(s.lubyIndex + 1)
+		conflictsSinceRestart := s.conflicts - s.restartCount
+		return conflictsSinceRestart >= threshold
+	}
+	
+	// Adaptive restart: restart if current LBD is much worse than average
+	// This indicates we're in an unproductive search region
+	avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
+	
+	// Restart if current LBD > 1.5x average (Glucose-style threshold)
+	// This is more aggressive than Luby and escapes bad search regions faster
+	adaptiveThreshold := avgLBD * 1.5
+	
+	return float64(s.lastConflictLBD) > adaptiveThreshold
 }
 
 // restart performs a restart: clear the trail and reset to level 0
@@ -1607,6 +1650,12 @@ func (s *CDCLSolver) restart() {
 	
 	// Update restart count to current conflict count (for next threshold calculation)
 	s.restartCount = s.conflicts
+	
+	// Reset LBD statistics for adaptive restarts
+	// Start fresh after restart
+	s.lbdSum = 0
+	s.lbdCount = 0
+	s.lastConflictLBD = 0
 	
 	// Increment Luby index for next restart
 	s.lubyIndex++
