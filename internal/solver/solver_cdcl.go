@@ -1391,6 +1391,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		return preprocessResult
 	}
 
+	// Initialize watched literals AFTER preprocessing (preprocessing modifies clauses)
+	s.cnf.InitializeWatches()
+
 	for {
 		s.iterations++
 		if s.maxIter > 0 && s.iterations > s.maxIter {
@@ -1451,6 +1454,147 @@ func (s *CDCLSolver) allAssigned() bool {
 	return true
 }
 
+// propagateBinary propagates binary clauses using watched literals
+// Returns (conflict, clauseIdx) where clauseIdx >= 0 means unit propagated (encoded), < 0 means conflict
+func (s *CDCLSolver) propagateBinary() (bool, int) {
+	// Skip if watches not initialized yet (during preprocessing)
+	if s.cnf.WatchList == nil || len(s.cnf.WatchList) == 0 {
+		return false, -1
+	}
+	
+	// Process all assigned literals on the trail that haven't been processed yet
+	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
+		assignedVar := uint32(s.trail[trailIdx])
+		assignedValue := s.assignments[assignedVar].Value
+		
+		// When a literal becomes true, check clauses watching its negation
+		// If literal L is true, clauses watching ¬L are satisfied
+		// If literal L is false, clauses watching L need attention
+		falseLit := cnf.NewLiteral(assignedVar, assignedValue) // The literal that is FALSE
+		falseLitIdx := cnf.LitToIndex(falseLit)
+		
+		// Get all binary clauses watching this false literal
+		watchList := s.cnf.WatchList[falseLitIdx]
+		
+		for i := 0; i < len(watchList); i++ {
+			binIdx := watchList[i]
+			binClause := s.cnf.BinaryClauses[binIdx]
+			
+			// Get the two watched literals
+			watchAIdx := s.cnf.BinaryWatchA[binIdx]
+			watchBIdx := s.cnf.BinaryWatchB[binIdx]
+			
+			watchA := cnf.IndexToLit(watchAIdx)
+			watchB := cnf.IndexToLit(watchBIdx)
+			
+			// One of these watches should be the false literal
+			// The other watch is what we need to check
+			var otherWatch cnf.Literal
+			var otherWatchIdx int
+			
+			if watchA == falseLit {
+				otherWatch = watchB
+				otherWatchIdx = watchBIdx
+			} else if watchB == falseLit {
+				otherWatch = watchA
+				otherWatchIdx = watchAIdx
+			} else {
+				// Neither watch is the false literal - this shouldn't happen
+				// Skip this clause (it's watching other literals)
+				continue
+			}
+			
+			// Check the other watch
+			otherVar := otherWatch.Var()
+			
+			if s.assignments[otherVar].Level != 0 {
+				// Other literal is already assigned
+				otherValue := s.assignments[otherVar].Value
+				otherIsTrue := (!otherWatch.IsNegated() && otherValue) || (otherWatch.IsNegated() && !otherValue)
+				
+				if otherIsTrue {
+					// Clause is satisfied by the other watch
+					continue
+				}
+				// Both watches are false - CONFLICT!
+				return true, -binIdx - 2
+			}
+			
+			// Other watch is unassigned - this is unit propagation!
+			// But we need to check if there's an alternative watch
+			lit1 := cnf.Literal(binClause.Lit1)
+			lit2 := cnf.Literal(binClause.Lit2)
+			
+			// Check if either clause literal can be a new watch
+			foundNewWatch := false
+			
+			// Try lit1
+			var1 := lit1.Var()
+			lit1IsFalse := s.assignments[var1].Level != 0 && 
+				((!lit1.IsNegated() && !s.assignments[var1].Value) || 
+				 (lit1.IsNegated() && s.assignments[var1].Value))
+			
+			if !lit1IsFalse {
+				newWatchIdx := cnf.LitToIndex(lit1)
+				if newWatchIdx != otherWatchIdx && newWatchIdx != falseLitIdx {
+					// Update watches: keep falseLit, replace otherWatch with lit1
+					if watchA == falseLit {
+						s.cnf.BinaryWatchA[binIdx] = falseLitIdx
+						s.cnf.BinaryWatchB[binIdx] = newWatchIdx
+					} else {
+						s.cnf.BinaryWatchA[binIdx] = newWatchIdx
+						s.cnf.BinaryWatchB[binIdx] = falseLitIdx
+					}
+					s.cnf.WatchList[newWatchIdx] = append(s.cnf.WatchList[newWatchIdx], binIdx)
+					foundNewWatch = true
+				}
+			}
+			
+			if !foundNewWatch {
+				// Try lit2
+				var2 := lit2.Var()
+				lit2IsFalse := s.assignments[var2].Level != 0 && 
+					((!lit2.IsNegated() && !s.assignments[var2].Value) || 
+					 (lit2.IsNegated() && s.assignments[var2].Value))
+				
+				if !lit2IsFalse {
+					newWatchIdx := cnf.LitToIndex(lit2)
+					if newWatchIdx != otherWatchIdx && newWatchIdx != falseLitIdx {
+						// Update watches
+						if watchA == falseLit {
+							s.cnf.BinaryWatchA[binIdx] = falseLitIdx
+							s.cnf.BinaryWatchB[binIdx] = newWatchIdx
+						} else {
+							s.cnf.BinaryWatchA[binIdx] = newWatchIdx
+							s.cnf.BinaryWatchB[binIdx] = falseLitIdx
+						}
+						s.cnf.WatchList[newWatchIdx] = append(s.cnf.WatchList[newWatchIdx], binIdx)
+						foundNewWatch = true
+					}
+				}
+			}
+			
+			if !foundNewWatch {
+				// No alternative watch found - the other watch MUST be true
+				// This is unit propagation - assign it directly
+				propLit := otherWatch
+				propVar := propLit.Var()
+				
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(propLit, assignLevel, -binIdx-2)
+				
+				// Signal that we propagated (return conflict=false, but with positive clauseIdx)
+				return false, int(propVar) + 1 // +1 to distinguish from -1 (no propagation)
+			}
+		}
+	}
+	
+	return false, -1 // No conflict, no propagation
+}
+
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
@@ -1461,7 +1605,19 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// Check original clauses for conflicts and unit propagation
+		// Propagate binary clauses using watched literals (O(1) per clause)
+		conflict, clauseIdx := s.propagateBinary()
+		if conflict {
+			return true, clauseIdx
+		}
+		if clauseIdx >= 0 {
+			// Unit propagation happened (clauseIdx encodes which literal was propagated)
+			unitPropagated = true
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
+		// Check original (non-binary) clauses for conflicts and unit propagation
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
 			
