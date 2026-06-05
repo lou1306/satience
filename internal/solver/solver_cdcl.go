@@ -156,6 +156,9 @@ func (s *CDCLSolver) preprocess() SolveResult {
 	// Preprocessing modifies clauses, so the cached indices are stale
 	s.cnf.RebuildShortClauses()
 	
+	// Initialize watched literals for binary clauses after preprocessing
+	s.cnf.InitializeWatches()
+	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses (%d binary, %d ternary)\n", 
 			s.cnf.NumVars, s.cnf.NumClauses, len(s.cnf.BinaryClauses), len(s.cnf.TernaryClauses))
@@ -933,77 +936,144 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// OPTIMIZATION 1: Propagate binary clauses first (O(1) per clause)
-		// Binary clause (a ∨ b): if ¬a then propagate b, if ¬b then propagate a
-		for binIdx, binClause := range s.cnf.BinaryClauses {
-			lit1 := cnf.Literal(binClause.Lit1)
-			lit2 := cnf.Literal(binClause.Lit2)
+		// Process trail using watched literals for binary clauses
+		for trailIndex < len(s.trail) {
+			litIdx := s.trail[trailIndex]
+			trailIndex++
 			
-			var1 := lit1.Var()
-			var2 := lit2.Var()
-			assign1 := s.assignments[var1]
-			assign2 := s.assignments[var2]
+			varIdx := uint32(litIdx)
+			assign := s.assignments[varIdx]
 			
-			// Check if lit1 is false
-			if assign1.Level != 0 {
-				lit1False := (!lit1.IsNegated() && !assign1.Value) || (lit1.IsNegated() && assign1.Value)
-				if lit1False {
-					// lit1 is false, check lit2
-					if assign2.Level != 0 {
-						// lit2 is also assigned - check for conflict
-						lit2False := (!lit2.IsNegated() && !assign2.Value) || (lit2.IsNegated() && assign2.Value)
-						if lit2False {
-							// Both literals false - conflict!
-							// Find the clause index for error reporting
-							for clauseIdx, clause := range s.cnf.Clauses {
-								if len(clause.Literals) == 2 && 
-								   clause.Literals[0] == lit1 && 
-								   clause.Literals[1] == lit2 {
-									return true, clauseIdx
-								}
+			// Get the FALSE literal (the one that just became false)
+			// When x=false, we check clauses watching x
+			// When x=true, we check clauses watching ¬x
+			falseLit := cnf.NewLiteral(varIdx, !assign.Value)
+			watchIdx := cnf.LitToIndex(falseLit)
+			
+			if watchIdx >= len(s.cnf.WatchList) {
+				continue
+			}
+			
+			// Get watch list for this literal
+			wlist := s.cnf.WatchList[watchIdx]
+			
+			// Process all clauses watching this literal
+			for i := 0; i < len(wlist); {
+				binIdx := wlist[i]
+				
+				if binIdx >= len(s.cnf.BinaryClauses) {
+					// Invalid index, skip
+					i++
+					continue
+				}
+				
+				binClause := s.cnf.BinaryClauses[binIdx]
+				lit1 := cnf.Literal(binClause.Lit1)
+				lit2 := cnf.Literal(binClause.Lit2)
+				
+				// Get current watch indices for this clause
+				watchA := s.cnf.BinaryWatchA[binIdx]
+				watchB := s.cnf.BinaryWatchB[binIdx]
+				
+				// Determine which watch is the false one we're processing
+				otherWatch := -1
+				if watchA == watchIdx {
+					otherWatch = watchB
+				} else if watchB == watchIdx {
+					otherWatch = watchA
+				} else {
+					// This clause doesn't watch this literal anymore (stale watch list entry)
+					// Remove from watch list
+					wlist = append(wlist[:i], wlist[i+1:]...)
+					s.cnf.WatchList[watchIdx] = wlist
+					continue
+				}
+				
+				// Check the other watched literal
+				otherLit := cnf.IndexToLit(otherWatch)
+				otherAssign := s.assignments[otherLit.Var()]
+				
+				if otherAssign.Level != 0 {
+					// Other watch is also assigned
+					otherFalse := (!otherLit.IsNegated() && !otherAssign.Value) || (otherLit.IsNegated() && otherAssign.Value)
+					if otherFalse {
+						// Both watches are false = CONFLICT
+						for clauseIdx, clause := range s.cnf.Clauses {
+							if len(clause.Literals) == 2 && 
+							   clause.Literals[0] == lit1 && 
+							   clause.Literals[1] == lit2 {
+								return true, clauseIdx
 							}
-							return true, 0 // Fallback
 						}
-					} else {
-						// lit2 is unassigned - propagate it
-						assignLevel := s.level
-						if assignLevel == 0 {
-							assignLevel = 1
-						}
-						s.assignLiteral(lit2, assignLevel, -binIdx-1)
-						unitPropagated = true
-						break
+						return true, 0
 					}
+					// Other watch is true, clause is satisfied
+					i++
+					continue
+				}
+				
+				// Other watch is unassigned - try to find a new watch
+				// Check lit1 first
+				newWatch := -1
+				lit1Assign := s.assignments[lit1.Var()]
+				if lit1Assign.Level == 0 {
+					newWatch = cnf.LitToIndex(lit1)
+				} else {
+					lit1False := (!lit1.IsNegated() && !lit1Assign.Value) || (lit1.IsNegated() && lit1Assign.Value)
+					if !lit1False {
+						// lit1 is true, clause is satisfied
+						i++
+						continue
+					}
+				}
+				
+				// Check lit2
+				if newWatch == -1 {
+					lit2Assign := s.assignments[lit2.Var()]
+					if lit2Assign.Level == 0 {
+						newWatch = cnf.LitToIndex(lit2)
+					} else {
+						lit2False := (!lit2.IsNegated() && !lit2Assign.Value) || (lit2.IsNegated() && lit2Assign.Value)
+						if !lit2False {
+							// lit2 is true, clause is satisfied
+							i++
+							continue
+						}
+					}
+				}
+				
+				if newWatch != -1 {
+					// Found a new literal to watch
+					// Update the watch that was false
+					if watchA == watchIdx {
+						s.cnf.BinaryWatchA[binIdx] = newWatch
+					} else {
+						s.cnf.BinaryWatchB[binIdx] = newWatch
+					}
+					
+					// Add clause to new watch list
+					if newWatch < len(s.cnf.WatchList) {
+						s.cnf.WatchList[newWatch] = append(s.cnf.WatchList[newWatch], binIdx)
+					}
+					
+					// Remove from old watch list
+					wlist = append(wlist[:i], wlist[i+1:]...)
+					s.cnf.WatchList[watchIdx] = wlist
+					// Don't increment i, process next clause at same index
+				} else {
+					// Can't find new watch - other watch must be propagated
+					assignLevel := s.level
+					if assignLevel == 0 {
+						assignLevel = 1
+					}
+					s.assignLiteral(otherLit, assignLevel, -binIdx-1)
+					unitPropagated = true
+					break
 				}
 			}
 			
-			// Check if lit2 is false (symmetric)
-			if assign2.Level != 0 {
-				lit2False := (!lit2.IsNegated() && !assign2.Value) || (lit2.IsNegated() && assign2.Value)
-				if lit2False {
-					if assign1.Level != 0 {
-						lit1False := (!lit1.IsNegated() && !assign1.Value) || (lit1.IsNegated() && assign1.Value)
-						if lit1False {
-							// Both literals false - conflict!
-							for clauseIdx, clause := range s.cnf.Clauses {
-								if len(clause.Literals) == 2 && 
-								   clause.Literals[0] == lit1 && 
-								   clause.Literals[1] == lit2 {
-									return true, clauseIdx
-								}
-							}
-							return true, 0
-						}
-					} else {
-						assignLevel := s.level
-						if assignLevel == 0 {
-							assignLevel = 1
-						}
-						s.assignLiteral(lit1, assignLevel, -binIdx-1)
-						unitPropagated = true
-						break
-					}
-				}
+			if unitPropagated {
+				break
 			}
 		}
 		
