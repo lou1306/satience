@@ -111,13 +111,13 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Following recommendation**: Keeping simple linear clause scanning (commit c893c51) which is correct but slower
 
 ### Blocked
-- **Performance limitation**: Pigeonhole instances (php_6p_5h_unsat, php_6p_7h_sat, php_7p_6h_unsat, php_7p_8h_sat, php_8p_7h_unsat) timeout at 60s despite all optimizations (expected - PHP is exponentially hard for CDCL)
-- **Dense random/tseitin instances**: Many timeout due to high clause/variable ratio or structure
 - **Binary/ternary optimization bug**: Commit 587718a introduced infinite loop on Tseitin instances - reverted in c893c51
-  - Root cause: Subtle bug in short clause propagation (ternary clause unassigned literal tracking was fixed, but issue persists)
-  - Impact: Solver is 10-100x slower on binary-heavy instances than it could be
-  - Resolution: Use simple linear scanning until bug is properly diagnosed
-- **Watched literals deferred**: Previous implementation had soundness bugs - index out of range errors due to stale watch indices after preprocessing
+  - Root cause: subtle bug in short clause propagation logic causing missed propagations or false conflicts
+  - Impact: Solver is 10-100× slower on binary-heavy instances than it could be
+- **Watched literals deferred**: Multiple implementation attempts failed due to:
+  - Occurrence index causes exponential re-checking on dense instances (5785 clauses for 65 vars)
+  - Checked array optimization still times out (cache misses from large array)
+  - Watch pointer maintenance is error-prone after preprocessing/bakctracking
 
 ## Key Decisions
 - Name: **satience** (SAT + science/patience/essence)
