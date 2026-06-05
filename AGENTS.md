@@ -72,10 +72,14 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
   - Added safeguard: skips BCE on large formulas (>5000 clauses) to avoid excessive preprocessing time
   - Successfully removes blocked clauses on crafted instances
 - **Comprehensive evaluation**: 20/20 correct results on random instances ≤200 vars, all models verified
-- **Implemented binary clause optimization**: O(1) propagation for binary clauses, compact storage as uint32 pairs
-- **Implemented ternary clause optimization**: Optimized propagation for 3-literal clauses
-- **Three-tier propagate()**: Binary → ternary → long clauses (>3 literals)
-- **Verified binary optimization**: Detected 20 binary + 10 ternary clauses in test instance, 100% fuzzer soundness
+- **Binary/ternary clause optimization attempted**: Implemented O(1) binary clause propagation and optimized ternary clause handling
+- **Bug discovered**: Binary/ternary optimization causes infinite backtracking loop on Tseitin grid instances
+- **Bug investigation**: 
+  - Preprocessing eliminates all binary clauses from tseitin_grid_5x5 (8→0 binary, 48 ternary remain)
+  - Fixed ternary clause bug (incorrect unassigned literal tracking), but issue persists
+  - Root cause: Subtle bug in short clause propagation logic causing missed propagations or false conflicts
+- **Resolution**: Reverted binary/ternary optimization in commit c893c51, using simple linear clause scanning
+- **Current status**: Solver is correct and complete, just slower on binary-heavy instances
 - **Implemented adaptive restarts (Glucose-style)**: LBD-based restart criterion instead of pure Luby sequence
 - **LBD tracking**: calculateLBD() method computes Literal Block Distance for learned clauses
 - **Adaptive threshold**: Restart when current LBD > 1.5× average LBD (after 100 conflicts of data)
@@ -104,11 +108,15 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
   - 6f157d5 - Implement adaptive restarts (Glucose-style)
 
 ### In Progress
-- (none)
+- **Following recommendation**: Keeping simple linear clause scanning (commit c893c51) which is correct but slower
 
 ### Blocked
 - **Performance limitation**: Pigeonhole instances (php_6p_5h_unsat, php_6p_7h_sat, php_7p_6h_unsat, php_7p_8h_sat, php_8p_7h_unsat) timeout at 60s despite all optimizations (expected - PHP is exponentially hard for CDCL)
 - **Dense random/tseitin instances**: Many timeout due to high clause/variable ratio or structure
+- **Binary/ternary optimization bug**: Commit 587718a introduced infinite loop on Tseitin instances - reverted in c893c51
+  - Root cause: Subtle bug in short clause propagation (ternary clause unassigned literal tracking was fixed, but issue persists)
+  - Impact: Solver is 10-100x slower on binary-heavy instances than it could be
+  - Resolution: Use simple linear scanning until bug is properly diagnosed
 - **Watched literals deferred**: Previous implementation had soundness bugs - index out of range errors due to stale watch indices after preprocessing
 
 ## Key Decisions
@@ -138,9 +146,10 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Watched literals deferred**: Too complex for incremental implementation - needs complete redesign with careful testing
 - **Evaluation approach**: Test 20 random instances < 200 vars, stop on first wrong result, verify models for SAT instances
 - **Fuzzer approach**: Generate random and structured CNF instances, verify SAT models satisfy all clauses, test pigeonhole (known UNSAT)
-- **Binary clause storage**: Two uint32 values per clause for cache efficiency (BinaryClause struct)
-- **Ternary clause storage**: Three uint32 values per clause (TernaryClause struct)
-- **Three-tier propagation**: Binary clauses first (O(1)), then ternary, then long clauses (>3 literals)
+- **Binary clause storage**: Two uint32 values per clause for cache efficiency (BinaryClause struct) - IMPLEMENTED BUT BUGGY
+- **Ternary clause storage**: Three uint32 values per clause (TernaryClause struct) - IMPLEMENTED BUT BUGGY
+- **Three-tier propagation**: Binary → ternary → long clauses - REVERTED due to soundness bug
+- **Current propagation**: Simple linear scanning of all clauses (O(n) but correct)
 - **Rebuild after preprocessing**: Call RebuildShortClauses() after preprocessing modifies clause database
 
 ## Next Steps
@@ -314,7 +323,8 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Fuzzer verified soundness**: 100% model verification on SAT instances (30/30 tests, all models verified)
 - **propagate() fixed (3 bugs)**: Restarts clause checking, firstPass flag, units at level >= 1
 - **propagate() optimized**: Inlined literalIsTrue, cached varIdx, uses mask constants
-- **Binary clause optimization**: Three-tier propagation (binary → ternary → long), O(1) per binary clause
+- **Binary/ternary optimization REVERTED**: Commit 587718a caused infinite loop, reverted in c893c51
+- **Current propagation**: Simple linear scanning of all clauses (O(n) but correct)
 - **Adaptive restarts**: LBD-based criterion (1.5× threshold), fallback to Luby until 100 conflicts
 - **Profile results**: propagate() = 96.77% CPU, IsNegated = 2.15%
 - **Performance by instance type**:
@@ -344,7 +354,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **isClauseBlockedBy()**: Helper checking if clause is blocked by specific literal
 - **resolveOnVar()**: Helper computing resolvent of two clauses on a variable
 - **preprocess()**: Applies all preprocessing techniques before search, calls RebuildShortClauses() at end
-- **propagate()**: Three-tier propagation - binary clauses (O(1)), ternary clauses, then long clauses (>3 literals)
+- **propagate()**: Simple linear scanning of all clauses (binary/ternary optimization reverted due to bug)
 - **Watched literals bugs encountered**: Index out of range errors due to stale watch indices after preprocessing simplifies clauses
 - **Evaluation script**: `benchmark/eval_small_random.sh [n_instances]` - tests N random instances < 200 vars, 60s timeout each
 - **Download script**: `benchmark/download_instances.py [n] [max_vars]` - downloads N instances from GBD families likely to have small instances
@@ -357,7 +367,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 ## Relevant Files
 - `/home/luca/git/opencode-sat-new/internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF, BinaryClause, TernaryClause) with bit operation constants and short clause indexing
 - `/home/luca/git/opencode-sat-new/internal/parser/parser.go`: DIMACS CNF parser
-- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, **adaptive restarts (Glucose-style)**, optimized three-tier propagate(), clause minimization, preprocessing pipeline, binary/ternary clause optimization, **calculateLBD() method**
+- `/home/luca/git/opencode-sat-new/internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP clause learning, backjumping, LBD-based clause deletion, phase saving, **adaptive restarts (Glucose-style)**, simple linear propagate() (binary/ternary opt reverted), clause minimization, preprocessing pipeline, **calculateLBD() method**
 - `/home/luca/git/opencode-sat-new/internal/solver/vsids.go`: VSIDS heuristic with activity decay, selectVariableWithPhase() for phase saving
 - `/home/luca/git/opencode-sat-new/internal/solver/solver.go`: Base solver with propagation
 - `/home/luca/git/opencode-sat-new/internal/solver/solver_test.go`: Unit tests (15/15 passing)
