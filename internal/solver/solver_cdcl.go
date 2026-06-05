@@ -30,11 +30,13 @@ type CDCLSolver struct {
 	learnedArena *cnf.ClauseArena    // Arena-based learned clause storage
 	clauseActivity []float64
 	clauseAge    []int
+	clauseSize   []int // Track clause size for deletion
 	currentAge   int
 	verbose      bool
 	decisions    int
 	backjumpLevel int
 	maxLearned   int
+	minLearned   int // Minimum clauses to keep (aggressive deletion target)
 	savedPhase   []bool
 	restartBase  int
 	restartCount int
@@ -46,7 +48,8 @@ type CDCLSolver struct {
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := 10000 // Initial limit on learned clauses
+	maxLearned := 200   // Reduced from 10000 - keep only highest-quality clauses
+	minLearned := 100   // Target after deletion (50% reduction)
 	restartBase := 100  // Base for Luby restart sequence
 	return &CDCLSolver{
 		cnf:         formula,
@@ -60,7 +63,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:  0,
 		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
-		learnedArena: cnf.NewClauseArena(10000), // Pre-allocate for learned clauses
+		learnedArena: cnf.NewClauseArena(1000), // Reduced arena size
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
 		currentAge:   0,
@@ -68,6 +71,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decisions:   0,
 		backjumpLevel: 0,
 		maxLearned:   maxLearned,
+		minLearned:   minLearned,
 		savedPhase:  make([]bool, formula.NumVars),
 		restartBase:  restartBase,
 		restartCount: 0,
@@ -548,10 +552,68 @@ func (s *CDCLSolver) restart() {
 		s.inprocessing()
 	}
 	
+	// Clear all learned clauses on restart (original behavior)
+	// Rationale: restarts are frequent (every 100-400 conflicts), so keeping clauses
+	// doesn't help much. Better to start fresh and relearn high-quality clauses.
 	s.learnedClauses = s.learnedClauses[:0]
 	s.clauseActivity = s.clauseActivity[:0]
 	s.clauseAge = s.clauseAge[:0]
+	s.clauseSize = s.clauseSize[:0]
 	s.learnedArena.Reset() // Clear arena memory
+	
+	// Don't clear all learned clauses - keep glue clauses (LBD <= 3)
+	// This preserves valuable learned information across restarts
+	// IMPORTANT: Calculate LBD BEFORE clearing assignments!
+	glueCount := 0
+	isGlue := make([]bool, len(s.learnedClauses))
+	
+	for i, clause := range s.learnedClauses {
+		// Calculate LBD BEFORE clearing trail
+		levelSet := make(map[int]bool)
+		for _, lit := range clause.Literals {
+			lvl := s.assignments[lit.Var()].Level
+			if lvl > 0 {
+				levelSet[lvl] = true
+			}
+		}
+		lbd := len(levelSet)
+		
+		// Keep glue clauses (LBD <= 3)
+		if lbd <= 3 {
+			glueCount++
+			isGlue[i] = true
+		}
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Restart: keeping %d glue clauses, deleting %d non-glue\n", glueCount, len(s.learnedClauses)-glueCount)
+	}
+	
+	// Compact to keep only glue clauses
+	newClauses := make([]cnf.Clause, 0, glueCount)
+	newActivity := make([]float64, 0, glueCount)
+	newAge := make([]int, 0, glueCount)
+	newSize := make([]int, 0, glueCount)
+	
+	for i := range s.learnedClauses {
+		if isGlue[i] {
+			newClauses = append(newClauses, s.learnedClauses[i])
+			newActivity = append(newActivity, s.clauseActivity[i])
+			newAge = append(newAge, s.clauseAge[i])
+			newSize = append(newSize, s.clauseSize[i])
+		}
+	}
+	
+	s.learnedClauses = newClauses
+	s.clauseActivity = newActivity
+	s.clauseAge = newAge
+	s.clauseSize = newSize
+	
+	// Rebuild arena with only glue clauses
+	s.learnedArena.Reset()
+	for _, clause := range s.learnedClauses {
+		s.learnedArena.AllocateClause(clause.Literals, true)
+	}
 	
 	s.lubyIndex++
 	s.restartCount = s.conflicts
@@ -1496,6 +1558,10 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		// Learned clause (encoded as negative index)
 		learnedIdx := -clauseIdx - 1
 		conflictLits = s.learnedClauses[learnedIdx].Literals
+		// Bump activity for learned clause involved in conflict
+		if learnedIdx < len(s.clauseActivity) {
+			s.clauseActivity[learnedIdx] += 1.0
+		}
 	}
 	
 	s.vsids.bumpClause(conflictLits)
@@ -1504,8 +1570,13 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
+	// Decay clause activity periodically
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
+		// Also decay clause activity
+		for i := range s.clauseActivity {
+			s.clauseActivity[i] *= 0.95
+		}
 	}
 }
 
@@ -1587,12 +1658,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	// Only learn non-empty clauses
-	if len(learnedLits) > 0 {
-		// Check if we need to delete clauses
-		if len(s.learnedClauses) >= s.maxLearned {
-			s.deleteLearnedClauses()
-		}
+		// Only learn non-empty clauses
+		if len(learnedLits) > 0 {
+			// Check if we need to delete clauses
+			if len(s.learnedClauses) >= s.maxLearned {
+				if s.verbose {
+					fmt.Printf("c [verbose] Triggering deletion: %d clauses >= maxLearned %d\n", len(s.learnedClauses), s.maxLearned)
+				}
+				s.deleteLearnedClauses()
+			}
 		
 		// Allocate in arena (contiguous memory)
 		_ = s.learnedArena.AllocateClause(learnedLits, true)
@@ -1600,6 +1674,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Track metadata in parallel arrays
 		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
+		s.clauseSize = append(s.clauseSize, len(learnedLits))
 		s.currentAge++
 		
 		// Also keep in slice for compatibility (temporary)
@@ -1646,23 +1721,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// Tiered LBD-based clause deletion
-	// Tier 1: Glue clauses (LBD ≤ 2) - NEVER delete
-	// Tier 2: Useful clauses (LBD 3-6) - delete if old
-	// Tier 3: Trash clauses (LBD > 6) - delete aggressively
+	// LBD + Size + Activity based clause deletion
+	// Protect: Glue clauses (LBD ≤ 3), short clauses (< 10 literals), active clauses
+	// Delete: Large clauses (> 20 literals), high LBD (> 6), old inactive clauses
 	
-	// Calculate LBD and tier for each learned clause
 	type clauseInfo struct {
-		idx   int
-		lbd   int
-		age   int
-		tier  int
+		idx      int
+		lbd      int
+		size     int
+		age      int
+		activity float64
+		score    float64 // Higher = more likely to delete
 	}
 	
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
 	
 	for i, clause := range s.learnedClauses {
-		// Count unique decision levels in the clause
+		// Calculate LBD
 		levelSet := make(map[int]bool)
 		for _, lit := range clause.Literals {
 			lvl := s.assignments[lit.Var()].Level
@@ -1672,62 +1747,73 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 		lbd := len(levelSet)
 		
-		// Determine tier
-		var tier int
-		if lbd <= 2 {
-			tier = 1 // Glue - protect
-		} else if lbd <= 6 {
-			tier = 2 // Useful
-		} else {
-			tier = 3 // Trash
+		size := len(clause.Literals)
+		age := s.currentAge - s.clauseAge[i]
+		activity := s.clauseActivity[i]
+		
+		// Calculate deletion score (higher = delete first)
+		// Base score from LBD (most important)
+		score := float64(lbd) * 100.0
+		
+		// Penalty for large size (aggressively delete long clauses)
+		if size > 20 {
+			score += float64(size-20) * 50.0
+		}
+		
+		// Penalty for old age
+		score += float64(age) * 0.5
+		
+		// Bonus for activity (reduce score for active clauses)
+		score -= activity * 10.0
+		
+		// PROTECTION: Never delete glue clauses with LBD <= 3
+		if lbd <= 3 {
+			score = -1000.0 // Very low score = never delete
+		}
+		
+		// PROTECTION: Never delete very short clauses (< 5 literals)
+		if size < 5 {
+			score = -500.0 // Very low score
 		}
 		
 		clauses = append(clauses, clauseInfo{
-			idx:  i,
-			lbd:  lbd,
-			age:  s.currentAge - s.clauseAge[i],
-			tier: tier,
+			idx:      i,
+			lbd:      lbd,
+			size:     size,
+			age:      age,
+			activity: activity,
+			score:    score,
 		})
 	}
 	
-	// Sort by tier (primary), then LBD, then age
-	// Delete tier 3 first, then tier 2, never tier 1
+	// Sort by score (descending - highest score = delete first)
 	for i := 0; i < len(clauses); i++ {
 		for j := i + 1; j < len(clauses); j++ {
-			// Higher tier = delete first
-			// Within same tier: higher LBD and older age = delete first
-			if clauses[i].tier < clauses[j].tier {
-				continue // i is better tier, keep order
-			}
-			if clauses[i].tier > clauses[j].tier {
+			if clauses[i].score < clauses[j].score {
 				clauses[i], clauses[j] = clauses[j], clauses[i]
-				continue
 			}
-			// Same tier: compare by score
-			scoreI := clauses[i].lbd*100 + clauses[i].age
-			scoreJ := clauses[j].lbd*100 + clauses[j].age
-			if scoreI < scoreJ {
-				continue // i is better, keep order
-			}
-			clauses[i], clauses[j] = clauses[j], clauses[i]
 		}
 	}
 	
-	// Determine how many to delete (target 50% reduction, but protect glues)
-	toDelete := len(s.learnedClauses) / 2
+	// Target: reduce to minLearned clauses (aggressive deletion)
+	toKeep := s.minLearned
+	if toKeep > len(s.learnedClauses) {
+		toKeep = len(s.learnedClauses) // Can't keep more than we have
+	}
+	toDelete := len(s.learnedClauses) - toKeep
 	
-	// Mark clauses to delete (skip glue clauses)
+	// Mark clauses to delete
 	keep := make([]bool, len(s.learnedClauses))
 	deleted := 0
 	
 	for i := range keep {
-		keep[i] = true
+		keep[i] = true // Default: keep all
 	}
 	
 	for i := 0; i < len(clauses) && deleted < toDelete; i++ {
 		idx := clauses[i].idx
-		// Never delete glue clauses (tier 1)
-		if clauses[i].tier == 1 {
+		// Skip protected clauses (score < 0 means protected)
+		if clauses[i].score < 0 {
 			continue
 		}
 		keep[idx] = false
@@ -1735,27 +1821,34 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 	
 	// Compact the slices
-	newClauses := make([]cnf.Clause, 0, len(s.learnedClauses)-deleted)
-	newActivity := make([]float64, 0, len(s.learnedClauses)-deleted)
-	newAge := make([]int, 0, len(s.learnedClauses)-deleted)
+	newClauses := make([]cnf.Clause, 0, toKeep)
+	newActivity := make([]float64, 0, toKeep)
+	newAge := make([]int, 0, toKeep)
+	newSize := make([]int, 0, toKeep)
 	
 	for i := range s.learnedClauses {
 		if keep[i] {
 			newClauses = append(newClauses, s.learnedClauses[i])
 			newActivity = append(newActivity, s.clauseActivity[i])
 			newAge = append(newAge, s.clauseAge[i])
+			newSize = append(newSize, s.clauseSize[i])
 		}
 	}
 	
 	s.learnedClauses = newClauses
 	s.clauseActivity = newActivity
 	s.clauseAge = newAge
+	s.clauseSize = newSize
 	
 	// Rebuild arena from compacted slices (ensures contiguous memory)
 	s.learnedArena.Reset()
 	for i, clause := range s.learnedClauses {
 		s.learnedArena.AllocateClause(clause.Literals, true)
 		_ = i // Use index variable
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", deleted, len(s.learnedClauses), toKeep)
 	}
 }
 
