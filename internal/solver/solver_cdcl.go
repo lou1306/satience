@@ -42,6 +42,9 @@ type CDCLSolver struct {
 	lbdSum        int    // Sum of LBDs for recent conflicts
 	lbdCount      int    // Number of conflicts tracked
 	lastConflictLBD int  // LBD of last learned clause
+	// Inprocessing fields
+	inprocInterval int    // Run inprocessing every N conflicts
+	inprocCount    int    // Number of times inprocessing ran
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -74,6 +77,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lbdSum:       0,
 		lbdCount:     0,
 		lastConflictLBD: 0,
+		inprocInterval: 1000, // Run inprocessing every 1000 conflicts
+		inprocCount:    0,
 	}
 }
 
@@ -95,6 +100,7 @@ func (s *CDCLSolver) GetStats() map[string]int {
 		"iterations":    s.iterations,
 		"learned":       len(s.learnedClauses),
 		"level":         s.level,
+		"inprocessing":  s.inprocCount,
 	}
 }
 
@@ -108,6 +114,7 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c Iterations:    %d\n", s.iterations)
 	fmt.Printf("c Learned:       %d\n", len(s.learnedClauses))
 	fmt.Printf("c Max Level:     %d\n", s.level)
+	fmt.Printf("c Inprocessing:  %d\n", s.inprocCount)
 	fmt.Printf("c \n")
 }
 
@@ -877,6 +884,12 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			if s.shouldRestart() {
 				s.restart()
 			}
+			
+			// Check if we should run inprocessing
+			if s.conflicts > 0 && s.conflicts%s.inprocInterval == 0 {
+				s.inprocessing()
+			}
+			
 			continue
 		}
 
@@ -1668,7 +1681,185 @@ func (s *CDCLSolver) restart() {
 	// This is done automatically by the main solve loop
 }
 
+// inprocessing applies simplification techniques during search
+// Called periodically (every N conflicts) to clean up the formula
+// Returns true if simplification was performed, false if skipped
+func (s *CDCLSolver) inprocessing() bool {
+	// Skip inprocessing if we're at a high decision level (deep in search)
+	// Inprocessing is most effective at lower levels
+	if s.level > 10 {
+		return false
+	}
+	
+	// Only apply lightweight inprocessing during search
+	// Full preprocessing is too expensive
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Inprocessing #%d at conflict %d, level %d\n", 
+			s.inprocCount+1, s.conflicts, s.level)
+	}
+	
+	// Apply subsumption elimination on original clauses
+	// This is relatively cheap and can remove redundant clauses
+	s.subsumptionElimination()
+	
+	// Apply limited variable elimination
+	// Only try to eliminate variables with low occurrence count
+	s.limitedVariableElimination(10) // Max 10 occurrences
+	
+	// Rebuild short clauses after modifications
+	s.cnf.RebuildShortClauses()
+	
+	s.inprocCount++
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] After inprocessing: %d clauses (%d binary, %d ternary)\n",
+			s.cnf.NumClauses, len(s.cnf.BinaryClauses), len(s.cnf.TernaryClauses))
+	}
+	
+	return true
+}
 
+// limitedVariableElimination tries to eliminate variables with few occurrences
+// maxOccurrences limits which variables to consider (higher = more expensive)
+// Returns UNSAT if empty clause created, SAT if all clauses satisfied, UNKNOWN otherwise
+func (s *CDCLSolver) limitedVariableElimination(maxOccurrences int) SolveResult {
+	eliminatedCount := 0
+	
+	// Try to eliminate each variable with low occurrence count
+	for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+		// Skip assigned variables
+		if s.assignments[varIdx].Level != 0 {
+			continue
+		}
+		
+		// Count occurrences
+		posCount := 0
+		negCount := 0
+		
+		for _, clause := range s.cnf.Clauses {
+			if clause.Learned {
+				continue // Only consider original clauses
+			}
+			for _, lit := range clause.Literals {
+				if lit.Var() == varIdx {
+					if lit.IsNegated() {
+						negCount++
+					} else {
+						posCount++
+					}
+				}
+			}
+		}
+		
+		// Skip if variable appears too often
+		if posCount+negCount > maxOccurrences {
+			continue
+		}
+		
+		// Skip if variable is pure (already satisfied)
+		if posCount == 0 || negCount == 0 {
+			continue
+		}
+		
+		// Find clauses containing x and ¬x
+		posClauses := make([]int, 0)
+		negClauses := make([]int, 0)
+		
+		for i, clause := range s.cnf.Clauses {
+			if clause.Learned {
+				continue
+			}
+			for _, lit := range clause.Literals {
+				if lit.Var() == varIdx {
+					if !lit.IsNegated() {
+						posClauses = append(posClauses, i)
+					} else {
+						negClauses = append(negClauses, i)
+					}
+					break
+				}
+			}
+		}
+		
+		// Compute resolvents
+		resolvents := make([]cnf.Clause, 0)
+		resolventSet := make(map[string]bool)
+		
+		for _, posIdx := range posClauses {
+			posClause := s.cnf.Clauses[posIdx]
+			
+			for _, negIdx := range negClauses {
+				negClause := s.cnf.Clauses[negIdx]
+				
+				resolvent := s.resolve(posClause, negClause, varIdx)
+				if resolvent != nil {
+					if !s.isTautology(resolvent) {
+						key := s.clauseKey(resolvent)
+						if !resolventSet[key] {
+							resolventSet[key] = true
+							resolvents = append(resolvents, *resolvent)
+						}
+					}
+				}
+			}
+		}
+		
+		// Check if elimination is beneficial
+		originalCount := len(posClauses) + len(negClauses)
+		if len(resolvents) < originalCount {
+			// Check for empty clause
+			for _, resolvent := range resolvents {
+				if len(resolvent.Literals) == 0 {
+					if s.verbose {
+						fmt.Printf("c [verbose] Inprocessing: empty clause from var %d elimination\n", varIdx)
+					}
+					return UNSAT
+				}
+			}
+			
+			// Remove original clauses and add resolvents
+			keepClauses := make([]cnf.Clause, 0)
+			for _, clause := range s.cnf.Clauses {
+				keep := true
+				for _, lit := range clause.Literals {
+					if lit.Var() == varIdx {
+						keep = false
+						break
+					}
+				}
+				if keep {
+					keepClauses = append(keepClauses, clause)
+				}
+			}
+			
+			for _, resolvent := range resolvents {
+				keepClauses = append(keepClauses, resolvent)
+			}
+			
+			s.cnf.Clauses = keepClauses
+			s.cnf.NumClauses = len(keepClauses)
+			
+			eliminatedCount++
+			
+			if s.verbose {
+				fmt.Printf("c [verbose] Inprocessing: eliminated var %d (%d -> %d clauses)\n",
+					varIdx, originalCount, len(resolvents))
+			}
+		}
+	}
+	
+	if s.verbose && eliminatedCount > 0 {
+		fmt.Printf("c [verbose] Inprocessing: eliminated %d variables\n", eliminatedCount)
+	}
+	
+	// Check if all clauses satisfied
+	if len(s.cnf.Clauses) == 0 {
+		return SAT
+	}
+	
+	return UNKNOWN
+}
 
 // Debug methods for testing
 func (s *CDCLSolver) PropagateDebug() (bool, int) {
