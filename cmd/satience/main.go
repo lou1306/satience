@@ -14,6 +14,7 @@ func main() {
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0 = unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
+	lrb := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	flag.Parse()
 
 	args := flag.Args()
@@ -52,6 +53,9 @@ func main() {
 	}
 	if *verbose {
 		s.SetVerbose(true)
+	}
+	if *lrb {
+		s.EnableLRB()
 	}
 	
 	result := s.SolveWithResult()

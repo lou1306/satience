@@ -73,6 +73,11 @@ func (s *CDCLSolver) SetVerbose(v bool) {
 	s.verbose = v
 }
 
+// EnableLRB enables LRB (Learning Rate Based) heuristic
+func (s *CDCLSolver) EnableLRB() {
+	s.vsids.EnableLRB()
+}
+
 // GetStats returns solving statistics
 func (s *CDCLSolver) GetStats() map[string]int {
 	return map[string]int{
@@ -461,18 +466,21 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// LBD-based clause deletion
-	// Keep clauses with high activity or low LBD (learned block distance)
-	// Delete clauses with low activity and high LBD
+	// Tiered LBD-based clause deletion
+	// Tier 1: Glue clauses (LBD ≤ 2) - NEVER delete
+	// Tier 2: Useful clauses (LBD 3-6) - delete if old
+	// Tier 3: Trash clauses (LBD > 6) - delete aggressively
 	
-	// Calculate LBD for each learned clause
+	// Calculate LBD and tier for each learned clause
 	type clauseInfo struct {
 		idx   int
 		lbd   int
 		age   int
+		tier  int
 	}
 	
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
+	
 	for i, clause := range s.learnedClauses {
 		// Count unique decision levels in the clause
 		levelSet := make(map[int]bool)
@@ -484,47 +492,72 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 		lbd := len(levelSet)
 		
+		// Determine tier
+		var tier int
+		if lbd <= 2 {
+			tier = 1 // Glue - protect
+		} else if lbd <= 6 {
+			tier = 2 // Useful
+		} else {
+			tier = 3 // Trash
+		}
+		
 		clauses = append(clauses, clauseInfo{
-			idx: i,
-			lbd: lbd,
-			age: s.currentAge - s.clauseAge[i],
+			idx:  i,
+			lbd:  lbd,
+			age:  s.currentAge - s.clauseAge[i],
+			tier: tier,
 		})
 	}
 	
-	// Sort by LBD (primary) and age (secondary)
-	// Lower LBD = more useful, keep it
-	// Higher age = older, more likely to delete
+	// Sort by tier (primary), then LBD, then age
+	// Delete tier 3 first, then tier 2, never tier 1
 	for i := 0; i < len(clauses); i++ {
 		for j := i + 1; j < len(clauses); j++ {
-			// Higher LBD and older age = delete first
+			// Higher tier = delete first
+			// Within same tier: higher LBD and older age = delete first
+			if clauses[i].tier < clauses[j].tier {
+				continue // i is better tier, keep order
+			}
+			if clauses[i].tier > clauses[j].tier {
+				clauses[i], clauses[j] = clauses[j], clauses[i]
+				continue
+			}
+			// Same tier: compare by score
 			scoreI := clauses[i].lbd*100 + clauses[i].age
 			scoreJ := clauses[j].lbd*100 + clauses[j].age
 			if scoreI < scoreJ {
-				clauses[i], clauses[j] = clauses[j], clauses[i]
+				continue // i is better, keep order
 			}
+			clauses[i], clauses[j] = clauses[j], clauses[i]
 		}
 	}
 	
-	// Delete bottom 50% of clauses (highest LBD + oldest)
+	// Determine how many to delete (target 50% reduction, but protect glues)
 	toDelete := len(s.learnedClauses) / 2
-	if toDelete == 0 {
-		toDelete = 1
-	}
 	
-	// Mark clauses to delete
+	// Mark clauses to delete (skip glue clauses)
 	keep := make([]bool, len(s.learnedClauses))
+	deleted := 0
+	
 	for i := range keep {
 		keep[i] = true
 	}
 	
-	for i := 0; i < toDelete && i < len(clauses); i++ {
-		keep[clauses[i].idx] = false
+	for i := 0; i < len(clauses) && deleted < toDelete; i++ {
+		idx := clauses[i].idx
+		// Never delete glue clauses (tier 1)
+		if clauses[i].tier == 1 {
+			continue
+		}
+		keep[idx] = false
+		deleted++
 	}
 	
 	// Compact the slices
-	newClauses := make([]cnf.Clause, 0, len(s.learnedClauses)-toDelete)
-	newActivity := make([]float64, 0, len(s.learnedClauses)-toDelete)
-	newAge := make([]int, 0, len(s.learnedClauses)-toDelete)
+	newClauses := make([]cnf.Clause, 0, len(s.learnedClauses)-deleted)
+	newActivity := make([]float64, 0, len(s.learnedClauses)-deleted)
+	newAge := make([]int, 0, len(s.learnedClauses)-deleted)
 	
 	for i := range s.learnedClauses {
 		if keep[i] {
