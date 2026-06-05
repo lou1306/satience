@@ -1741,18 +1741,67 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	// Resolve with reason clauses for literals at current level
-	// Work backwards through the trail at current level
-	for i := len(s.trail) - 1; i >= s.trailHead[s.level] && levelCount[s.level] > 1; i-- {
+	// OPTIMIZATION: Prefer variables with shorter reason clauses
+	// This produces shorter learned clauses with lower LBD (MiniSat/Glucose strategy)
+	
+	// Build list of variables to resolve on (those in clause at current level with reasons)
+	type resolveCandidate struct {
+		varIdx uint32
+		size   int
+	}
+	candidates := make([]resolveCandidate, 0, 16) // Pre-allocate reasonable size
+	
+	for i := s.trailHead[s.level]; i < len(s.trail) && len(candidates) < 100; i++ {
 		varIdx := uint32(s.trail[i])
-		
-		if !literalInClause[varIdx] {
-			continue // This variable is not in our learned clause
+		if literalInClause[varIdx] {
+			reasonIdx := s.implication[varIdx]
+			if reasonIdx >= 0 {
+				size := len(s.cnf.Clauses[reasonIdx].Literals)
+				candidates = append(candidates, resolveCandidate{varIdx, size})
+			} else if reasonIdx < 0 {
+				learnedIdx := -reasonIdx - 1
+				if learnedIdx < len(s.learnedClauses) {
+					size := len(s.learnedClauses[learnedIdx].Literals)
+					candidates = append(candidates, resolveCandidate{varIdx, size})
+				}
+			}
 		}
+	}
+	
+	// Simple selection sort for smallest reason clauses (more efficient than bubble sort)
+	// Only sort first few candidates - we just need "good enough" ordering
+	for i := 0; i < len(candidates) && i < 10; i++ {
+		minIdx := i
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].size < candidates[minIdx].size {
+				minIdx = j
+			}
+		}
+		if minIdx != i {
+			candidates[i], candidates[minIdx] = candidates[minIdx], candidates[i]
+		}
+	}
+	
+	// Resolve in order of preference (shortest reason clauses first)
+	// Track current clause size for early termination
+	currentSize := 0
+	for _, inClause := range literalInClause {
+		if inClause {
+			currentSize++
+		}
+	}
+	
+	for i := 0; i < len(candidates) && levelCount[s.level] > 1; i++ {
+		varIdx := candidates[i].varIdx
 		
 		// Get the reason clause for this literal
 		reasonIdx := s.implication[varIdx]
 		if reasonIdx < 0 {
 			continue // Decision variable, no reason clause
+		}
+		
+		if !literalInClause[varIdx] {
+			continue // May have been removed by previous resolution
 		}
 		
 		// Get the reason clause literals
@@ -1764,11 +1813,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			reasonLits = s.learnedClauses[learnedIdx].Literals
 		}
 		
+		// EARLY TERMINATION: If current clause is already good (size < 8), stop
+		// This prevents over-resolution that adds unnecessary literals
+		if currentSize < 8 && levelCount[s.level] == 2 {
+			// One more resolution will give us 1-UIP with small clause
+			// Check if this resolution would significantly increase size
+			if len(reasonLits) > 6 {
+				// Skip this resolution, try next variable
+				continue
+			}
+		}
+		
 		// Remove this literal from the learned clause (resolution)
 		literalInClause[varIdx] = false
 		levelCount[s.assignments[varIdx].Level]--
 		
 		// Add all other literals from the reason clause
+		newLiterals := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
 			if v == varIdx {
@@ -1780,9 +1841,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				lvl := s.assignments[v].Level
 				if lvl <= s.level {
 					levelCount[lvl]++
+					newLiterals++
 				}
 			}
 		}
+		
+		// Update size estimate
+		currentSize = currentSize - 1 + newLiterals
 	}
 	
 	// Build the learned clause from remaining literals
@@ -2091,13 +2156,19 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Bonus for activity (reduce score for active clauses)
 		score -= activity * 10.0
 		
-		// PROTECTION: Never delete core glue clauses (LBD <= 2)
-		if lbd <= 2 && size < 10 {
-			score = -1000.0 // Never delete core glue (unless large)
+		// PROTECTION: Only protect very best clauses
+		// LBD <= 2 AND size < 6: never delete (core glue)
+		if lbd <= 2 && size < 6 {
+			score = -1000.0 // Never delete core glue
 		}
 		
-		// Don't protect LBD=3 clauses - they're good but not essential
-		// Removed: LBD==3 protection (was causing accumulation)
+		// LBD == 3 AND size < 4: protect (very short good clauses)
+		if lbd == 3 && size < 4 {
+			score = -500.0
+		}
+		
+		// All other clauses are fair game for deletion
+		// Especially: LBD >= 4 or size >= 6
 		
 		// PENALTY: Aggressively delete high-LBD clauses (LBD > 6)
 		if lbd > 6 {
@@ -2191,14 +2262,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 				if i >= 100 {
 					break // Sample first 100
 				}
-				levelSet := make(map[int]bool)
-				for _, lit := range clause.Literals {
-					lvl := s.assignments[lit.Var()].Level
-					if lvl > 0 {
-						levelSet[lvl] = true
-					}
-				}
-				lbd := len(levelSet)
+				// Use stored LBD (calculated at learning time)
+				lbd := s.clauseLBD[i]
 				size := len(clause.Literals)
 				if lbd <= 3 {
 					protectedLBD++
@@ -2207,7 +2272,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 					protectedSize++
 				}
 			}
-			fmt.Printf("c [debug] Protection stats (sample 100): LBD≤3=%d, size<5=%d\n", protectedLBD, protectedSize)
+			fmt.Printf("c [debug] Protection stats (sample 100): storedLBD≤3=%d, size<5=%d\n", protectedLBD, protectedSize)
 		}
 	}
 }
