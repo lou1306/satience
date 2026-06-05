@@ -456,3 +456,66 @@ func (ca *ClauseArena) Reset() {
 func (ca *ClauseArena) CapacityBytes() int {
 	return cap(ca.buffer) * 4  // 4 bytes per uint32
 }
+
+// AddLearnedClauseToWatches adds a learned clause to the appropriate watch list
+// based on its size. Called after learnClause() creates a new learned clause.
+// learnedClauseIdx is the index in the learnedClauses slice.
+func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal) {
+	switch len(literals) {
+	case 2:
+		// Binary learned clause - add to BinaryWatchA/B and WatchList
+		binIdx := len(c.BinaryClauses)
+		c.BinaryClauses = append(c.BinaryClauses, BinaryClause{
+			Lit1: uint32(literals[0]),
+			Lit2: uint32(literals[1]),
+		})
+		
+		lit1Idx := LitToIndex(literals[0])
+		lit2Idx := LitToIndex(literals[1])
+		
+		// Encode learned clause index as negative to distinguish from original clauses
+		// We use a separate tracking for learned binary clauses
+		// For now, just add to watch lists with the binary clause index
+		c.BinaryWatchA = append(c.BinaryWatchA, lit1Idx)
+		c.BinaryWatchB = append(c.BinaryWatchB, lit2Idx)
+		
+		c.WatchList[lit1Idx] = append(c.WatchList[lit1Idx], binIdx)
+		c.WatchList[lit2Idx] = append(c.WatchList[lit2Idx], binIdx)
+		
+	case 3:
+		// Ternary learned clause - add to TernaryWatchA/B/C and TernaryWatchList
+		ternIdx := len(c.TernaryClauses)
+		c.TernaryClauses = append(c.TernaryClauses, TernaryClause{
+			Lit1: uint32(literals[0]),
+			Lit2: uint32(literals[1]),
+			Lit3: uint32(literals[2]),
+		})
+		
+		lit1Idx := LitToIndex(literals[0])
+		lit2Idx := LitToIndex(literals[1])
+		lit3Idx := LitToIndex(literals[2])
+		
+		c.TernaryWatchA = append(c.TernaryWatchA, lit1Idx)
+		c.TernaryWatchB = append(c.TernaryWatchB, lit2Idx)
+		c.TernaryWatchC = append(c.TernaryWatchC, lit3Idx)
+		c.TernaryClauseIndices = append(c.TernaryClauseIndices, -learnedClauseIdx-1) // Negative to indicate learned
+		
+		c.TernaryWatchList[lit1Idx] = append(c.TernaryWatchList[lit1Idx], ternIdx)
+		c.TernaryWatchList[lit2Idx] = append(c.TernaryWatchList[lit2Idx], ternIdx)
+		c.TernaryWatchList[lit3Idx] = append(c.TernaryWatchList[lit3Idx], ternIdx)
+		
+	default:
+		// Long learned clause (>3 literals) - add to LongWatchA/B and WatchListLong
+		longIdx := len(c.LongClauseIndices)
+		c.LongClauseIndices = append(c.LongClauseIndices, -learnedClauseIdx-1) // Negative to indicate learned
+		
+		lit1Idx := LitToIndex(literals[0])
+		lit2Idx := LitToIndex(literals[1])
+		
+		c.LongWatchA = append(c.LongWatchA, lit1Idx)
+		c.LongWatchB = append(c.LongWatchB, lit2Idx)
+		
+		c.WatchListLong[lit1Idx] = append(c.WatchListLong[lit1Idx], longIdx)
+		c.WatchListLong[lit2Idx] = append(c.WatchListLong[lit2Idx], longIdx)
+	}
+}

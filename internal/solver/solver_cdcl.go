@@ -2144,57 +2144,6 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// Check learned clauses for conflicts and unit propagation
-		for learnedIdx := range s.learnedClauses {
-			clause := &s.learnedClauses[learnedIdx]
-			
-			// Count satisfied, false, and unassigned literals
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-			
-			for _, lit := range clause.Literals {
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
-					unassignedCount++
-					unassignedLit = lit
-				} else {
-					// Inline literalIsTrue check for performance
-					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
-				}
-			}
-			
-			if satisfiedCount > 0 {
-				continue // Clause is satisfied
-			}
-			
-			if unassignedCount == 0 && falseCount > 0 {
-				// All literals are false - conflict!
-				return true, -learnedIdx - 1 // negative to distinguish from original clauses
-			}
-			
-			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
-				// Unit clause - propagate the unassigned literal
-				s.assignLiteral(unassignedLit, s.level, -learnedIdx-1)
-				unitPropagated = true
-				break
-			}
-		}
-		
-		// If we propagated a unit from learned clause, restart from beginning
-		if unitPropagated {
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
-		
 		trailIndex++
 	}
 
@@ -2497,6 +2446,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.deleteLearnedClauses()
 		}
 		
+		learnedClauseIdx := len(s.learnedClauses)
 		_ = s.learnedArena.AllocateClause(learnedLits, true)
 		
 		s.clauseActivity = append(s.clauseActivity, 0.0)
@@ -2507,6 +2457,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		
 		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 		s.learnedClauses = append(s.learnedClauses, newClause)
+		
+		// Add learned clause to watched literals scheme
+		s.cnf.AddLearnedClauseToWatches(learnedClauseIdx, learnedLits)
 	}
 	
 	// Calculate backjump level
