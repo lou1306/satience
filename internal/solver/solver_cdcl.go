@@ -3,6 +3,7 @@ package solver
 import (
 	"fmt"
 	"satience/internal/cnf"
+	"time"
 )
 
 // SolveResult represents the result of solving
@@ -47,6 +48,7 @@ type CDCLSolver struct {
 	lastConflictLBD int
 	conflictsAtLevel []int  // Track conflicts per decision level
 	lastRandomDecision int  // Last conflict where we made random decision
+	minimizeTimeLimit time.Duration // Time limit per minimization attempt
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -85,6 +87,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lastConflictLBD: 0,
 		conflictsAtLevel: make([]int, formula.NumVars+1),
 		lastRandomDecision: -1000,
+		minimizeTimeLimit: 500 * time.Microsecond, // 0.5ms per minimization attempt
 	}
 }
 
@@ -2251,12 +2254,27 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal, literalInC
 		return learnedLits
 	}
 	
+	// TIME-LIMITED MINIMIZATION: Check if minimization is taking too long
+	// This prevents pathological cases where minimization dominates search time
+	startTime := time.Now()
+	defer func() {
+		elapsed := time.Since(startTime)
+		if s.verbose && elapsed > s.minimizeTimeLimit {
+			fmt.Printf("c [minimization] Skipped: took %v (limit %v)\n", elapsed, s.minimizeTimeLimit)
+		}
+	}()
+	
 	originalSize := len(learnedLits)
 	
 	// Step 1: Recursive minimization
 	// Try to remove each literal by checking if it's implied by others
 	// A literal L can be removed if the clause without L is already satisfied
 	learnedLits = s.recursiveMinimize(learnedLits)
+	
+	// Check time after recursive minimization
+	if time.Since(startTime) > s.minimizeTimeLimit {
+		return learnedLits // Skip local minimization to save time
+	}
 	
 	// Step 2: Local minimization
 	// Check against short clauses in the database to find subsumptions
