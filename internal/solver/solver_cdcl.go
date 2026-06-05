@@ -1458,7 +1458,8 @@ func (s *CDCLSolver) allAssigned() bool {
 // Returns (conflict, clauseIdx) where clauseIdx >= 0 means unit propagated (encoded), < 0 means conflict
 func (s *CDCLSolver) propagateBinary() (bool, int) {
 	// Skip if watches not initialized yet (during preprocessing)
-	if s.cnf.WatchList == nil || len(s.cnf.WatchList) == 0 {
+	// Check if BinaryWatchA is nil (set by InitializeWatches)
+	if s.cnf.BinaryWatchA == nil {
 		return false, -1
 	}
 	
