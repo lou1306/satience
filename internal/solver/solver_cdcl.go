@@ -501,38 +501,41 @@ func luby(i int) int {
 }
 
 func (s *CDCLSolver) shouldRestart() bool {
-	// Very aggressive restarts for structured instances
-	// PHP and similar instances benefit from restarts every 100 conflicts
-	aggressiveThreshold := 100
+	// Glucose-style adaptive restarts (PRIMARY)
+	// Luby sequence as fallback (SECONDARY)
 	
-	conflictsSinceRestart := s.conflicts - s.restartCount
-	
-	// First, check if we should use aggressive restarts
-	// Detect structured instances by high conflict rate at low decision levels
-	if s.conflicts > 500 && s.level <= 8 {
-		// Structured instance: use very frequent restarts
-		if conflictsSinceRestart >= aggressiveThreshold {
-			return true
+	// Need at least 50 conflicts for LBD statistics
+	if s.lbdCount >= 50 {
+		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
+		
+		// Debug: print LBD stats periodically
+		if s.verbose && s.conflicts % 1000 == 0 {
+			fmt.Printf("c [verbose] LBD stats: avg=%.2f, last=%d, threshold=%.2f\n", avgLBD, s.lastConflictLBD, 1.5*avgLBD)
+		}
+		
+		// Glucose criterion: restart when current LBD > 1.5× average
+		// This escapes unproductive search regions immediately
+		if s.lastConflictLBD > int(1.5*avgLBD) && s.lastConflictLBD > 3 {
+			if len(s.learnedClauses) >= 50 {
+				return true
+			}
+		}
+		
+		// Also restart if LBD is very high (absolute threshold)
+		// This prevents deep searches with weak learned clauses
+		if s.lastConflictLBD > 12 {
+			if len(s.learnedClauses) >= 50 {
+				return true
+			}
 		}
 	}
 	
-	// Hybrid restart strategy: Luby + adaptive (Glucose-style)
-	// For the first 100 conflicts, use Luby to collect statistics
-	if s.lbdCount < 100 {
-		threshold := s.restartBase * luby(s.lubyIndex + 1)
-		return conflictsSinceRestart >= threshold
-	}
+	// Fallback to Luby sequence for regular restarts
+	// This ensures restarts happen even if LBD criterion not met
+	lubyValue := luby(s.lubyIndex + 1)
+	threshold := lubyValue * s.restartBase
 	
-	// After 100 conflicts, use adaptive restarts based on LBD
-	// Restart if current LBD is much worse than average
-	avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
-	if s.lastConflictLBD > int(2.0*avgLBD) {
-		return true
-	}
-	
-	// Fallback to Luby for periodic restarts
-	threshold := s.restartBase * luby(s.lubyIndex + 1)
-	return conflictsSinceRestart >= threshold
+	return s.conflicts-s.restartCount >= threshold
 }
 
 func (s *CDCLSolver) restart() {
@@ -556,11 +559,11 @@ func (s *CDCLSolver) restart() {
 		}
 		lbd := len(levelSet)
 		
-		// Keep glue clauses (LBD <= 5) - relaxed threshold
-		// LBD <= 2: core glue (most valuable)
-		// LBD 3-5: useful clauses (keep across restarts)
-		// LBD > 5: trash (delete)
-		if lbd <= 5 {
+		// Keep glue clauses (LBD <= 3) - Glucose-style strict threshold
+		// LBD <= 2: core glue (most valuable, never delete)
+		// LBD 3: useful glue (keep across restarts)
+		// LBD > 3: trash (delete on restart)
+		if lbd <= 3 {
 			glueCount++
 			isGlue[i] = true
 		}
@@ -1536,21 +1539,21 @@ func (s *CDCLSolver) decide() bool {
 		s.conflictsAtLevel[s.level]++
 	}
 	
-	// Diversification: force random decision if stuck at same level
-	// This helps escape local minima in the search space
-	stuckThreshold := 500 // conflicts at same level before forcing random
+	// Diversification: force random decision ONLY if severely stuck
+	// Modern solvers (MiniSat, Glucose) use <1% random decisions
+	// Rely on VSIDS/LRB heuristics for most decisions
+	stuckThreshold := 1000 // conflicts at same level before forcing random
 	forceRandom := false
 	
 	if s.level > 0 && s.conflictsAtLevel[s.level] > stuckThreshold {
-		// Been stuck at this level for too long
-		if s.conflicts - s.lastRandomDecision > 100 { // At least 100 conflicts since last random
+		// Severely stuck - force random decision
+		if s.conflicts - s.lastRandomDecision > 500 { // At least 500 conflicts since last random
 			forceRandom = true
 		}
 	}
 	
-	// Also add 5% random decisions to prevent getting stuck
-	if !forceRandom && s.conflicts > 0 && s.conflicts % 20 == 0 {
-		// 5% chance of random decision
+	// Add 0.5% random decisions (every 200 conflicts) - much reduced from 5%
+	if !forceRandom && s.conflicts > 0 && s.conflicts % 200 == 0 {
 		forceRandom = true
 	}
 	
@@ -1829,9 +1832,17 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Bonus for activity (reduce score for active clauses)
 		score -= activity * 10.0
 		
-		// PROTECTION: Never delete glue clauses with LBD <= 5
-		if lbd <= 5 {
-			score = -1000.0 // Very low score = never delete
+		// PROTECTION: Never delete core glue clauses (LBD <= 2)
+		// LBD 3 clauses: protect if short (< 10 literals)
+		if lbd <= 2 {
+			score = -1000.0 // Never delete core glue
+		} else if lbd == 3 && size < 10 {
+			score = -500.0 // Protect short LBD-3 clauses
+		}
+		
+		// PENALTY: Aggressively delete high-LBD clauses (LBD > 6)
+		if lbd > 6 {
+			score += 500.0 // Strong deletion bias
 		}
 		
 		// PROTECTION: Never delete very short clauses (< 5 literals)
