@@ -2,6 +2,7 @@ package solver
 
 import (
 	"fmt"
+	"runtime"
 	"satience/internal/cnf"
 	"time"
 )
@@ -53,8 +54,8 @@ type CDCLSolver struct {
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := 500   // Allow more accumulation between restarts
-	minLearned := 200   // Target after deletion (60% reduction)
+	maxLearned := 100   // CRITICAL: Keep learned clause database small to avoid O(n) propagation slowdown
+	minLearned := 50    // Target after deletion (50% reduction)
 	restartBase := 100  // Base for Luby restart sequence
 	return &CDCLSolver{
 		cnf:         formula,
@@ -199,8 +200,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	initialClauses := s.cnf.NumClauses
 	
-	// Limit to 3 passes to prevent memory explosion on dense instances
-	for pass := 0; pass < 3; pass++ {
+	// Limit to 2 passes to prevent memory explosion on dense instances
+	for pass := 0; pass < 2; pass++ {
 		if s.verbose {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
@@ -224,19 +225,22 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return equivResult
 		}
 		
-		if s.conflicts < 1000 {
-			failedResult := s.failedLiteralElimination()
-			if failedResult != UNKNOWN {
-				return failedResult
-			}
-		}
+		// DISABLED: Failed literal elimination causes massive memory usage
+		// On PHP: O(n²) unit propagations, each allocating trail/implication copies
+		// 30 vars × 2 polarities × multiple passes = thousands of allocations
+		// if s.conflicts < 1000 {
+		// 	failedResult := s.failedLiteralElimination()
+		// 	if failedResult != UNKNOWN {
+		// 		return failedResult
+		// 	}
+		// }
 		
 		veResult := s.variableElimination()
 		if veResult != UNKNOWN {
 			return veResult
 		}
 		
-		if s.cnf.NumClauses == initialClauses && pass >= 2 {
+		if s.cnf.NumClauses == initialClauses && pass >= 1 {
 			break
 		}
 		initialClauses = s.cnf.NumClauses
@@ -700,14 +704,14 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
 	}
 	
-	// SAFEGUARD: Skip variable elimination on large formulas to prevent memory explosion
-	// PHP and similar dense instances create too many resolvents (Cartesian product)
-	if s.cnf.NumClauses > 100 {
-		if s.verbose {
-			fmt.Printf("c [verbose] Variable elimination: skipped (%d clauses > 100)\n", s.cnf.NumClauses)
-		}
-		return UNKNOWN
+	// SAFEGUARD: Skip variable elimination to prevent memory explosion
+	// VE creates resolvent sets (Cartesian product of pos×neg clauses)
+	// On PHP: 6 pos clauses × 10 neg clauses = 60 resolvents per variable
+	// This causes massive allocations and GC pressure
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: skipped (memory safety)\n")
 	}
+	return UNKNOWN
 	
 	eliminatedCount := 0
 	resolventCount := 0
@@ -1421,9 +1425,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	for {
 		s.iterations++
-		if s.iterations % 1000000 == 0 && s.verbose {
-			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d\n", 
-				s.iterations, s.conflicts, s.level, len(s.learnedClauses))
+		if s.iterations % 10000 == 0 && s.verbose {
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n", 
+				s.iterations, s.conflicts, s.level, len(s.learnedClauses), mem.Alloc/1024/1024)
 		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
 			if s.verbose {
@@ -2058,6 +2064,15 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 }
 
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
+	s.conflicts++ // Increment conflict counter
+	
+	// DEBUG: Print every conflict (without mem stats to avoid allocation)
+	if s.verbose && s.conflicts <= 50 {
+		arenaCapMB := s.learnedArena.CapacityBytes() / 1024 / 1024
+		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d, arenaCap %dMB\n", 
+			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail), arenaCapMB)
+	}
+	
 	// 1-UIP clause learning
 	// Start with the conflicting clause and resolve with reason clauses
 	// until we have exactly one literal at the current decision level
@@ -2213,7 +2228,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	lbd := len(levelSet)
 	
 	// Apply clause minimization to reduce size
-	learnedLits = s.minimizeLearnedClause(learnedLits, literalInClause, literalIsNegated)
+	// DISABLED: Minimization causes massive memory allocation (reason unknown)
+	// learnedLits = s.minimizeLearnedClause(learnedLits, literalInClause, literalIsNegated)
 	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {

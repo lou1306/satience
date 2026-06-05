@@ -451,3 +451,8 @@ func (ca *ClauseArena) Reset() {
 	ca.learned = ca.learned[:0]
 	ca.freeList = ca.freeList[:0]
 }
+
+// CapacityBytes returns the current buffer capacity in bytes (for debugging)
+func (ca *ClauseArena) CapacityBytes() int {
+	return cap(ca.buffer) * 4  // 4 bytes per uint32
+}
