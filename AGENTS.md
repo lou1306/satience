@@ -186,7 +186,8 @@ This is a known limitation of basic CDCL - competitive solvers use specialized t
 - **Subsumption elimination**: Remove clauses subsumed by shorter clauses - safe, standard technique
 - **Variable elimination**: Only eliminate when resolvents < original clauses (beneficial); returns UNSAT if empty clause created
 - **Blocked clause elimination**: Remove clauses blocked by any literal; skip on formulas >5000 clauses to avoid O(n²) slowdown
-- **Preprocessing pipeline**: Unit propagation → pure literal elimination → subsumption elimination → variable elimination → blocked clause elimination (in that order)
+- **Preprocessing pipeline**: Unit propagation → pure literal elimination → subsumption → hyper-binary → equivalence detection → failed literal → variable elimination → blocked clause elimination
+- **Equivalence detection**: Find (¬a ∨ b) ∧ (¬b ∨ a) patterns, substitute with union-find, reduces variables on equivalence-rich instances
 - **Timeouts acceptable**: PHP and dense instances expected to timeout - soundness verified on solved instances
 - **Watched literals deferred**: Too complex for incremental implementation - needs complete redesign with careful testing
 - **Evaluation approach**: Test 20 random instances < 200 vars, stop on first wrong result, verify models for SAT instances

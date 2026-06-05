@@ -143,9 +143,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		
 		s.hyperBinaryResolution()
 		
-		veResult := s.variableElimination()
-		if veResult != UNKNOWN {
-			return veResult
+		equivResult := s.equivalenceDetection()
+		if equivResult != UNKNOWN {
+			return equivResult
 		}
 		
 		if s.conflicts < 1000 {
@@ -153,6 +153,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			if failedResult != UNKNOWN {
 				return failedResult
 			}
+		}
+		
+		veResult := s.variableElimination()
+		if veResult != UNKNOWN {
+			return veResult
 		}
 		
 		if s.cnf.NumClauses == initialClauses && pass >= 2 {
@@ -967,6 +972,209 @@ func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
 	s.cnf.Clauses = newClauses
 	s.cnf.NumClauses = len(newClauses)
 	return false
+}
+
+func (s *CDCLSolver) equivalenceDetection() SolveResult {
+	// Detect equivalence relations from binary clauses
+	// Pattern: (¬a ∨ b) ∧ (¬b ∨ a) means a ↔ b
+	// Build equivalence classes and substitute representatives
+	
+	// Step 1: Find all binary equivalence clauses
+	// Store as adjacency list: equivGraph[a] = list of variables equivalent to a
+	equivGraph := make(map[uint32][]uint32)
+	
+	for _, clause := range s.cnf.Clauses {
+		if len(clause.Literals) != 2 {
+			continue
+		}
+		
+		lit1 := clause.Literals[0]
+		lit2 := clause.Literals[1]
+		
+		// Check for (¬a ∨ b) pattern
+		// This is equivalent to: a → b
+		var a, b uint32
+		var aNeg, bNeg bool
+		
+		if lit1.IsNegated() && !lit2.IsNegated() {
+			// (¬a ∨ b): a = lit1.Var(), b = lit2.Var()
+			a = lit1.Var()
+			b = lit2.Var()
+			aNeg = true
+			bNeg = false
+		} else if !lit1.IsNegated() && lit2.IsNegated() {
+			// (a ∨ ¬b): a = lit1.Var(), b = lit2.Var()
+			a = lit1.Var()
+			b = lit2.Var()
+			aNeg = false
+			bNeg = true
+		} else {
+			continue // Not an implication pattern
+		}
+		
+		// Store directed implication: a → b (with polarity info)
+		// We need both (¬a ∨ b) AND (¬b ∨ a) for equivalence
+		if aNeg && !bNeg {
+			// This is (¬a ∨ b) = a → b
+			if _, exists := equivGraph[a]; !exists {
+				equivGraph[a] = make([]uint32, 0)
+			}
+			// Mark that a implies b (we'll check for b implies a later)
+			equivGraph[a] = append(equivGraph[a], b)
+		}
+	}
+	
+	// Step 2: Find bidirectional implications (equivalences)
+	// Use union-find to group equivalent variables
+	parent := make([]uint32, s.cnf.NumVars)
+	for i := range parent {
+		parent[i] = uint32(i)
+	}
+	
+	var find func(uint32) uint32
+	find = func(x uint32) uint32 {
+		if parent[x] != x {
+			parent[x] = find(parent[x])
+		}
+		return parent[x]
+	}
+	
+	union := func(x, y uint32) {
+		px, py := find(x), find(y)
+		if px != py {
+			parent[px] = py
+		}
+	}
+	
+	// Check for bidirectional implications
+	for a, implications := range equivGraph {
+		for _, b := range implications {
+			// Check if b also implies a
+			if bImps, exists := equivGraph[b]; exists {
+				for _, c := range bImps {
+					if c == a {
+						// Found: a → b and b → a, so a ↔ b
+						union(a, b)
+					}
+				}
+			}
+		}
+	}
+	
+	// Step 3: Count equivalence classes and substitutions
+	equivCount := 0
+	substituted := make([]bool, s.cnf.NumVars)
+	
+	// For each equivalence class, pick representative (lowest var index)
+	// Substitute all other variables with representative
+	classMembers := make(map[uint32][]uint32)
+	for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+		root := find(varIdx)
+		classMembers[root] = append(classMembers[root], uint32(varIdx))
+	}
+	
+	// Build substitution map: varIdx -> (representative, samePolarity)
+	type substitution struct {
+		rep    uint32
+		samePol bool
+	}
+	substMap := make(map[uint32]substitution)
+	
+	for _, members := range classMembers {
+		if len(members) < 2 {
+			continue
+		}
+		
+		// Representative is the lowest index
+		rep := members[0]
+		for _, m := range members[1:] {
+			substMap[m] = substitution{rep: rep, samePol: true}
+			substituted[m] = true
+			equivCount++
+		}
+	}
+	
+	if equivCount == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Equivalence detection: no equivalences found\n")
+		}
+		return UNKNOWN
+	}
+	
+	// Step 4: Substitute throughout formula
+	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	
+	for _, clause := range s.cnf.Clauses {
+		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
+		clauseChanged := false
+		
+		for _, lit := range clause.Literals {
+			varIdx := lit.Var()
+			
+			if subst, exists := substMap[varIdx]; exists {
+				// Substitute with representative
+				newLit := cnf.NewLiteral(subst.rep, lit.IsNegated() != subst.samePol)
+				newLiterals = append(newLiterals, newLit)
+				clauseChanged = true
+			} else {
+				newLiterals = append(newLiterals, lit)
+			}
+		}
+		
+		// Remove duplicate literals after substitution
+		if clauseChanged {
+			seen := make(map[uint32]bool)
+			uniqueLiterals := make([]cnf.Literal, 0)
+			hasBothPolarities := false
+			
+			for _, lit := range newLiterals {
+				varIdx := lit.Var()
+				if _, exists := seen[varIdx]; exists {
+					// Check if we already have opposite polarity
+					existingLit := cnf.Literal(varIdx)
+					if existingLit.IsNegated() != lit.IsNegated() {
+						// Both polarities present → clause is tautology
+						hasBothPolarities = true
+						break
+					}
+				} else {
+					seen[varIdx] = lit.IsNegated()
+					uniqueLiterals = append(uniqueLiterals, lit)
+				}
+			}
+			
+			if hasBothPolarities {
+				continue // Tautology, skip
+			}
+			newLiterals = uniqueLiterals
+		}
+		
+		if len(newLiterals) == 0 {
+			// Empty clause → UNSAT
+			if s.verbose {
+				fmt.Printf("c [verbose] Equivalence detection: empty clause created (UNSAT)\n")
+			}
+			return UNSAT
+		}
+		
+		newClauses = append(newClauses, cnf.Clause{Literals: newLiterals, Learned: clause.Learned})
+	}
+	
+	s.cnf.Clauses = newClauses
+	s.cnf.NumClauses = len(newClauses)
+	
+	// Update VSIDS for eliminated variables
+	for varIdx := range substMap {
+		// Discourage eliminated vars by setting very low activity
+		s.vsids.activity[varIdx] = 0.0
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Equivalence detection: found %d equivalences, substituted %d variables\n", 
+			equivCount, len(substMap))
+	}
+	
+	return UNKNOWN
 }
 
 func (s *CDCLSolver) pureLiteralElimination() SolveResult {
