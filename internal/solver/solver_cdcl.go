@@ -739,14 +739,17 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
 	}
 	
-	// SAFEGUARD: Skip variable elimination to prevent memory explosion
-	// VE creates resolvent sets (Cartesian product of pos×neg clauses)
-	// On PHP: 6 pos clauses × 10 neg clauses = 60 resolvents per variable
-	// This causes massive allocations and GC pressure
-	if s.verbose {
-		fmt.Printf("c [verbose] Variable elimination: skipped (memory safety)\n")
-	}
-	return UNKNOWN
+	// RE-ENABLED with strict memory/time limits
+	// Previous implementation was disabled due to memory explosion on PHP
+	// New safeguards:
+	// 1. Time limit: 2 seconds total for VE
+	// 2. Degree limit: Skip variables appearing in >100 clauses
+	// 3. Conservative elimination: Only if resolvents <= original clauses
+	// 4. Per-variable time limit: 100ms max per variable
+	
+	startTime := time.Now()
+	totalTimeLimit := 2 * time.Second
+	varTimeLimit := 100 * time.Millisecond
 	
 	eliminatedCount := 0
 	resolventCount := 0
@@ -760,6 +763,16 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			if eliminated[varIdx] {
 				continue
 			}
+			
+			// Check total time limit
+			if time.Since(startTime) > totalTimeLimit {
+				if s.verbose {
+					fmt.Printf("c [verbose] Variable elimination: time limit reached (%.2fs)\n", time.Since(startTime).Seconds())
+				}
+				goto done
+			}
+			
+			varStartTime := time.Now()
 			
 			posClauses := make([]int, 0)
 			negClauses := make([]int, 0)
@@ -785,14 +798,40 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				}
 			}
 			
+			// DEGREE LIMIT: Skip variables with high degree
+			// Variables appearing in >100 clauses cause resolvent explosion
+			totalDegree := len(posClauses) + len(negClauses)
+			if totalDegree > 100 {
+				continue
+			}
+			
 			if len(posClauses) == 0 || len(negClauses) == 0 {
 				continue
 			}
 			
-			resolvents := make([]cnf.Clause, 0)
+			// CONSERVATIVE elimination: only allow if resolvents <= original clauses
+			// This prevents memory explosion on PHP and similar instances
+			originalCount := len(posClauses) + len(negClauses)
+			maxResolvents := originalCount // 0% blowup allowed (must not increase clauses)
+			
+			// Early exit check: Cartesian product would be too large
+			if len(posClauses) * len(negClauses) > maxResolvents * 2 {
+				// Too many potential resolvents, skip this variable
+				continue
+			}
+			
+			resolvents := make([]cnf.Clause, 0, maxResolvents)
 			resolventSet := make(map[string]bool)
 			
 			for _, posIdx := range posClauses {
+				// Check per-variable time limit
+				if time.Since(varStartTime) > varTimeLimit {
+					if s.verbose {
+						fmt.Printf("c [verbose] Var %d: time limit for this variable\n", varIdx)
+					}
+					goto nextVar
+				}
+				
 				posClause := s.cnf.Clauses[posIdx]
 				
 				for _, negIdx := range negClauses {
@@ -805,17 +844,18 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 							if !resolventSet[key] {
 								resolventSet[key] = true
 								resolvents = append(resolvents, *resolvent)
+								
+								// Early exit if resolvents exceed limit
+								if len(resolvents) > maxResolvents {
+									goto nextVar
+								}
 							}
 						}
 					}
 				}
 			}
 			
-			originalCount := len(posClauses) + len(negClauses)
-			// CONSERVATIVE elimination: only allow if resolvents <= original clauses
-			// This prevents memory explosion on PHP and similar instances
-			// Aggressive elimination (50% blowup) causes OOM on dense instances
-			maxResolvents := originalCount
+			// Only eliminate if resolvents <= original (already checked during construction)
 			if len(resolvents) <= maxResolvents {
 				if s.verbose {
 					fmt.Printf("c [verbose] Eliminating var %d: %d clauses -> %d resolvents\n", 
@@ -859,8 +899,12 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				resolventCount += len(resolvents)
 				changed = true
 			}
+			
+			nextVar:
 		}
 	}
+	
+	done:
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] Variable elimination: eliminated %d variables, added %d resolvents\n", 
