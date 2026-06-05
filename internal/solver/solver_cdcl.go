@@ -50,6 +50,20 @@ type CDCLSolver struct {
 	conflictsAtLevel []int  // Track conflicts per decision level
 	lastRandomDecision int  // Last conflict where we made random decision
 	minimizeTimeLimit time.Duration // Time limit per minimization attempt
+	
+	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
+	tmpLiteralInClause []bool
+	tmpLiteralIsNegated []bool
+	tmpLevelCount []int
+	tmpCandidates []resolveCandidate
+	tmpLevelSet []int // For LBD calculation (replaces map)
+	tmpLevelSetUsed []bool // Track which levels are in tmpLevelSet
+}
+
+// resolveCandidate is used in learnClause for sorting resolution order
+type resolveCandidate struct {
+	varIdx uint32
+	size   int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -69,7 +83,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:  0,
 		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
-		learnedArena: cnf.NewClauseArena(1000), // Reduced arena size
+		learnedArena: cnf.NewClauseArena(50000), // Pre-allocate arena (200 KB)
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
 		clauseLBD:    make([]int, 0),
@@ -89,6 +103,13 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		conflictsAtLevel: make([]int, formula.NumVars+1),
 		lastRandomDecision: -1000,
 		minimizeTimeLimit: 500 * time.Microsecond, // 0.5ms per minimization attempt
+		// Pre-allocate reusable buffers
+		tmpLiteralInClause: make([]bool, formula.NumVars),
+		tmpLiteralIsNegated: make([]bool, formula.NumVars),
+		tmpLevelCount: make([]int, formula.NumVars+1),
+		tmpCandidates: make([]resolveCandidate, 0, 100),
+		tmpLevelSet: make([]int, 0, formula.NumVars),
+		tmpLevelSetUsed: make([]bool, formula.NumVars+1),
 	}
 }
 
@@ -697,6 +718,20 @@ func (s *CDCLSolver) restart() {
 	s.lbdCount = 0
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
+	
+	// Clear temporary buffers after restart (assignments are cleared, levels reset)
+	for i := range s.tmpLiteralInClause {
+		s.tmpLiteralInClause[i] = false
+		s.tmpLiteralIsNegated[i] = false
+	}
+	for i := range s.tmpLevelCount {
+		s.tmpLevelCount[i] = 0
+	}
+	for i := range s.tmpLevelSetUsed {
+		s.tmpLevelSetUsed[i] = false
+	}
+	s.tmpLevelSet = s.tmpLevelSet[:0]
+	s.tmpCandidates = s.tmpCandidates[:0]
 }
 
 func (s *CDCLSolver) variableElimination() SolveResult {
@@ -2064,104 +2099,93 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 }
 
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
-	s.conflicts++ // Increment conflict counter
+	s.conflicts++
 	
-	// DEBUG: Print every conflict (without mem stats to avoid allocation)
-	if s.verbose && s.conflicts <= 50 {
+	// DEBUG: Print every conflict
+	if s.verbose && s.conflicts <= 100 {
 		arenaCapMB := s.learnedArena.CapacityBytes() / 1024 / 1024
 		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d, arenaCap %dMB\n", 
 			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail), arenaCapMB)
 	}
 	
-	// 1-UIP clause learning
-	// Start with the conflicting clause and resolve with reason clauses
-	// until we have exactly one literal at the current decision level
-	
-	// Track which literals are in the learned clause
-	literalInClause := make([]bool, s.cnf.NumVars)
-	literalIsNegated := make([]bool, s.cnf.NumVars)
-	
-	// Count literals at each level
-	levelCount := make([]int, s.level+1)
+	// Clear reusable buffers (O(n) but much faster than allocation)
+	for i := range s.tmpLiteralInClause {
+		s.tmpLiteralInClause[i] = false
+		s.tmpLiteralIsNegated[i] = false
+	}
+	for i := range s.tmpLevelCount[:s.level+1] {
+		s.tmpLevelCount[i] = 0
+	}
+	s.tmpCandidates = s.tmpCandidates[:0]
+	s.tmpLevelSet = s.tmpLevelSet[:0]
+	for i := range s.tmpLevelSetUsed[:s.level+1] {
+		s.tmpLevelSetUsed[i] = false
+	}
 	
 	// Add all literals from the conflicting clause
 	for _, lit := range conflictLits {
 		varIdx := lit.Var()
-		if !literalInClause[varIdx] {
-			literalInClause[varIdx] = true
-			literalIsNegated[varIdx] = lit.IsNegated()
+		if !s.tmpLiteralInClause[varIdx] {
+			s.tmpLiteralInClause[varIdx] = true
+			s.tmpLiteralIsNegated[varIdx] = lit.IsNegated()
 			lvl := s.assignments[varIdx].Level
 			if lvl <= s.level {
-				levelCount[lvl]++
+				s.tmpLevelCount[lvl]++
 			}
 		}
 	}
 	
-	// Resolve with reason clauses for literals at current level
-	// OPTIMIZATION: Prefer variables with shorter reason clauses
-	// This produces shorter learned clauses with lower LBD (MiniSat/Glucose strategy)
-	
 	// Build list of variables to resolve on (those in clause at current level with reasons)
-	type resolveCandidate struct {
-		varIdx uint32
-		size   int
-	}
-	candidates := make([]resolveCandidate, 0, 16) // Pre-allocate reasonable size
-	
-	for i := s.trailHead[s.level]; i < len(s.trail) && len(candidates) < 100; i++ {
+	for i := s.trailHead[s.level]; i < len(s.trail) && len(s.tmpCandidates) < 100; i++ {
 		varIdx := uint32(s.trail[i])
-		if literalInClause[varIdx] {
+		if s.tmpLiteralInClause[varIdx] {
 			reasonIdx := s.implication[varIdx]
 			if reasonIdx >= 0 {
 				size := len(s.cnf.Clauses[reasonIdx].Literals)
-				candidates = append(candidates, resolveCandidate{varIdx, size})
+				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx, size})
 			} else if reasonIdx < 0 {
 				learnedIdx := -reasonIdx - 1
 				if learnedIdx < len(s.learnedClauses) {
 					size := len(s.learnedClauses[learnedIdx].Literals)
-					candidates = append(candidates, resolveCandidate{varIdx, size})
+					s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx, size})
 				}
 			}
 		}
 	}
 	
-	// Simple selection sort for smallest reason clauses (more efficient than bubble sort)
-	// Only sort first few candidates - we just need "good enough" ordering
-	for i := 0; i < len(candidates) && i < 10; i++ {
+	// Simple selection sort for smallest reason clauses
+	for i := 0; i < len(s.tmpCandidates) && i < 10; i++ {
 		minIdx := i
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].size < candidates[minIdx].size {
+		for j := i + 1; j < len(s.tmpCandidates); j++ {
+			if s.tmpCandidates[j].size < s.tmpCandidates[minIdx].size {
 				minIdx = j
 			}
 		}
 		if minIdx != i {
-			candidates[i], candidates[minIdx] = candidates[minIdx], candidates[i]
+			s.tmpCandidates[i], s.tmpCandidates[minIdx] = s.tmpCandidates[minIdx], s.tmpCandidates[i]
 		}
 	}
 	
 	// Resolve in order of preference (shortest reason clauses first)
-	// Track current clause size for early termination
 	currentSize := 0
-	for _, inClause := range literalInClause {
+	for _, inClause := range s.tmpLiteralInClause {
 		if inClause {
 			currentSize++
 		}
 	}
 	
-	for i := 0; i < len(candidates) && levelCount[s.level] > 1; i++ {
-		varIdx := candidates[i].varIdx
+	for i := 0; i < len(s.tmpCandidates) && s.tmpLevelCount[s.level] > 1; i++ {
+		varIdx := s.tmpCandidates[i].varIdx
 		
-		// Get the reason clause for this literal
 		reasonIdx := s.implication[varIdx]
 		if reasonIdx < 0 {
-			continue // Decision variable, no reason clause
+			continue
 		}
 		
-		if !literalInClause[varIdx] {
-			continue // May have been removed by previous resolution
+		if !s.tmpLiteralInClause[varIdx] {
+			continue
 		}
 		
-		// Get the reason clause literals
 		var reasonLits []cnf.Literal
 		if reasonIdx >= 0 {
 			reasonLits = s.cnf.Clauses[reasonIdx].Literals
@@ -2170,70 +2194,58 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			reasonLits = s.learnedClauses[learnedIdx].Literals
 		}
 		
-		// EARLY TERMINATION: If current clause is already good (size < 8), stop
-		// This prevents over-resolution that adds unnecessary literals
-		if currentSize < 8 && levelCount[s.level] == 2 {
-			// One more resolution will give us 1-UIP with small clause
-			// Check if this resolution would significantly increase size
+		if currentSize < 8 && s.tmpLevelCount[s.level] == 2 {
 			if len(reasonLits) > 6 {
-				// Skip this resolution, try next variable
 				continue
 			}
 		}
 		
-		// Remove this literal from the learned clause (resolution)
-		literalInClause[varIdx] = false
-		levelCount[s.assignments[varIdx].Level]--
+		s.tmpLiteralInClause[varIdx] = false
+		s.tmpLevelCount[s.assignments[varIdx].Level]--
 		
-		// Add all other literals from the reason clause
 		newLiterals := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
 			if v == varIdx {
-				continue // Skip the literal we're resolving on
+				continue
 			}
-			if !literalInClause[v] {
-				literalInClause[v] = true
-				literalIsNegated[v] = lit.IsNegated()
+			if !s.tmpLiteralInClause[v] {
+				s.tmpLiteralInClause[v] = true
+				s.tmpLiteralIsNegated[v] = lit.IsNegated()
 				lvl := s.assignments[v].Level
 				if lvl <= s.level {
-					levelCount[lvl]++
+					s.tmpLevelCount[lvl]++
 					newLiterals++
 				}
 			}
 		}
 		
-		// Update size estimate
 		currentSize = currentSize - 1 + newLiterals
 	}
 	
 	// Build the learned clause from remaining literals
 	learnedLits := make([]cnf.Literal, 0)
-	for varIdx, inClause := range literalInClause {
+	for varIdx, inClause := range s.tmpLiteralInClause {
 		if inClause {
-			learnedLits = append(learnedLits, cnf.NewLiteral(uint32(varIdx), literalIsNegated[varIdx]))
+			learnedLits = append(learnedLits, cnf.NewLiteral(uint32(varIdx), s.tmpLiteralIsNegated[varIdx]))
 		}
 	}
 	
-	// Calculate LBD before minimization (on original learned literals)
-	levelSet := make(map[int]bool)
-	for varIdx, inClause := range literalInClause {
+	// Calculate LBD using reusable buffer (no map allocation)
+	lbd := 0
+	for varIdx, inClause := range s.tmpLiteralInClause {
 		if inClause {
 			lvl := s.assignments[varIdx].Level
-			if lvl > 0 {
-				levelSet[lvl] = true
+			if lvl > 0 && !s.tmpLevelSetUsed[lvl] {
+				s.tmpLevelSetUsed[lvl] = true
+				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+				lbd++
 			}
 		}
 	}
-	lbd := len(levelSet)
-	
-	// Apply clause minimization to reduce size
-	// DISABLED: Minimization causes massive memory allocation (reason unknown)
-	// learnedLits = s.minimizeLearnedClause(learnedLits, literalInClause, literalIsNegated)
 	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {
-		// Check if we need to delete clauses
 		if len(s.learnedClauses) >= s.maxLearned {
 			if s.verbose {
 				fmt.Printf("c [verbose] Triggering deletion: %d clauses >= maxLearned %d\n", len(s.learnedClauses), s.maxLearned)
@@ -2241,26 +2253,21 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.deleteLearnedClauses()
 		}
 		
-		// Allocate in arena (contiguous memory)
 		_ = s.learnedArena.AllocateClause(learnedLits, true)
 		
-		// Track metadata in parallel arrays
 		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.clauseSize = append(s.clauseSize, len(learnedLits))
-		s.clauseLBD = append(s.clauseLBD, lbd) // Store LBD at learning time
+		s.clauseLBD = append(s.clauseLBD, lbd)
 		s.currentAge++
 		
-		// Also keep in slice for compatibility (temporary)
 		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 		s.learnedClauses = append(s.learnedClauses, newClause)
 	}
 	
-	// Calculate backjump level: second-highest level in learned clause
-	// The 1-UIP clause has exactly one literal at current level
-	// Backjump to the highest level among the other literals
+	// Calculate backjump level
 	backjumpLevel := 0
-	for varIdx, inClause := range literalInClause {
+	for varIdx, inClause := range s.tmpLiteralInClause {
 		if inClause {
 			lvl := s.assignments[varIdx].Level
 			if lvl > backjumpLevel && lvl < s.level {
@@ -2269,12 +2276,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	// If no other level found, backjump to level 0 (but we'll use level 1 minimum)
 	if backjumpLevel == 0 {
 		backjumpLevel = 1
 	}
 	
-	// Update LBD statistics for adaptive restarts
 	s.lastConflictLBD = lbd
 	s.lbdSum += lbd
 	s.lbdCount++
