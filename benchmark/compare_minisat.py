@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare satience vs MiniSat on various SAT/UNSAT benchmarks."""
+"""Compare satience vs MiniSat on various SAT/UNSAT benchmarks.
+
+Note: Runs instances sequentially (max 1 solver instance at a time).
+Do not add parallel execution - limit is 8 concurrent solver instances.
+"""
 
 import subprocess
 import sys
