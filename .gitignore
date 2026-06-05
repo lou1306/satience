@@ -1,7 +1,32 @@
+# Editor configs
 opencode.json
+
+# Binaries
+satience
+fuzz
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Benchmark artifacts
 benchmark/benchmark_results.csv
 benchmark/gbd_instances/
 benchmark/gbd_downloads/
 benchmark/gbd-data-temp/
 benchmark/meta.db
 benchmark/test_instances/
+benchmark/*.csv
+benchmark/*.txt
+
+# Test files
+*.test
+*.out
+
+# Profiles
+*.prof
+*.pprof
+
+# Logs
+*.log
