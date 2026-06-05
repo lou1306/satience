@@ -102,12 +102,410 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c \n")
 }
 
+func (s *CDCLSolver) preprocessAggressive() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+
+	initialClauses := s.cnf.NumClauses
+	
+	for pass := 0; pass < 3; pass++ {
+		if s.verbose {
+			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
+		}
+		
+		unitResult := s.unitPropagationPreprocess()
+		if unitResult != UNKNOWN {
+			return unitResult
+		}
+		
+		pureResult := s.pureLiteralElimination()
+		if pureResult != UNKNOWN {
+			return pureResult
+		}
+		
+		s.selfSubsumption()
+		
+		s.hyperBinaryResolution()
+		
+		if s.cnf.NumClauses == initialClauses {
+			break
+		}
+		initialClauses = s.cnf.NumClauses
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+	
+	return UNKNOWN
+}
+
+func (s *CDCLSolver) selfSubsumption() {
+	changed := true
+	for changed {
+		changed = false
+		for i := 0; i < len(s.cnf.Clauses); i++ {
+			for j := 0; j < len(s.cnf.Clauses); j++ {
+				if i == j {
+					continue
+				}
+				
+				clauseA := s.cnf.Clauses[i]
+				clauseB := s.cnf.Clauses[j]
+				
+				if len(clauseA.Literals) != 2 || len(clauseB.Literals) < 2 {
+					continue
+				}
+				
+				for _, litA := range clauseA.Literals {
+					for _, litB := range clauseB.Literals {
+						if litA.Var() == litB.Var() && litA.IsNegated() != litB.IsNegated() {
+						resolvent := s.resolveOnVar(clauseA, clauseB, litA.Var())
+						if resolvent != nil && s.subsumes(resolvent, &s.cnf.Clauses[j]) {
+							s.cnf.Clauses[j] = *resolvent
+							changed = true
+							if s.verbose {
+								fmt.Printf("c [verbose] Self-subsumption: strengthened clause\n")
+							}
+						}
+							goto nextPair
+						}
+					}
+				}
+				nextPair:
+			}
+		}
+	}
+}
+
+func (s *CDCLSolver) hyperBinaryResolution() {
+	binaryUnits := make(map[uint32]bool)
+	
+	for _, clause := range s.cnf.Clauses {
+		if len(clause.Literals) == 2 {
+			lit1, lit2 := clause.Literals[0], clause.Literals[1]
+			if s.isUnitLiteral(lit1) {
+				binaryUnits[lit1.Var()] = !lit1.IsNegated()
+			}
+			if s.isUnitLiteral(lit2) {
+				binaryUnits[lit2.Var()] = !lit2.IsNegated()
+			}
+		}
+	}
+	
+	if len(binaryUnits) == 0 {
+		return
+	}
+	
+	for i := 0; i < len(s.cnf.Clauses); i++ {
+		clause := s.cnf.Clauses[i]
+		if len(clause.Literals) < 3 {
+			continue
+		}
+		
+		newLiterals := make([]cnf.Literal, 0)
+		for _, lit := range clause.Literals {
+			if assigned, exists := binaryUnits[lit.Var()]; exists {
+				litTrue := !lit.IsNegated()
+				if litTrue == assigned {
+					goto satisfied
+				}
+			} else {
+				newLiterals = append(newLiterals, lit)
+			}
+		}
+		
+		if len(newLiterals) == 0 {
+			if s.verbose {
+				fmt.Printf("c [verbose] Hyper-binary: empty clause\n")
+			}
+			return
+		}
+		
+		s.cnf.Clauses[i] = cnf.Clause{Literals: newLiterals, Learned: false}
+	satisfied:
+	}
+	
+	newClauses := make([]cnf.Clause, 0)
+	for _, clause := range s.cnf.Clauses {
+		satisfied := false
+		for _, lit := range clause.Literals {
+			if assigned, exists := binaryUnits[lit.Var()]; exists {
+				litTrue := !lit.IsNegated()
+				if litTrue == assigned {
+					satisfied = true
+					break
+				}
+			}
+		}
+		if !satisfied {
+			newClauses = append(newClauses, clause)
+		}
+	}
+	s.cnf.Clauses = newClauses
+	s.cnf.NumClauses = len(newClauses)
+}
+
+func (s *CDCLSolver) isUnitLiteral(lit cnf.Literal) bool {
+	varIdx := lit.Var()
+	for _, clause := range s.cnf.Clauses {
+		if len(clause.Literals) == 1 && clause.Literals[0].Var() == varIdx {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause {
+	literals := make([]cnf.Literal, 0)
+	foundNeg := false
+	foundPos := false
+	
+	for _, lit := range c1.Literals {
+		if lit.Var() == varIdx {
+			if lit.IsNegated() {
+				foundNeg = true
+			} else {
+				foundPos = true
+			}
+		} else {
+			literals = append(literals, lit)
+		}
+	}
+	
+	for _, lit := range c2.Literals {
+		if lit.Var() == varIdx {
+			if lit.IsNegated() {
+				foundNeg = true
+			} else {
+				foundPos = true
+			}
+		} else {
+			literals = append(literals, lit)
+		}
+	}
+	
+	if !(foundNeg && foundPos) {
+		return nil
+	}
+	
+	return &cnf.Clause{Literals: literals, Learned: false}
+}
+
+func (s *CDCLSolver) subsumes(c1, c2 *cnf.Clause) bool {
+	if len(c1.Literals) >= len(c2.Literals) {
+		return false
+	}
+	
+	set := make(map[uint32]bool)
+	for _, lit := range c1.Literals {
+		key := uint32(lit)<<1 | boolToUint(lit.IsNegated())
+		set[key] = true
+	}
+	
+	for _, lit := range c2.Literals {
+		key := uint32(lit)<<1 | boolToUint(lit.IsNegated())
+		if !set[key] {
+			return false
+		}
+	}
+	return true
+}
+
+func boolToUint(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
+	changed := true
+	for changed {
+		changed = false
+		
+		clauseCount := len(s.cnf.Clauses)
+		for clauseIdx := 0; clauseIdx < clauseCount; clauseIdx++ {
+			clause := s.cnf.Clauses[clauseIdx]
+			
+			satisfied := false
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if s.assignments[varIdx].Level != 0 {
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfied = true
+						break
+					}
+					falseCount++
+				} else {
+					unassignedCount++
+					unassignedLit = lit
+				}
+			}
+			
+			if satisfied {
+				continue
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				if s.verbose {
+					fmt.Printf("c [verbose] Preprocessing: conflict in unit propagation\n")
+				}
+				return UNSAT
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				varIdx := unassignedLit.Var()
+				value := !unassignedLit.IsNegated()
+				s.assignments[varIdx] = Assignment{
+					Value: value,
+					Level: 1,
+				}
+				changed = true
+				
+				conflict := s.simplifyAfterAssignment(varIdx, value)
+				if conflict {
+					if s.verbose {
+						fmt.Printf("c [verbose] Preprocessing: empty clause created\n")
+					}
+					return UNSAT
+				}
+				
+				clauseCount = len(s.cnf.Clauses)
+				if clauseIdx >= clauseCount {
+					clauseIdx = clauseCount - 1
+				}
+			}
+		}
+	}
+	
+	return UNKNOWN
+}
+
+func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
+	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	for _, clause := range s.cnf.Clauses {
+		satisfied := false
+		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
+		
+		for _, lit := range clause.Literals {
+			if lit.Var() == varIdx {
+				litValue := !lit.IsNegated()
+				if litValue == value {
+					satisfied = true
+					break
+				}
+			} else {
+				newLiterals = append(newLiterals, lit)
+			}
+		}
+		
+		if satisfied {
+			continue
+		}
+		
+		if len(newLiterals) == 0 {
+			return true
+		}
+		
+		newClauses = append(newClauses, cnf.Clause{Literals: newLiterals, Learned: false})
+	}
+	s.cnf.Clauses = newClauses
+	s.cnf.NumClauses = len(newClauses)
+	return false
+}
+
+func (s *CDCLSolver) pureLiteralElimination() SolveResult {
+	changed := true
+	for changed {
+		changed = false
+		
+		hasPositive := make([]bool, s.cnf.NumVars)
+		hasNegative := make([]bool, s.cnf.NumVars)
+		
+		for _, clause := range s.cnf.Clauses {
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if s.assignments[varIdx].Level != 0 {
+					continue
+				}
+				if lit.IsNegated() {
+					hasNegative[varIdx] = true
+				} else {
+					hasPositive[varIdx] = true
+				}
+			}
+		}
+		
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if s.assignments[varIdx].Level != 0 {
+				continue
+			}
+			
+			isPure := false
+			pureValue := false
+			
+			if hasPositive[varIdx] && !hasNegative[varIdx] {
+				isPure = true
+				pureValue = true
+			} else if hasNegative[varIdx] && !hasPositive[varIdx] {
+				isPure = true
+				pureValue = false
+			}
+			
+			if isPure {
+				s.assignments[varIdx] = Assignment{
+					Value: pureValue,
+					Level: 1,
+				}
+				changed = true
+				
+				conflict := s.simplifyAfterAssignment(varIdx, pureValue)
+				if conflict {
+					if s.verbose {
+						fmt.Printf("c [verbose] Pure literal elimination: empty clause created\n")
+					}
+					return UNSAT
+				}
+				
+				if s.verbose {
+					fmt.Printf("c [verbose] Pure literal elimination: assigned var %d = %v\n", varIdx, pureValue)
+				}
+			}
+		}
+	}
+	
+	if len(s.cnf.Clauses) == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
+		}
+		return SAT
+	}
+	
+	return UNKNOWN
+}
+
 func (s *CDCLSolver) Solve() bool {
 	result := s.SolveWithResult()
 	return result == SAT
 }
 
 func (s *CDCLSolver) SolveWithResult() SolveResult {
+	preprocessResult := s.preprocessAggressive()
+	if preprocessResult != UNKNOWN {
+		if s.verbose {
+			s.printStats()
+		}
+		return preprocessResult
+	}
+
 	for {
 		s.iterations++
 		if s.maxIter > 0 && s.iterations > s.maxIter {
@@ -127,7 +525,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				}
 				return UNSAT
 			}
-			// Reset backjump level for next conflict
 			s.backjumpLevel = 0
 			continue
 		}
