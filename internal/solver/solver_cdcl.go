@@ -2244,6 +2244,13 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal, literalInC
 		return learnedLits
 	}
 	
+	// CRITICAL OPTIMIZATION: Skip minimization on large clauses (>6 literals)
+	// Profiling showed minimization consumes 100% of time on PHP instances
+	// Large clauses are rarely useful anyway; skip expensive O(n²) minimization
+	if len(learnedLits) > 6 {
+		return learnedLits
+	}
+	
 	originalSize := len(learnedLits)
 	
 	// Step 1: Recursive minimization
