@@ -61,6 +61,17 @@ type Clause struct {
 	Learned  bool
 }
 
+// ClauseArena manages contiguous memory for clause storage
+// All literals are stored in a single buffer for cache efficiency
+// Clauses are referenced by (offset, length) pairs
+type ClauseArena struct {
+	buffer    []uint32 // Contiguous storage for all literals
+	offsets   []int    // Start offset of each clause in buffer
+	sizes     []int    // Number of literals in each clause
+	learned   []bool   // Whether each clause is learned
+	freeList  []int    // Indices of freed slots for reuse
+}
+
 // CNF represents a CNF formula with optimized storage for short clauses
 type CNF struct {
 	NumVars        uint32
@@ -70,19 +81,26 @@ type CNF struct {
 	TernaryClauses []TernaryClause // Ternary clauses stored separately
 	
 	// Watched literals for binary clauses
-	// watchList[lit] contains indices of binary clauses watching that literal
+	// WatchList[lit] contains indices of binary clauses watching that literal
 	// Literal index: varIdx * 2 + (0 for positive, 1 for negated)
 	WatchList [][]int
 	// binaryWatchA and binaryWatchB store which literals each binary clause watches
 	// Each is an index into the literal space: varIdx * 2 + (0 for positive, 1 for negated)
 	BinaryWatchA []int
 	BinaryWatchB []int
+	
+	// Arena-based clause storage (alternative to Clauses slice)
+	Arena *ClauseArena
 }
+
+
 
 // NewCNF creates a new CNF formula
 func NewCNF(numVars uint32, numClauses int) *CNF {
 	// Watch list has 2 entries per variable (positive and negative literal)
 	watchListSize := int(numVars) * 2
+	// Pre-allocate arena with estimated capacity
+	arenaCapacity := numClauses * 4 // Average 4 literals per clause
 	return &CNF{
 		NumVars:        numVars,
 		Clauses:        make([]Clause, 0, numClauses),
@@ -90,8 +108,20 @@ func NewCNF(numVars uint32, numClauses int) *CNF {
 		BinaryClauses:  make([]BinaryClause, 0, numClauses/2),
 		TernaryClauses: make([]TernaryClause, 0, numClauses/3),
 		WatchList:      make([][]int, watchListSize),
-		BinaryWatchA:   nil, // Will be initialized after preprocessing
+		BinaryWatchA:   nil,
 		BinaryWatchB:   nil,
+		Arena:          NewClauseArena(arenaCapacity),
+	}
+}
+
+// NewClauseArena creates a new clause arena with pre-allocated buffer
+func NewClauseArena(capacity int) *ClauseArena {
+	return &ClauseArena{
+		buffer:   make([]uint32, 0, capacity),
+		offsets:  make([]int, 0, capacity/4),
+		sizes:    make([]int, 0, capacity/4),
+		learned:  make([]bool, 0, capacity/4),
+		freeList: make([]int, 0),
 	}
 }
 
@@ -198,4 +228,123 @@ func (c *CNF) InitializeWatches() {
 		c.WatchList[idx1] = append(c.WatchList[idx1], binIdx)
 		c.WatchList[idx2] = append(c.WatchList[idx2], binIdx)
 	}
+}
+
+// Arena methods for clause allocation and access
+
+// AllocateClause allocates a clause in the arena and returns its index
+func (ca *ClauseArena) AllocateClause(literals []Literal, learned bool) int {
+	// Reuse freed slot if available
+	var idx int
+	if len(ca.freeList) > 0 {
+		idx = ca.freeList[len(ca.freeList)-1]
+		ca.freeList = ca.freeList[:len(ca.freeList)-1]
+		// Update existing entry
+		ca.offsets[idx] = len(ca.buffer)
+		ca.sizes[idx] = len(literals)
+		ca.learned[idx] = learned
+	} else {
+		// Allocate new slot
+		idx = len(ca.offsets)
+		ca.offsets = append(ca.offsets, len(ca.buffer))
+		ca.sizes = append(ca.sizes, len(literals))
+		ca.learned = append(ca.learned, learned)
+	}
+	
+	// Append literals to buffer
+	for _, lit := range literals {
+		ca.buffer = append(ca.buffer, uint32(lit))
+	}
+	
+	return idx
+}
+
+// GetClauseLiterals returns the literals for a clause at given index
+func (ca *ClauseArena) GetClauseLiterals(idx int) []Literal {
+	offset := ca.offsets[idx]
+	size := ca.sizes[idx]
+	literals := make([]Literal, size)
+	for i := 0; i < size; i++ {
+		literals[i] = Literal(ca.buffer[offset+i])
+	}
+	return literals
+}
+
+// IsLearned returns whether a clause is learned
+func (ca *ClauseArena) IsLearned(idx int) bool {
+	return ca.learned[idx]
+}
+
+// FreeClause marks a clause slot as free for reuse
+func (ca *ClauseArena) FreeClause(idx int) {
+	ca.freeList = append(ca.freeList, idx)
+}
+
+// NumClauses returns the number of allocated clauses
+func (ca *ClauseArena) NumClauses() int {
+	return len(ca.offsets) - len(ca.freeList)
+}
+
+// Compact removes gaps from freed clauses and rebuilds indices
+// Returns a mapping from old indices to new indices
+func (ca *ClauseArena) Compact() []int {
+	if len(ca.freeList) == 0 {
+		return nil // No compaction needed
+	}
+	
+	// Build mapping from old to new indices
+	oldToNew := make([]int, len(ca.offsets))
+	for i := range oldToNew {
+		oldToNew[i] = i
+	}
+	
+	// Create new arrays
+	newBuffer := make([]uint32, 0, len(ca.buffer))
+	newOffsets := make([]int, 0, len(ca.offsets))
+	newSizes := make([]int, 0, len(ca.sizes))
+	newLearned := make([]bool, 0, len(ca.learned))
+	
+	newIdx := 0
+	for oldIdx := range ca.offsets {
+		// Check if this index is in freeList
+		isFree := false
+		for _, freeIdx := range ca.freeList {
+			if freeIdx == oldIdx {
+				isFree = true
+				break
+			}
+		}
+		
+		if !isFree {
+			oldToNew[oldIdx] = newIdx
+			newOffsets = append(newOffsets, len(newBuffer))
+			newSizes = append(newSizes, ca.sizes[oldIdx])
+			newLearned = append(newLearned, ca.learned[oldIdx])
+			
+			// Copy literals
+			offset := ca.offsets[oldIdx]
+			size := ca.sizes[oldIdx]
+			for i := 0; i < size; i++ {
+				newBuffer = append(newBuffer, ca.buffer[offset+i])
+			}
+			newIdx++
+		}
+	}
+	
+	ca.buffer = newBuffer
+	ca.offsets = newOffsets
+	ca.sizes = newSizes
+	ca.learned = newLearned
+	ca.freeList = ca.freeList[:0]
+	
+	return oldToNew
+}
+
+// Reset clears all clauses and resets the arena
+func (ca *ClauseArena) Reset() {
+	ca.buffer = ca.buffer[:0]
+	ca.offsets = ca.offsets[:0]
+	ca.sizes = ca.sizes[:0]
+	ca.learned = ca.learned[:0]
+	ca.freeList = ca.freeList[:0]
 }

@@ -26,7 +26,8 @@ type CDCLSolver struct {
 	implication  []int
 	iterations   int
 	maxIter      int
-	learnedClauses []cnf.Clause
+	learnedClauses []cnf.Clause      // Original clauses (keep for compatibility)
+	learnedArena *cnf.ClauseArena    // Arena-based learned clause storage
 	clauseActivity []float64
 	clauseAge    []int
 	currentAge   int
@@ -59,6 +60,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:  0,
 		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
+		learnedArena: cnf.NewClauseArena(10000), // Pre-allocate for learned clauses
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
 		currentAge:   0,
@@ -544,6 +546,7 @@ func (s *CDCLSolver) restart() {
 	s.learnedClauses = s.learnedClauses[:0]
 	s.clauseActivity = s.clauseActivity[:0]
 	s.clauseAge = s.clauseAge[:0]
+	s.learnedArena.Reset() // Clear arena memory
 	
 	s.lubyIndex++
 	s.restartCount = s.conflicts
@@ -1378,19 +1381,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {
-		// Check if this learned clause subsumes any existing learned clauses
-		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
-		s.subsumeLearnedClauses(&newClause)
-		
 		// Check if we need to delete clauses
 		if len(s.learnedClauses) >= s.maxLearned {
 			s.deleteLearnedClauses()
 		}
 		
-		s.learnedClauses = append(s.learnedClauses, newClause)
-		s.clauseActivity = append(s.clauseActivity, 0.0) // Initial activity
+		// Allocate in arena (contiguous memory)
+		_ = s.learnedArena.AllocateClause(learnedLits, true)
+		
+		// Track metadata in parallel arrays
+		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.currentAge++
+		
+		// Also keep in slice for compatibility (temporary)
+		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
+		s.learnedClauses = append(s.learnedClauses, newClause)
 	}
 	
 	// Calculate backjump level: second-highest level in learned clause
@@ -1536,6 +1542,13 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.learnedClauses = newClauses
 	s.clauseActivity = newActivity
 	s.clauseAge = newAge
+	
+	// Rebuild arena from compacted slices (ensures contiguous memory)
+	s.learnedArena.Reset()
+	for i, clause := range s.learnedClauses {
+		s.learnedArena.AllocateClause(clause.Literals, true)
+		_ = i // Use index variable
+	}
 }
 
 func (s *CDCLSolver) backtrack() bool {
