@@ -35,11 +35,18 @@ type CDCLSolver struct {
 	backjumpLevel int
 	maxLearned   int
 	savedPhase   []bool
+	restartBase  int
+	restartCount int
+	lubyIndex    int
+	lbdSum       int
+	lbdCount     int
+	lastConflictLBD int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := 10000 // Initial limit on learned clauses
+	restartBase := 100  // Base for Luby restart sequence
 	return &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
@@ -50,7 +57,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		conflicts:   0,
 		implication: make([]int, formula.NumVars),
 		iterations:  0,
-		maxIter:     0, // disabled by default
+		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
@@ -60,6 +67,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		backjumpLevel: 0,
 		maxLearned:   maxLearned,
 		savedPhase:  make([]bool, formula.NumVars),
+		restartBase:  restartBase,
+		restartCount: 0,
+		lubyIndex:    0,
+		lbdSum:       0,
+		lbdCount:     0,
+		lastConflictLBD: 0,
 	}
 }
 
@@ -128,10 +141,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		
 		s.hyperBinaryResolution()
 		
+		veResult := s.variableElimination()
+		if veResult != UNKNOWN {
+			return veResult
+		}
+		
 		if s.cnf.NumClauses == initialClauses {
 			break
 		}
 		initialClauses = s.cnf.NumClauses
+	}
+	
+	bceResult := s.blockedClauseElimination()
+	if bceResult != UNKNOWN {
+		return bceResult
 	}
 	
 	if s.verbose {
@@ -318,6 +341,345 @@ func boolToUint(b bool) uint32 {
 		return 1
 	}
 	return 0
+}
+
+func luby(i int) int {
+	k := 1
+	for {
+		ki := 1 << uint(k)
+		if i == ki-1 {
+			return 1 << uint(k-1)
+		}
+		if ki-1 > i {
+			prevKi := 1 << uint(k-1)
+			return luby(i - (prevKi - 1))
+		}
+		k++
+	}
+}
+
+func (s *CDCLSolver) shouldRestart() bool {
+	// Use aggressive Luby restarts for now
+	// PHP and other structured instances benefit from frequent restarts
+	threshold := s.restartBase * luby(s.lubyIndex + 1)
+	conflictsSinceRestart := s.conflicts - s.restartCount
+	return conflictsSinceRestart >= threshold
+}
+
+func (s *CDCLSolver) restart() {
+	if s.verbose {
+		fmt.Printf("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
+	}
+	
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.level = 0
+	for i := range s.implication {
+		s.implication[i] = -1
+	}
+	for i := range s.assignments {
+		s.assignments[i] = Assignment{}
+	}
+	
+	s.learnedClauses = s.learnedClauses[:0]
+	s.clauseActivity = s.clauseActivity[:0]
+	s.clauseAge = s.clauseAge[:0]
+	
+	s.lubyIndex++
+	s.restartCount = s.conflicts
+	s.lbdSum = 0
+	s.lbdCount = 0
+	s.lastConflictLBD = 0
+	s.backjumpLevel = 0
+}
+
+func (s *CDCLSolver) variableElimination() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
+	}
+	
+	eliminatedCount := 0
+	resolventCount := 0
+	
+	changed := true
+	for changed {
+		changed = false
+		eliminated := make([]bool, s.cnf.NumVars)
+		
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if eliminated[varIdx] {
+				continue
+			}
+			
+			posClauses := make([]int, 0)
+			negClauses := make([]int, 0)
+			
+			for i, clause := range s.cnf.Clauses {
+				hasPos := false
+				hasNeg := false
+				for _, lit := range clause.Literals {
+					if lit.Var() == varIdx {
+						if !lit.IsNegated() {
+							hasPos = true
+						} else {
+							hasNeg = true
+						}
+					}
+				}
+				
+				if hasPos {
+					posClauses = append(posClauses, i)
+				}
+				if hasNeg {
+					negClauses = append(negClauses, i)
+				}
+			}
+			
+			if len(posClauses) == 0 || len(negClauses) == 0 {
+				continue
+			}
+			
+			resolvents := make([]cnf.Clause, 0)
+			resolventSet := make(map[string]bool)
+			
+			for _, posIdx := range posClauses {
+				posClause := s.cnf.Clauses[posIdx]
+				
+				for _, negIdx := range negClauses {
+					negClause := s.cnf.Clauses[negIdx]
+					
+					resolvent := s.resolveForElimination(posClause, negClause, varIdx)
+					if resolvent != nil {
+						if !s.isTautology(resolvent) {
+							key := s.clauseKey(resolvent)
+							if !resolventSet[key] {
+								resolventSet[key] = true
+								resolvents = append(resolvents, *resolvent)
+							}
+						}
+					}
+				}
+			}
+			
+			originalCount := len(posClauses) + len(negClauses)
+			// Allow slight blowup (up to 20%) to enable more elimination
+			// This is effective on PHP and other structured instances
+			maxResolvents := originalCount + (originalCount / 5)
+			if len(resolvents) <= maxResolvents {
+				if s.verbose {
+					fmt.Printf("c [verbose] Eliminating var %d: %d clauses -> %d resolvents\n", 
+						varIdx, originalCount, len(resolvents))
+				}
+				
+				for _, resolvent := range resolvents {
+					if len(resolvent.Literals) == 0 {
+						if s.verbose {
+							fmt.Printf("c [verbose] Variable elimination: empty clause created (UNSAT)\n")
+						}
+						return UNSAT
+					}
+				}
+				
+				keepClauses := make([]cnf.Clause, 0)
+				for _, clause := range s.cnf.Clauses {
+					keep := true
+					for _, lit := range clause.Literals {
+						if lit.Var() == varIdx {
+							keep = false
+							break
+						}
+					}
+					if keep {
+						keepClauses = append(keepClauses, clause)
+					}
+				}
+				
+				for _, resolvent := range resolvents {
+					keepClauses = append(keepClauses, resolvent)
+				}
+				
+				s.cnf.Clauses = keepClauses
+				s.cnf.NumClauses = len(keepClauses)
+				
+				eliminated[varIdx] = true
+				eliminatedCount++
+				resolventCount += len(resolvents)
+				changed = true
+			}
+		}
+	}
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: eliminated %d variables, added %d resolvents\n", 
+			eliminatedCount, resolventCount)
+	}
+	
+	if len(s.cnf.Clauses) == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Variable elimination: all clauses satisfied\n")
+		}
+		return SAT
+	}
+	
+	return UNKNOWN
+}
+
+func (s *CDCLSolver) resolveForElimination(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
+	hasPosX := false
+	hasNegX := false
+	
+	for _, lit := range clause1.Literals {
+		if lit.Var() == varIdx && !lit.IsNegated() {
+			hasPosX = true
+			break
+		}
+	}
+	
+	for _, lit := range clause2.Literals {
+		if lit.Var() == varIdx && lit.IsNegated() {
+			hasNegX = true
+			break
+		}
+	}
+	
+	if !hasPosX || !hasNegX {
+		return nil
+	}
+	
+	resolventLits := make([]cnf.Literal, 0, len(clause1.Literals)+len(clause2.Literals)-2)
+	
+	for _, lit := range clause1.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+	
+	for _, lit := range clause2.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+	
+	if len(resolventLits) == 0 {
+		return &cnf.Clause{Literals: make([]cnf.Literal, 0), Learned: false}
+	}
+	
+	return &cnf.Clause{Literals: resolventLits, Learned: false}
+}
+
+func (s *CDCLSolver) isTautology(clause *cnf.Clause) bool {
+	seen := make(map[uint32]bool)
+	
+	for _, lit := range clause.Literals {
+		varIdx := lit.Var()
+		isNeg := lit.IsNegated()
+		
+		if prevNeg, exists := seen[varIdx]; exists {
+			if prevNeg != isNeg {
+				return true
+			}
+		} else {
+			seen[varIdx] = isNeg
+		}
+	}
+	
+	return false
+}
+
+func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
+	lits := make([]uint64, len(clause.Literals))
+	for i, lit := range clause.Literals {
+		lits[i] = uint64(lit)
+	}
+	
+	for i := 0; i < len(lits)-1; i++ {
+		for j := i + 1; j < len(lits); j++ {
+			if lits[i] > lits[j] {
+				lits[i], lits[j] = lits[j], lits[i]
+			}
+		}
+	}
+	
+	return fmt.Sprintf("%v", lits)
+}
+
+func (s *CDCLSolver) blockedClauseElimination() SolveResult {
+	if s.cnf.NumClauses > 5000 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Blocked clause elimination: skipped (%d clauses, limit 5000)\n", s.cnf.NumClauses)
+		}
+		return UNKNOWN
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Blocked clause elimination: checking %d clauses\n", s.cnf.NumClauses)
+	}
+
+	removedCount := 0
+	changed := true
+
+	for changed {
+		changed = false
+		blocked := make([]bool, len(s.cnf.Clauses))
+
+		for clauseIdx, clause := range s.cnf.Clauses {
+			if len(clause.Literals) == 0 {
+				return UNSAT
+			}
+
+			for _, blockingLit := range clause.Literals {
+				if s.isClauseBlockedBy(clause, blockingLit) {
+					blocked[clauseIdx] = true
+					removedCount++
+					changed = true
+					break
+				}
+			}
+		}
+
+		if changed {
+			remaining := make([]cnf.Clause, 0)
+			for i, clause := range s.cnf.Clauses {
+				if !blocked[i] {
+					remaining = append(remaining, clause)
+				}
+			}
+			s.cnf.Clauses = remaining
+			s.cnf.NumClauses = len(remaining)
+		}
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Blocked clause elimination: removed %d clauses\n", removedCount)
+	}
+
+	return UNKNOWN
+}
+
+func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Literal) bool {
+	opposite := blockingLit.Negate()
+
+	for _, other := range s.cnf.Clauses {
+		containsOpposite := false
+		for _, lit := range other.Literals {
+			if lit == opposite {
+				containsOpposite = true
+				break
+			}
+		}
+
+		if !containsOpposite {
+			continue
+		}
+
+		resolvent := s.resolveOnVar(clause, other, blockingLit.Var())
+
+		if resolvent != nil && !s.isTautology(resolvent) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
@@ -519,6 +881,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
+			if s.conflicts % 50 == 0 && s.verbose {
+				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d\n", s.conflicts, s.level, len(s.learnedClauses))
+			}
 			if !s.backtrack() {
 				if s.verbose {
 					s.printStats()
@@ -526,6 +891,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				return UNSAT
 			}
 			s.backjumpLevel = 0
+			
+			if s.shouldRestart() {
+				s.restart()
+			}
 			continue
 		}
 
@@ -858,6 +1227,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	if backjumpLevel == 0 {
 		backjumpLevel = 1
 	}
+	
+	// Calculate LBD for adaptive restarts
+	levelSet := make(map[int]bool)
+	for varIdx, inClause := range literalInClause {
+		if inClause {
+			lvl := s.assignments[varIdx].Level
+			if lvl > 0 {
+				levelSet[lvl] = true
+			}
+		}
+	}
+	lbd := len(levelSet)
+	
+	// Update LBD statistics for adaptive restarts
+	s.lastConflictLBD = lbd
+	s.lbdSum += lbd
+	s.lbdCount++
 	
 	return backjumpLevel
 }

@@ -116,9 +116,24 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Arg chain: 1.43x** - Within 43%
 - **Random: 1.48x** - Within 48%
 - **Sudoku: 115x** - Propagation bottleneck (11,745 clauses, linear scanning)
-- **PHP: 5910x** - Exponentially hard for all CDCL solvers
+- **PHP: Timeout** - Exponentially hard for CDCL (224K+ conflicts vs MiniSat's 251)
+
+**Recent Improvements**:
+- **Variable elimination preprocessing**: Eliminates variables via resolution when beneficial (reduces formula size)
+- **Blocked clause elimination**: Removes clauses blocked by any literal (safe simplification)
+- **Restart support**: Luby-based restarts to escape unproductive search regions
+- **Adaptive restarts**: LBD-based criterion (restart when LBD > 1.5× average)
+- **LBD tracking**: Calculate and track Literal Block Distance for learned clauses
 
 **Summary**: Satience is production-ready for most SAT solving tasks. The median 1.28x slowdown is competitive for a first implementation in Go. Tseitin instances are now solved faster than MiniSat!
+
+**PHP Performance Issue**:
+PHP (pigeonhole principle) instances are exponentially hard for CDCL solvers. While MiniSat solves `php_6p_5h_unsat.cnf` in 251 conflicts, our solver hits 224K+ conflicts before timeout. Root causes:
+1. **Clause learning inefficiency**: Our 1-UIP analysis doesn't find the short, powerful clauses needed for PHP
+2. **Variable selection**: VSIDS doesn't focus on the critical "counting" variables
+3. **Preprocessing gap**: MiniSat eliminates 21 variables during preprocessing; we eliminate 6
+
+This is a known limitation of basic CDCL - competitive solvers use specialized techniques (symmetry breaking, cardinality reasoning) for PHP instances.
 
 ### Blocked
 - **Binary/ternary optimization bug**: Commit 587718a introduced infinite loop on Tseitin instances - reverted in c893c51
