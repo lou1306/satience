@@ -238,20 +238,18 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		
 		s.hyperBinaryResolution()
 		
-		equivResult := s.equivalenceDetection()
-		if equivResult != UNKNOWN {
-			return equivResult
-		}
-		
-		// DISABLED: Failed literal elimination causes massive memory usage
-		// On PHP: O(n²) unit propagations, each allocating trail/implication copies
-		// 30 vars × 2 polarities × multiple passes = thousands of allocations
-		// if s.conflicts < 1000 {
-		// 	failedResult := s.failedLiteralElimination()
-		// 	if failedResult != UNKNOWN {
-		// 		return failedResult
-		// 	}
+		// DISABLED: Equivalence detection causes issues with certain patterns
+		// Needs more testing before re-enabling
+		// equivResult := s.equivalenceDetection()
+		// if equivResult != UNKNOWN {
+		// 	return equivResult
 		// }
+		
+		// RE-ENABLED: Failed literal elimination with strict safeguards
+		failedResult := s.failedLiteralElimination()
+		if failedResult != UNKNOWN {
+			return failedResult
+		}
 		
 		veResult := s.variableElimination()
 		if veResult != UNKNOWN {
@@ -439,21 +437,77 @@ func (s *CDCLSolver) isSubsumedByAny(clause cnf.Clause, clauses []cnf.Clause) bo
 	return false
 }
 
+// failedLiteralElimination detects literals that must be false through trial assignment
+//
+// Algorithm:
+// For each unassigned variable x, try assigning x=false and propagate.
+// If conflict occurs, then x must be true (failed literal).
+// This is a powerful preprocessing technique but can be expensive.
+//
+// Safeguards to prevent memory explosion (learned from PHP instances):
+// 1. Time limit: 500ms total for entire failed literal elimination
+// 2. Per-variable limit: 10ms max per variable
+// 3. Formula size limit: Skip if >2000 variables or >5000 clauses
+// 4. Early termination: Stop if clause count grows by >10%
+// 5. Skip dense instances: Skip if clause/variable ratio >10
 func (s *CDCLSolver) failedLiteralElimination() SolveResult {
+	// Strict safeguards to prevent memory explosion
+	if s.cnf.NumVars > 2000 || s.cnf.NumClauses > 5000 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Failed literal: skipped (too large: %d vars, %d clauses)\n", 
+				s.cnf.NumVars, s.cnf.NumClauses)
+		}
+		return UNKNOWN
+	}
+	
+	density := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
+	if density > 10 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Failed literal: skipped (dense instance: %.1f clauses/var)\n", density)
+		}
+		return UNKNOWN
+	}
+	
 	if s.verbose {
 		fmt.Printf("c [verbose] Failed literal elimination: checking %d variables\n", s.cnf.NumVars)
 	}
 	
+	startTime := time.Now()
+	totalTimeLimit := 500 * time.Millisecond
+	varTimeLimit := 10 * time.Millisecond
+	initialClauses := s.cnf.NumClauses
+	maxClauses := initialClauses * 110 / 100 // Allow 10% growth
+	
 	changed := true
 	for changed {
 		changed = false
+		
+		// Check total time limit
+		if time.Since(startTime) > totalTimeLimit {
+			if s.verbose {
+				fmt.Printf("c [verbose] Failed literal: time limit reached (%.2fs)\n", 
+					time.Since(startTime).Seconds())
+			}
+			break
+		}
 		
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			if s.assignments[varIdx].Level != 0 {
 				continue
 			}
 			
+			// Check per-variable time limit
+			varStartTime := time.Now()
+			
 			for polarity := 0; polarity < 2; polarity++ {
+				// Check time limit for this variable
+				if time.Since(varStartTime) > varTimeLimit {
+					if s.verbose {
+						fmt.Printf("c [verbose] Failed literal: var %d time limit\n", varIdx)
+					}
+					goto nextVar
+				}
+				
 				value := polarity == 0
 				lit := cnf.NewLiteral(varIdx, !value)
 				
@@ -480,6 +534,15 @@ func (s *CDCLSolver) failedLiteralElimination() SolveResult {
 						return UNSAT
 					}
 					
+					// Check clause growth
+					if s.cnf.NumClauses > maxClauses {
+						if s.verbose {
+							fmt.Printf("c [verbose] Failed literal: clause growth limit (%d -> %d)\n",
+								initialClauses, s.cnf.NumClauses)
+						}
+						return UNKNOWN
+					}
+					
 					changed = true
 					if s.verbose {
 						fmt.Printf("c [verbose] Failed literal: var %d = %v\n", varIdx, oppositeValue)
@@ -496,7 +559,14 @@ func (s *CDCLSolver) failedLiteralElimination() SolveResult {
 					s.level = 0
 				}
 			}
+			
+			nextVar:
 		}
+	}
+	
+	if s.verbose && changed {
+		fmt.Printf("c [verbose] Failed literal: eliminated %d variables\n", 
+			initialClauses - s.cnf.NumClauses)
 	}
 	
 	return UNKNOWN
@@ -1252,10 +1322,14 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	// Detect equivalence relations from binary clauses
 	// Pattern: (¬a ∨ b) ∧ (¬b ∨ a) means a ↔ b
 	// Build equivalence classes and substitute representatives
+	// Enhanced to detect transitive chains: a ↔ b and b ↔ c implies a ↔ c
 	
-	// Step 1: Find all binary equivalence clauses
-	// Store as adjacency list: equivGraph[a] = list of variables equivalent to a
-	equivGraph := make(map[uint32][]uint32)
+	// Step 1: Find all bidirectional implications
+	// Store as adjacency list for finding bidirectional edges
+	type implication struct {
+		from, to uint32
+	}
+	implications := make([]implication, 0)
 	
 	for _, clause := range s.cnf.Clauses {
 		if len(clause.Literals) != 2 {
@@ -1265,41 +1339,28 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 		lit1 := clause.Literals[0]
 		lit2 := clause.Literals[1]
 		
-		// Check for (¬a ∨ b) pattern
-		// This is equivalent to: a → b
-		var a, b uint32
-		var aNeg, bNeg bool
-		
+		// Only detect (¬a ∨ b) pattern for equivalence
 		if lit1.IsNegated() && !lit2.IsNegated() {
-			// (¬a ∨ b): a = lit1.Var(), b = lit2.Var()
-			a = lit1.Var()
-			b = lit2.Var()
-			aNeg = true
-			bNeg = false
+			// (¬a ∨ b) = a → b
+			implications = append(implications, implication{lit1.Var(), lit2.Var()})
 		} else if !lit1.IsNegated() && lit2.IsNegated() {
-			// (a ∨ ¬b): a = lit1.Var(), b = lit2.Var()
-			a = lit1.Var()
-			b = lit2.Var()
-			aNeg = false
-			bNeg = true
-		} else {
-			continue // Not an implication pattern
+			// (a ∨ ¬b) = b → a
+			implications = append(implications, implication{lit2.Var(), lit1.Var()})
 		}
-		
-		// Store directed implication: a → b (with polarity info)
-		// We need both (¬a ∨ b) AND (¬b ∨ a) for equivalence
-		if aNeg && !bNeg {
-			// This is (¬a ∨ b) = a → b
-			if _, exists := equivGraph[a]; !exists {
-				equivGraph[a] = make([]uint32, 0)
-			}
-			// Mark that a implies b (we'll check for b implies a later)
-			equivGraph[a] = append(equivGraph[a], b)
-		}
+		// Skip (a ∨ b) and (¬a ∨ ¬b) - not equivalence patterns
 	}
 	
-	// Step 2: Find bidirectional implications (equivalences)
-	// Use union-find to group equivalent variables
+	// Step 2: Build bidirectional graph
+	// hasEdge[a][b] = true if a → b exists
+	hasEdge := make(map[uint32]map[uint32]bool)
+	for _, imp := range implications {
+		if hasEdge[imp.from] == nil {
+			hasEdge[imp.from] = make(map[uint32]bool)
+		}
+		hasEdge[imp.from][imp.to] = true
+	}
+	
+	// Step 3: Use union-find to group equivalent variables
 	parent := make([]uint32, s.cnf.NumVars)
 	for i := range parent {
 		parent[i] = uint32(i)
@@ -1320,37 +1381,26 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 		}
 	}
 	
-	// Check for bidirectional implications
-	for a, implications := range equivGraph {
-		for _, b := range implications {
-			// Check if b also implies a
-			if bImps, exists := equivGraph[b]; exists {
-				for _, c := range bImps {
-					if c == a {
-						// Found: a → b and b → a, so a ↔ b
-						union(a, b)
-					}
-				}
+	// Find bidirectional implications and union them
+	for a, targets := range hasEdge {
+		for b := range targets {
+			if hasEdge[b] != nil && hasEdge[b][a] {
+				// Found: a → b and b → a, so a ↔ b
+				union(a, b)
 			}
 		}
 	}
 	
-	// Step 3: Count equivalence classes and substitutions
-	equivCount := 0
-	substituted := make([]bool, s.cnf.NumVars)
-	
-	// For each equivalence class, pick representative (lowest var index)
-	// Substitute all other variables with representative
+	// Step 4: Count equivalence classes and build substitution map
 	classMembers := make(map[uint32][]uint32)
 	for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 		root := find(varIdx)
-		classMembers[root] = append(classMembers[root], uint32(varIdx))
+		classMembers[root] = append(classMembers[root], varIdx)
 	}
 	
-	// Build substitution map: varIdx -> (representative, samePolarity)
 	type substitution struct {
-		rep    uint32
-		samePol bool
+		rep     uint32
+		samePol bool // always true for standard equivalence
 	}
 	substMap := make(map[uint32]substitution)
 	
@@ -1363,19 +1413,17 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 		rep := members[0]
 		for _, m := range members[1:] {
 			substMap[m] = substitution{rep: rep, samePol: true}
-			substituted[m] = true
-			equivCount++
 		}
 	}
 	
-	if equivCount == 0 {
+	if len(substMap) == 0 {
 		if s.verbose {
 			fmt.Printf("c [verbose] Equivalence detection: no equivalences found\n")
 		}
 		return UNKNOWN
 	}
 	
-	// Step 4: Substitute throughout formula
+	// Step 5: Substitute throughout formula
 	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
 	
 	for _, clause := range s.cnf.Clauses {
@@ -1386,7 +1434,6 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			varIdx := lit.Var()
 			
 			if subst, exists := substMap[varIdx]; exists {
-				// Substitute with representative
 				newLit := cnf.NewLiteral(subst.rep, lit.IsNegated() != subst.samePol)
 				newLiterals = append(newLiterals, newLit)
 				clauseChanged = true
@@ -1395,7 +1442,7 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			}
 		}
 		
-		// Remove duplicate literals after substitution
+		// Remove duplicate literals and detect tautologies
 		if clauseChanged {
 			seen := make(map[uint32]bool)
 			uniqueLiterals := make([]cnf.Literal, 0)
@@ -1404,10 +1451,8 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			for _, lit := range newLiterals {
 				varIdx := lit.Var()
 				if _, exists := seen[varIdx]; exists {
-					// Check if we already have opposite polarity
-					existingLit := cnf.Literal(varIdx)
-					if existingLit.IsNegated() != lit.IsNegated() {
-						// Both polarities present → clause is tautology
+					// Duplicate variable - check if opposite polarity
+					if seen[varIdx] != lit.IsNegated() {
 						hasBothPolarities = true
 						break
 					}
@@ -1418,15 +1463,14 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			}
 			
 			if hasBothPolarities {
-				continue // Tautology, skip
+				continue // Tautology
 			}
 			newLiterals = uniqueLiterals
 		}
 		
 		if len(newLiterals) == 0 {
-			// Empty clause → UNSAT
 			if s.verbose {
-				fmt.Printf("c [verbose] Equivalence detection: empty clause created (UNSAT)\n")
+				fmt.Printf("c [verbose] Equivalence detection: empty clause (UNSAT)\n")
 			}
 			return UNSAT
 		}
@@ -1437,15 +1481,13 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	s.cnf.Clauses = newClauses
 	s.cnf.NumClauses = len(newClauses)
 	
-	// Update VSIDS for eliminated variables
+	// Zero out activity for eliminated variables
 	for varIdx := range substMap {
-		// Discourage eliminated vars by setting very low activity
 		s.vsids.activity[varIdx] = 0.0
 	}
 	
 	if s.verbose {
-		fmt.Printf("c [verbose] Equivalence detection: found %d equivalences, substituted %d variables\n", 
-			equivCount, len(substMap))
+		fmt.Printf("c [verbose] Equivalence detection: eliminated %d variables\n", len(substMap))
 	}
 	
 	return UNKNOWN
