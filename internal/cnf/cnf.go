@@ -89,6 +89,16 @@ type CNF struct {
 	BinaryWatchA []int
 	BinaryWatchB []int
 	
+	// Watched literals for ternary clauses (3 literals)
+	// WatchListTernary[lit] contains indices into TernaryClauseIndices
+	TernaryWatchList [][]int
+	// ternaryWatchA/B/C store which literals each ternary clause watches
+	TernaryWatchA []int
+	TernaryWatchB []int
+	TernaryWatchC []int
+	// TernaryClauseIndices maps watch index to actual clause index in Clauses[]
+	TernaryClauseIndices []int
+	
 	// Watched literals for long clauses (>3 literals)
 	// WatchListLong[lit] contains indices into LongClauseIndices
 	// LongClauseIndices[watchIdx] maps to the actual clause index in Clauses[]
@@ -120,6 +130,11 @@ func NewCNF(numVars uint32, numClauses int) *CNF {
 		WatchList:      make([][]int, watchListSize),
 		BinaryWatchA:   nil,
 		BinaryWatchB:   nil,
+		TernaryWatchList: make([][]int, watchListSize),
+		TernaryWatchA:    nil,
+		TernaryWatchB:    nil,
+		TernaryWatchC:    nil,
+		TernaryClauseIndices: nil,
 		WatchListLong:  make([][]int, watchListSize),
 		LongWatchA:     nil,
 		LongWatchB:     nil,
@@ -212,15 +227,17 @@ func IndexToLit(idx int) Literal {
 	return NewLiteral(varIdx, isNegated)
 }
 
-// InitializeWatches initializes the watched literals scheme for binary and long clauses
+// InitializeWatches initializes the watched literals scheme for binary, ternary, and long clauses
 // Should be called AFTER preprocessing, before search starts
 func (c *CNF) InitializeWatches() {
 	// Clear watch lists
 	watchListSize := int(c.NumVars) * 2
 	c.WatchList = make([][]int, watchListSize)
+	c.TernaryWatchList = make([][]int, watchListSize)
 	c.WatchListLong = make([][]int, watchListSize)
 	for i := range c.WatchList {
 		c.WatchList[i] = make([]int, 0)
+		c.TernaryWatchList[i] = make([]int, 0)
 		c.WatchListLong[i] = make([]int, 0)
 	}
 	
@@ -242,6 +259,44 @@ func (c *CNF) InitializeWatches() {
 		// Add clause to both watch lists
 		c.WatchList[idx1] = append(c.WatchList[idx1], binIdx)
 		c.WatchList[idx2] = append(c.WatchList[idx2], binIdx)
+	}
+	
+	// Initialize watch arrays for ternary clauses (3 literals)
+	ternaryClauseCount := 0
+	for _, clause := range c.Clauses {
+		if len(clause.Literals) == 3 && !clause.Learned {
+			ternaryClauseCount++
+		}
+	}
+	
+	c.TernaryWatchA = make([]int, ternaryClauseCount)
+	c.TernaryWatchB = make([]int, ternaryClauseCount)
+	c.TernaryWatchC = make([]int, ternaryClauseCount)
+	c.TernaryClauseIndices = make([]int, ternaryClauseCount)
+	
+	ternIdx := 0
+	for clauseIdx, clause := range c.Clauses {
+		if len(clause.Literals) == 3 && !clause.Learned {
+			lit1 := clause.Literals[0]
+			lit2 := clause.Literals[1]
+			lit3 := clause.Literals[2]
+			
+			idx1 := LitToIndex(lit1)
+			idx2 := LitToIndex(lit2)
+			idx3 := LitToIndex(lit3)
+			
+			c.TernaryWatchA[ternIdx] = idx1
+			c.TernaryWatchB[ternIdx] = idx2
+			c.TernaryWatchC[ternIdx] = idx3
+			c.TernaryClauseIndices[ternIdx] = clauseIdx
+			
+			// Add clause to all three watch lists
+			c.TernaryWatchList[idx1] = append(c.TernaryWatchList[idx1], ternIdx)
+			c.TernaryWatchList[idx2] = append(c.TernaryWatchList[idx2], ternIdx)
+			c.TernaryWatchList[idx3] = append(c.TernaryWatchList[idx3], ternIdx)
+			
+			ternIdx++
+		}
 	}
 	
 	// Initialize watch arrays for long clauses (>3 literals)
