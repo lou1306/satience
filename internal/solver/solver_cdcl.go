@@ -2118,9 +2118,9 @@ func (s *CDCLSolver) tryLocalMinimizeWithClause(learnedLits, dbClause []cnf.Lite
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// LBD + Size + Activity based clause deletion
-	// Protect: Glue clauses (LBD ≤ 3), short clauses (< 10 literals), active clauses
-	// Delete: Large clauses (> 20 literals), high LBD (> 6), old inactive clauses
+	// Aggressive clause deletion - keep only the absolute best clauses
+	// Strategy: Delete by age first, then by quality
+	// Rationale: Old clauses, even with good LBD, may not be relevant to current search
 	
 	type clauseInfo struct {
 		idx      int
@@ -2142,41 +2142,38 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		activity := s.clauseActivity[i]
 		
 		// Calculate deletion score (higher = delete first)
-		// Base score from LBD (most important)
-		score := float64(lbd) * 100.0
+		// PRIMARY FACTOR: Age (old clauses are less relevant)
+		score := float64(age) * 10.0
 		
-		// Penalty for large size (aggressively delete long clauses)
-		if size > 20 {
-			score += float64(size-20) * 50.0
+		// SECONDARY FACTOR: LBD (higher LBD = less useful)
+		score += float64(lbd) * 50.0
+		
+		// TERTIARY FACTOR: Size (larger clauses are less useful)
+		score += float64(size) * 5.0
+		
+		// BONUS: Activity (active clauses are more useful)
+		score -= activity * 20.0
+		
+		// PROTECTION: Only protect truly exceptional clauses
+		// LBD == 2 AND size <= 4 AND age < 100: core glue, never delete
+		if lbd == 2 && size <= 4 && age < 100 {
+			score = -1000.0 // Absolutely never delete
 		}
 		
-		// Penalty for old age
-		score += float64(age) * 0.5
-		
-		// Bonus for activity (reduce score for active clauses)
-		score -= activity * 10.0
-		
-		// PROTECTION: Only protect very best clauses
-		// LBD <= 2 AND size < 6: never delete (core glue)
-		if lbd <= 2 && size < 6 {
-			score = -1000.0 // Never delete core glue
+		// LBD == 3 AND size <= 3 AND age < 50: very good, protect unless very old
+		if lbd == 3 && size <= 3 && age < 50 {
+			score = -500.0 // Protect unless very old
 		}
 		
-		// LBD == 3 AND size < 4: protect (very short good clauses)
-		if lbd == 3 && size < 4 {
-			score = -500.0
+		// FORCE DELETION: Very old clauses (age > 500) regardless of LBD
+		if age > 500 {
+			score += 1000.0 // Force deletion of very old clauses
 		}
 		
-		// All other clauses are fair game for deletion
-		// Especially: LBD >= 4 or size >= 6
-		
-		// PENALTY: Aggressively delete high-LBD clauses (LBD > 6)
-		if lbd > 6 {
-			score += 500.0 // Strong deletion bias
+		// FORCE DELETION: Large clauses (size > 15) regardless of LBD
+		if size > 15 {
+			score += 800.0 // Force deletion of large clauses
 		}
-		
-		// Don't protect all short clauses - only very short ones
-		// Removed: size < 5 protection (was causing accumulation)
 		
 		clauses = append(clauses, clauseInfo{
 			idx:      i,
