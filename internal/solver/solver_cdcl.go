@@ -199,7 +199,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	initialClauses := s.cnf.NumClauses
 	
-	for pass := 0; pass < 5; pass++ {
+	// Limit to 3 passes to prevent memory explosion on dense instances
+	for pass := 0; pass < 3; pass++ {
 		if s.verbose {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
@@ -699,6 +700,15 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
 	}
 	
+	// SAFEGUARD: Skip variable elimination on large formulas to prevent memory explosion
+	// PHP and similar dense instances create too many resolvents (Cartesian product)
+	if s.cnf.NumClauses > 100 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Variable elimination: skipped (%d clauses > 100)\n", s.cnf.NumClauses)
+		}
+		return UNKNOWN
+	}
+	
 	eliminatedCount := 0
 	resolventCount := 0
 	
@@ -763,10 +773,10 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			}
 			
 			originalCount := len(posClauses) + len(negClauses)
-			// More aggressive elimination: allow up to 50% blowup
-			// This enables elimination on PHP and other structured instances
-			// where resolvents can be reused for multiple eliminations
-			maxResolvents := originalCount + (originalCount / 2)
+			// CONSERVATIVE elimination: only allow if resolvents <= original clauses
+			// This prevents memory explosion on PHP and similar instances
+			// Aggressive elimination (50% blowup) causes OOM on dense instances
+			maxResolvents := originalCount
 			if len(resolvents) <= maxResolvents {
 				if s.verbose {
 					fmt.Printf("c [verbose] Eliminating var %d: %d clauses -> %d resolvents\n", 
@@ -891,11 +901,14 @@ func (s *CDCLSolver) isTautology(clause *cnf.Clause) bool {
 }
 
 func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
-	lits := make([]uint64, len(clause.Literals))
+	// Use a more efficient encoding: pack sorted literals into a string
+	// For small clauses (≤8 literals), this avoids fmt.Sprintf allocation
+	lits := make([]uint32, len(clause.Literals))
 	for i, lit := range clause.Literals {
-		lits[i] = uint64(lit)
+		lits[i] = uint32(lit)
 	}
 	
+	// Sort literals for canonical representation
 	for i := 0; i < len(lits)-1; i++ {
 		for j := i + 1; j < len(lits); j++ {
 			if lits[i] > lits[j] {
@@ -904,7 +917,16 @@ func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
 		}
 	}
 	
-	return fmt.Sprintf("%v", lits)
+	// Encode as bytes: each literal is 4 bytes
+	key := make([]byte, len(lits)*4)
+	for i, lit := range lits {
+		key[i*4] = byte(lit)
+		key[i*4+1] = byte(lit >> 8)
+		key[i*4+2] = byte(lit >> 16)
+		key[i*4+3] = byte(lit >> 24)
+	}
+	
+	return string(key)
 }
 
 func (s *CDCLSolver) blockedClauseElimination() SolveResult {
@@ -1399,6 +1421,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	for {
 		s.iterations++
+		if s.iterations % 1000000 == 0 && s.verbose {
+			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d\n", 
+				s.iterations, s.conflicts, s.level, len(s.learnedClauses))
+		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
 			if s.verbose {
 				fmt.Printf("c [verbose] Iteration limit reached (%d)\n", s.maxIter)
