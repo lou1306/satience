@@ -11,6 +11,15 @@ DB="/home/luca/git/opencode-sat-new/benchmark/meta.db"
 INSTANCES_DIR="/home/luca/git/opencode-sat-new/benchmark/gbd_instances"
 TIMEOUT=60  # seconds per instance
 
+# Cleanup function to kill any orphaned solver processes
+cleanup() {
+    pkill -9 -f "satience" 2>/dev/null || true
+    pkill -9 -f "minisat" 2>/dev/null || true
+}
+
+# Run cleanup at start
+cleanup
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -133,6 +142,9 @@ echo -e "Correct: ${GREEN}$correct${NC}"
 echo -e "Wrong: ${RED}$wrong${NC}"
 echo -e "Timeout: ${YELLOW}$timeout_count${NC}"
 echo ""
+
+# Cleanup solver processes
+cleanup
 
 if [ $wrong -gt 0 ]; then
     echo -e "${RED}TESTS FAILED${NC}"

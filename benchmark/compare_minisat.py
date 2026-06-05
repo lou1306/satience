@@ -8,6 +8,7 @@ Do not add parallel execution - limit is 8 concurrent solver instances.
 import subprocess
 import sys
 import os
+import signal
 import sqlite3
 from pathlib import Path
 
@@ -16,57 +17,84 @@ BENCHMARK_DIR = Path(__file__).parent / "gbd_instances"
 META_DB = Path(__file__).parent / "meta.db"
 
 def run_solver(solver_cmd, cnf_file, timeout=TIMEOUT):
-    """Run a solver and return (status, returncode, output)."""
+    """Run a solver and return (status, returncode, output).
+    
+    Ensures process is properly killed even on timeout.
+    """
     try:
-        result = subprocess.run(
+        # Use Popen for better process control
+        proc = subprocess.Popen(
             f"{solver_cmd} {cnf_file}",
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout
+            preexec_fn=os.setsid  # Create process group
         )
-        output = result.stdout + result.stderr
-
-        # Parse result
-        if "SAT" in output and "UNSAT" not in output:
-            status = "SAT"
-        elif "UNSAT" in output:
-            status = "UNSAT"
-        else:
-            status = "UNKNOWN"
-
-        return status, result.returncode, output
-
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", None, ""
+        
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            output = stdout + stderr
+            
+            # Parse result
+            if "SAT" in output and "UNSAT" not in output:
+                status = "SAT"
+            elif "UNSAT" in output:
+                status = "UNSAT"
+            else:
+                status = "UNKNOWN"
+            
+            return status, proc.returncode, output
+        except subprocess.TimeoutExpired:
+            # Kill entire process group to ensure all children are killed
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            return "TIMEOUT", None, ""
     except Exception as e:
         return "ERROR", str(e), ""
 
 def time_solver(solver_cmd, cnf_file, timeout=TIMEOUT):
-    """Time a solver run."""
+    """Time a solver run.
+    
+    Ensures process is properly killed even on timeout.
+    """
     import time
     start = time.time()
     try:
-        result = subprocess.run(
+        # Use Popen for better process control
+        proc = subprocess.Popen(
             f"{solver_cmd} {cnf_file}",
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout
+            preexec_fn=os.setsid  # Create process group
         )
-        elapsed = time.time() - start
-        output = result.stdout + result.stderr
-
-        if "SAT" in output and "UNSAT" not in output:
-            status = "SAT"
-        elif "UNSAT" in output:
-            status = "UNSAT"
-        else:
-            status = "UNKNOWN"
-
-        return status, elapsed
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", timeout
+        
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            elapsed = time.time() - start
+            output = stdout + stderr
+            
+            if "SAT" in output and "UNSAT" not in output:
+                status = "SAT"
+            elif "UNSAT" in output:
+                status = "UNSAT"
+            else:
+                status = "UNKNOWN"
+            
+            return status, elapsed
+        except subprocess.TimeoutExpired:
+            # Kill entire process group
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            return "TIMEOUT", timeout
     except Exception as e:
         return "ERROR", None
 
@@ -101,7 +129,30 @@ def count_vars_clauses(cnf_file):
                         pass
     return 0, 0
 
+def cleanup_solver_processes():
+    """Kill any orphaned satience/minisat processes from previous runs."""
+    try:
+        result = subprocess.run(
+            "pgrep -f 'satience|minisat'",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.stdout.strip():
+            pids = [pid.strip() for pid in result.stdout.strip().split('\n') if pid.strip()]
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+            print(f"c [cleanup] Killed {len(pids)} orphaned solver processes")
+    except Exception:
+        pass
+
 def main():
+    # Clean up any orphaned processes from previous runs
+    cleanup_solver_processes()
+    
     # Select diverse instances
     cnf_files = list(BENCHMARK_DIR.glob("*.cnf"))
 

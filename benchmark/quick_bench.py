@@ -7,6 +7,8 @@ Do not add parallel execution - limit is 8 concurrent solver instances.
 
 import subprocess
 import time
+import signal
+import os
 from pathlib import Path
 
 TIMEOUT = 30
@@ -46,29 +48,65 @@ INSTANCES = [
 ]
 
 def run_solver(solver, cnf_path, timeout=TIMEOUT):
-    """Run solver and return (result, time)."""
+    """Run solver and return (result, time).
+    
+    Ensures process is properly killed even on timeout.
+    """
     try:
         start = time.time()
-        result = subprocess.run(
+        # Use Popen for better process control
+        proc = subprocess.Popen(
             f"{solver} {cnf_path}",
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout
+            preexec_fn=os.setsid  # Create process group
         )
-        elapsed = time.time() - start
-        output = result.stdout + result.stderr
         
-        if "SAT" in output and "UNSAT" not in output:
-            return "SAT", elapsed
-        elif "UNSAT" in output:
-            return "UNSAT", elapsed
-        else:
-            return "UNKNOWN", elapsed
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", timeout
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            elapsed = time.time() - start
+            output = stdout + stderr
+            
+            if "SAT" in output and "UNSAT" not in output:
+                return "SAT", elapsed
+            elif "UNSAT" in output:
+                return "UNSAT", elapsed
+            else:
+                return "UNKNOWN", elapsed
+        except subprocess.TimeoutExpired:
+            # Kill entire process group to ensure all children are killed
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            return "TIMEOUT", timeout
     except Exception as e:
         return "ERROR", None
+
+def cleanup_solver_processes():
+    """Kill any orphaned satience/minisat processes from previous runs."""
+    import re
+    try:
+        result = subprocess.run(
+            "pgrep -f 'satience|minisat'",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                if pid.strip():
+                    try:
+                        os.kill(int(pid.strip()), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, ValueError):
+                        pass
+            print(f"c [cleanup] Killed {len(pids)} orphaned solver processes")
+    except Exception:
+        pass
 
 def get_stats(cnf_path):
     """Get vars and clauses from CNF."""
@@ -80,6 +118,9 @@ def get_stats(cnf_path):
     return 0, 0
 
 def main():
+    # Clean up any orphaned processes from previous runs
+    cleanup_solver_processes()
+    
     benchmark_dir = Path("benchmark/gbd_instances")
     
     print("=" * 100)

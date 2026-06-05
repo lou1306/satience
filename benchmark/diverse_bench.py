@@ -7,6 +7,8 @@ Do not add parallel execution - limit is 8 concurrent solver instances.
 
 import subprocess
 import time
+import signal
+import os
 from pathlib import Path
 
 TIMEOUT = 60
@@ -43,31 +45,66 @@ INSTANCES = [
     ("sudoku", "sudoku_3x3_empty_sat.cnf"),
 ]
 
-def run_solver(solver, cnf_path, timeout=TIMEOUT):
-    """Run solver and return (result, time)."""
+def cleanup_solver_processes():
+    """Kill any orphaned solver processes."""
     try:
-        start = time.time()
         result = subprocess.run(
-            f"{solver} {cnf_path}",
+            "pgrep -f 'satience|minisat'",
             shell=True,
             capture_output=True,
-            text=True,
-            timeout=timeout
+            text=True
         )
-        elapsed = time.time() - start
+        if result.stdout.strip():
+            pids = [pid.strip() for pid in result.stdout.strip().split('\n') if pid.strip()]
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+            print(f"c [cleanup] Killed {len(pids)} orphaned solver processes")
+    except Exception:
+        pass
+
+def run_solver(solver, cnf_path, timeout=TIMEOUT):
+    """Run solver and return (result, time).
+    
+    Ensures process is properly killed even on timeout.
+    """
+    try:
+        start = time.time()
+        proc = subprocess.Popen(
+            f"{solver} {cnf_path}",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=os.setsid
+        )
         
-        if "SAT" in result.stdout:
-            return "SAT", elapsed
-        elif "UNSAT" in result.stdout:
-            return "UNSAT", elapsed
-        else:
-            return "UNKNOWN", elapsed
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", timeout
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            elapsed = time.time() - start
+            
+            if "SAT" in stdout:
+                return "SAT", elapsed
+            elif "UNSAT" in stdout:
+                return "UNSAT", elapsed
+            else:
+                return "UNKNOWN", elapsed
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            return "TIMEOUT", timeout
     except Exception as e:
         return "ERROR", 0
 
 def main():
+    # Clean up orphaned processes
+    cleanup_solver_processes()
+    
     print("=" * 100)
     print("SATIENCE vs MiniSat - Diverse Family Benchmark")
     print("=" * 100)
