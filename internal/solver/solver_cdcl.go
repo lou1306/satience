@@ -122,7 +122,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	initialClauses := s.cnf.NumClauses
 	
-	for pass := 0; pass < 3; pass++ {
+	for pass := 0; pass < 5; pass++ {
 		if s.verbose {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
@@ -146,7 +146,14 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return veResult
 		}
 		
-		if s.cnf.NumClauses == initialClauses {
+		if s.conflicts < 1000 {
+			failedResult := s.failedLiteralElimination()
+			if failedResult != UNKNOWN {
+				return failedResult
+			}
+		}
+		
+		if s.cnf.NumClauses == initialClauses && pass >= 2 {
 			break
 		}
 		initialClauses = s.cnf.NumClauses
@@ -270,6 +277,126 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 	s.cnf.NumClauses = len(newClauses)
 }
 
+func (s *CDCLSolver) subsumptionElimination() {
+	removed := 0
+	
+	for i := 0; i < len(s.cnf.Clauses); i++ {
+		for j := 0; j < len(s.cnf.Clauses); j++ {
+			if i == j {
+				continue
+			}
+			
+			if s.subsumes(&s.cnf.Clauses[i], &s.cnf.Clauses[j]) {
+				s.cnf.Clauses[j] = s.cnf.Clauses[len(s.cnf.Clauses)-1]
+				s.cnf.Clauses = s.cnf.Clauses[:len(s.cnf.Clauses)-1]
+				removed++
+				if j < len(s.cnf.Clauses) {
+					j--
+				}
+			}
+		}
+	}
+	
+	if s.verbose && removed > 0 {
+		fmt.Printf("c [verbose] Subsumption elimination: removed %d clauses\n", removed)
+	}
+}
+
+func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
+	// Remove learned clauses that are subsumed by the new clause
+	remaining := make([]cnf.Clause, 0, len(s.learnedClauses))
+	removed := 0
+	
+	for i := range s.learnedClauses {
+		if !s.subsumes(newClause, &s.learnedClauses[i]) {
+			remaining = append(remaining, s.learnedClauses[i])
+		} else {
+			removed++
+		}
+	}
+	
+	if removed > 0 {
+		s.learnedClauses = remaining
+		s.clauseActivity = make([]float64, len(s.learnedClauses))
+		s.clauseAge = make([]int, len(s.learnedClauses))
+		if s.verbose {
+			fmt.Printf("c [verbose] Learned clause subsumption: removed %d clauses\n", removed)
+		}
+	}
+}
+
+func (s *CDCLSolver) isSubsumedByAny(clause cnf.Clause, clauses []cnf.Clause) bool {
+	for _, other := range clauses {
+		if s.subsumes(&other, &clause) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *CDCLSolver) failedLiteralElimination() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Failed literal elimination: checking %d variables\n", s.cnf.NumVars)
+	}
+	
+	changed := true
+	for changed {
+		changed = false
+		
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if s.assignments[varIdx].Level != 0 {
+				continue
+			}
+			
+			for polarity := 0; polarity < 2; polarity++ {
+				value := polarity == 0
+				lit := cnf.NewLiteral(varIdx, !value)
+				
+				savedTrail := len(s.trail)
+				savedImplication := make([]int, len(s.implication))
+				copy(savedImplication, s.implication)
+				
+				s.assignLiteral(lit, 1, -1)
+				conflict, _ := s.propagate()
+				
+				if conflict {
+					oppositeValue := !value
+					s.assignments[varIdx] = Assignment{
+						Value: oppositeValue,
+						Level: 1,
+					}
+					s.trail = s.trail[:savedTrail]
+					s.trailHead = s.trailHead[:1]
+					s.level = 0
+					copy(s.implication, savedImplication)
+					
+					conflict = s.simplifyAfterAssignment(varIdx, oppositeValue)
+					if conflict {
+						return UNSAT
+					}
+					
+					changed = true
+					if s.verbose {
+						fmt.Printf("c [verbose] Failed literal: var %d = %v\n", varIdx, oppositeValue)
+					}
+					break
+				} else {
+					for i := savedTrail; i < len(s.trail); i++ {
+						v := uint32(s.trail[i])
+						s.assignments[v] = Assignment{}
+						s.implication[v] = savedImplication[v]
+					}
+					s.trail = s.trail[:savedTrail]
+					s.trailHead = s.trailHead[:1]
+					s.level = 0
+				}
+			}
+		}
+	}
+	
+	return UNKNOWN
+}
+
 func (s *CDCLSolver) isUnitLiteral(lit cnf.Literal) bool {
 	varIdx := lit.Var()
 	for _, clause := range s.cnf.Clauses {
@@ -359,10 +486,37 @@ func luby(i int) int {
 }
 
 func (s *CDCLSolver) shouldRestart() bool {
-	// Use aggressive Luby restarts for now
-	// PHP and other structured instances benefit from frequent restarts
-	threshold := s.restartBase * luby(s.lubyIndex + 1)
+	// Very aggressive restarts for structured instances
+	// PHP and similar instances benefit from restarts every 100 conflicts
+	aggressiveThreshold := 100
+	
 	conflictsSinceRestart := s.conflicts - s.restartCount
+	
+	// First, check if we should use aggressive restarts
+	// Detect structured instances by high conflict rate at low decision levels
+	if s.conflicts > 500 && s.level <= 8 {
+		// Structured instance: use very frequent restarts
+		if conflictsSinceRestart >= aggressiveThreshold {
+			return true
+		}
+	}
+	
+	// Hybrid restart strategy: Luby + adaptive (Glucose-style)
+	// For the first 100 conflicts, use Luby to collect statistics
+	if s.lbdCount < 100 {
+		threshold := s.restartBase * luby(s.lubyIndex + 1)
+		return conflictsSinceRestart >= threshold
+	}
+	
+	// After 100 conflicts, use adaptive restarts based on LBD
+	// Restart if current LBD is much worse than average
+	avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
+	if s.lastConflictLBD > int(2.0*avgLBD) {
+		return true
+	}
+	
+	// Fallback to Luby for periodic restarts
+	threshold := s.restartBase * luby(s.lubyIndex + 1)
 	return conflictsSinceRestart >= threshold
 }
 
@@ -379,6 +533,12 @@ func (s *CDCLSolver) restart() {
 	}
 	for i := range s.assignments {
 		s.assignments[i] = Assignment{}
+	}
+	
+	// Inprocessing: apply subsumption elimination before clearing learned clauses
+	// This helps on PHP instances by simplifying the clause database
+	if s.conflicts > 0 && s.conflicts % 500 == 0 {
+		s.inprocessing()
 	}
 	
 	s.learnedClauses = s.learnedClauses[:0]
@@ -462,9 +622,10 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			}
 			
 			originalCount := len(posClauses) + len(negClauses)
-			// Allow slight blowup (up to 20%) to enable more elimination
-			// This is effective on PHP and other structured instances
-			maxResolvents := originalCount + (originalCount / 5)
+			// More aggressive elimination: allow up to 50% blowup
+			// This enables elimination on PHP and other structured instances
+			// where resolvents can be reused for multiple eliminations
+			maxResolvents := originalCount + (originalCount / 2)
 			if len(resolvents) <= maxResolvents {
 				if s.verbose {
 					fmt.Printf("c [verbose] Eliminating var %d: %d clauses -> %d resolvents\n", 
@@ -495,7 +656,9 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				}
 				
 				for _, resolvent := range resolvents {
-					keepClauses = append(keepClauses, resolvent)
+					if !s.isSubsumedByAny(resolvent, keepClauses) {
+						keepClauses = append(keepClauses, resolvent)
+					}
 				}
 				
 				s.cnf.Clauses = keepClauses
@@ -680,6 +843,25 @@ func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Litera
 	}
 
 	return true
+}
+
+func (s *CDCLSolver) inprocessing() {
+	if s.verbose {
+		fmt.Printf("c [verbose] Inprocessing: %d conflicts, %d clauses\n", s.conflicts, s.cnf.NumClauses)
+	}
+	
+	initialClauses := s.cnf.NumClauses
+	
+	s.subsumptionElimination()
+	
+	if s.conflicts % 1000 == 0 {
+		s.selfSubsumption()
+		s.variableElimination()
+	}
+	
+	if s.verbose && initialClauses != s.cnf.NumClauses {
+		fmt.Printf("c [verbose] Inprocessing: reduced from %d to %d clauses\n", initialClauses, s.cnf.NumClauses)
+	}
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
@@ -1196,15 +1378,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	// Only learn non-empty clauses
 	if len(learnedLits) > 0 {
+		// Check if this learned clause subsumes any existing learned clauses
+		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
+		s.subsumeLearnedClauses(&newClause)
+		
 		// Check if we need to delete clauses
 		if len(s.learnedClauses) >= s.maxLearned {
 			s.deleteLearnedClauses()
 		}
 		
-		s.learnedClauses = append(s.learnedClauses, cnf.Clause{
-			Literals: learnedLits,
-			Learned:  true,
-		})
+		s.learnedClauses = append(s.learnedClauses, newClause)
 		s.clauseActivity = append(s.clauseActivity, 0.0) // Initial activity
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.currentAge++
