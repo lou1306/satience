@@ -1596,6 +1596,139 @@ func (s *CDCLSolver) propagateBinary() (bool, int) {
 	return false, -1 // No conflict, no propagation
 }
 
+// propagateLong propagates long clauses (>3 literals) using watched literals
+// Returns (conflict, clauseIdx) where clauseIdx >= 0 means conflict/unit, < 0 means no issue
+func (s *CDCLSolver) propagateLong() (bool, int) {
+	// Skip if watches not initialized yet (during preprocessing)
+	if s.cnf.LongWatchA == nil {
+		return false, -1
+	}
+	
+	// Process all assigned literals on the trail that haven't been processed yet
+	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
+		assignedVar := uint32(s.trail[trailIdx])
+		assignedValue := s.assignments[assignedVar].Value
+		
+		// When a literal becomes false, check clauses watching it
+		falseLit := cnf.NewLiteral(assignedVar, assignedValue) // The literal that is FALSE
+		falseLitIdx := cnf.LitToIndex(falseLit)
+		
+		// Get all long clauses watching this false literal
+		watchList := s.cnf.WatchListLong[falseLitIdx]
+		
+		for i := 0; i < len(watchList); i++ {
+			watchIdx := watchList[i]
+			clauseIdx := s.cnf.LongClauseIndices[watchIdx]
+			clause := &s.cnf.Clauses[clauseIdx]
+			
+			// Get the two watched literals
+			watchAIdx := s.cnf.LongWatchA[watchIdx]
+			watchBIdx := s.cnf.LongWatchB[watchIdx]
+			
+			watchA := cnf.IndexToLit(watchAIdx)
+			watchB := cnf.IndexToLit(watchBIdx)
+			
+			// One of these watches should be the false literal
+			// The other watch is what we need to check
+			var otherWatch cnf.Literal
+			
+			if watchA == falseLit {
+				otherWatch = watchB
+			} else if watchB == falseLit {
+				otherWatch = watchA
+			} else {
+				// Neither watch is the false literal - this shouldn't happen
+				// Skip this clause (it's watching other literals)
+				continue
+			}
+			
+			// Check the other watch
+			otherVar := otherWatch.Var()
+			
+			if s.assignments[otherVar].Level != 0 {
+				// Other literal is already assigned
+				otherValue := s.assignments[otherVar].Value
+				otherIsTrue := (!otherWatch.IsNegated() && otherValue) || (otherWatch.IsNegated() && !otherValue)
+				
+				if otherIsTrue {
+					// Clause is satisfied by the other watch
+					continue
+				}
+				// Both watches are false - need to find a new watch
+			}
+			
+			// Try to find a new watch among the unwatched literals
+			foundNewWatch := false
+			for _, lit := range clause.Literals {
+				litIdx := cnf.LitToIndex(lit)
+				
+				// Skip if this is one of the current watches
+				if litIdx == watchAIdx || litIdx == watchBIdx {
+					continue
+				}
+				
+				// Check if this literal can be a new watch
+				varIdx := lit.Var()
+				if s.assignments[varIdx].Level == 0 {
+					// Unassigned literal - perfect new watch!
+					// Update watches: keep falseLit, replace otherWatch with this lit
+					if watchA == falseLit {
+						s.cnf.LongWatchA[watchIdx] = falseLitIdx
+						s.cnf.LongWatchB[watchIdx] = litIdx
+					} else {
+						s.cnf.LongWatchA[watchIdx] = litIdx
+						s.cnf.LongWatchB[watchIdx] = falseLitIdx
+					}
+					
+					// Update watch lists
+					// Remove from old watch list, add to new one
+					// For simplicity, just add to new watch list (lazy cleanup)
+					s.cnf.WatchListLong[litIdx] = append(s.cnf.WatchListLong[litIdx], watchIdx)
+					
+					foundNewWatch = true
+					break
+				}
+				
+				// Check if assigned literal is true
+				litValue := s.assignments[varIdx].Value
+				litIsTrue := (!lit.IsNegated() && litValue) || (lit.IsNegated() && !litValue)
+				if litIsTrue {
+					// True literal - good new watch
+					if watchA == falseLit {
+						s.cnf.LongWatchA[watchIdx] = falseLitIdx
+						s.cnf.LongWatchB[watchIdx] = litIdx
+					} else {
+						s.cnf.LongWatchA[watchIdx] = litIdx
+						s.cnf.LongWatchB[watchIdx] = falseLitIdx
+					}
+					
+					s.cnf.WatchListLong[litIdx] = append(s.cnf.WatchListLong[litIdx], watchIdx)
+					foundNewWatch = true
+					break
+				}
+			}
+			
+			if !foundNewWatch {
+				// No alternative watch found - the other watch MUST be true
+				// If other watch is unassigned, this is unit propagation
+				if s.assignments[otherVar].Level == 0 {
+					// Unit propagation - assign it
+					assignLevel := s.level
+					if assignLevel == 0 {
+						assignLevel = 1
+					}
+					s.assignLiteral(otherWatch, assignLevel, clauseIdx)
+					return false, int(otherVar) + 1 // Signal propagation
+				}
+				// Both watches false and no new watch - CONFLICT!
+				return true, clauseIdx
+			}
+		}
+	}
+	
+	return false, -1 // No conflict, no propagation
+}
+
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
@@ -1618,9 +1751,32 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// Check original (non-binary) clauses for conflicts and unit propagation
+		// Propagate long clauses using watched literals
+		conflict, clauseIdx = s.propagateLong()
+		if conflict {
+			return true, clauseIdx
+		}
+		if clauseIdx >= 0 {
+			// Unit propagation happened
+			unitPropagated = true
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
+		// Check original clauses not using watched literals
+		// (ternary clauses and 4-literal clauses; binary and >3 literal use watched literals)
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
+			
+			// Skip binary clauses (handled by propagateBinary)
+			if len(clause.Literals) == 2 {
+				continue
+			}
+			
+			// Skip long clauses (handled by propagateLong)
+			if len(clause.Literals) > 4 {
+				continue
+			}
 			
 			// Count satisfied, false, and unassigned literals
 			satisfiedCount := 0

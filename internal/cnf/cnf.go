@@ -89,6 +89,16 @@ type CNF struct {
 	BinaryWatchA []int
 	BinaryWatchB []int
 	
+	// Watched literals for long clauses (>3 literals)
+	// WatchListLong[lit] contains indices into LongClauseIndices
+	// LongClauseIndices[watchIdx] maps to the actual clause index in Clauses[]
+	WatchListLong [][]int
+	// longWatchA and longWatchB store which literals each long clause watches
+	LongWatchA []int
+	LongWatchB []int
+	// LongClauseIndices maps watch index to actual clause index in Clauses[]
+	LongClauseIndices []int
+	
 	// Arena-based clause storage (alternative to Clauses slice)
 	Arena *ClauseArena
 }
@@ -110,6 +120,9 @@ func NewCNF(numVars uint32, numClauses int) *CNF {
 		WatchList:      make([][]int, watchListSize),
 		BinaryWatchA:   nil,
 		BinaryWatchB:   nil,
+		WatchListLong:  make([][]int, watchListSize),
+		LongWatchA:     nil,
+		LongWatchB:     nil,
 		Arena:          NewClauseArena(arenaCapacity),
 	}
 }
@@ -199,14 +212,16 @@ func IndexToLit(idx int) Literal {
 	return NewLiteral(varIdx, isNegated)
 }
 
-// InitializeWatches initializes the watched literals scheme for binary clauses
+// InitializeWatches initializes the watched literals scheme for binary and long clauses
 // Should be called AFTER preprocessing, before search starts
 func (c *CNF) InitializeWatches() {
 	// Clear watch lists
 	watchListSize := int(c.NumVars) * 2
 	c.WatchList = make([][]int, watchListSize)
+	c.WatchListLong = make([][]int, watchListSize)
 	for i := range c.WatchList {
 		c.WatchList[i] = make([]int, 0)
+		c.WatchListLong[i] = make([]int, 0)
 	}
 	
 	// Initialize watch arrays for binary clauses
@@ -227,6 +242,39 @@ func (c *CNF) InitializeWatches() {
 		// Add clause to both watch lists
 		c.WatchList[idx1] = append(c.WatchList[idx1], binIdx)
 		c.WatchList[idx2] = append(c.WatchList[idx2], binIdx)
+	}
+	
+	// Initialize watch arrays for long clauses (>3 literals)
+	longClauseCount := 0
+	for _, clause := range c.Clauses {
+		if len(clause.Literals) > 3 && !clause.Learned {
+			longClauseCount++
+		}
+	}
+	
+	c.LongWatchA = make([]int, longClauseCount)
+	c.LongWatchB = make([]int, longClauseCount)
+	c.LongClauseIndices = make([]int, longClauseCount)
+	
+	longIdx := 0
+	for clauseIdx, clause := range c.Clauses {
+		if len(clause.Literals) > 3 && !clause.Learned {
+			lit1 := clause.Literals[0]
+			lit2 := clause.Literals[1]
+			
+			idx1 := LitToIndex(lit1)
+			idx2 := LitToIndex(lit2)
+			
+			c.LongWatchA[longIdx] = idx1
+			c.LongWatchB[longIdx] = idx2
+			c.LongClauseIndices[longIdx] = clauseIdx
+			
+			// Add clause to both watch lists
+			c.WatchListLong[idx1] = append(c.WatchListLong[idx1], longIdx)
+			c.WatchListLong[idx2] = append(c.WatchListLong[idx2], longIdx)
+			
+			longIdx++
+		}
 	}
 }
 
