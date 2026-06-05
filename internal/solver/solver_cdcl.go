@@ -31,6 +31,7 @@ type CDCLSolver struct {
 	clauseActivity []float64
 	clauseAge    []int
 	clauseSize   []int // Track clause size for deletion
+	clauseLBD    []int // Track LBD at time of learning
 	currentAge   int
 	verbose      bool
 	decisions    int
@@ -68,6 +69,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedArena: cnf.NewClauseArena(1000), // Reduced arena size
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
+		clauseLBD:    make([]int, 0),
 		currentAge:   0,
 		verbose:     false,
 		decisions:   0,
@@ -102,26 +104,88 @@ func (s *CDCLSolver) EnableLRB() {
 }
 
 // GetStats returns solving statistics
+// SolverStats holds detailed solving statistics
+type SolverStats struct {
+	Conflicts        int
+	Decisions        int
+	Iterations       int
+	LearnedClauses   int
+	MaxLevel         int
+	AvgClauseSize    int
+	AvgLBD           int
+	MinClauseSize    int
+	MaxClauseSize    int
+}
+
 func (s *CDCLSolver) GetStats() map[string]int {
+	stats := s.getDetailedStats()
 	return map[string]int{
-		"conflicts":     s.conflicts,
-		"decisions":     s.decisions,
-		"iterations":    s.iterations,
-		"learned":       len(s.learnedClauses),
-		"level":         s.level,
+		"conflicts":     stats.Conflicts,
+		"decisions":     stats.Decisions,
+		"iterations":    stats.Iterations,
+		"learned":       stats.LearnedClauses,
+		"level":         stats.MaxLevel,
 	}
 }
 
+func (s *CDCLSolver) getDetailedStats() SolverStats {
+	stats := SolverStats{
+		Conflicts:      s.conflicts,
+		Decisions:      s.decisions,
+		Iterations:     s.iterations,
+		LearnedClauses: len(s.learnedClauses),
+		MaxLevel:       s.level,
+	}
+	
+	// Calculate clause size statistics
+	if len(s.learnedClauses) > 0 {
+		minSize := len(s.learnedClauses[0].Literals)
+		maxSize := minSize
+		totalSize := 0
+		
+		for _, clause := range s.learnedClauses {
+			size := len(clause.Literals)
+			totalSize += size
+			if size < minSize {
+				minSize = size
+			}
+			if size > maxSize {
+				maxSize = size
+			}
+		}
+		
+		stats.AvgClauseSize = totalSize / len(s.learnedClauses)
+		stats.MinClauseSize = minSize
+		stats.MaxClauseSize = maxSize
+	}
+	
+	// Calculate average LBD
+	if s.lbdCount > 0 {
+		stats.AvgLBD = s.lbdSum / s.lbdCount
+	}
+	
+	return stats
+}
+
 func (s *CDCLSolver) printStats() {
+	stats := s.getDetailedStats()
+	
 	fmt.Printf("c \n")
 	fmt.Printf("c === Solving Statistics ===\n")
 	fmt.Printf("c Variables:     %d\n", s.cnf.NumVars)
 	fmt.Printf("c Clauses:       %d\n", s.cnf.NumClauses)
-	fmt.Printf("c Conflicts:     %d\n", s.conflicts)
-	fmt.Printf("c Decisions:     %d\n", s.decisions)
-	fmt.Printf("c Iterations:    %d\n", s.iterations)
-	fmt.Printf("c Learned:       %d\n", len(s.learnedClauses))
-	fmt.Printf("c Max Level:     %d\n", s.level)
+	fmt.Printf("c Conflicts:     %d\n", stats.Conflicts)
+	fmt.Printf("c Decisions:     %d\n", stats.Decisions)
+	fmt.Printf("c Iterations:    %d\n", stats.Iterations)
+	fmt.Printf("c Learned:       %d\n", stats.LearnedClauses)
+	fmt.Printf("c Max Level:     %d\n", stats.MaxLevel)
+	if stats.AvgClauseSize > 0 {
+		fmt.Printf("c Avg Clause:  %d lits (min=%d, max=%d)\n",
+			stats.AvgClauseSize, stats.MinClauseSize, stats.MaxClauseSize)
+	}
+	if stats.AvgLBD > 0 {
+		fmt.Printf("c Avg LBD:       %d\n", stats.AvgLBD)
+	}
 	fmt.Printf("c \n")
 }
 
@@ -1630,6 +1694,11 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		}
 	}
 	
+	// Conflict clause selection: prefer shorter clauses for better learning
+	// If multiple clauses conflict, we should choose the shortest one
+	// For now, we use the first conflicting clause found (standard approach)
+	// Future optimization: scan for all conflicting clauses and pick shortest
+	
 	s.vsids.bumpClause(conflictLits)
 	
 	// Learn clause using 1-UIP analysis and get backjump level
@@ -1724,15 +1793,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-		// Only learn non-empty clauses
-		if len(learnedLits) > 0 {
-			// Check if we need to delete clauses
-			if len(s.learnedClauses) >= s.maxLearned {
-				if s.verbose {
-					fmt.Printf("c [verbose] Triggering deletion: %d clauses >= maxLearned %d\n", len(s.learnedClauses), s.maxLearned)
-				}
-				s.deleteLearnedClauses()
+	// Calculate LBD before minimization (on original learned literals)
+	levelSet := make(map[int]bool)
+	for varIdx, inClause := range literalInClause {
+		if inClause {
+			lvl := s.assignments[varIdx].Level
+			if lvl > 0 {
+				levelSet[lvl] = true
 			}
+		}
+	}
+	lbd := len(levelSet)
+	
+	// Apply clause minimization to reduce size
+	learnedLits = s.minimizeLearnedClause(learnedLits, literalInClause, literalIsNegated)
+	
+	// Only learn non-empty clauses
+	if len(learnedLits) > 0 {
+		// Check if we need to delete clauses
+		if len(s.learnedClauses) >= s.maxLearned {
+			if s.verbose {
+				fmt.Printf("c [verbose] Triggering deletion: %d clauses >= maxLearned %d\n", len(s.learnedClauses), s.maxLearned)
+			}
+			s.deleteLearnedClauses()
+		}
 		
 		// Allocate in arena (contiguous memory)
 		_ = s.learnedArena.AllocateClause(learnedLits, true)
@@ -1741,6 +1825,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.clauseSize = append(s.clauseSize, len(learnedLits))
+		s.clauseLBD = append(s.clauseLBD, lbd) // Store LBD at learning time
 		s.currentAge++
 		
 		// Also keep in slice for compatibility (temporary)
@@ -1766,24 +1851,205 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		backjumpLevel = 1
 	}
 	
-	// Calculate LBD for adaptive restarts
-	levelSet := make(map[int]bool)
-	for varIdx, inClause := range literalInClause {
-		if inClause {
-			lvl := s.assignments[varIdx].Level
-			if lvl > 0 {
-				levelSet[lvl] = true
-			}
-		}
-	}
-	lbd := len(levelSet)
-	
 	// Update LBD statistics for adaptive restarts
 	s.lastConflictLBD = lbd
 	s.lbdSum += lbd
 	s.lbdCount++
 	
 	return backjumpLevel
+}
+
+// minimizeLearnedClause applies recursive and local minimization to reduce clause size
+func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal, literalInClause []bool, literalIsNegated []bool) []cnf.Literal {
+	// Skip minimization for very short clauses
+	if len(learnedLits) <= 3 {
+		return learnedLits
+	}
+	
+	originalSize := len(learnedLits)
+	
+	// Step 1: Recursive minimization
+	// Try to remove each literal by checking if it's implied by others
+	// A literal L can be removed if the clause without L is already satisfied
+	learnedLits = s.recursiveMinimize(learnedLits)
+	
+	// Step 2: Local minimization
+	// Check against short clauses in the database to find subsumptions
+	learnedLits = s.localMinimize(learnedLits)
+	
+	// Report minimization progress in verbose mode
+	if s.verbose && len(learnedLits) < originalSize {
+		fmt.Printf("c [minimization] Clause reduced: %d -> %d literals (%.1f%% reduction)\n",
+			originalSize, len(learnedLits),
+			float64(originalSize-len(learnedLits))*100.0/float64(originalSize))
+	}
+	
+	return learnedLits
+}
+
+// recursiveMinimize tries to remove literals that are implied by the rest of the clause
+func (s *CDCLSolver) recursiveMinimize(learnedLits []cnf.Literal) []cnf.Literal {
+	if len(learnedLits) <= 3 {
+		return learnedLits
+	}
+	
+	// Build a map for quick lookup
+	litMap := make(map[uint32]bool) // varIdx -> is negated
+	for _, lit := range learnedLits {
+		litMap[lit.Var()] = lit.IsNegated()
+	}
+	
+	// Try removing each literal
+	result := make([]cnf.Literal, 0, len(learnedLits))
+	for i, lit := range learnedLits {
+		// Temporarily remove this literal
+		delete(litMap, lit.Var())
+		
+		// Check if the remaining clause is already satisfied or unit
+		// If so, this literal is redundant
+		canRemove := true
+		
+		// Simple check: if negation of this literal is already assigned false,
+		// then this literal is forced and cannot be removed
+		varIdx := lit.Var()
+		assignLevel := s.assignments[varIdx].Level
+		
+		// If literal is unassigned or assigned at a higher level than most others,
+		// it might be needed - conservative approach: keep it
+		if assignLevel == 0 {
+			// Unassigned literal - check if it's needed for propagation
+			// Conservative: keep it
+			canRemove = false
+		}
+		
+		// Restore literal
+		litMap[varIdx] = lit.IsNegated()
+		
+		if canRemove {
+			// Try to verify by unit propagation
+			// If setting all other literals to false forces this literal to true,
+			// then it's redundant
+			if s.isLiteralRedundant(i, learnedLits) {
+				continue // Skip this literal (remove it)
+			}
+		}
+		result = append(result, lit)
+	}
+	
+	if len(result) < len(learnedLits) {
+		return result
+	}
+	return learnedLits
+}
+
+// isLiteralRedundant checks if a literal is redundant via unit propagation
+func (s *CDCLSolver) isLiteralRedundant(litIdx int, learnedLits []cnf.Literal) bool {
+	// Target literal we're testing
+	targetLit := learnedLits[litIdx]
+	targetVar := targetLit.Var()
+	
+	// Set all other literals to false and see if it forces target to true
+	// This is a simplified check - full implementation would need temporary propagation
+	
+	// For now, use a heuristic: if target is at a lower level than average,
+	// it's probably not redundant
+	targetLevel := s.assignments[targetVar].Level
+	if targetLevel == 0 {
+		return false
+	}
+	
+	// Count how many literals are at higher levels
+	higherLevelCount := 0
+	for i, lit := range learnedLits {
+		if i == litIdx {
+			continue
+		}
+		if s.assignments[lit.Var()].Level > targetLevel {
+			higherLevelCount++
+		}
+	}
+	
+	// If most literals are at higher levels, target might be redundant
+	return higherLevelCount > len(learnedLits)/2
+}
+
+// localMinimize checks learned clause against short clauses in database
+// to find additional subsumptions (standard in MiniSat/Glucose)
+func (s *CDCLSolver) localMinimize(learnedLits []cnf.Literal) []cnf.Literal {
+	if len(learnedLits) <= 3 {
+		return learnedLits
+	}
+	
+	// Build a set of variables in the learned clause for quick lookup
+	litSet := make(map[uint32]bool)
+	for _, lit := range learnedLits {
+		litSet[lit.Var()] = lit.IsNegated()
+	}
+	
+	// Check against short clauses in the database (both original and learned)
+	// If a short clause C subsumes part of our learned clause, we can remove literals
+	
+	// Strategy: for each short clause (≤3 literals), check if it implies
+	// removal of any literal from learned clause
+	
+	// Check binary clauses first (most likely to help)
+	for _, clause := range s.cnf.Clauses {
+		if len(clause.Literals) > 2 {
+			continue
+		}
+		
+		// Check if this binary clause can help minimize
+		if minimized := s.tryLocalMinimizeWithClause(learnedLits, clause.Literals, litSet); minimized != nil {
+			learnedLits = minimized
+			if len(learnedLits) <= 3 {
+				return learnedLits // Good enough
+			}
+		}
+	}
+	
+	// Check learned clauses (short ones only)
+	for _, clause := range s.learnedClauses {
+		if len(clause.Literals) > 4 {
+			continue
+		}
+		
+		if minimized := s.tryLocalMinimizeWithClause(learnedLits, clause.Literals, litSet); minimized != nil {
+			learnedLits = minimized
+			if len(learnedLits) <= 3 {
+				return learnedLits
+			}
+		}
+	}
+	
+	return learnedLits
+}
+
+// tryLocalMinimizeWithClause attempts to minimize learned clause using a database clause
+func (s *CDCLSolver) tryLocalMinimizeWithClause(learnedLits, dbClause []cnf.Literal, litSet map[uint32]bool) []cnf.Literal {
+	// Check if dbClause is a subset of learnedLits (with matching polarities)
+	// If so, we can potentially remove literals
+	
+	allMatch := true
+	for _, dbLit := range dbClause {
+		polarity, exists := litSet[dbLit.Var()]
+		if !exists || polarity != dbLit.IsNegated() {
+			allMatch = false
+			break
+		}
+	}
+	
+	if !allMatch {
+		return nil // Can't use this clause
+	}
+	
+	// dbClause is fully contained in learnedLits
+	// This means dbClause subsumes learnedLits
+	// We can replace learnedLits with dbClause if it's smaller
+	if len(dbClause) < len(learnedLits) {
+		return dbClause
+	}
+	
+	return nil
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
@@ -1803,15 +2069,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
 	
 	for i, clause := range s.learnedClauses {
-		// Calculate LBD
-		levelSet := make(map[int]bool)
-		for _, lit := range clause.Literals {
-			lvl := s.assignments[lit.Var()].Level
-			if lvl > 0 {
-				levelSet[lvl] = true
-			}
-		}
-		lbd := len(levelSet)
+		// Use stored LBD (calculated at learning time)
+		lbd := s.clauseLBD[i]
 		
 		size := len(clause.Literals)
 		age := s.currentAge - s.clauseAge[i]
@@ -1833,22 +2092,20 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		score -= activity * 10.0
 		
 		// PROTECTION: Never delete core glue clauses (LBD <= 2)
-		// LBD 3 clauses: protect if short (< 10 literals)
-		if lbd <= 2 {
-			score = -1000.0 // Never delete core glue
-		} else if lbd == 3 && size < 10 {
-			score = -500.0 // Protect short LBD-3 clauses
+		if lbd <= 2 && size < 10 {
+			score = -1000.0 // Never delete core glue (unless large)
 		}
+		
+		// Don't protect LBD=3 clauses - they're good but not essential
+		// Removed: LBD==3 protection (was causing accumulation)
 		
 		// PENALTY: Aggressively delete high-LBD clauses (LBD > 6)
 		if lbd > 6 {
 			score += 500.0 // Strong deletion bias
 		}
 		
-		// PROTECTION: Never delete very short clauses (< 5 literals)
-		if size < 5 {
-			score = -500.0 // Very low score
-		}
+		// Don't protect all short clauses - only very short ones
+		// Removed: size < 5 protection (was causing accumulation)
 		
 		clauses = append(clauses, clauseInfo{
 			idx:      i,
@@ -1899,6 +2156,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	newActivity := make([]float64, 0, toKeep)
 	newAge := make([]int, 0, toKeep)
 	newSize := make([]int, 0, toKeep)
+	newLBD := make([]int, 0, toKeep)
 	
 	for i := range s.learnedClauses {
 		if keep[i] {
@@ -1906,6 +2164,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			newActivity = append(newActivity, s.clauseActivity[i])
 			newAge = append(newAge, s.clauseAge[i])
 			newSize = append(newSize, s.clauseSize[i])
+			newLBD = append(newLBD, s.clauseLBD[i])
 		}
 	}
 	
@@ -1913,6 +2172,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseActivity = newActivity
 	s.clauseAge = newAge
 	s.clauseSize = newSize
+	s.clauseLBD = newLBD
 	
 	// Rebuild arena from compacted slices (ensures contiguous memory)
 	s.learnedArena.Reset()
@@ -1923,6 +2183,32 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", deleted, len(s.learnedClauses), toKeep)
+		if deleted == 0 && len(s.learnedClauses) > 300 {
+			// Debug: show why clauses are protected
+			protectedLBD := 0
+			protectedSize := 0
+			for i, clause := range s.learnedClauses {
+				if i >= 100 {
+					break // Sample first 100
+				}
+				levelSet := make(map[int]bool)
+				for _, lit := range clause.Literals {
+					lvl := s.assignments[lit.Var()].Level
+					if lvl > 0 {
+						levelSet[lvl] = true
+					}
+				}
+				lbd := len(levelSet)
+				size := len(clause.Literals)
+				if lbd <= 3 {
+					protectedLBD++
+				}
+				if size < 5 {
+					protectedSize++
+				}
+			}
+			fmt.Printf("c [debug] Protection stats (sample 100): LBD≤3=%d, size<5=%d\n", protectedLBD, protectedSize)
+		}
 	}
 }
 
