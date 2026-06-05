@@ -44,12 +44,14 @@ type CDCLSolver struct {
 	lbdSum       int
 	lbdCount     int
 	lastConflictLBD int
+	conflictsAtLevel []int  // Track conflicts per decision level
+	lastRandomDecision int  // Last conflict where we made random decision
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := 200   // Reduced from 10000 - keep only highest-quality clauses
-	minLearned := 100   // Target after deletion (50% reduction)
+	maxLearned := 500   // Allow more accumulation between restarts
+	minLearned := 200   // Target after deletion (60% reduction)
 	restartBase := 100  // Base for Luby restart sequence
 	return &CDCLSolver{
 		cnf:         formula,
@@ -79,6 +81,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lbdSum:       0,
 		lbdCount:     0,
 		lastConflictLBD: 0,
+		conflictsAtLevel: make([]int, formula.NumVars+1),
+		lastRandomDecision: -1000,
 	}
 }
 
@@ -536,39 +540,13 @@ func (s *CDCLSolver) restart() {
 		fmt.Printf("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 	}
 	
-	s.trail = s.trail[:0]
-	s.trailHead = s.trailHead[:1]
-	s.level = 0
-	for i := range s.implication {
-		s.implication[i] = -1
-	}
-	for i := range s.assignments {
-		s.assignments[i] = Assignment{}
-	}
-	
-	// Inprocessing: apply subsumption elimination before clearing learned clauses
-	// This helps on PHP instances by simplifying the clause database
-	if s.conflicts > 0 && s.conflicts % 500 == 0 {
-		s.inprocessing()
-	}
-	
-	// Clear all learned clauses on restart (original behavior)
-	// Rationale: restarts are frequent (every 100-400 conflicts), so keeping clauses
-	// doesn't help much. Better to start fresh and relearn high-quality clauses.
-	s.learnedClauses = s.learnedClauses[:0]
-	s.clauseActivity = s.clauseActivity[:0]
-	s.clauseAge = s.clauseAge[:0]
-	s.clauseSize = s.clauseSize[:0]
-	s.learnedArena.Reset() // Clear arena memory
-	
-	// Don't clear all learned clauses - keep glue clauses (LBD <= 3)
-	// This preserves valuable learned information across restarts
-	// IMPORTANT: Calculate LBD BEFORE clearing assignments!
+	// IMPORTANT: Calculate LBD and identify glue clauses BEFORE clearing assignments!
+	// Glue clauses (LBD <= 3) are preserved across restarts
 	glueCount := 0
 	isGlue := make([]bool, len(s.learnedClauses))
 	
 	for i, clause := range s.learnedClauses {
-		// Calculate LBD BEFORE clearing trail
+		// Calculate LBD while assignments are still valid
 		levelSet := make(map[int]bool)
 		for _, lit := range clause.Literals {
 			lvl := s.assignments[lit.Var()].Level
@@ -578,8 +556,11 @@ func (s *CDCLSolver) restart() {
 		}
 		lbd := len(levelSet)
 		
-		// Keep glue clauses (LBD <= 3)
-		if lbd <= 3 {
+		// Keep glue clauses (LBD <= 5) - relaxed threshold
+		// LBD <= 2: core glue (most valuable)
+		// LBD 3-5: useful clauses (keep across restarts)
+		// LBD > 5: trash (delete)
+		if lbd <= 5 {
 			glueCount++
 			isGlue[i] = true
 		}
@@ -587,6 +568,26 @@ func (s *CDCLSolver) restart() {
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] Restart: keeping %d glue clauses, deleting %d non-glue\n", glueCount, len(s.learnedClauses)-glueCount)
+	}
+	
+	// Clear trail and assignments
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.level = 0
+	for i := range s.implication {
+		s.implication[i] = -1
+	}
+	for i := range s.assignments {
+		s.assignments[i] = Assignment{}
+	}
+	// Reset conflicts at all levels
+	for i := range s.conflictsAtLevel {
+		s.conflictsAtLevel[i] = 0
+	}
+	
+	// Inprocessing: apply subsumption elimination periodically
+	if s.conflicts > 0 && s.conflicts % 500 == 0 {
+		s.inprocessing()
 	}
 	
 	// Compact to keep only glue clauses
@@ -1506,12 +1507,74 @@ func (s *CDCLSolver) propagate() (bool, int) {
 	return false, -1
 }
 
+// selectRandomUnassigned selects a random unassigned variable
+func (s *CDCLSolver) selectRandomUnassigned() uint32 {
+	unassigned := make([]uint32, 0)
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level == 0 {
+			unassigned = append(unassigned, i)
+		}
+	}
+	
+	if len(unassigned) == 0 {
+		return 0
+	}
+	
+	// Simple deterministic "random" selection based on conflict count
+	// This ensures reproducibility while providing diversification
+	idx := s.conflicts % len(unassigned)
+	return unassigned[idx]
+}
+
 func (s *CDCLSolver) decide() bool {
 	if !s.vsids.hasUnassigned(s.assignments, s.cnf.NumVars) {
 		return false
 	}
 
-	varIdx, phase := s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+	// Track conflicts at current level
+	if s.level > 0 && s.level < len(s.conflictsAtLevel) {
+		s.conflictsAtLevel[s.level]++
+	}
+	
+	// Diversification: force random decision if stuck at same level
+	// This helps escape local minima in the search space
+	stuckThreshold := 500 // conflicts at same level before forcing random
+	forceRandom := false
+	
+	if s.level > 0 && s.conflictsAtLevel[s.level] > stuckThreshold {
+		// Been stuck at this level for too long
+		if s.conflicts - s.lastRandomDecision > 100 { // At least 100 conflicts since last random
+			forceRandom = true
+		}
+	}
+	
+	// Also add 5% random decisions to prevent getting stuck
+	if !forceRandom && s.conflicts > 0 && s.conflicts % 20 == 0 {
+		// 5% chance of random decision
+		forceRandom = true
+	}
+	
+	var varIdx uint32
+	var phase bool
+	
+	if forceRandom {
+		// Select random unassigned variable
+		varIdx = s.selectRandomUnassigned()
+		// Random phase
+		phase = s.conflicts % 2 == 0
+		s.lastRandomDecision = s.conflicts
+		
+		if s.verbose && s.conflicts % 1000 == 0 {
+			fmt.Printf("c [verbose] Diversification: random decision at conflict %d, level %d\n", s.conflicts, s.level)
+		}
+		
+		// Reset conflicts at this level after random decision
+		if s.level > 0 && s.level < len(s.conflictsAtLevel) {
+			s.conflictsAtLevel[s.level] = 0
+		}
+	} else {
+		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+	}
 
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
@@ -1766,8 +1829,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Bonus for activity (reduce score for active clauses)
 		score -= activity * 10.0
 		
-		// PROTECTION: Never delete glue clauses with LBD <= 3
-		if lbd <= 3 {
+		// PROTECTION: Never delete glue clauses with LBD <= 5
+		if lbd <= 5 {
 			score = -1000.0 // Very low score = never delete
 		}
 		
@@ -1884,6 +1947,11 @@ func (s *CDCLSolver) backtrack() bool {
 	s.trail = s.trail[:decisionPoint]
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
+	
+	// Reset conflicts at levels > bjLevel since we're backtracking
+	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
+		s.conflictsAtLevel[i] = 0
+	}
 
 	// Flip the decision at the backjump level
 	s.assignments[decisionVar] = Assignment{
