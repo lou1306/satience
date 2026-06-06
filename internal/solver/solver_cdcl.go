@@ -69,7 +69,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := 100   // CRITICAL: Keep learned clause database small to avoid O(n) propagation slowdown
 	minLearned := 50    // Target after deletion (50% reduction)
 	restartBase := 100  // Base for Luby restart sequence
-	return &CDCLSolver{
+	
+	solver := &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
 		trail:       make([]int, 0),
@@ -108,6 +109,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLevelSet: make([]int, 0, formula.NumVars),
 		tmpLevelSetUsed: make([]bool, formula.NumVars+1),
 	}
+	
+	// Enable LBD-based VSIDS for better variable selection
+	// Variables in low-LBD clauses get higher priority
+	solver.vsids.EnableLBD()
+	
+	return solver
 }
 
 // SetMaxIter sets the maximum iteration limit (0 = unlimited)
@@ -2448,6 +2455,8 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	// Decay clause activity periodically
 	if s.conflicts%100 == 0 {
 		s.vsids.decay()
+		// Also decay LBD bonus
+		s.vsids.decayLBD()
 		// Also decay clause activity
 		for i := range s.clauseActivity {
 			s.clauseActivity[i] *= 0.95
@@ -2760,6 +2769,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			// Add learned clause to watched literals scheme
 			s.cnf.AddLearnedClauseToWatches(learnedClauseIdx, learnedLits)
+			
+			// LBD-based VSIDS: bump variables in low-LBD clauses
+			s.vsids.bumpLBD(learnedLits, lbd)
 		}
 	}
 	

@@ -4,14 +4,17 @@ import "satience/internal/cnf"
 
 // VSIDS implements the VSIDS (Variable State Independent Decaying Sum) heuristic
 // with optional LRB (Learning Rate Based) conflict participation tracking
+// and LBD-based activity (variables in low-LBD clauses get higher activity)
 type VSIDS struct {
 	activity            []float64 // Activity score for each variable
 	conflictParticipation []int   // Number of conflicts each variable participates in
 	decayFactor         float64   // Decay factor (typically 0.95)
 	inverseDecay        float64   // 1/decay for efficiency
 	useLRB              bool      // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval    int       // Decay LRB scores every N conflicts
+	lrbDecayInterval    int       // Decay every N conflicts
 	conflictCount       int       // Total conflicts for LRB decay timing
+	useLBD              bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
+	lbdBonus            []float64 // Bonus score from appearing in low-LBD clauses
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -24,6 +27,8 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		useLRB:                false, // Default to VSIDS
 		lrbDecayInterval:      1024,  // Decay every 1024 conflicts
 		conflictCount:         0,
+		useLBD:                false, // LBD-based activity disabled by default
+		lbdBonus:              make([]float64, numVars),
 	}
 }
 
@@ -41,6 +46,41 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 // EnableLRB enables LRB (Learning Rate Based) heuristic
 func (v *VSIDS) EnableLRB() {
 	v.useLRB = true
+}
+
+// EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
+func (v *VSIDS) EnableLBD() {
+	v.useLBD = true
+}
+
+// bumpLBD adds LBD bonus to variables in a learned clause
+// Lower LBD = higher bonus (glue clauses are most important)
+func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
+	if !v.useLBD {
+		return
+	}
+	
+	// Bonus formula: higher bonus for lower LBD
+	// LBD=2: bonus = 100 (glue clause - very important)
+	// LBD=3: bonus = 50
+	// LBD=4: bonus = 25
+	// etc.
+	bonus := 200.0 / float64(lbd)
+	
+	for _, lit := range literals {
+		v.lbdBonus[lit.Var()] += bonus
+	}
+}
+
+// decayLBD decays LBD bonus scores (called periodically)
+func (v *VSIDS) decayLBD() {
+	if !v.useLBD {
+		return
+	}
+	
+	for i := range v.lbdBonus {
+		v.lbdBonus[i] *= 0.9 // Decay by 10% each time
+	}
 }
 
 // bump increases the activity of a variable
@@ -96,6 +136,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 // selectVariableWithPhase returns the unassigned variable with highest activity
 // and the phase to assign (true=positive, false=negative) based on saved phase
 // Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity)
+// Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
 func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
 	bestVar := uint32(0)
 	bestScore := -1.0
@@ -105,10 +146,13 @@ func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []b
 			continue
 		}
 		
-		// Use LRB score (conflict participation) or VSIDS activity
+		// Calculate score based on enabled heuristics
 		var score float64
 		if v.useLRB {
 			score = float64(v.conflictParticipation[i])
+		} else if v.useLBD {
+			// Combine base activity with LBD bonus
+			score = v.activity[i] + v.lbdBonus[i]
 		} else {
 			score = v.activity[i]
 		}
