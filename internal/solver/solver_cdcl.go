@@ -922,12 +922,15 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 	// Aggressive variable elimination with relaxed limits
 	// Increased from 2s to 5s total, 100ms to 200ms per var, degree 100 to 150
 	// Modern solvers (CaDiCaL) are much more aggressive
+	// ALLOW 10% BLOWUP: Controlled formula growth for better elimination
 	startTime := time.Now()
 	totalTimeLimit := 5 * time.Second
 	varTimeLimit := 200 * time.Millisecond
 	
 	eliminatedCount := 0
 	resolventCount := 0
+	initialClauses := s.cnf.NumClauses
+	maxClauses := initialClauses * 110 / 100 // Allow 10% blowup
 	
 	changed := true
 	for changed {
@@ -943,6 +946,15 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			if time.Since(startTime) > totalTimeLimit {
 				if s.verbose {
 					fmt.Printf("c [verbose] Variable elimination: time limit reached (%.2fs)\n", time.Since(startTime).Seconds())
+				}
+				goto done
+			}
+			
+			// Check clause blowup limit
+			if s.cnf.NumClauses > maxClauses {
+				if s.verbose {
+					fmt.Printf("c [verbose] Variable elimination: clause blowup limit reached (%d > %d)\n", 
+						s.cnf.NumClauses, maxClauses)
 				}
 				goto done
 			}
@@ -984,10 +996,10 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				continue
 			}
 			
-			// CONSERVATIVE elimination: only allow if resolvents <= original clauses
-			// This prevents memory explosion on Sudoku and similar instances
+			// ALLOW 10% BLOWUP: More aggressive than 0% but still controlled
+			// This allows eliminating variables that slightly increase clause count
 			originalCount := len(posClauses) + len(negClauses)
-			maxResolvents := originalCount // 0% blowup allowed (must not increase clauses)
+			maxResolvents := originalCount + (originalCount / 10) // 10% blowup allowed
 			
 			// Early exit check: Cartesian product would be too large
 			if len(posClauses) * len(negClauses) > maxResolvents * 2 {
@@ -2443,13 +2455,20 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	}
 	
 	// DISABLED: Inprocessing causes soundness bugs with watched literals
-	// When clauses are removed during search, ternary watch structures become stale
-	// Fix requires rebuilding watches after clause removal (expensive) or lazy removal
+	// When clauses are removed during search, watch structures become stale
+	// The fix requires careful handling of both original and learned clauses
 	// 
 	// Inprocessing: apply subsumption elimination every 500 conflicts
 	// This removes redundant clauses during search to keep the formula small
-	// if s.conflicts%500 == 0 {
+	// if s.conflicts%500 == 0 && s.conflicts > 0 {
 	// 	s.inprocessSubsumption()
+	// 	// CRITICAL: Rebuild watched literals after clause removal
+	// 	if s.verbose {
+	// 		fmt.Printf("c [inprocess] Rebuilding watched literals after clause removal\n")
+	// 	}
+	// 	// Need to rebuild both original AND learned clause watches
+	// 	// This is complex because learned clauses are stored separately
+	// 	// For now, inprocessing is disabled to maintain soundness
 	// }
 }
 
