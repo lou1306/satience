@@ -2229,33 +2229,19 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// Propagate binary clauses using watched literals (O(1) per clause)
-		conflict, clauseIdx := s.propagateBinary()
-		if conflict {
-			return true, clauseIdx
-		}
-		if clauseIdx >= 0 {
-			// Unit propagation happened (clauseIdx encodes which literal was propagated)
-			unitPropagated = true
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
-		
-		// Propagate ternary clauses using watched literals
-		conflict, clauseIdx = s.propagateTernary()
-		if conflict {
-			return true, clauseIdx
-		}
-		if clauseIdx >= 0 {
-			// Unit propagation happened
-			unitPropagated = true
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
-		
-		// TEMPORARILY DISABLED: Watched literals for long clauses has soundness bugs
-		// Using linear scanning for correctness until watched literals is fixed properly
-		// conflict, clauseIdx = s.propagateLong()
+		// DISABLED: Binary/ternary watched literals has soundness bugs on PHP instances
+		// Using linear scanning for ALL clauses for correctness
+		// conflict, clauseIdx := s.propagateBinary()
+		// if conflict {
+		// 	return true, clauseIdx
+		// }
+		// if clauseIdx >= 0 {
+		// 	unitPropagated = true
+		// 	trailIndex = s.trailHead[s.level]
+		// 	continue
+		// }
+		// 
+		// conflict, clauseIdx = s.propagateTernary()
 		// if conflict {
 		// 	return true, clauseIdx
 		// }
@@ -2265,14 +2251,9 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		// 	continue
 		// }
 		
-		// Use linear scanning for all clauses with >= 4 literals
+		// Use linear scanning for ALL clauses (simple but correct)
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
-			
-			// Skip binary and ternary clauses (handled above)
-			if len(clause.Literals) <= 3 {
-				continue
-			}
 			
 			// Count satisfied, false, and unassigned literals
 			satisfiedCount := 0
