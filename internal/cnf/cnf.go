@@ -512,3 +512,49 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		c.WatchListLong[lit2Idx] = append(c.WatchListLong[lit2Idx], longIdx)
 	}
 }
+
+// RebuildLongClauseWatches rebuilds all watch lists for long clauses from scratch
+// This removes duplicate entries that accumulate during propagation
+// Call this when total watch list size exceeds threshold (e.g., 10x number of clauses)
+func (c *CNF) RebuildLongClauseWatches() {
+	// Clear all watch lists
+	watchListSize := int(c.NumVars) * 2
+	for i := 0; i < watchListSize; i++ {
+		c.WatchListLong[i] = c.WatchListLong[i][:0]
+	}
+	
+	// Clear watch arrays
+	c.LongWatchA = c.LongWatchA[:0]
+	c.LongWatchB = c.LongWatchB[:0]
+	c.LongClauseIndices = c.LongClauseIndices[:0]
+	
+	// Rebuild from original clauses
+	longWatchIdx := 0
+	for clauseIdx, clause := range c.Clauses {
+		if len(clause.Literals) > 3 && !clause.Learned {
+			lit1 := clause.Literals[0]
+			lit2 := clause.Literals[1]
+			
+			idx1 := LitToIndex(lit1)
+			idx2 := LitToIndex(lit2)
+			
+			c.LongWatchA = append(c.LongWatchA, idx1)
+			c.LongWatchB = append(c.LongWatchB, idx2)
+			c.LongClauseIndices = append(c.LongClauseIndices, clauseIdx)
+			
+			c.WatchListLong[idx1] = append(c.WatchListLong[idx1], longWatchIdx)
+			c.WatchListLong[idx2] = append(c.WatchListLong[idx2], longWatchIdx)
+			
+			longWatchIdx++
+		}
+	}
+}
+
+// GetLongWatchListSize returns total size of all watch lists for long clauses
+func (c *CNF) GetLongWatchListSize() int {
+	total := 0
+	for _, list := range c.WatchListLong {
+		total += len(list)
+	}
+	return total
+}

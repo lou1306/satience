@@ -2065,6 +2065,20 @@ func (s *CDCLSolver) propagateLong() (bool, int) {
 		return false, -1
 	}
 	
+	// Check if watch lists have grown too large (lazy cleanup)
+	// Rebuild if total size exceeds 10x the number of long clauses
+	longClauseCount := len(s.cnf.LongClauseIndices)
+	if longClauseCount > 0 {
+		watchListSize := s.cnf.GetLongWatchListSize()
+		maxWatchListSize := longClauseCount * 2 * 10 // 2 watches per clause, allow 10x bloat
+		if watchListSize > maxWatchListSize {
+			// Rebuild watch lists to remove duplicates
+			s.cnf.RebuildLongClauseWatches()
+			// Also rebuild learned clause watches
+			s.rebuildLearnedLongWatches()
+		}
+	}
+	
 	// Process all assigned literals on the trail that haven't been processed yet
 	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
 		assignedVar := uint32(s.trail[trailIdx])
@@ -2076,8 +2090,9 @@ func (s *CDCLSolver) propagateLong() (bool, int) {
 		
 		// Get all long clauses watching this false literal
 		watchList := s.cnf.WatchListLong[falseLitIdx]
+		initialLen := len(watchList) // Capture initial length to avoid infinite loop
 		
-		for i := 0; i < len(watchList); i++ {
+		for i := 0; i < initialLen; i++ {
 			watchIdx := watchList[i]
 			clauseIdx := s.cnf.LongClauseIndices[watchIdx]
 			
@@ -2238,79 +2253,21 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// DISABLED: Watched literals for long clauses has performance bugs
-		// Using simple linear scanning for all clauses >= 4 literals
-		// conflict, clauseIdx = s.propagateLong()
-		// if conflict {
-		// 	return true, clauseIdx
-		// }
-		// if clauseIdx >= 0 {
-		// 	unitPropagated = true
-		// 	trailIndex = s.trailHead[s.level]
-		// 	continue
-		// }
-		
-		// Check all clauses with >= 4 literals using linear scanning
-		for clauseIdx := range s.cnf.Clauses {
-			clause := &s.cnf.Clauses[clauseIdx]
-			
-			// Skip binary clauses (handled by propagateBinary)
-			if len(clause.Literals) == 2 {
-				continue
-			}
-			
-			// Skip ternary clauses (handled by propagateTernary)
-			if len(clause.Literals) == 3 {
-				continue
-			}
-			
-			// Process all clauses with >= 4 literals
-			
-			// Count satisfied, false, and unassigned literals
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-			
-			for _, lit := range clause.Literals {
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
-					unassignedCount++
-					unassignedLit = lit
-				} else {
-					// Inline literalIsTrue check for performance
-					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
-				}
-			}
-			
-			if satisfiedCount > 0 {
-				continue // Clause is satisfied
-			}
-			
-			if unassignedCount == 0 && falseCount > 0 {
-				// All literals are false - conflict!
-				return true, clauseIdx
-			}
-			
-			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
-				// Unit clause - propagate the unassigned literal
-				// Use max(1, s.level) to ensure we never assign at level 0
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
-				s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
-				unitPropagated = true
-				break
-			}
+		// Propagate long clauses (>3 literals) using watched literals
+		conflict, clauseIdx = s.propagateLong()
+		if conflict {
+			return true, clauseIdx
 		}
+		if clauseIdx >= 0 {
+			// Unit propagation happened
+			unitPropagated = true
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
+		// Skip linear scanning - handled by propagateLong() with watched literals
+		// Break out of the loop since propagateLong() handles all clauses >= 4 literals
+		break
 		
 		// If we propagated a unit, restart from beginning
 		if unitPropagated {
@@ -2798,6 +2755,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.lbdCount++
 	
 	return backjumpLevel
+}
+
+// rebuildLearnedLongWatches rebuilds watch lists for learned long clauses
+// Called after RebuildLongClauseWatches() to restore learned clause watches
+func (s *CDCLSolver) rebuildLearnedLongWatches() {
+	for learnedIdx, clause := range s.learnedClauses {
+		if len(clause.Literals) > 3 {
+			s.cnf.AddLearnedClauseToWatches(learnedIdx, clause.Literals)
+		}
+	}
 }
 
 // deleteLearnedClauses removes low-quality learned clauses to control memory usage
