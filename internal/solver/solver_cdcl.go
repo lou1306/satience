@@ -1789,6 +1789,55 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
+		for learnedIdx := range s.learnedClauses {
+			clause := &s.learnedClauses[learnedIdx]
+			
+			satisfiedCount := 0
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				litLevel := s.assignments[varIdx].Level
+				if litLevel == 0 {
+					unassignedCount++
+					unassignedLit = lit
+				} else {
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfiedCount++
+					} else {
+						falseCount++
+					}
+				}
+			}
+			
+			if satisfiedCount > 0 {
+				continue
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				return true, -learnedIdx - 1
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(unassignedLit, assignLevel, -learnedIdx-1)
+				unitPropagated = true
+				break
+			}
+		}
+		
+		if unitPropagated {
+			trailIndex = s.trailHead[s.level]
+			continue
+		}
+		
 		trailIndex++
 	}
 
