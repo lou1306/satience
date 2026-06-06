@@ -437,6 +437,102 @@ func (s *CDCLSolver) isSubsumedByAny(clause cnf.Clause, clauses []cnf.Clause) bo
 	return false
 }
 
+// inprocessSubsumption applies subsumption elimination during search (inprocessing)
+//
+// Inprocessing is the application of preprocessing techniques during the search phase.
+// This is crucial for maintaining a small, simplified formula throughout solving.
+//
+// What it does:
+// 1. Remove original clauses subsumed by shorter original clauses
+// 2. Remove original clauses subsumed by learned clauses
+// 3. Remove learned clauses subsumed by other learned clauses
+//
+// Why it helps:
+// - Learned clauses can subsume original clauses (especially short learned clauses)
+// - Reduces the formula size, making propagation faster
+// - Removes redundant constraints that slow down search
+//
+// Safeguards:
+// - Only run every 500 conflicts (expensive O(n²) operation)
+// - Skip on large formulas (>5000 clauses)
+// - Time limit of 200ms to avoid slowing down search
+func (s *CDCLSolver) inprocessSubsumption() {
+	if s.cnf.NumClauses > 5000 {
+		return
+	}
+	
+	startTime := time.Now()
+	timeLimit := 200 * time.Millisecond
+	
+	removedOriginal := 0
+	removedLearned := 0
+	
+	// Remove original clauses subsumed by learned clauses
+	// This is the most impactful: learned clauses are often shorter and more general
+	remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	for i := range s.cnf.Clauses {
+		subsumed := false
+		for j := range s.learnedClauses {
+			if s.subsumes(&s.learnedClauses[j], &s.cnf.Clauses[i]) {
+				subsumed = true
+				break
+			}
+		}
+		if !subsumed {
+			remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
+		} else {
+			removedOriginal++
+		}
+	}
+	
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+	
+	if removedOriginal > 0 {
+		s.cnf.Clauses = remainingOriginal
+		s.cnf.NumClauses = len(s.cnf.Clauses)
+		if s.verbose {
+			fmt.Printf("c [inprocess] Removed %d original clauses subsumed by learned clauses\n", removedOriginal)
+		}
+	}
+	
+	// Remove learned clauses subsumed by other learned clauses
+	// Keep only the most general (shortest) learned clauses
+	if len(s.learnedClauses) > 100 {
+		remainingLearned := make([]cnf.Clause, 0, len(s.learnedClauses))
+		for i := range s.learnedClauses {
+			subsumed := false
+			for j := range s.learnedClauses {
+				if i != j && s.subsumes(&s.learnedClauses[j], &s.learnedClauses[i]) {
+					subsumed = true
+					break
+				}
+			}
+			if !subsumed {
+				remainingLearned = append(remainingLearned, s.learnedClauses[i])
+			} else {
+				removedLearned++
+			}
+		}
+		
+		if removedLearned > 0 {
+			s.learnedClauses = remainingLearned
+			s.clauseActivity = make([]float64, len(s.learnedClauses))
+			s.clauseAge = make([]int, len(s.learnedClauses))
+			if s.verbose {
+				fmt.Printf("c [inprocess] Removed %d learned clauses subsumed by other learned clauses\n", removedLearned)
+			}
+		}
+	}
+	
+	totalRemoved := removedOriginal + removedLearned
+	if s.verbose && totalRemoved > 0 {
+		fmt.Printf("c [inprocess] Inprocessing subsumption: removed %d clauses (%d original, %d learned)\n", 
+			totalRemoved, removedOriginal, removedLearned)
+	}
+}
+
 // failedLiteralElimination detects literals that must be false through trial assignment
 //
 // Algorithm:
@@ -2344,6 +2440,12 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		for i := range s.clauseActivity {
 			s.clauseActivity[i] *= 0.95
 		}
+	}
+	
+	// Inprocessing: apply subsumption elimination every 500 conflicts
+	// This removes redundant clauses during search to keep the formula small
+	if s.conflicts%500 == 0 {
+		s.inprocessSubsumption()
 	}
 }
 
