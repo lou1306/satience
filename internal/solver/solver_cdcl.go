@@ -792,16 +792,7 @@ func (s *CDCLSolver) restart() {
 		s.inprocessing()
 	}
 	
-	// TEMPORARY FIX: Skip learned clause deletion to avoid watch corruption
-	// Keep ALL learned clauses (don't compact)
-	// This avoids the soundness bug but uses more memory
-	// TODO: Implement proper separate watch structures for learned clauses
-	
-	if s.verbose {
-		fmt.Printf("c [verbose] Restart: keeping all %d learned clauses (deletion disabled)\n", len(s.learnedClauses))
-	}
-	
-	// Just reset restart counters
+	// Reset restart counters
 	s.lubyIndex++
 	s.restartCount = s.conflicts
 	s.lbdSum = 0
@@ -2538,28 +2529,109 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	// Only learn non-empty clauses
+	// TWO-TIER APPROACH: Separate glue clauses (LBD ≤ 3) from normal clauses
+	// Glue clauses: watched, kept forever, high priority
+	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
+	
 	if len(learnedLits) > 0 {
-		if len(s.learnedClauses) >= s.maxLearned {
-			if s.verbose {
-				fmt.Printf("c [verbose] Triggering deletion: %d clauses >= maxLearned %d\n", len(s.learnedClauses), s.maxLearned)
+		// LBD FILTERING: Reject very low-quality clauses immediately
+		if lbd > 50 {
+			// Skip this clause - too many decision levels, unlikely to be useful
+			if s.verbose && s.conflicts <= 100 {
+				fmt.Printf("c [debug] Skipping learned clause: LBD=%d > 50\n", lbd)
 			}
-			s.deleteLearnedClauses()
+		} else {
+			// Check if we need to delete clauses
+			// Keep max 5000 normal clauses + all glue clauses
+			maxNormalClauses := 5000
+			normalCount := 0
+			for _, lbdVal := range s.clauseLBD {
+				if lbdVal > 3 {
+					normalCount++
+				}
+			}
+			
+			if normalCount >= maxNormalClauses && lbd > 3 {
+				// Delete oldest 50% of normal clauses (by age)
+				if s.verbose {
+					fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", normalCount, maxNormalClauses)
+				}
+				
+				// Mark clauses to keep
+				keepClause := make([]bool, len(s.learnedClauses))
+				for i := range s.learnedClauses {
+					if s.clauseLBD[i] <= 3 {
+						// Keep all glue clauses
+						keepClause[i] = true
+					} else {
+						// Keep only newest 50% of normal clauses
+						ageRank := 0
+						for j := range s.learnedClauses {
+							if s.clauseLBD[j] > 3 && s.clauseAge[j] < s.clauseAge[i] {
+								ageRank++
+							}
+						}
+						keepClause[i] = (ageRank < normalCount/2)
+					}
+				}
+				
+				// Compact arrays
+				newClauses := make([]cnf.Clause, 0)
+				newActivity := make([]float64, 0)
+				newAge := make([]int, 0)
+				newSize := make([]int, 0)
+				newLBD := make([]int, 0)
+				
+				for i := range s.learnedClauses {
+					if keepClause[i] {
+						newClauses = append(newClauses, s.learnedClauses[i])
+						newActivity = append(newActivity, s.clauseActivity[i])
+						newAge = append(newAge, s.clauseAge[i])
+						newSize = append(newSize, s.clauseSize[i])
+						newLBD = append(newLBD, s.clauseLBD[i])
+					}
+				}
+				
+				s.learnedClauses = newClauses
+				s.clauseActivity = newActivity
+				s.clauseAge = newAge
+				s.clauseSize = newSize
+				s.clauseLBD = newLBD
+				
+				// Rebuild watches from scratch (O(n) but rare)
+				// Clear old learned clause watches
+				for i := range s.cnf.WatchListLong {
+					s.cnf.WatchListLong[i] = make([]int, 0)
+				}
+				for i := range s.cnf.WatchList {
+					s.cnf.WatchList[i] = make([]int, 0)
+				}
+				for i := range s.cnf.TernaryWatchList {
+					s.cnf.TernaryWatchList[i] = make([]int, 0)
+				}
+				
+				// Re-add all kept learned clauses with new indices
+				for i, clause := range s.learnedClauses {
+					s.cnf.AddLearnedClauseToWatches(i, clause.Literals)
+				}
+			}
+			
+			// Add the new learned clause
+			learnedClauseIdx := len(s.learnedClauses)
+			_ = s.learnedArena.AllocateClause(learnedLits, true)
+			
+			s.clauseActivity = append(s.clauseActivity, 0.0)
+			s.clauseAge = append(s.clauseAge, s.currentAge)
+			s.clauseSize = append(s.clauseSize, len(learnedLits))
+			s.clauseLBD = append(s.clauseLBD, lbd)
+			s.currentAge++
+			
+			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
+			s.learnedClauses = append(s.learnedClauses, newClause)
+			
+			// Add learned clause to watched literals scheme
+			s.cnf.AddLearnedClauseToWatches(learnedClauseIdx, learnedLits)
 		}
-		
-		learnedClauseIdx := len(s.learnedClauses)
-		_ = s.learnedArena.AllocateClause(learnedLits, true)
-		
-		s.clauseActivity = append(s.clauseActivity, 0.0)
-		s.clauseAge = append(s.clauseAge, s.currentAge)
-		s.clauseSize = append(s.clauseSize, len(learnedLits))
-		s.clauseLBD = append(s.clauseLBD, lbd)
-		s.currentAge++
-		
-		newClause := cnf.Clause{Literals: learnedLits, Learned: true}
-		s.learnedClauses = append(s.learnedClauses, newClause)
-		
-		// Add learned clause to watched literals scheme
-		s.cnf.AddLearnedClauseToWatches(learnedClauseIdx, learnedLits)
 	}
 	
 	// Calculate backjump level
