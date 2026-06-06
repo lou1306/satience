@@ -1,0 +1,48 @@
+{
+  "summary": {
+    "total": 2,
+    "satience_correct": 0,
+    "matches": 1,
+    "median_speedup": 0
+  },
+  "results": [
+    {
+      "instance": "benchmark/gbd_instances/e0daae7b94d54c77ea7979c7a2568344.cnf",
+      "hash": "e0daae7b94d54c77ea7979c7a2568344",
+      "family": "uniform-random",
+      "track": "e0daae7b94d54c77ea7979c7a2568344",
+      "expected_result": "unsat",
+      "vars": 70,
+      "clauses": 6230,
+      "satience_time": 60,
+      "satience_result": "TIMEOUT",
+      "satience_conflicts": 0,
+      "satience_decisions": 0,
+      "minisat_time": 60,
+      "minisat_result": "TIMEOUT",
+      "minisat_conflicts": 0,
+      "speedup": 1.0,
+      "match": true,
+      "timeout": true
+    },
+    {
+      "instance": "benchmark/gbd_instances/961811bc85fb3ad199c351be6c5b800e.cnf",
+      "hash": "961811bc85fb3ad199c351be6c5b800e",
+      "family": "random",
+      "track": "961811bc85fb3ad199c351be6c5b800e",
+      "expected_result": "sat",
+      "vars": 120,
+      "clauses": 1872,
+      "satience_time": 60,
+      "satience_result": "TIMEOUT",
+      "satience_conflicts": 0,
+      "satience_decisions": 0,
+      "minisat_time": 34.881367444992065,
+      "minisat_result": "SAT",
+      "minisat_conflicts": 0,
+      "speedup": 0.5813561240832011,
+      "match": false,
+      "timeout": true
+    }
+  ]
+}
