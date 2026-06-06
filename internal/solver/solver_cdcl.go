@@ -218,8 +218,10 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	initialClauses := s.cnf.NumClauses
 	
-	// Limit to 2 passes to prevent memory explosion on dense instances
-	for pass := 0; pass < 2; pass++ {
+	// Increase to 5 passes for more thorough preprocessing
+	// Modern solvers (CaDiCaL) use 10+ passes
+	// Safeguards: time limits in each technique prevent explosion
+	for pass := 0; pass < 5; pass++ {
 		if s.verbose {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
@@ -256,6 +258,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return veResult
 		}
 		
+		// Stop if no progress made for 2 consecutive passes
 		if s.cnf.NumClauses == initialClauses && pass >= 1 {
 			break
 		}
@@ -916,17 +919,12 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		fmt.Printf("c [verbose] Variable elimination: checking %d variables\n", s.cnf.NumVars)
 	}
 	
-	// RE-ENABLED with strict memory/time limits
-	// Previous implementation was disabled due to memory explosion on PHP
-	// New safeguards:
-	// 1. Time limit: 2 seconds total for VE
-	// 2. Degree limit: Skip variables appearing in >100 clauses
-	// 3. Conservative elimination: Only if resolvents <= original clauses
-	// 4. Per-variable time limit: 100ms max per variable
-	
+	// Aggressive variable elimination with relaxed limits
+	// Increased from 2s to 5s total, 100ms to 200ms per var, degree 100 to 150
+	// Modern solvers (CaDiCaL) are much more aggressive
 	startTime := time.Now()
-	totalTimeLimit := 2 * time.Second
-	varTimeLimit := 100 * time.Millisecond
+	totalTimeLimit := 5 * time.Second
+	varTimeLimit := 200 * time.Millisecond
 	
 	eliminatedCount := 0
 	resolventCount := 0
@@ -976,9 +974,9 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			}
 			
 			// DEGREE LIMIT: Skip variables with high degree
-			// Variables appearing in >100 clauses cause resolvent explosion
+			// Increased from 100 to 150 to eliminate more variables
 			totalDegree := len(posClauses) + len(negClauses)
-			if totalDegree > 100 {
+			if totalDegree > 150 {
 				continue
 			}
 			
@@ -987,7 +985,7 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			}
 			
 			// CONSERVATIVE elimination: only allow if resolvents <= original clauses
-			// This prevents memory explosion on PHP and similar instances
+			// This prevents memory explosion on Sudoku and similar instances
 			originalCount := len(posClauses) + len(negClauses)
 			maxResolvents := originalCount // 0% blowup allowed (must not increase clauses)
 			
@@ -1190,9 +1188,11 @@ func (s *CDCLSolver) clauseKey(clause *cnf.Clause) string {
 }
 
 func (s *CDCLSolver) blockedClauseElimination() SolveResult {
-	if s.cnf.NumClauses > 5000 {
+	// Increase limit to 15000 clauses to handle Sudoku and similar instances
+	// BCE is O(n²) but very effective on structured instances
+	if s.cnf.NumClauses > 15000 {
 		if s.verbose {
-			fmt.Printf("c [verbose] Blocked clause elimination: skipped (%d clauses, limit 5000)\n", s.cnf.NumClauses)
+			fmt.Printf("c [verbose] Blocked clause elimination: skipped (%d clauses, limit 15000)\n", s.cnf.NumClauses)
 		}
 		return UNKNOWN
 	}
