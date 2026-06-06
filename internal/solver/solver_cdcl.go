@@ -2253,21 +2253,68 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// Propagate long clauses (>3 literals) using watched literals
-		conflict, clauseIdx = s.propagateLong()
-		if conflict {
-			return true, clauseIdx
-		}
-		if clauseIdx >= 0 {
-			// Unit propagation happened
-			unitPropagated = true
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
+		// TEMPORARILY DISABLED: Watched literals for long clauses has soundness bugs
+		// Using linear scanning for correctness until watched literals is fixed properly
+		// conflict, clauseIdx = s.propagateLong()
+		// if conflict {
+		// 	return true, clauseIdx
+		// }
+		// if clauseIdx >= 0 {
+		// 	unitPropagated = true
+		// 	trailIndex = s.trailHead[s.level]
+		// 	continue
+		// }
 		
-		// Skip linear scanning - handled by propagateLong() with watched literals
-		// Break out of the loop since propagateLong() handles all clauses >= 4 literals
-		break
+		// Use linear scanning for all clauses with >= 4 literals
+		for clauseIdx := range s.cnf.Clauses {
+			clause := &s.cnf.Clauses[clauseIdx]
+			
+			// Skip binary and ternary clauses (handled above)
+			if len(clause.Literals) <= 3 {
+				continue
+			}
+			
+			// Count satisfied, false, and unassigned literals
+			satisfiedCount := 0
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				litLevel := s.assignments[varIdx].Level
+				if litLevel == 0 {
+					unassignedCount++
+					unassignedLit = lit
+				} else {
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfiedCount++
+					} else {
+						falseCount++
+					}
+				}
+			}
+			
+			if satisfiedCount > 0 {
+				continue
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				return true, clauseIdx
+			}
+			
+			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
+				unitPropagated = true
+				break
+			}
+		}
 		
 		// If we propagated a unit, restart from beginning
 		if unitPropagated {
