@@ -1552,6 +1552,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		return preprocessResult
 	}
 
+	// Initialize VSIDS with clause-length weighted activity BEFORE search
+	// Variables in shorter clauses get higher activity (more constrained = more important)
+	s.vsids.InitializeFromClauses(s.cnf.Clauses)
+
 	// Initialize watched literals AFTER preprocessing (preprocessing modifies clauses)
 	s.cnf.InitializeWatches()
 
