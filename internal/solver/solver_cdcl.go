@@ -2442,11 +2442,15 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		}
 	}
 	
+	// DISABLED: Inprocessing causes soundness bugs with watched literals
+	// When clauses are removed during search, ternary watch structures become stale
+	// Fix requires rebuilding watches after clause removal (expensive) or lazy removal
+	// 
 	// Inprocessing: apply subsumption elimination every 500 conflicts
 	// This removes redundant clauses during search to keep the formula small
-	if s.conflicts%500 == 0 {
-		s.inprocessSubsumption()
-	}
+	// if s.conflicts%500 == 0 {
+	// 	s.inprocessSubsumption()
+	// }
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause
