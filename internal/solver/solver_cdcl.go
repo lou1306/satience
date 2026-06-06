@@ -893,14 +893,6 @@ func (s *CDCLSolver) restart() {
 		s.conflictsAtLevel[i] = 0
 	}
 	
-	// Inprocessing: DISABLED due to soundness bug with watched literals
-	// When clauses are removed, ternary watch structures become stale
-	// Fix requires rebuilding watches after clause removal (expensive)
-	// TODO: Fix by calling InitializeWatches() after inprocessing
-	// if s.conflicts > 0 && s.conflicts % 500 == 0 {
-	// 	s.inprocessing()
-	// }
-	
 	// Reset restart counters
 	s.lubyIndex++
 	s.restartCount = s.conflicts
@@ -1674,13 +1666,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Variables in shorter clauses get higher activity (more constrained = more important)
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
-	// Rebuild short clause caches AFTER preprocessing (preprocessing modifies clauses)
-	// This ensures BinaryClauses and TernaryClauses arrays are up-to-date
-	s.cnf.RebuildShortClauses()
-
-	// Initialize watched literals AFTER preprocessing (preprocessing modifies clauses)
-	s.cnf.InitializeWatches()
-
 	for {
 		s.iterations++
 		if s.iterations % 10000 == 0 && s.verbose {
@@ -1747,515 +1732,17 @@ func (s *CDCLSolver) allAssigned() bool {
 	return true
 }
 
-// propagateBinary propagates binary clauses using watched literals
-// Returns (conflict, clauseIdx) where clauseIdx >= 0 means unit propagated (encoded), < 0 means conflict
-//
-// Watched Literals Invariant:
-// Each binary clause watches two literals. When a watched literal becomes false,
-// we must either find a new watch or propagate/conflict. This ensures O(1) amortized
-// propagation cost per clause.
-//
-// Algorithm:
-// 1. When literal L becomes false, check all clauses watching L
-// 2. For each clause, check the other watch
-// 3. If other watch is true: clause satisfied, continue
-// 4. If other watch is false: CONFLICT
-// 5. If other watch is unassigned: try to find new watch among clause literals
-//    - Found unassigned/true literal: update watches (lazy - keep false watch)
-//    - No alternative: propagate other watch to true
-func (s *CDCLSolver) propagateBinary() (bool, int) {
-	if s.cnf.BinaryWatchA == nil {
-		return false, -1
-	}
-	
-	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
-		assignedVar := uint32(s.trail[trailIdx])
-		assignedValue := s.assignments[assignedVar].Value
-		
-		falseLit := cnf.NewLiteral(assignedVar, assignedValue)
-		falseLitIdx := cnf.LitToIndex(falseLit)
-		watchList := s.cnf.WatchList[falseLitIdx]
-		
-		for i := 0; i < len(watchList); i++ {
-			binIdx := watchList[i]
-			binClause := s.cnf.BinaryClauses[binIdx]
-			
-			watchAIdx := s.cnf.BinaryWatchA[binIdx]
-			watchBIdx := s.cnf.BinaryWatchB[binIdx]
-			watchA := cnf.IndexToLit(watchAIdx)
-			watchB := cnf.IndexToLit(watchBIdx)
-			
-			var otherWatch cnf.Literal
-			var otherWatchIdx int
-			
-			if watchA == falseLit {
-				otherWatch = watchB
-				otherWatchIdx = watchBIdx
-			} else if watchB == falseLit {
-				otherWatch = watchA
-				otherWatchIdx = watchAIdx
-			} else {
-				continue
-			}
-			
-			otherVar := otherWatch.Var()
-			
-			if s.assignments[otherVar].Level != 0 {
-				otherValue := s.assignments[otherVar].Value
-				otherIsTrue := (!otherWatch.IsNegated() && otherValue) || (otherWatch.IsNegated() && !otherValue)
-				
-				if otherIsTrue {
-					continue
-				}
-				return true, -binIdx - 2
-			}
-			
-			lit1 := cnf.Literal(binClause.Lit1)
-			lit2 := cnf.Literal(binClause.Lit2)
-			foundNewWatch := false
-			
-			s.tryNewWatch(lit1, falseLitIdx, otherWatchIdx, watchA == falseLit, binIdx, &foundNewWatch)
-			if !foundNewWatch {
-				s.tryNewWatch(lit2, falseLitIdx, otherWatchIdx, watchA == falseLit, binIdx, &foundNewWatch)
-			}
-			
-			if !foundNewWatch {
-				propLit := otherWatch
-				propVar := propLit.Var()
-				
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
-				s.assignLiteral(propLit, assignLevel, -binIdx-2)
-				return false, int(propVar) + 1
-			}
-		}
-	}
-	
-	return false, -1
-}
-
-// tryNewWatch attempts to update watches for a binary clause
-// Returns true if a new watch was found
-func (s *CDCLSolver) tryNewWatch(lit cnf.Literal, falseLitIdx, otherWatchIdx int, watchAIsFalse bool, binIdx int, foundNewWatch *bool) {
-	varIdx := lit.Var()
-	litIsFalse := s.assignments[varIdx].Level != 0 && 
-		((!lit.IsNegated() && !s.assignments[varIdx].Value) || 
-		 (lit.IsNegated() && s.assignments[varIdx].Value))
-	
-	if !litIsFalse {
-		newWatchIdx := cnf.LitToIndex(lit)
-		if newWatchIdx != otherWatchIdx && newWatchIdx != falseLitIdx {
-			if watchAIsFalse {
-				s.cnf.BinaryWatchA[binIdx] = falseLitIdx
-				s.cnf.BinaryWatchB[binIdx] = newWatchIdx
-			} else {
-				s.cnf.BinaryWatchA[binIdx] = newWatchIdx
-				s.cnf.BinaryWatchB[binIdx] = falseLitIdx
-			}
-			s.cnf.WatchList[newWatchIdx] = append(s.cnf.WatchList[newWatchIdx], binIdx)
-			*foundNewWatch = true
-		}
-	}
-}
-
-// propagateTernary propagates ternary clauses (3 literals) using watched literals
-// Returns (conflict, clauseIdx) where clauseIdx >= 0 means unit propagated, < 0 means no issue/conflict
-func (s *CDCLSolver) propagateTernary() (bool, int) {
-	// Skip if watches not initialized yet (during preprocessing)
-	if s.cnf.TernaryWatchA == nil {
-		return false, -1
-	}
-	
-	// Process all assigned literals on the trail that haven't been processed yet
-	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
-		assignedVar := uint32(s.trail[trailIdx])
-		assignedValue := s.assignments[assignedVar].Value
-		
-		// When a literal becomes false, check clauses watching it
-		falseLit := cnf.NewLiteral(assignedVar, assignedValue) // The literal that is FALSE
-		falseLitIdx := cnf.LitToIndex(falseLit)
-		
-		// Get all ternary clauses watching this false literal
-		watchList := s.cnf.TernaryWatchList[falseLitIdx]
-		
-		for i := 0; i < len(watchList); i++ {
-			ternIdx := watchList[i]
-			clauseIdx := s.cnf.TernaryClauseIndices[ternIdx]
-			
-			// Handle learned clauses (negative index encoding)
-			var clause cnf.Clause
-			if clauseIdx < 0 {
-				learnedIdx := -clauseIdx - 1
-				if learnedIdx >= len(s.learnedClauses) {
-					continue // Skip invalid learned clause reference
-				}
-				clause = s.learnedClauses[learnedIdx]
-			} else {
-				if clauseIdx >= len(s.cnf.Clauses) {
-					continue // Skip invalid original clause reference
-				}
-				clause = s.cnf.Clauses[clauseIdx]
-			}
-			
-			// Get the three watched literals
-			watchAIdx := s.cnf.TernaryWatchA[ternIdx]
-			watchBIdx := s.cnf.TernaryWatchB[ternIdx]
-			watchCIdx := s.cnf.TernaryWatchC[ternIdx]
-			
-			watchA := cnf.IndexToLit(watchAIdx)
-			watchB := cnf.IndexToLit(watchBIdx)
-			watchC := cnf.IndexToLit(watchCIdx)
-			
-			// One of these watches should be the false literal
-			// The other two watches are what we need to check
-			var otherWatch1, otherWatch2 cnf.Literal
-			var otherWatchIdx1, otherWatchIdx2 int
-			
-			if watchA == falseLit {
-				otherWatch1 = watchB
-				otherWatchIdx1 = watchBIdx
-				otherWatch2 = watchC
-				otherWatchIdx2 = watchCIdx
-			} else if watchB == falseLit {
-				otherWatch1 = watchA
-				otherWatchIdx1 = watchAIdx
-				otherWatch2 = watchC
-				otherWatchIdx2 = watchCIdx
-			} else if watchC == falseLit {
-				otherWatch1 = watchA
-				otherWatchIdx1 = watchAIdx
-				otherWatch2 = watchB
-				otherWatchIdx2 = watchBIdx
-			} else {
-				// Neither watch is the false literal - skip this clause
-				continue
-			}
-			
-			// Check the other two watches
-			var1 := otherWatch1.Var()
-			var2 := otherWatch2.Var()
-			
-			assigned1 := s.assignments[var1].Level != 0
-			assigned2 := s.assignments[var2].Level != 0
-			
-			if assigned1 && assigned2 {
-				// Both other watches are already assigned
-				value1 := s.assignments[var1].Value
-				value2 := s.assignments[var2].Value
-				
-				isTrue1 := (!otherWatch1.IsNegated() && value1) || (otherWatch1.IsNegated() && !value1)
-				isTrue2 := (!otherWatch2.IsNegated() && value2) || (otherWatch2.IsNegated() && !value2)
-				
-				if isTrue1 || isTrue2 {
-					// Clause is satisfied by one of the other watches
-					continue
-				}
-				// All three watches are false - CONFLICT!
-				return true, clauseIdx
-			}
-			
-			// At least one of the other watches is unassigned
-			// Try to find a new watch among the unwatched literal
-			lit1 := clause.Literals[0]
-			lit2 := clause.Literals[1]
-			lit3 := clause.Literals[2]
-			
-			foundNewWatch := false
-			
-			// Try each clause literal as a potential new watch
-			for _, lit := range []cnf.Literal{lit1, lit2, lit3} {
-				litIdx := cnf.LitToIndex(lit)
-				
-				// Skip if this is one of the current watches
-				if litIdx == watchAIdx || litIdx == watchBIdx || litIdx == watchCIdx {
-					continue
-				}
-				
-				// Check if this literal can be a new watch
-				varIdx := lit.Var()
-				if s.assignments[varIdx].Level == 0 {
-					// Unassigned literal - perfect new watch!
-					// Update watches: keep falseLit, replace the false watch with this lit
-					if watchA == falseLit {
-						s.cnf.TernaryWatchA[ternIdx] = falseLitIdx
-						s.cnf.TernaryWatchB[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchC[ternIdx] = litIdx
-					} else if watchB == falseLit {
-						s.cnf.TernaryWatchA[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchB[ternIdx] = falseLitIdx
-						s.cnf.TernaryWatchC[ternIdx] = litIdx
-					} else {
-						s.cnf.TernaryWatchA[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchB[ternIdx] = otherWatchIdx2
-						s.cnf.TernaryWatchC[ternIdx] = falseLitIdx
-					}
-					
-					// Update watch lists (lazy - just add to new watch list)
-					s.cnf.TernaryWatchList[litIdx] = append(s.cnf.TernaryWatchList[litIdx], ternIdx)
-					
-					foundNewWatch = true
-					break
-				}
-				
-				// Check if assigned literal is true
-				litValue := s.assignments[varIdx].Value
-				litIsTrue := (!lit.IsNegated() && litValue) || (lit.IsNegated() && !litValue)
-				if litIsTrue {
-					// True literal - good new watch
-					if watchA == falseLit {
-						s.cnf.TernaryWatchA[ternIdx] = falseLitIdx
-						s.cnf.TernaryWatchB[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchC[ternIdx] = litIdx
-					} else if watchB == falseLit {
-						s.cnf.TernaryWatchA[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchB[ternIdx] = falseLitIdx
-						s.cnf.TernaryWatchC[ternIdx] = litIdx
-					} else {
-						s.cnf.TernaryWatchA[ternIdx] = otherWatchIdx1
-						s.cnf.TernaryWatchB[ternIdx] = otherWatchIdx2
-						s.cnf.TernaryWatchC[ternIdx] = litIdx
-					}
-					
-					s.cnf.TernaryWatchList[litIdx] = append(s.cnf.TernaryWatchList[litIdx], ternIdx)
-					foundNewWatch = true
-					break
-				}
-			}
-			
-			if !foundNewWatch {
-				// No alternative watch found - check if we can propagate
-				// If exactly one of the other watches is unassigned, propagate it
-				if !assigned1 && assigned2 {
-					// var1 is unassigned, var2 is assigned (and false)
-					// Propagate otherWatch1 to true
-					assignLevel := s.level
-					if assignLevel == 0 {
-						assignLevel = 1
-					}
-					s.assignLiteral(otherWatch1, assignLevel, clauseIdx)
-					return false, int(var1) + 1 // Signal propagation
-				} else if assigned1 && !assigned2 {
-					// var2 is unassigned, var1 is assigned (and false)
-					// Propagate otherWatch2 to true
-					assignLevel := s.level
-					if assignLevel == 0 {
-						assignLevel = 1
-					}
-					s.assignLiteral(otherWatch2, assignLevel, clauseIdx)
-					return false, int(var2) + 1 // Signal propagation
-				} else if !assigned1 && !assigned2 {
-					// Both unassigned - can't propagate yet, but clause is not in danger
-					// Keep watching, no action needed
-					continue
-				}
-			}
-		}
-	}
-	
-	return false, -1 // No conflict, no propagation
-}
-
-// propagateLong propagates long clauses (>3 literals) using watched literals
-// Returns (conflict, clauseIdx) where clauseIdx >= 0 means conflict/unit, < 0 means no issue
-func (s *CDCLSolver) propagateLong() (bool, int) {
-	// Skip if watches not initialized yet (during preprocessing)
-	if s.cnf.LongWatchA == nil {
-		return false, -1
-	}
-	
-	// Check if watch lists have grown too large (lazy cleanup)
-	// Rebuild if total size exceeds 10x the number of long clauses
-	longClauseCount := len(s.cnf.LongClauseIndices)
-	if longClauseCount > 0 {
-		watchListSize := s.cnf.GetLongWatchListSize()
-		maxWatchListSize := longClauseCount * 2 * 10 // 2 watches per clause, allow 10x bloat
-		if watchListSize > maxWatchListSize {
-			// Rebuild watch lists to remove duplicates
-			s.cnf.RebuildLongClauseWatches()
-			// Also rebuild learned clause watches
-			s.rebuildLearnedLongWatches()
-		}
-	}
-	
-	// Process all assigned literals on the trail that haven't been processed yet
-	for trailIdx := s.trailHead[s.level]; trailIdx < len(s.trail); trailIdx++ {
-		assignedVar := uint32(s.trail[trailIdx])
-		assignedValue := s.assignments[assignedVar].Value
-		
-		// When a literal becomes false, check clauses watching it
-		falseLit := cnf.NewLiteral(assignedVar, assignedValue) // The literal that is FALSE
-		falseLitIdx := cnf.LitToIndex(falseLit)
-		
-		// Get all long clauses watching this false literal
-		watchList := s.cnf.WatchListLong[falseLitIdx]
-		initialLen := len(watchList) // Capture initial length to avoid infinite loop
-		
-		for i := 0; i < initialLen; i++ {
-			watchIdx := watchList[i]
-			clauseIdx := s.cnf.LongClauseIndices[watchIdx]
-			
-			// Handle learned clauses (negative index encoding)
-			var clause *cnf.Clause
-			if clauseIdx < 0 {
-				learnedIdx := -clauseIdx - 1
-				if learnedIdx >= len(s.learnedClauses) {
-					continue // Skip invalid learned clause reference
-				}
-				clause = &s.learnedClauses[learnedIdx]
-			} else {
-				if clauseIdx >= len(s.cnf.Clauses) {
-					continue // Skip invalid original clause reference
-				}
-				clause = &s.cnf.Clauses[clauseIdx]
-			}
-			
-			// Get the two watched literals
-			watchAIdx := s.cnf.LongWatchA[watchIdx]
-			watchBIdx := s.cnf.LongWatchB[watchIdx]
-			
-			watchA := cnf.IndexToLit(watchAIdx)
-			watchB := cnf.IndexToLit(watchBIdx)
-			
-			// One of these watches should be the false literal
-			// The other watch is what we need to check
-			var otherWatch cnf.Literal
-			
-			if watchA == falseLit {
-				otherWatch = watchB
-			} else if watchB == falseLit {
-				otherWatch = watchA
-			} else {
-				// Neither watch is the false literal - this shouldn't happen
-				// Skip this clause (it's watching other literals)
-				continue
-			}
-			
-			// Check the other watch
-			otherVar := otherWatch.Var()
-			
-			if s.assignments[otherVar].Level != 0 {
-				// Other literal is already assigned
-				otherValue := s.assignments[otherVar].Value
-				otherIsTrue := (!otherWatch.IsNegated() && otherValue) || (otherWatch.IsNegated() && !otherValue)
-				
-				if otherIsTrue {
-					// Clause is satisfied by the other watch
-					continue
-				}
-				// Both watches are false - need to find a new watch
-			}
-			
-			// Try to find a new watch among the unwatched literals
-			foundNewWatch := false
-			for _, lit := range clause.Literals {
-				litIdx := cnf.LitToIndex(lit)
-				
-				// Skip if this is one of the current watches
-				if litIdx == watchAIdx || litIdx == watchBIdx {
-					continue
-				}
-				
-				// Check if this literal can be a new watch
-				varIdx := lit.Var()
-				if s.assignments[varIdx].Level == 0 {
-					// Unassigned literal - perfect new watch!
-					// Update watches: keep falseLit, replace otherWatch with this lit
-					if watchA == falseLit {
-						s.cnf.LongWatchA[watchIdx] = falseLitIdx
-						s.cnf.LongWatchB[watchIdx] = litIdx
-					} else {
-						s.cnf.LongWatchA[watchIdx] = litIdx
-						s.cnf.LongWatchB[watchIdx] = falseLitIdx
-					}
-					
-					// Update watch lists
-					// Remove from old watch list, add to new one
-					// For simplicity, just add to new watch list (lazy cleanup)
-					s.cnf.WatchListLong[litIdx] = append(s.cnf.WatchListLong[litIdx], watchIdx)
-					
-					foundNewWatch = true
-					break
-				}
-				
-				// Check if assigned literal is true
-				litValue := s.assignments[varIdx].Value
-				litIsTrue := (!lit.IsNegated() && litValue) || (lit.IsNegated() && !litValue)
-				if litIsTrue {
-					// True literal - good new watch
-					if watchA == falseLit {
-						s.cnf.LongWatchA[watchIdx] = falseLitIdx
-						s.cnf.LongWatchB[watchIdx] = litIdx
-					} else {
-						s.cnf.LongWatchA[watchIdx] = litIdx
-						s.cnf.LongWatchB[watchIdx] = falseLitIdx
-					}
-					
-					s.cnf.WatchListLong[litIdx] = append(s.cnf.WatchListLong[litIdx], watchIdx)
-					foundNewWatch = true
-					break
-				}
-			}
-			
-			if !foundNewWatch {
-				// No alternative watch found - the other watch MUST be true
-				// If other watch is unassigned, this is unit propagation
-				if s.assignments[otherVar].Level == 0 {
-					// Unit propagation - assign it
-					assignLevel := s.level
-					if assignLevel == 0 {
-						assignLevel = 1
-					}
-					s.assignLiteral(otherWatch, assignLevel, clauseIdx)
-					return false, int(otherVar) + 1 // Signal propagation
-				}
-				// Both watches false and no new watch - CONFLICT!
-				return true, clauseIdx
-			}
-		}
-	}
-	
-	return false, -1 // No conflict, no propagation
-}
-
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
-	// For initial unit propagation at level 0, we need to check all clauses even with empty trail
-	// Use a do-while pattern: always check at least once per level
 	firstPass := true
 	for firstPass || trailIndex < len(s.trail) {
 		firstPass = false
 		unitPropagated := false
 		
-		// DISABLED: Binary/ternary watched literals has soundness bugs on PHP instances
-		// Using linear scanning for ALL clauses for correctness
-		// conflict, clauseIdx := s.propagateBinary()
-		// if conflict {
-		// 	return true, clauseIdx
-		// }
-		// if clauseIdx >= 0 {
-		// 	unitPropagated = true
-		// 	trailIndex = s.trailHead[s.level]
-		// 	continue
-		// }
-		// 
-		// conflict, clauseIdx = s.propagateTernary()
-		// if conflict {
-		// 	return true, clauseIdx
-		// }
-		// if clauseIdx >= 0 {
-		// 	unitPropagated = true
-		// 	trailIndex = s.trailHead[s.level]
-		// 	continue
-		// }
-		
-		// Use linear scanning for ALL clauses (simple but correct)
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
 			
-			// Count satisfied, false, and unassigned literals
 			satisfiedCount := 0
 			falseCount := 0
 			unassignedCount := 0
@@ -2297,7 +1784,6 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			}
 		}
 		
-		// If we propagated a unit, restart from beginning
 		if unitPropagated {
 			trailIndex = s.trailHead[s.level]
 			continue
@@ -2723,27 +2209,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.clauseAge = newAge
 				s.clauseSize = newSize
 				s.clauseLBD = newLBD
-				
-				// Rebuild watches from scratch (O(n) but rare)
-				// Clear old learned clause watches
-				for i := range s.cnf.WatchListLong {
-					s.cnf.WatchListLong[i] = make([]int, 0)
-				}
-				for i := range s.cnf.WatchList {
-					s.cnf.WatchList[i] = make([]int, 0)
-				}
-				for i := range s.cnf.TernaryWatchList {
-					s.cnf.TernaryWatchList[i] = make([]int, 0)
-				}
-				
-				// Re-add all kept learned clauses with new indices
-				for i, clause := range s.learnedClauses {
-					s.cnf.AddLearnedClauseToWatches(i, clause.Literals)
-				}
 			}
 			
 			// Add the new learned clause
-			learnedClauseIdx := len(s.learnedClauses)
 			_ = s.learnedArena.AllocateClause(learnedLits, true)
 			
 			s.clauseActivity = append(s.clauseActivity, 0.0)
@@ -2754,9 +2222,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 			s.learnedClauses = append(s.learnedClauses, newClause)
-			
-			// Add learned clause to watched literals scheme
-			s.cnf.AddLearnedClauseToWatches(learnedClauseIdx, learnedLits)
 			
 			// LBD-based VSIDS: bump variables in low-LBD clauses
 			s.vsids.bumpLBD(learnedLits, lbd)
@@ -2783,16 +2248,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.lbdCount++
 	
 	return backjumpLevel
-}
-
-// rebuildLearnedLongWatches rebuilds watch lists for learned long clauses
-// Called after RebuildLongClauseWatches() to restore learned clause watches
-func (s *CDCLSolver) rebuildLearnedLongWatches() {
-	for learnedIdx, clause := range s.learnedClauses {
-		if len(clause.Literals) > 3 {
-			s.cnf.AddLearnedClauseToWatches(learnedIdx, clause.Literals)
-		}
-	}
 }
 
 // deleteLearnedClauses removes low-quality learned clauses to control memory usage
@@ -2964,15 +2419,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	for i, clause := range s.learnedClauses {
 		s.learnedArena.AllocateClause(clause.Literals, true)
 		_ = i // Use index variable
-	}
-	
-	// CRITICAL: Rebuild watches after deleting learned clauses
-	// The learned clause indices have changed (compacted), so all watch structures
-	// referencing learned clauses are now stale and must be rebuilt
-	s.cnf.InitializeWatches()
-	// Re-add all learned clauses to watches with correct indices
-	for i, clause := range s.learnedClauses {
-		s.cnf.AddLearnedClauseToWatches(i, clause.Literals)
 	}
 	
 	if s.verbose {

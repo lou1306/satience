@@ -17,6 +17,12 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 
 ## Progress
 ### Done
+- **Watched literals bug fixed**: Disabled buggy watched literals for long clauses (≥4 literals), restored soundness with linear scanning
+- **Baseline benchmark established**: 10/10 instances correct (100% soundness), documented in BASELINE_2026_06_06.md
+- **Performance characterized**: 
+  - Fast instances (< 0.01s): algebra_xor, arg_chain, small PHP, tseitin
+  - Slow instances: sudoku (9.4s, 1000x slower than MiniSat due to linear scanning)
+  - Median solve time: 0.004s (excluding outliers)
 - Phase 1: Minimal DPLL solver with unit propagation, backtracking, CLI
 - VSIDS variable selection heuristic with decay
 - **Re-implemented clause learning**: 1-UIP conflict analysis with learned clause database
