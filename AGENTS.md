@@ -14,6 +14,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - 60 second timeout per benchmark
 - Real GBD instances from benchmark-database.de
 - **SAT Competition 2026 output format**: Fully compliant
+- **NO hybrid/middle-ground watched literals**: Do not implement partial watched literals schemes (e.g., watched literals for binary clauses only, tiered approaches, gradual implementations). Either implement complete watched literals from scratch or use linear scanning.
 
 ## Progress
 ### Done

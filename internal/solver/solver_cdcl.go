@@ -233,7 +233,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
 		
+		// Run unit propagation first to catch any existing units
 		unitResult := s.unitPropagationPreprocess()
+		if unitResult != UNKNOWN {
+			return unitResult
+		}
+		
+		// Variable elimination can create unit clauses
+		veResult := s.variableElimination()
+		if veResult != UNKNOWN {
+			return veResult
+		}
+		
+		// Run unit propagation again after variable elimination
+		unitResult = s.unitPropagationPreprocess()
 		if unitResult != UNKNOWN {
 			return unitResult
 		}
@@ -243,9 +256,17 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return pureResult
 		}
 		
+		s.subsumptionElimination()
+		
 		s.selfSubsumption()
 		
 		s.hyperBinaryResolution()
+		
+		// Run unit propagation after hyper-binary resolution
+		unitResult = s.unitPropagationPreprocess()
+		if unitResult != UNKNOWN {
+			return unitResult
+		}
 		
 		// DISABLED: Equivalence detection causes issues with certain patterns
 		// Needs more testing before re-enabling
@@ -258,11 +279,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		failedResult := s.failedLiteralElimination()
 		if failedResult != UNKNOWN {
 			return failedResult
-		}
-		
-		veResult := s.variableElimination()
-		if veResult != UNKNOWN {
-			return veResult
 		}
 		
 		// Stop if no progress made for 2 consecutive passes
@@ -410,7 +426,7 @@ func (s *CDCLSolver) subsumptionElimination() {
 		}
 	}
 	
-	if s.verbose && removed > 0 {
+	if s.verbose {
 		fmt.Printf("c [verbose] Subsumption elimination: removed %d clauses\n", removed)
 	}
 }
@@ -1686,7 +1702,12 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		if conflict {
 			s.handleConflict(clauseIdx)
 			if s.conflicts % 50 == 0 && s.verbose {
-				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d\n", s.conflicts, s.level, len(s.learnedClauses))
+				propsPerDec := 0.0
+				if s.decisions > 0 {
+					propsPerDec = float64(s.iterations) / float64(s.decisions)
+				}
+				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, props/dec %.1f\n", 
+					s.conflicts, s.level, len(s.learnedClauses), s.decisions, propsPerDec)
 			}
 			if !s.backtrack() {
 				if s.verbose {
