@@ -1777,49 +1777,55 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		for clauseIdx := range s.cnf.Clauses {
-			clause := &s.cnf.Clauses[clauseIdx]
-			
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-			
-			for _, lit := range clause.Literals {
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
-					unassignedCount++
-					unassignedLit = lit
+		// Optimized propagation for original clauses using contiguous literal pool
+	numOriginalClauses := s.cnf.NumOriginalClauses()
+	for clauseIdx := 0; clauseIdx < numOriginalClauses; clauseIdx++ {
+		offset, size := s.cnf.GetOriginalClauseInfo(clauseIdx)
+		pool := s.cnf.GetLiteralPool()
+		
+		satisfiedCount := 0
+		falseCount := 0
+		unassignedCount := 0
+		var unassignedLit cnf.Literal
+		
+		// Inline literal iteration (avoids range overhead)
+		for i := 0; i < size; i++ {
+			lit := cnf.Literal(pool[offset+i])
+			varIdx := lit.Var()
+			litLevel := s.assignments[varIdx].Level
+			if litLevel == 0 {
+				unassignedCount++
+				unassignedLit = lit
+			} else {
+				assign := s.assignments[varIdx]
+				// Inlined literalIsTrue check (avoids function call)
+				isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+				if isTrue {
+					satisfiedCount++
 				} else {
-					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
+					falseCount++
 				}
-			}
-			
-			if satisfiedCount > 0 {
-				continue
-			}
-			
-			if unassignedCount == 0 && falseCount > 0 {
-				return true, clauseIdx
-			}
-			
-			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
-				s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
-				unitPropagated = true
-				break
 			}
 		}
+		
+		if satisfiedCount > 0 {
+			continue
+		}
+		
+		if unassignedCount == 0 && falseCount > 0 {
+			return true, clauseIdx
+		}
+		
+		if unassignedCount == 1 && falseCount == size-1 {
+			assignLevel := s.level
+			if assignLevel == 0 {
+				assignLevel = 1
+			}
+			s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
+			unitPropagated = true
+			break
+		}
+	}
 		
 		if unitPropagated {
 			trailIndex = s.trailHead[s.level]

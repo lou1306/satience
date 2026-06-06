@@ -64,8 +64,14 @@ type CNF struct {
 	Clauses    []Clause
 	NumClauses int
 	
-	// Arena-based clause storage (alternative to Clauses slice)
+	// Arena-based clause storage for cache efficiency
 	Arena *ClauseArena
+	
+	// Contiguous literal storage for original clauses (optimization)
+	// All original clause literals stored in one array for better cache locality
+	originalClauseOffsets []int // Start offset of each clause
+	originalClauseSizes   []int // Number of literals in each clause
+	literalPool           []uint32 // Contiguous storage for all original clause literals
 }
 
 
@@ -93,12 +99,23 @@ func NewClauseArena(capacity int) *ClauseArena {
 	}
 }
 
-// AddClause adds a clause to the CNF formula
+// AddClause adds a clause to the CNF formula (stores in contiguous pool)
 func (c *CNF) AddClause(literals []Literal, learned bool) {
+	// Store in Clauses slice for backwards compatibility
 	c.Clauses = append(c.Clauses, Clause{
 		Literals: literals,
 		Learned:  learned,
 	})
+	
+	// Also store in contiguous literal pool for cache efficiency
+	offset := len(c.literalPool)
+	c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
+	c.originalClauseSizes = append(c.originalClauseSizes, len(literals))
+	
+	for _, lit := range literals {
+		c.literalPool = append(c.literalPool, uint32(lit))
+	}
+	
 	c.NumClauses++
 }
 
@@ -241,6 +258,103 @@ func (ca *ClauseArena) Reset() {
 // CapacityBytes returns the current buffer capacity in bytes (for debugging)
 func (ca *ClauseArena) CapacityBytes() int {
 	return cap(ca.buffer) * 4  // 4 bytes per uint32
+}
+
+// ClauseRef is a reference to a clause in the arena
+type ClauseRef struct {
+	Offset int
+	Size   int
+}
+
+// GetClauseRef returns a reference to a clause without allocating a slice
+func (ca *ClauseArena) GetClauseRef(idx int) ClauseRef {
+	if idx < 0 || idx >= len(ca.offsets) {
+		return ClauseRef{}
+	}
+	return ClauseRef{
+		Offset: ca.offsets[idx],
+		Size:   ca.sizes[idx],
+	}
+}
+
+// ClauseIter is an iterator for clause literals (avoids slice allocation)
+type ClauseIter struct {
+	buffer []uint32
+	offset int
+	size   int
+	pos    int
+}
+
+// Next returns the next literal in the clause, or false if done
+func (ci *ClauseIter) Next() (Literal, bool) {
+	if ci.pos >= ci.size {
+		return 0, false
+	}
+	lit := Literal(ci.buffer[ci.offset + ci.pos])
+	ci.pos++
+	return lit, true
+}
+
+// Reset resets the iterator to the beginning
+func (ci *ClauseIter) Reset() {
+	ci.pos = 0
+}
+
+// Size returns the number of literals in the clause
+func (ci *ClauseIter) Size() int {
+	return ci.size
+}
+
+// IterClause returns an iterator for a clause (zero-allocation)
+func (ca *ClauseArena) IterClause(idx int) ClauseIter {
+	if idx < 0 || idx >= len(ca.offsets) {
+		return ClauseIter{}
+	}
+	return ClauseIter{
+		buffer: ca.buffer,
+		offset: ca.offsets[idx],
+		size:   ca.sizes[idx],
+		pos:    0,
+	}
+}
+
+// GetClauseLiteralsSlice returns clause literals as a slice (allocates)
+// Use IterClause for zero-allocation iteration
+func (ca *ClauseArena) GetClauseLiteralsSlice(idx int) []Literal {
+	offset := ca.offsets[idx]
+	size := ca.sizes[idx]
+	literals := make([]Literal, size)
+	for i := 0; i < size; i++ {
+		literals[i] = Literal(ca.buffer[offset+i])
+	}
+	return literals
+}
+
+// GetOriginalClauseLiterals returns literals for an original clause (zero-allocation view)
+// Returns offset and size into the literal pool
+func (c *CNF) GetOriginalClauseLiterals(clauseIdx int) (offset int, size int, pool []uint32) {
+	if clauseIdx < 0 || clauseIdx >= len(c.originalClauseOffsets) {
+		return 0, 0, nil
+	}
+	return c.originalClauseOffsets[clauseIdx], c.originalClauseSizes[clauseIdx], c.literalPool
+}
+
+// NumOriginalClauses returns the number of original clauses
+func (c *CNF) NumOriginalClauses() int {
+	return len(c.originalClauseOffsets)
+}
+
+// GetOriginalClauseInfo returns the offset and size for an original clause
+func (c *CNF) GetOriginalClauseInfo(clauseIdx int) (offset int, size int) {
+	if clauseIdx < 0 || clauseIdx >= len(c.originalClauseOffsets) {
+		return 0, 0
+	}
+	return c.originalClauseOffsets[clauseIdx], c.originalClauseSizes[clauseIdx]
+}
+
+// GetLiteralPool returns the contiguous literal storage
+func (c *CNF) GetLiteralPool() []uint32 {
+	return c.literalPool
 }
 
 
