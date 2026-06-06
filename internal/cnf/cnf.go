@@ -262,19 +262,15 @@ func (c *CNF) InitializeWatches() {
 	}
 	
 	// Initialize watch arrays for ternary clauses (3 literals)
-	ternaryClauseCount := 0
-	for _, clause := range c.Clauses {
-		if len(clause.Literals) == 3 && !clause.Learned {
-			ternaryClauseCount++
-		}
-	}
+	// Use slices that can grow for learned clauses
+	// Note: TernaryClauses is already populated by RebuildShortClauses/AddClause
+	// We need a separate counter for watch indices
+	c.TernaryWatchA = make([]int, 0)
+	c.TernaryWatchB = make([]int, 0)
+	c.TernaryWatchC = make([]int, 0)
+	c.TernaryClauseIndices = make([]int, 0)
 	
-	c.TernaryWatchA = make([]int, ternaryClauseCount)
-	c.TernaryWatchB = make([]int, ternaryClauseCount)
-	c.TernaryWatchC = make([]int, ternaryClauseCount)
-	c.TernaryClauseIndices = make([]int, ternaryClauseCount)
-	
-	ternIdx := 0
+	ternWatchIdx := 0
 	for clauseIdx, clause := range c.Clauses {
 		if len(clause.Literals) == 3 && !clause.Learned {
 			lit1 := clause.Literals[0]
@@ -285,33 +281,27 @@ func (c *CNF) InitializeWatches() {
 			idx2 := LitToIndex(lit2)
 			idx3 := LitToIndex(lit3)
 			
-			c.TernaryWatchA[ternIdx] = idx1
-			c.TernaryWatchB[ternIdx] = idx2
-			c.TernaryWatchC[ternIdx] = idx3
-			c.TernaryClauseIndices[ternIdx] = clauseIdx
+			c.TernaryWatchA = append(c.TernaryWatchA, idx1)
+			c.TernaryWatchB = append(c.TernaryWatchB, idx2)
+			c.TernaryWatchC = append(c.TernaryWatchC, idx3)
+			c.TernaryClauseIndices = append(c.TernaryClauseIndices, clauseIdx)
 			
 			// Add clause to all three watch lists
-			c.TernaryWatchList[idx1] = append(c.TernaryWatchList[idx1], ternIdx)
-			c.TernaryWatchList[idx2] = append(c.TernaryWatchList[idx2], ternIdx)
-			c.TernaryWatchList[idx3] = append(c.TernaryWatchList[idx3], ternIdx)
+			c.TernaryWatchList[idx1] = append(c.TernaryWatchList[idx1], ternWatchIdx)
+			c.TernaryWatchList[idx2] = append(c.TernaryWatchList[idx2], ternWatchIdx)
+			c.TernaryWatchList[idx3] = append(c.TernaryWatchList[idx3], ternWatchIdx)
 			
-			ternIdx++
+			ternWatchIdx++
 		}
 	}
 	
 	// Initialize watch arrays for long clauses (>3 literals)
-	longClauseCount := 0
-	for _, clause := range c.Clauses {
-		if len(clause.Literals) > 3 && !clause.Learned {
-			longClauseCount++
-		}
-	}
+	// Use slices that can grow for learned clauses
+	c.LongWatchA = make([]int, 0)
+	c.LongWatchB = make([]int, 0)
+	c.LongClauseIndices = make([]int, 0)
 	
-	c.LongWatchA = make([]int, longClauseCount)
-	c.LongWatchB = make([]int, longClauseCount)
-	c.LongClauseIndices = make([]int, longClauseCount)
-	
-	longIdx := 0
+	longWatchIdx := 0
 	for clauseIdx, clause := range c.Clauses {
 		if len(clause.Literals) > 3 && !clause.Learned {
 			lit1 := clause.Literals[0]
@@ -320,15 +310,15 @@ func (c *CNF) InitializeWatches() {
 			idx1 := LitToIndex(lit1)
 			idx2 := LitToIndex(lit2)
 			
-			c.LongWatchA[longIdx] = idx1
-			c.LongWatchB[longIdx] = idx2
-			c.LongClauseIndices[longIdx] = clauseIdx
+			c.LongWatchA = append(c.LongWatchA, idx1)
+			c.LongWatchB = append(c.LongWatchB, idx2)
+			c.LongClauseIndices = append(c.LongClauseIndices, clauseIdx)
 			
 			// Add clause to both watch lists
-			c.WatchListLong[idx1] = append(c.WatchListLong[idx1], longIdx)
-			c.WatchListLong[idx2] = append(c.WatchListLong[idx2], longIdx)
+			c.WatchListLong[idx1] = append(c.WatchListLong[idx1], longWatchIdx)
+			c.WatchListLong[idx2] = append(c.WatchListLong[idx2], longWatchIdx)
 			
-			longIdx++
+			longWatchIdx++
 		}
 	}
 }
@@ -484,10 +474,7 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		
 	case 3:
 		// Ternary learned clause - add to TernaryWatchA/B/C and TernaryWatchList
-		// BUG: Uses len(TernaryClauses) but TernaryClauseIndices has different size!
-		// InitializeWatches() populates TernaryClauseIndices for original clauses,
-		// but does NOT populate TernaryClauses. This causes index mismatch.
-		// FIX NEEDED: Track original ternary count and use: ternIdx = originalCount + len(TernaryClauses)
+		// Use len(TernaryClauses) as the index - this continues from original clauses
 		ternIdx := len(c.TernaryClauses)
 		c.TernaryClauses = append(c.TernaryClauses, TernaryClause{
 			Lit1: uint32(literals[0]),
@@ -499,6 +486,7 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		lit2Idx := LitToIndex(literals[1])
 		lit3Idx := LitToIndex(literals[2])
 		
+		// Append to watch arrays (consistent with InitializeWatches)
 		c.TernaryWatchA = append(c.TernaryWatchA, lit1Idx)
 		c.TernaryWatchB = append(c.TernaryWatchB, lit2Idx)
 		c.TernaryWatchC = append(c.TernaryWatchC, lit3Idx)

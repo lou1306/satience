@@ -1674,6 +1674,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Variables in shorter clauses get higher activity (more constrained = more important)
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
+	// Rebuild short clause caches AFTER preprocessing (preprocessing modifies clauses)
+	// This ensures BinaryClauses and TernaryClauses arrays are up-to-date
+	s.cnf.RebuildShortClauses()
+
 	// Initialize watched literals AFTER preprocessing (preprocessing modifies clauses)
 	s.cnf.InitializeWatches()
 
