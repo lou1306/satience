@@ -2238,20 +2238,19 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// Propagate long clauses using watched literals
-		conflict, clauseIdx = s.propagateLong()
-		if conflict {
-			return true, clauseIdx
-		}
-		if clauseIdx >= 0 {
-			// Unit propagation happened
-			unitPropagated = true
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
+		// DISABLED: Watched literals for long clauses has performance bugs
+		// Using simple linear scanning for all clauses >= 4 literals
+		// conflict, clauseIdx = s.propagateLong()
+		// if conflict {
+		// 	return true, clauseIdx
+		// }
+		// if clauseIdx >= 0 {
+		// 	unitPropagated = true
+		// 	trailIndex = s.trailHead[s.level]
+		// 	continue
+		// }
 		
-		// Check original clauses not using watched literals
-		// (only 4-literal clauses; binary/ternary and >3 literal use watched literals)
+		// Check all clauses with >= 4 literals using linear scanning
 		for clauseIdx := range s.cnf.Clauses {
 			clause := &s.cnf.Clauses[clauseIdx]
 			
@@ -2265,10 +2264,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 				continue
 			}
 			
-			// Skip long clauses (handled by propagateLong)
-			if len(clause.Literals) > 4 {
-				continue
-			}
+			// Process all clauses with >= 4 literals
 			
 			// Count satisfied, false, and unassigned literals
 			satisfiedCount := 0
