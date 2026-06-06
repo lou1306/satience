@@ -239,6 +239,12 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return unitResult
 		}
 		
+		// Equivalence detection: find a↔b patterns and substitute (BEFORE VE destroys binary clauses)
+		equivResult := s.equivalenceDetection()
+		if equivResult != UNKNOWN {
+			return equivResult
+		}
+		
 		// Variable elimination can create unit clauses
 		veResult := s.variableElimination()
 		if veResult != UNKNOWN {
@@ -267,13 +273,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		if unitResult != UNKNOWN {
 			return unitResult
 		}
-		
-		// DISABLED: Equivalence detection causes issues with certain patterns
-		// Needs more testing before re-enabling
-		// equivResult := s.equivalenceDetection()
-		// if equivResult != UNKNOWN {
-		// 	return equivResult
-		// }
 		
 		// RE-ENABLED: Failed literal elimination with strict safeguards
 		failedResult := s.failedLiteralElimination()
@@ -1420,6 +1419,10 @@ func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
 }
 
 func (s *CDCLSolver) equivalenceDetection() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] EquivalenceDetection() called with %d clauses\n", s.cnf.NumClauses)
+	}
+	
 	// Detect equivalence relations from binary clauses
 	// Pattern: (¬a ∨ b) ∧ (¬b ∨ a) means a ↔ b
 	// Build equivalence classes and substitute representatives
@@ -1431,12 +1434,14 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 		from, to uint32
 	}
 	implications := make([]implication, 0)
+	binaryCount := 0
 	
 	for _, clause := range s.cnf.Clauses {
 		if len(clause.Literals) != 2 {
 			continue
 		}
 		
+		binaryCount++
 		lit1 := clause.Literals[0]
 		lit2 := clause.Literals[1]
 		
@@ -1449,6 +1454,11 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			implications = append(implications, implication{lit2.Var(), lit1.Var()})
 		}
 		// Skip (a ∨ b) and (¬a ∨ ¬b) - not equivalence patterns
+	}
+	
+	if s.verbose && len(implications) > 0 {
+		fmt.Printf("c [verbose] Equivalence detection: found %d implications from %d binary clauses\n", 
+			len(implications), binaryCount)
 	}
 	
 	// Step 2: Build bidirectional graph
@@ -1518,14 +1528,18 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	}
 	
 	if len(substMap) == 0 {
-		if s.verbose {
-			fmt.Printf("c [verbose] Equivalence detection: no equivalences found\n")
+		if s.verbose && len(implications) > 0 {
+			fmt.Printf("c [verbose] Equivalence detection: no bidirectional implications found\n")
 		}
 		return UNKNOWN
 	}
 	
 	// Step 5: Substitute throughout formula
 	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	
+	if s.verbose {
+		fmt.Printf("c [debug] Equivalence detection: processing %d clauses\n", len(s.cnf.Clauses))
+	}
 	
 	for _, clause := range s.cnf.Clauses {
 		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
@@ -1535,7 +1549,8 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			varIdx := lit.Var()
 			
 			if subst, exists := substMap[varIdx]; exists {
-				newLit := cnf.NewLiteral(subst.rep, lit.IsNegated() != subst.samePol)
+				// Preserve polarity when substituting: if lit is negated, new lit is negated
+				newLit := cnf.NewLiteral(subst.rep, lit.IsNegated())
 				newLiterals = append(newLiterals, newLit)
 				clauseChanged = true
 			} else {
@@ -1571,7 +1586,7 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 		
 		if len(newLiterals) == 0 {
 			if s.verbose {
-				fmt.Printf("c [verbose] Equivalence detection: empty clause (UNSAT)\n")
+				fmt.Printf("c [verbose] Equivalence detection: empty clause created (UNSAT)\n")
 			}
 			return UNSAT
 		}
@@ -1588,7 +1603,8 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	}
 	
 	if s.verbose {
-		fmt.Printf("c [verbose] Equivalence detection: eliminated %d variables\n", len(substMap))
+		fmt.Printf("c [verbose] Equivalence detection: eliminated %d variables, resulting in %d clauses\n", 
+			len(substMap), s.cnf.NumClauses)
 	}
 	
 	return UNKNOWN
