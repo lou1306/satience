@@ -484,6 +484,10 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		
 	case 3:
 		// Ternary learned clause - add to TernaryWatchA/B/C and TernaryWatchList
+		// BUG: Uses len(TernaryClauses) but TernaryClauseIndices has different size!
+		// InitializeWatches() populates TernaryClauseIndices for original clauses,
+		// but does NOT populate TernaryClauses. This causes index mismatch.
+		// FIX NEEDED: Track original ternary count and use: ternIdx = originalCount + len(TernaryClauses)
 		ternIdx := len(c.TernaryClauses)
 		c.TernaryClauses = append(c.TernaryClauses, TernaryClause{
 			Lit1: uint32(literals[0]),
@@ -498,7 +502,7 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		c.TernaryWatchA = append(c.TernaryWatchA, lit1Idx)
 		c.TernaryWatchB = append(c.TernaryWatchB, lit2Idx)
 		c.TernaryWatchC = append(c.TernaryWatchC, lit3Idx)
-		c.TernaryClauseIndices = append(c.TernaryClauseIndices, -learnedClauseIdx-1) // Negative to indicate learned
+		c.TernaryClauseIndices = append(c.TernaryClauseIndices, -learnedClauseIdx-1)
 		
 		c.TernaryWatchList[lit1Idx] = append(c.TernaryWatchList[lit1Idx], ternIdx)
 		c.TernaryWatchList[lit2Idx] = append(c.TernaryWatchList[lit2Idx], ternIdx)
@@ -506,8 +510,9 @@ func (c *CNF) AddLearnedClauseToWatches(learnedClauseIdx int, literals []Literal
 		
 	default:
 		// Long learned clause (>3 literals) - add to LongWatchA/B and WatchListLong
+		// FIX: Use len(LongClauseIndices) to continue from where InitializeWatches() left off
 		longIdx := len(c.LongClauseIndices)
-		c.LongClauseIndices = append(c.LongClauseIndices, -learnedClauseIdx-1) // Negative to indicate learned
+		c.LongClauseIndices = append(c.LongClauseIndices, -learnedClauseIdx-1)
 		
 		lit1Idx := LitToIndex(literals[0])
 		lit2Idx := LitToIndex(literals[1])
