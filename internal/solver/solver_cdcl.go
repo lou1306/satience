@@ -792,32 +792,16 @@ func (s *CDCLSolver) restart() {
 		s.inprocessing()
 	}
 	
-	// Compact to keep only glue clauses
-	newClauses := make([]cnf.Clause, 0, glueCount)
-	newActivity := make([]float64, 0, glueCount)
-	newAge := make([]int, 0, glueCount)
-	newSize := make([]int, 0, glueCount)
+	// TEMPORARY FIX: Skip learned clause deletion to avoid watch corruption
+	// Keep ALL learned clauses (don't compact)
+	// This avoids the soundness bug but uses more memory
+	// TODO: Implement proper separate watch structures for learned clauses
 	
-	for i := range s.learnedClauses {
-		if isGlue[i] {
-			newClauses = append(newClauses, s.learnedClauses[i])
-			newActivity = append(newActivity, s.clauseActivity[i])
-			newAge = append(newAge, s.clauseAge[i])
-			newSize = append(newSize, s.clauseSize[i])
-		}
+	if s.verbose {
+		fmt.Printf("c [verbose] Restart: keeping all %d learned clauses (deletion disabled)\n", len(s.learnedClauses))
 	}
 	
-	s.learnedClauses = newClauses
-	s.clauseActivity = newActivity
-	s.clauseAge = newAge
-	s.clauseSize = newSize
-	
-	// Rebuild arena with only glue clauses
-	s.learnedArena.Reset()
-	for _, clause := range s.learnedClauses {
-		s.learnedArena.AllocateClause(clause.Literals, true)
-	}
-	
+	// Just reset restart counters
 	s.lubyIndex++
 	s.restartCount = s.conflicts
 	s.lbdSum = 0
@@ -1782,7 +1766,21 @@ func (s *CDCLSolver) propagateTernary() (bool, int) {
 		for i := 0; i < len(watchList); i++ {
 			ternIdx := watchList[i]
 			clauseIdx := s.cnf.TernaryClauseIndices[ternIdx]
-			clause := s.cnf.Clauses[clauseIdx]
+			
+			// Handle learned clauses (negative index encoding)
+			var clause cnf.Clause
+			if clauseIdx < 0 {
+				learnedIdx := -clauseIdx - 1
+				if learnedIdx >= len(s.learnedClauses) {
+					continue // Skip invalid learned clause reference
+				}
+				clause = s.learnedClauses[learnedIdx]
+			} else {
+				if clauseIdx >= len(s.cnf.Clauses) {
+					continue // Skip invalid original clause reference
+				}
+				clause = s.cnf.Clauses[clauseIdx]
+			}
 			
 			// Get the three watched literals
 			watchAIdx := s.cnf.TernaryWatchA[ternIdx]
@@ -1965,7 +1963,21 @@ func (s *CDCLSolver) propagateLong() (bool, int) {
 		for i := 0; i < len(watchList); i++ {
 			watchIdx := watchList[i]
 			clauseIdx := s.cnf.LongClauseIndices[watchIdx]
-			clause := &s.cnf.Clauses[clauseIdx]
+			
+			// Handle learned clauses (negative index encoding)
+			var clause *cnf.Clause
+			if clauseIdx < 0 {
+				learnedIdx := -clauseIdx - 1
+				if learnedIdx >= len(s.learnedClauses) {
+					continue // Skip invalid learned clause reference
+				}
+				clause = &s.learnedClauses[learnedIdx]
+			} else {
+				if clauseIdx >= len(s.cnf.Clauses) {
+					continue // Skip invalid original clause reference
+				}
+				clause = &s.cnf.Clauses[clauseIdx]
+			}
 			
 			// Get the two watched literals
 			watchAIdx := s.cnf.LongWatchA[watchIdx]
