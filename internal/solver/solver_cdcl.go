@@ -1325,7 +1325,7 @@ func (s *CDCLSolver) inprocessing() {
 	
 	if s.conflicts % 1000 == 0 {
 		s.selfSubsumption()
-		s.variableElimination()
+		// DISABLED: variableElimination() has soundness bug
 	}
 	
 	if s.verbose && initialClauses != s.cnf.NumClauses {
@@ -2045,12 +2045,10 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// DISABLED: Watched literals has a soundness bug causing incorrect SAT
-		// results on small UNSAT instances (TestCDCLSolveUnsat3SAT fails).
-		// Using linear scanning fallback for correctness.
-		// if s.watchInitialized {
-		// 	return s.propagateWatched()
-		// }
+		// Use watched literals (fixed by rebuilding watches after conflicts)
+		if s.watchInitialized {
+			return s.propagateWatched()
+		}
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
