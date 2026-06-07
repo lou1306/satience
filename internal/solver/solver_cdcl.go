@@ -1911,11 +1911,13 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				if s.assignments[blit.Var()].Level == 0 {
 					// Propagate blit
 					s.assignLiteral(blit, s.level, int(clauseID))
-					// Keep watch and restart propagation
+					// Keep watch and restart propagation from beginning
 					watches[newWatchCount] = watch
 					newWatchCount++
 					s.watchLists[watchIdx] = watches[:newWatchCount]
-					return false, -1
+					// Restart from beginning of trail
+					trailIndex = s.trailHead[s.level]
+					break  // Break out of watch loop, continue trail loop
 				}
 				if !s.literalIsTrue(blit) {
 					// Conflict: both watched literals are false
@@ -1959,11 +1961,13 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				if s.assignments[blit.Var()].Level == 0 {
 					// Propagate blit
 					s.assignLiteral(blit, s.level, int(clauseID))
-					// Keep watch and restart
+					// Keep watch and restart from beginning
 					watches[newWatchCount] = watch
 					newWatchCount++
 					s.watchLists[watchIdx] = watches[:newWatchCount]
-					return false, -1
+					// Restart from beginning of trail
+					trailIndex = s.trailHead[s.level]
+					break  // Break out of watch loop, continue trail loop
 				}
 				if !s.literalIsTrue(blit) {
 					// Conflict: all literals are false
@@ -2841,3 +2845,61 @@ func (s *CDCLSolver) backtrack() bool {
 }
 
 
+
+// SolveWithResultNoPreprocess solves without preprocessing (for debugging watched literals)
+func (s *CDCLSolver) SolveWithResultNoPreprocess(skipPreprocess bool) SolveResult {
+	if !skipPreprocess {
+		return s.SolveWithResult()
+	}
+	
+	// Skip preprocessing, just initialize watches and solve
+	if s.verbose {
+		fmt.Printf("c [verbose] Skipping preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+	
+	// CRITICAL: Must do initial unit propagation before watched literals!
+	if s.verbose {
+		fmt.Printf("c [verbose] Initial unit propagation before watched literals\n")
+	}
+	unitResult := s.unitPropagationPreprocess()
+	if unitResult != UNKNOWN {
+		return unitResult
+	}
+	
+	s.initWatches()
+	s.vsids.InitializeFromClauses(s.cnf.Clauses)
+	
+	for {
+		s.iterations++
+		if s.maxIter > 0 && s.iterations > s.maxIter {
+			return UNKNOWN
+		}
+		
+		conflict, clauseIdx := s.propagate()
+		if conflict {
+			s.handleConflict(clauseIdx)
+			if !s.backtrack() {
+				return UNSAT
+			}
+			s.backjumpLevel = 0
+			
+			if s.shouldRestart() {
+				s.restart()
+			}
+			continue
+		}
+		
+		if s.allAssigned() {
+			return SAT
+		}
+		
+		if !s.decide() {
+			return UNSAT
+		}
+	}
+}
+
+// WatchListsForDebug returns watch lists for debugging
+func (s *CDCLSolver) WatchListsForDebug() [][]cnf.Watch {
+	return s.watchLists
+}
