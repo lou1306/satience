@@ -2926,37 +2926,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			return backjumpLevel
 		}
 		
-		// CLAUSE SIZE FILTERING: Only learn short, useful clauses
-		// Large clauses from 1-UIP with decisions are harmful - they slow down propagation
-		// without adding useful constraints. Skip clauses with >4 literals.
-		if len(learnedLits) > 4 {
-			if s.verbose && s.conflicts <= 100 {
-				fmt.Printf("c [debug] Skipping learned clause: size=%d > 4 (too large, likely from decisions)\n", len(learnedLits))
-			}
-			// Still return backjump level for correct backtracking
-			backjumpLevel := 0
-			for varIdx, inClause := range s.tmpLiteralInClause {
-				if inClause {
-					lvl := s.assignments[varIdx].Level
-					if lvl > backjumpLevel && lvl < s.level {
-						backjumpLevel = lvl
-					}
-				}
-			}
-			if backjumpLevel == 0 {
-				backjumpLevel = 1
-			}
-			return backjumpLevel
-		}
-		
-		// LBD FILTERING: Reject very low-quality clauses immediately
-		if lbd > 50 {
-			// Skip this clause - too many decision levels, unlikely to be useful
-			if s.verbose && s.conflicts <= 100 {
-				fmt.Printf("c [debug] Skipping learned clause: LBD=%d > 50\n", lbd)
-			}
-		} else {
-			// Check if we need to delete clauses
+		// Learn all clauses from 1-UIP (basic CDCL)
+		// Check if we need to delete clauses
 			// Keep max 5000 normal clauses + all glue clauses
 			maxNormalClauses := 5000
 			
@@ -3056,7 +3027,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			// LBD-based VSIDS: bump variables in low-LBD clauses
 			s.vsids.bumpLBD(learnedLits, lbd)
-		}
 	}
 	
 	// Calculate backjump level
