@@ -75,6 +75,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	minLearned := 50    // Target after deletion (50% reduction)
 	restartBase := 100  // Base for Luby restart sequence
 	
+	// Ensure literal pool is built for efficient propagation
+	formula.RebuildLiteralPool()
+	
 	solver := &CDCLSolver{
 		cnf:         formula,
 		assignments: make([]Assignment, formula.NumVars),
@@ -250,11 +253,12 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return equivResult
 		}
 		
-		// Variable elimination can create unit clauses
-		veResult := s.variableElimination()
-		if veResult != UNKNOWN {
-			return veResult
-		}
+		// DISABLED: Variable elimination has a soundness bug - it can make UNSAT
+		// instances appear SAT. See php_6p_5h_unsat.cnf. Must debug before re-enabling.
+		// veResult := s.variableElimination()
+		// if veResult != UNKNOWN {
+		// 	return veResult
+		// }
 		
 		// Run unit propagation again after variable elimination
 		unitResult = s.unitPropagationPreprocess()
@@ -2007,10 +2011,12 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// Use watched literals for propagation
-		if s.watchInitialized {
-			return s.propagateWatched()
-		}
+		// DISABLED: Watched literals has a soundness bug causing incorrect SAT
+		// results on small UNSAT instances (TestCDCLSolveUnsat3SAT fails).
+		// Using linear scanning fallback for correctness.
+		// if s.watchInitialized {
+		// 	return s.propagateWatched()
+		// }
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
