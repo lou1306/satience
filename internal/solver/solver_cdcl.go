@@ -1909,8 +1909,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			if isBinary {
 				// Binary clause: the other watched literal is 'blit'
 				if s.assignments[blit.Var()].Level == 0 {
-					// Propagate blit
-					s.assignLiteral(blit, s.level, int(clauseID))
+					// Propagate blit - use negative index for learned clauses
+					reasonIdx := int(clauseID)
+					if isLearned {
+						reasonIdx = -learnedIdx - 1
+					}
+					s.assignLiteral(blit, s.level, reasonIdx)
 					// Keep watch and restart propagation from beginning
 					watches[newWatchCount] = watch
 					newWatchCount++
@@ -1959,8 +1963,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				// No replacement found - clause is unit or conflicting
 				// The other watched literal (blit) is the only option
 				if s.assignments[blit.Var()].Level == 0 {
-					// Propagate blit
-					s.assignLiteral(blit, s.level, int(clauseID))
+					// Propagate blit - use negative index for learned clauses
+					reasonIdx := int(clauseID)
+					if isLearned {
+						reasonIdx = -learnedIdx - 1
+					}
+					s.assignLiteral(blit, s.level, reasonIdx)
 					// Keep watch and restart from beginning
 					watches[newWatchCount] = watch
 					newWatchCount++
