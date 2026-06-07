@@ -2415,15 +2415,22 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		for learnedIdx := range s.learnedClauses {
-			clause := &s.learnedClauses[learnedIdx]
+		// Optimized propagation for learned clauses using contiguous arena
+		numLearned := s.learnedArena.NumClauses()
+		for learnedIdx := 0; learnedIdx < numLearned; learnedIdx++ {
+			iter := s.learnedArena.IterClause(learnedIdx)
+			clauseSize := iter.Size()
 			
 			satisfiedCount := 0
 			falseCount := 0
 			unassignedCount := 0
 			var unassignedLit cnf.Literal
 			
-			for _, lit := range clause.Literals {
+			for {
+				lit, ok := iter.Next()
+				if !ok {
+					break
+				}
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
 				if litLevel == 0 {
@@ -2448,7 +2455,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 				return true, -learnedIdx - 1
 			}
 			
-			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
+			if unassignedCount == 1 && falseCount == clauseSize-1 {
 				assignLevel := s.level
 				if assignLevel == 0 {
 					assignLevel = 1
