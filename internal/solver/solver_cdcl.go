@@ -2169,8 +2169,16 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			// Get the blocking literal
 			blit := cnf.IndexToLit(int(blitIdx))
 			
+			if s.verbose {
+				fmt.Printf("c [WATCH] Processing watch: clauseID=%d, falseLit=%v, blit=%v, isBinary=%v\n",
+					clauseID, falseLit, blit, isBinary)
+			}
+			
 			// If blocking literal is true, clause is satisfied - keep watch
 			if s.literalIsTrue(blit) {
+				if s.verbose {
+					fmt.Printf("c [WATCH]   blit %v is TRUE, clause satisfied\n", blit)
+				}
 				watches[newWatchCount] = watch
 				newWatchCount++
 				continue
@@ -2225,15 +2233,34 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 			// Long clause: try to find a replacement watch
 			// Scan all literals except the two watched ones
+			if s.verbose {
+				fmt.Printf("c [WATCH]   Long clause %v, scanning for replacement...\n", clause.Literals)
+			}
 			foundReplacement := false
 			for _, clauseLit := range clause.Literals {
 				// Skip the two currently watched literals
 				if clauseLit == falseLit || clauseLit == blit {
+					if s.verbose {
+						fmt.Printf("c [WATCH]     Skipping watched lit %v\n", clauseLit)
+					}
 					continue
 				}
 				
+				litLevel := s.assignments[clauseLit.Var()].Level
+				litValue := s.assignments[clauseLit.Var()].Value
+				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
+				
+				if s.verbose {
+					fmt.Printf("c [WATCH]     Checking lit %v (var %d): level=%d, value=%v, litTrue=%v\n",
+						clauseLit, clauseLit.Var()+1, litLevel, litValue, litTrue)
+				}
+				
 				// Can watch this literal if it's true or unassigned
-				if s.literalIsTrue(clauseLit) || s.assignments[clauseLit.Var()].Level == 0 {
+				if litTrue || litLevel == 0 {
+					if s.verbose {
+						fmt.Printf("c [WATCH]     Found replacement: %v (level=%d, true=%v)\n",
+							clauseLit, litLevel, litTrue)
+					}
 					// Add watch for the new literal
 					newWatchIdx := cnf.LitToIndex(clauseLit)
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
@@ -2244,6 +2271,10 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					foundReplacement = true
 					break
 				}
+			}
+			
+			if s.verbose {
+				fmt.Printf("c [WATCH]   Replacement found: %v\n", foundReplacement)
 			}
 			
 			if !foundReplacement {
@@ -2293,11 +2324,11 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// TEMPORARILY DISABLED: Watched literals has soundness bugs
-		// Use simple linear propagation instead
-		// if s.watchInitialized {
-		// 	return s.propagateWatched()
-		// }
+		// DISABLED: Watched literals has soundness bug - variables decided instead of propagated
+		// Using linear propagation for correctness
+		if s.watchInitialized {
+			// return s.propagateWatched()
+		}
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
