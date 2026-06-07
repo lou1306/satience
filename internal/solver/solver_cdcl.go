@@ -2770,10 +2770,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		var foundVar uint32 = 0
 		found := false
 		
-		// Scan trail at current level to find resolvable literal
-		for i := s.trailHead[s.level]; i < len(s.trail); i++ {
-			varIdx := uint32(s.trail[i])
-			if s.tmpLiteralInClause[varIdx] && !s.tmpResolved[varIdx] {
+		// CRITICAL FIX: Scan ALL variables at current level, not just trail from decision point!
+		// When resolving, newly added literals may have been assigned earlier at this level.
+		// The old code scanned from trailHead[s.level] onward, missing literals assigned
+		// before the current decision but still at the current level.
+		// This caused 1-UIP to fail with 2+ literals at current level on PHP instances.
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if s.assignments[varIdx].Level == s.level && 
+			   s.tmpLiteralInClause[varIdx] && 
+			   !s.tmpResolved[varIdx] {
 				reasonIdx := s.implication[varIdx]
 				if reasonIdx != -1 { // Has a reason (not a decision)
 					foundVar = varIdx
