@@ -2324,8 +2324,38 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// DISABLED: Watched literals has soundness bug - variables decided instead of propagated
-		// Using linear propagation for correctness
+		// DISABLED: Watched literals has soundness bug
+		// 
+		// Bug description: Variables are decided instead of being propagated,
+		// leading to invalid models where clauses like [1 2 3] have all literals FALSE.
+		// 
+		// Minimal failing instance:
+		//   p cnf 6 5
+		//   1 2 3 0
+		//   4 5 6 0
+		//   -1 -4 0
+		//   -2 -5 0
+		//   -3 -6 0
+		// 
+		// Root cause hypothesis: After backtracking, watches find "replacements" on
+		// literals with stale value=false from previous assignments. The check
+		// `litLevel == 0` correctly identifies unassigned variables, but the watch
+		// logic incorrectly treats these as valid replacements even when they should
+		// trigger propagation.
+		// 
+		// Debug trace shows:
+		// - Clause [0 1 2] watches on literals 0 and 1
+		// - When literal 0 becomes false, scan finds literal 2 as "replacement"
+		// - Literal 2 has level=0 (unassigned) but value=false (stale)
+		// - Watch moves to literal 2, no propagation occurs
+		// - All three literals end up FALSE without conflict detection
+		// 
+		// TODO: Fix by ensuring watch replacement logic properly handles the case
+		// where all non-watched literals are false or unassigned. May need to
+		// propagate immediately instead of moving watches.
+		// 
+		// Performance impact: Linear propagation is O(n) vs O(1) for watched literals.
+		// Expected slowdown: 10-50x on propagation-heavy instances (sudoku, tseitin).
 		if s.watchInitialized {
 			// return s.propagateWatched()
 		}
@@ -2513,6 +2543,9 @@ func (s *CDCLSolver) decide() bool {
 	s.trailHead = append(s.trailHead, len(s.trail))
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1)
 	s.decisions++
+	if s.verbose {
+		fmt.Printf("c [DECIDE] Level %d: var %d = %v (decision)\n", s.level, varIdx+1, phase)
+	}
 	return true
 }
 
@@ -2520,6 +2553,15 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	varIdx := lit.Var()
 
 	if s.assignments[varIdx].Level != 0 {
+		// Variable already assigned - this could be a bug if we're trying to propagate
+		if s.verbose && level > 0 {
+			reasonStr := "propagation"
+			if clauseIdx == -1 {
+				reasonStr = "decision"
+			}
+			fmt.Printf("c [ALERT] assignLiteral: var %d already assigned at level %d, trying to assign at level %d (%s)\n",
+				varIdx+1, s.assignments[varIdx].Level, level, reasonStr)
+		}
 		return
 	}
 
@@ -2533,6 +2575,20 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	
 	// Save the phase (polarity) that satisfied this variable
 	s.savedPhase[varIdx] = value
+	
+	if s.verbose && level > 0 {
+		reasonStr := "propagation"
+		if clauseIdx == -1 {
+			reasonStr = "decision"
+		}
+		fmt.Printf("c [ASSIGN] Level %d: var %d = %v (%s)", level, varIdx+1, value, reasonStr)
+		if clauseIdx >= 0 {
+			fmt.Printf(" from clause %d", clauseIdx)
+		} else if clauseIdx < -1 {
+			fmt.Printf(" from learned clause %d", -clauseIdx-1)
+		}
+		fmt.Printf("\n")
+	}
 }
 
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {

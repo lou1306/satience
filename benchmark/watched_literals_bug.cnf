@@ -1,0 +1,16 @@
+c Minimal instance demonstrating watched literals soundness bug
+c 
+c This instance should be SATISFIABLE (e.g., 1=T, 2=F, 3=F, 4=F, 5=T, 6=T)
+c but watched literals propagation incorrectly returns UNSAT or finds invalid model
+c 
+c Root cause: Watch replacement logic finds "replacements" on literals with
+c stale value=false from previous assignments after backtracking.
+c 
+c Expected behavior with linear propagation: SATISFIABLE
+c Buggy behavior with watched literals: UNSAT or invalid model
+p cnf 6 5
+1 2 3 0
+4 5 6 0
+-1 -4 0
+-2 -5 0
+-3 -6 0
