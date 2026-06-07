@@ -72,24 +72,29 @@ Scanned all literals to detect unit clauses. Failed because:
 
 ## Recommended Fix Strategy
 
-### Phase 1: Simplify and Verify (2-3 days)
-1. Implement watched literals ONLY for binary clauses
-2. Keep linear propagation for ternary and longer clauses
-3. Add extensive invariant checking:
-   - Every clause must have at least one non-false watched literal
-   - Unit clauses must trigger propagation immediately
-   - Conflicts must be detected when both watches false
+**DO NOT implement watched literals incrementally.** The algorithm must work correctly for ALL clause types from the start:
+
+- Binary clauses interact with ternary and long clauses during propagation
+- Watch movement logic is identical regardless of clause length
+- Backtracking affects all watches uniformly
+- Partial implementation creates false confidence and wasted effort
+
+### Option A: Complete Rewrite (2-3 weeks)
+1. Study MiniSat's watched literals implementation thoroughly
+2. Implement for ALL clause types simultaneously
+3. Add extensive invariant checking from day 1
 4. Test on minimal instance until 100% correct
+5. Benchmark progressively on larger instances
 
-### Phase 2: Extend to Ternary (2-3 days)
-1. Add ternary clause support
-2. Maintain invariants from Phase 1
-3. Test on tseitin instances (ternary-heavy)
+### Option B: Integrate Reference Implementation (1 week)
+1. Port MiniSat's watched literals code to Go
+2. Integrate with our CDCL engine
+3. Test and benchmark
 
-### Phase 3: Full Implementation (3-5 days)
-1. Extend to all clause lengths
-2. Optimize watch movement
-3. Benchmark against MiniSat
+### Option C: Accept Performance Trade-off (Current)
+1. Keep linear propagation (correct)
+2. Optimize other areas (clause database, heuristics, preprocessing)
+3. Document performance gap clearly
 
 ## Alternative: Use Existing Implementation
 
