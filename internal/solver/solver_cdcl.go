@@ -2425,23 +2425,59 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// SKIP learned clause propagation - learned clauses have high LBD and rarely propagate
+		// CRITICAL: Must check learned clauses during propagation!
+		// Disabling this causes infinite loops: learned clauses don't prevent same conflict
 		// 
-		// Analysis of 6000+ conflicts on 0038cea06eae4c3234b7bb65d9a8497c.cnf:
-		// - 2157 learned clauses, but only 60 propagations from learned clauses
-		// - props/dec = 1.6 (should be >5 for efficient solving)
-		// - Learned clauses have LBD 5-18, spanning many decision levels
-		// - They rarely become unit because literals are spread across levels
-		// 
-		// Strategy: Rely on ORIGINAL CLAUSES for propagation (they're shorter, lower LBD)
-		// Learned clauses still help by:
-		// 1. Guiding VSIDS variable selection (bumpClause during conflict analysis)
-		// 2. Explaining conflicts during 1-UIP analysis
-		// 3. Detecting conflicts when all literals become false
-		// 
-		// This is similar to "lazy clause management" in some CDCL variants
-		// 
-		// Future optimization: Use watched literals for learned clauses (O(1) propagation check)
+		// Re-enable simple linear scanning of learned clauses (O(n) but correct)
+		numLearned := s.learnedArena.NumClauses()
+		for learnedIdx := 0; learnedIdx < numLearned; learnedIdx++ {
+			iter := s.learnedArena.IterClause(learnedIdx)
+			clauseSize := iter.Size()
+			
+			satisfiedCount := 0
+			falseCount := 0
+			unassignedCount := 0
+			var unassignedLit cnf.Literal
+			
+			for {
+				lit, ok := iter.Next()
+				if !ok {
+					break
+				}
+				varIdx := lit.Var()
+				litLevel := s.assignments[varIdx].Level
+				if litLevel == 0 {
+					unassignedCount++
+					unassignedLit = lit
+				} else {
+					assign := s.assignments[varIdx]
+					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					if isTrue {
+						satisfiedCount++
+					} else {
+						falseCount++
+					}
+				}
+			}
+			
+			if satisfiedCount > 0 {
+				continue
+			}
+			
+			if unassignedCount == 0 && falseCount > 0 {
+				return true, -learnedIdx - 1
+			}
+			
+			if unassignedCount == 1 && falseCount == clauseSize-1 {
+				assignLevel := s.level
+				if assignLevel == 0 {
+					assignLevel = 1
+				}
+				s.assignLiteral(unassignedLit, assignLevel, -learnedIdx-1)
+				unitPropagated = true
+				break
+			}
+		}
 		
 		if unitPropagated {
 			trailIndex = s.trailHead[s.level]
@@ -2783,11 +2819,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			reasonLits = s.learnedClauses[learnedIdx].Literals
 		}
 		
-		if currentSize < 8 && s.tmpLevelCount[s.level] == 2 {
-			if len(reasonLits) > 6 {
-				continue
-			}
-		}
+		// REMOVED: Heuristic that prevented proper 1-UIP analysis
+		// This caused PHP instances to hang - clauses had 2+ literals at current level
+		// instead of exactly 1, so they didn't prevent the same conflict
+		// 
+		// if currentSize < 8 && s.tmpLevelCount[s.level] == 2 {
+		// 	if len(reasonLits) > 6 {
+		// 		continue
+		// 	}
+		// }
 		
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpLevelCount[s.assignments[varIdx].Level]--
@@ -2814,10 +2854,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	// Build the learned clause from remaining literals
 	learnedLits := make([]cnf.Literal, 0)
+	litsAtCurrentLevel := 0
 	for varIdx, inClause := range s.tmpLiteralInClause {
 		if inClause {
 			learnedLits = append(learnedLits, cnf.NewLiteral(uint32(varIdx), s.tmpLiteralIsNegated[varIdx]))
+			if s.assignments[varIdx].Level == s.level {
+				litsAtCurrentLevel++
+			}
 		}
+	}
+	
+	if s.verbose && s.conflicts <= 20 {
+		fmt.Printf("c [debug] 1-UIP result: %d literals total, %d at current level %d\n", len(learnedLits), litsAtCurrentLevel, s.level)
 	}
 	
 	// Calculate LBD using reusable buffer (no map allocation)
