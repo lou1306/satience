@@ -2765,8 +2765,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					size := len(s.learnedClauses[learnedIdx].Literals)
 					s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx, size})
 				}
+			} else {
+				// reasonIdx == 0 means this is a DECISION (assigned at level 0 in our encoding)
+				if s.verbose && s.conflicts <= 10 {
+					fmt.Printf("c [debug] 1-UIP: var %d in clause is a DECISION at level %d (implication=%d)\n", varIdx, s.assignments[varIdx].Level, reasonIdx)
+				}
 			}
 		}
+	}
+	
+	if s.verbose && s.conflicts <= 10 {
+		fmt.Printf("c [debug] 1-UIP: %d candidates to resolve on, tmpLevelCount[%d]=%d\n", len(s.tmpCandidates), s.level, s.tmpLevelCount[s.level])
 	}
 	
 	// Simple selection sort for best reason clauses
@@ -2804,6 +2813,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		
 		reasonIdx := s.implication[varIdx]
 		if reasonIdx < 0 {
+			// This literal is a DECISION, not a propagation - has no reason clause
+			// Cannot resolve on decisions! This is why 1-UIP fails
+			if s.verbose && s.conflicts <= 10 {
+				fmt.Printf("c [debug] 1-UIP: var %d at level %d is a DECISION (no reason), cannot resolve\n", varIdx, s.assignments[varIdx].Level)
+			}
 			continue
 		}
 		
@@ -2830,9 +2844,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// }
 		
 		s.tmpLiteralInClause[varIdx] = false
-		s.tmpLevelCount[s.assignments[varIdx].Level]--
+		oldLevel := s.assignments[varIdx].Level
+		s.tmpLevelCount[oldLevel]--
 		
 		newLiterals := 0
+		newLiteralsAtCurrentLevel := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
 			if v == varIdx {
@@ -2845,8 +2861,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				if lvl <= s.level {
 					s.tmpLevelCount[lvl]++
 					newLiterals++
+					if lvl == s.level {
+						newLiteralsAtCurrentLevel++
+					}
 				}
 			}
+		}
+		
+		if s.verbose && s.conflicts <= 5 {
+			fmt.Printf("c [debug] 1-UIP: resolved var %d (level %d), reason has %d lits, %d at current level, tmpLevelCount[%d]=%d\n",
+				varIdx, oldLevel, len(reasonLits), newLiteralsAtCurrentLevel, s.level, s.tmpLevelCount[s.level])
 		}
 		
 		currentSize = currentSize - 1 + newLiterals
@@ -2864,8 +2888,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	if s.verbose && s.conflicts <= 20 {
-		fmt.Printf("c [debug] 1-UIP result: %d literals total, %d at current level %d\n", len(learnedLits), litsAtCurrentLevel, s.level)
+	if s.verbose {
+		fmt.Printf("c [debug] 1-UIP result: conflict=%d, %d literals total, %d at current level %d\n", s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
 	}
 	
 	// Calculate LBD using reusable buffer (no map allocation)
