@@ -2870,6 +2870,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		return backjumpLevel
 	}
 	
+	// CLAUSE MINIMIZATION via self-subsumption
+	// Try to remove literals from the learned clause by resolving with reason clauses
+	// This produces smaller, more general learned clauses
+	originalSize := len(learnedLits)
+	learnedLits = s.minimizeLearnedClause(learnedLits)
+	if s.verbose && len(learnedLits) < originalSize {
+		fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(learnedLits))
+	}
+	
 	// Calculate LBD using reusable buffer (no map allocation)
 	lbd := 0
 	for varIdx, inClause := range s.tmpLiteralInClause {
@@ -3118,6 +3127,64 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 // Scoring Formula:
 // score = age*10 + LBD*50 + size*5 - activity*20 + bonuses/penalties
 // Higher score = more likely to delete
+
+// minimizeLearnedClause reduces the size of a learned clause via self-subsumption
+func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Literal {
+	if len(learnedLits) <= 2 {
+		return learnedLits
+	}
+	
+	for i := range s.tmpLiteralInClause {
+		s.tmpLiteralInClause[i] = false
+	}
+	for _, lit := range learnedLits {
+		s.tmpLiteralInClause[lit.Var()] = true
+	}
+	
+	minimized := make([]cnf.Literal, 0, len(learnedLits))
+	
+	for _, lit := range learnedLits {
+		varIdx := lit.Var()
+		canRemove := false
+		
+		reasonIdx := s.implication[varIdx]
+		if reasonIdx != -1 {
+			var reasonLits []cnf.Literal
+			if reasonIdx >= 0 {
+				reasonLits = s.cnf.Clauses[reasonIdx].Literals
+			} else {
+				learnedIdx := -reasonIdx - 1
+				if learnedIdx < len(s.learnedClauses) {
+					reasonLits = s.learnedClauses[learnedIdx].Literals
+				}
+			}
+			
+			if reasonLits != nil {
+				allCovered := true
+				for _, reasonLit := range reasonLits {
+					if reasonLit.Var() == varIdx {
+						continue
+					}
+					if !s.tmpLiteralInClause[reasonLit.Var()] {
+						allCovered = false
+						break
+					}
+				}
+				
+				if allCovered {
+					canRemove = true
+				}
+			}
+		}
+		
+		if !canRemove {
+			minimized = append(minimized, lit)
+		}
+	}
+	
+	return minimized
+}
+
 func (s *CDCLSolver) deleteLearnedClauses() {
 	// Aggressive clause deletion - keep only the absolute best clauses
 	// Strategy: Delete by age first, then by quality
