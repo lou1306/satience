@@ -18,6 +18,7 @@ func main() {
 func run() int {
 	model := flag.Bool("model", false, "Print satisfying assignment")
 	verify := flag.Bool("verify", false, "Verify model is correct (implies -model)")
+	dpll := flag.Bool("dpll", false, "Use plain DPLL algorithm (no clause learning)")
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
@@ -66,7 +67,14 @@ func run() int {
 	}
 	
 	start := time.Now()
-	result := s.SolveWithResultNoPreprocess(*nopreprocess)
+	var result solver.SolveResult
+	if *dpll {
+		// Use plain DPLL algorithm (no clause learning)
+		result = s.SolveDPLL()
+	} else {
+		// Use CDCL algorithm
+		result = s.SolveWithResultNoPreprocess(*nopreprocess)
+	}
 	elapsed := time.Since(start)
 	
 	if *verbose {

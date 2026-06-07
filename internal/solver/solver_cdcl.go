@@ -3508,3 +3508,24 @@ func (s *CDCLSolver) shouldRebuildLBDOrder() bool {
 	// Rebuild periodically to account for new clauses with different LBD
 	return s.conflicts-s.lbdOrderLastRebuild >= 100
 }
+
+// SolveDPLL solves using plain DPLL algorithm (no clause learning, no CDCL)
+// This is useful for comparison and debugging
+func (s *CDCLSolver) SolveDPLL() SolveResult {
+	if s.verbose {
+		fmt.Printf("c Using plain DPLL algorithm (no clause learning)\n")
+	}
+	
+	// Create a simple DPLL solver
+	dpll := NewSolver(s.cnf)
+	
+	// Run DPLL
+	if dpll.Solve() {
+		// Copy DPLL assignments to CDCL solver for model extraction
+		for i := range dpll.assignments {
+			s.assignments[i] = dpll.assignments[i]
+		}
+		return SAT
+	}
+	return UNSAT
+}
