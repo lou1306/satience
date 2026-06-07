@@ -3315,6 +3315,26 @@ func (s *CDCLSolver) backtrack() bool {
 	if bjLevel <= 0 || bjLevel >= s.level {
 		bjLevel = s.level - 1
 	}
+	
+	// FIX: If backjumping to the same level as current max, we've already tried both polarities
+	// This happens when 1-UIP fails repeatedly and we keep backjumping to the same level
+	// In this case, backtrack one more level to avoid infinite flipping
+	if bjLevel == s.level-1 && len(s.trailHead) > bjLevel {
+		decisionPoint := s.trailHead[bjLevel]
+		if decisionPoint < len(s.trail) {
+			decisionVar := uint32(s.trail[decisionPoint])
+			// Check if this variable was already flipped (has implication from this level)
+			// If trailHead at this level points to same var, we're flipping repeatedly
+			if len(s.trail) > decisionPoint && uint32(s.trail[decisionPoint]) == decisionVar {
+				// Already at this decision, backtrack further
+				if bjLevel > 1 {
+					bjLevel--
+				} else {
+					return false // Can't backtrack further
+				}
+			}
+		}
+	}
 	if bjLevel < 1 {
 		if s.verbose && s.conflicts <= 20 {
 			fmt.Printf("c [BACKTRACK] FAIL: backjump level %d invalid (level=%d)\n", bjLevel, s.level)
