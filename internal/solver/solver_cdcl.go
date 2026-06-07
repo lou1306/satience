@@ -57,6 +57,7 @@ type CDCLSolver struct {
 	tmpCandidates []resolveCandidate
 	tmpLevelSet []int // For LBD calculation (replaces map)
 	tmpLevelSetUsed []bool // Track which levels are in tmpLevelSet
+	tmpResolved []bool // Track resolved variables in 1-UIP to prevent cycles
 	tmpClauseHash uint64 // Hash for duplicate detection
 	
 	// Watched literals infrastructure (Phase 1: data structures only)
@@ -130,12 +131,13 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		conflictsAtLevel: make([]int, formula.NumVars+1),
 		lastRandomDecision: -1000,
 		// Pre-allocate reusable buffers
-		tmpLiteralInClause: make([]bool, formula.NumVars),
-		tmpLiteralIsNegated: make([]bool, formula.NumVars),
-		tmpLevelCount: make([]int, formula.NumVars+1),
-		tmpCandidates: make([]resolveCandidate, 0, 100),
-		tmpLevelSet: make([]int, 0, formula.NumVars),
-		tmpLevelSetUsed: make([]bool, formula.NumVars+1),
+	tmpLiteralInClause: make([]bool, formula.NumVars),
+	tmpLiteralIsNegated: make([]bool, formula.NumVars),
+	tmpLevelCount: make([]int, formula.NumVars+1),
+	tmpCandidates: make([]resolveCandidate, 0, 100),
+	tmpLevelSet: make([]int, 0, formula.NumVars),
+	tmpLevelSetUsed: make([]bool, formula.NumVars+1),
+	tmpResolved: make([]bool, formula.NumVars),
 		// Initialize variable elimination tracking
 		eliminatedVars: make(map[uint32]eliminationInfo),
 	}
@@ -2751,107 +2753,69 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	// Build list of variables to resolve on (those in clause at current level with reasons)
-	for i := s.trailHead[s.level]; i < len(s.trail) && len(s.tmpCandidates) < 100; i++ {
-		varIdx := uint32(s.trail[i])
-		if s.tmpLiteralInClause[varIdx] {
-			reasonIdx := s.implication[varIdx]
-			if reasonIdx >= 0 {
-				size := len(s.cnf.Clauses[reasonIdx].Literals)
-				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx, size})
-			} else if reasonIdx < 0 {
-				learnedIdx := -reasonIdx - 1
-				if learnedIdx < len(s.learnedClauses) {
-					size := len(s.learnedClauses[learnedIdx].Literals)
-					s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx, size})
-				}
-			} else {
-				// reasonIdx == 0 means this is a DECISION (assigned at level 0 in our encoding)
-				if s.verbose && s.conflicts <= 10 {
-					fmt.Printf("c [debug] 1-UIP: var %d in clause is a DECISION at level %d (implication=%d)\n", varIdx, s.assignments[varIdx].Level, reasonIdx)
-				}
-			}
-		}
+	// 1-UIP: Resolve until exactly 1 literal remains at the current decision level
+	// KEY FIX: Dynamically find candidates by scanning trail, not pre-computing
+	// This ensures newly introduced literals at current level are also resolved
+	
+	currentSize := len(conflictLits)
+	resolvedCount := 0
+	
+	// Track which variables we've resolved on to prevent cycles
+	for i := range s.tmpResolved {
+		s.tmpResolved[i] = false
 	}
 	
-	if s.verbose && s.conflicts <= 10 {
-		fmt.Printf("c [debug] 1-UIP: %d candidates to resolve on, tmpLevelCount[%d]=%d\n", len(s.tmpCandidates), s.level, s.tmpLevelCount[s.level])
-	}
-	
-	// Simple selection sort for best reason clauses
-	// Prefer low-LBD clauses over size - low-LBD reasons produce low-LBD learned clauses
-	for i := 0; i < len(s.tmpCandidates) && i < 10; i++ {
-		minIdx := i
-		for j := i + 1; j < len(s.tmpCandidates); j++ {
-			// Calculate LBD for each candidate's reason clause
-			lbdI := s.getReasonLBD(s.tmpCandidates[minIdx].varIdx)
-			lbdJ := s.getReasonLBD(s.tmpCandidates[j].varIdx)
-			
-			// Primary: prefer low LBD
-			// Secondary: prefer short clauses (tie-breaker)
-			if lbdJ < lbdI {
-				minIdx = j
-			} else if lbdJ == lbdI && s.tmpCandidates[j].size < s.tmpCandidates[minIdx].size {
-				minIdx = j
-			}
-		}
-		if minIdx != i {
-			s.tmpCandidates[i], s.tmpCandidates[minIdx] = s.tmpCandidates[minIdx], s.tmpCandidates[i]
-		}
-	}
-	
-	// Resolve in order of preference (lowest-LBD reason clauses first)
-	currentSize := 0
-	for _, inClause := range s.tmpLiteralInClause {
-		if inClause {
-			currentSize++
-		}
-	}
-	
-	for i := 0; i < len(s.tmpCandidates) && s.tmpLevelCount[s.level] > 1; i++ {
-		varIdx := s.tmpCandidates[i].varIdx
+	for s.tmpLevelCount[s.level] > 1 {
+		// Find a literal at current level that's in our clause and has a reason
+		var foundVar uint32 = 0
+		found := false
 		
-		reasonIdx := s.implication[varIdx]
-		if reasonIdx < 0 {
-			// This literal is a DECISION, not a propagation - has no reason clause
-			// Cannot resolve on decisions! This is why 1-UIP fails
-			if s.verbose && s.conflicts <= 10 {
-				fmt.Printf("c [debug] 1-UIP: var %d at level %d is a DECISION (no reason), cannot resolve\n", varIdx, s.assignments[varIdx].Level)
+		// Scan trail at current level to find resolvable literal
+		for i := s.trailHead[s.level]; i < len(s.trail); i++ {
+			varIdx := uint32(s.trail[i])
+			if s.tmpLiteralInClause[varIdx] && !s.tmpResolved[varIdx] {
+				reasonIdx := s.implication[varIdx]
+				if reasonIdx != -1 { // Has a reason (not a decision)
+					foundVar = varIdx
+					found = true
+					break
+				}
 			}
-			continue
 		}
 		
-		if !s.tmpLiteralInClause[varIdx] {
-			continue
+		if !found {
+			// No more resolvable literals at current level
+			// This means remaining literals are decisions - cannot resolve further
+			break
 		}
+		
+		reasonIdx := s.implication[foundVar]
 		
 		var reasonLits []cnf.Literal
 		if reasonIdx >= 0 {
 			reasonLits = s.cnf.Clauses[reasonIdx].Literals
 		} else {
 			learnedIdx := -reasonIdx - 1
-			reasonLits = s.learnedClauses[learnedIdx].Literals
+			if learnedIdx < len(s.learnedClauses) {
+				reasonLits = s.learnedClauses[learnedIdx].Literals
+			} else {
+				// Learned clause was deleted, remove this literal and continue
+				s.tmpLiteralInClause[foundVar] = false
+				s.tmpLevelCount[s.level]--
+				continue
+			}
 		}
 		
-		// REMOVED: Heuristic that prevented proper 1-UIP analysis
-		// This caused PHP instances to hang - clauses had 2+ literals at current level
-		// instead of exactly 1, so they didn't prevent the same conflict
-		// 
-		// if currentSize < 8 && s.tmpLevelCount[s.level] == 2 {
-		// 	if len(reasonLits) > 6 {
-		// 		continue
-		// 	}
-		// }
-		
-		s.tmpLiteralInClause[varIdx] = false
-		oldLevel := s.assignments[varIdx].Level
+		// Resolve: remove foundVar from clause, add literals from reason
+		s.tmpLiteralInClause[foundVar] = false
+		s.tmpResolved[foundVar] = true // Mark as resolved to prevent cycles
+		oldLevel := s.assignments[foundVar].Level
 		s.tmpLevelCount[oldLevel]--
 		
 		newLiterals := 0
-		newLiteralsAtCurrentLevel := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
-			if v == varIdx {
+			if v == foundVar {
 				continue
 			}
 			if !s.tmpLiteralInClause[v] {
@@ -2861,18 +2825,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				if lvl <= s.level {
 					s.tmpLevelCount[lvl]++
 					newLiterals++
-					if lvl == s.level {
-						newLiteralsAtCurrentLevel++
-					}
 				}
 			}
 		}
 		
-		if s.verbose && s.conflicts <= 5 {
-			fmt.Printf("c [debug] 1-UIP: resolved var %d (level %d), reason has %d lits, %d at current level, tmpLevelCount[%d]=%d\n",
-				varIdx, oldLevel, len(reasonLits), newLiteralsAtCurrentLevel, s.level, s.tmpLevelCount[s.level])
-		}
-		
+		resolvedCount++
 		currentSize = currentSize - 1 + newLiterals
 	}
 	
