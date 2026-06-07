@@ -718,3 +718,50 @@ func TestDPLLPhp5p4hUnsat(t *testing.T) {
 // Root cause: VSIDS makes poor variable choices for PHP, and 1-UIP produces weak clauses
 // See: internal/solver/PHP_PERFORMANCE_BUG.md
 // func TestCDCLPhp5p4hUnsat(t *testing.T) { ... }
+
+func TestCDCLPhp6p5hUnsat(t *testing.T) {
+	// Pigeonhole principle: 6 pigeons, 5 holes
+	// Each pigeon must go to at least one hole (6 clauses of size 5)
+	// No two pigeons can share a hole (75 binary clauses)
+	// UNSAT: 6 pigeons cannot fit in 5 holes
+	// 
+	// This test validates the 1-UIP conflict analysis fix (commit 050befe).
+	// Before the fix, 1-UIP would fail with 2+ literals at current level,
+	// causing timeouts. After the fix, solves in <0.01s with proper learning.
+	c := cnf.CNF{
+		NumVars: 30,
+		Clauses: []cnf.Clause{},
+	}
+	
+	// Each pigeon goes to at least one hole
+	for p := 0; p < 6; p++ {
+		lits := []cnf.Literal{}
+		for h := 0; h < 5; h++ {
+			lits = append(lits, cnf.NewLiteral(uint32(p*5+h), false))
+		}
+		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
+	}
+	
+	// No two pigeons share a hole
+	for h := 0; h < 5; h++ {
+		for p1 := 0; p1 < 6; p1++ {
+			for p2 := p1 + 1; p2 < 6; p2++ {
+				c.Clauses = append(c.Clauses, cnf.Clause{
+					Literals: []cnf.Literal{
+						cnf.NewLiteral(uint32(p1*5+h), true),
+						cnf.NewLiteral(uint32(p2*5+h), true),
+					},
+				})
+			}
+		}
+	}
+	
+	c.NumClauses = len(c.Clauses)
+	
+	s := NewCDCLSolver(&c)
+	s.SetMaxIter(1000000)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT (pigeonhole 6 pigeons 5 holes), got %v", result)
+	}
+}
