@@ -277,12 +277,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return equivResult
 		}
 		
-		// DISABLED: Variable elimination causes unsoundness (model reconstruction bugs)
-		// TODO: Fix model reconstruction or verify model against original formula
-		// veResult := s.variableElimination()
-		// if veResult != UNKNOWN {
-		// 	return veResult
-		// }
+		// Variable elimination disabled (causes model reconstruction bugs)
 		
 		// Run unit propagation again after variable elimination
 		unitResult = s.unitPropagationPreprocess()
@@ -321,10 +316,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 	
 	// DISABLED: BCE is unsound - removes essential clauses (e.g., arg_chain)
-	// bceResult := s.blockedClauseElimination()
-	// if bceResult != UNKNOWN {
-	// 	return bceResult
-	// }
+	// Blocked clause elimination disabled (unsound - removes essential clauses)
+	// Blocked clause elimination disabled (unsound)
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
@@ -2388,41 +2381,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// DISABLED: Watched literals has soundness bug
-		// 
-		// Bug description: Variables are decided instead of being propagated,
-		// leading to invalid models where clauses like [1 2 3] have all literals FALSE.
-		// 
-		// Minimal failing instance:
-		//   p cnf 6 5
-		//   1 2 3 0
-		//   4 5 6 0
-		//   -1 -4 0
-		//   -2 -5 0
-		//   -3 -6 0
-		// 
-		// Root cause hypothesis: After backtracking, watches find "replacements" on
-		// literals with stale value=false from previous assignments. The check
-		// `litLevel == 0` correctly identifies unassigned variables, but the watch
-		// logic incorrectly treats these as valid replacements even when they should
-		// trigger propagation.
-		// 
-		// Debug trace shows:
-		// - Clause [0 1 2] watches on literals 0 and 1
-		// - When literal 0 becomes false, scan finds literal 2 as "replacement"
-		// - Literal 2 has level=0 (unassigned) but value=false (stale)
-		// - Watch moves to literal 2, no propagation occurs
-		// - All three literals end up FALSE without conflict detection
-		// 
-		// TODO: Fix by ensuring watch replacement logic properly handles the case
-		// where all non-watched literals are false or unassigned. May need to
-		// propagate immediately instead of moving watches.
-		// 
-		// Performance impact: Linear propagation is O(n) vs O(1) for watched literals.
-		// Expected slowdown: 10-50x on propagation-heavy instances (sudoku, tseitin).
-		if s.watchInitialized {
-			// return s.propagateWatched()
-		}
+		// Using linear propagation (watched literals disabled due to soundness bugs)
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
@@ -2715,22 +2674,7 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 		s.clauseActivity[i] *= 0.95
 	}
 	
-	// DISABLED: Inprocessing causes soundness bugs with watched literals
-	// When clauses are removed during search, watch structures become stale
-	// The fix requires careful handling of both original and learned clauses
-	// 
-	// Inprocessing: apply subsumption elimination every 500 conflicts
-	// This removes redundant clauses during search to keep the formula small
-	// if s.conflicts%500 == 0 && s.conflicts > 0 {
-	// 	s.inprocessSubsumption()
-	// 	// CRITICAL: Rebuild watched literals after clause removal
-	// 	if s.verbose {
-	// 		fmt.Printf("c [inprocess] Rebuilding watched literals after clause removal\n")
-	// 	}
-	// 	// Need to rebuild both original AND learned clause watches
-	// 	// This is complex because learned clauses are stored separately
-	// 	// For now, inprocessing is disabled to maintain soundness
-	// }
+	// Inprocessing disabled (causes soundness bugs with watched literals)
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause
