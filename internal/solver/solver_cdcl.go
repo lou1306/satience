@@ -1998,10 +1998,14 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// Use watched literals propagation if initialized
-		if s.watchInitialized {
-			return s.propagateWatched()
-		}
+		// TEMPORARILY DISABLED: Watched literals has performance bug
+		// causing 40x more conflicts than linear scanning (57K vs 1.3K on Sudoku)
+		// Root cause: watch maintenance corrupting search state (props/dec = 1.1)
+		// Infrastructure is sound and committed for future debugging
+		// 
+		// if s.watchInitialized {
+		// 	return s.propagateWatched()
+		// }
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
