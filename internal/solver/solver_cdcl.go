@@ -34,6 +34,7 @@ type CDCLSolver struct {
 	clauseAge    []int
 	clauseSize   []int // Track clause size for deletion
 	clauseLBD    []int // Track LBD at time of learning
+	normalClauseCount int // Track number of non-glue clauses (LBD > 3)
 	currentAge   int
 	verbose      bool
 	decisions    int
@@ -2006,14 +2007,10 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		firstPass = false
 		unitPropagated := false
 		
-		// TEMPORARILY DISABLED: Watched literals has performance bug
-		// causing 40x more conflicts than linear scanning (57K vs 1.3K on Sudoku)
-		// Root cause: watch maintenance corrupting search state (props/dec = 1.1)
-		// Infrastructure is sound and committed for future debugging
-		// 
-		// if s.watchInitialized {
-		// 	return s.propagateWatched()
-		// }
+		// Use watched literals for propagation
+		if s.watchInitialized {
+			return s.propagateWatched()
+		}
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
@@ -2486,17 +2483,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			// Check if we need to delete clauses
 			// Keep max 5000 normal clauses + all glue clauses
 			maxNormalClauses := 5000
-			normalCount := 0
-			for _, lbdVal := range s.clauseLBD {
-				if lbdVal > 3 {
-					normalCount++
-				}
-			}
 			
-			if normalCount >= maxNormalClauses && lbd > 3 {
+			if s.normalClauseCount >= maxNormalClauses && lbd > 3 {
 				// Delete oldest 50% of normal clauses (by age)
 				if s.verbose {
-					fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", normalCount, maxNormalClauses)
+					fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", s.normalClauseCount, maxNormalClauses)
 				}
 				
 				// Mark clauses to keep
@@ -2513,7 +2504,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 								ageRank++
 							}
 						}
-						keepClause[i] = (ageRank < normalCount/2)
+						keepClause[i] = (ageRank < s.normalClauseCount/2)
 					}
 				}
 				
@@ -2539,6 +2530,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.clauseAge = newAge
 				s.clauseSize = newSize
 				s.clauseLBD = newLBD
+				// Recalculate normal clause count after deletion
+				s.normalClauseCount = 0
+				for _, lbdVal := range s.clauseLBD {
+					if lbdVal > 3 {
+						s.normalClauseCount++
+					}
+				}
 			}
 			
 			// Add the new learned clause
@@ -2548,6 +2546,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.clauseAge = append(s.clauseAge, s.currentAge)
 			s.clauseSize = append(s.clauseSize, len(learnedLits))
 			s.clauseLBD = append(s.clauseLBD, lbd)
+			if lbd > 3 {
+				s.normalClauseCount++
+			}
 			s.currentAge++
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}

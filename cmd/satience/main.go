@@ -11,6 +11,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	model := flag.Bool("model", false, "Print satisfying assignment")
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
@@ -18,14 +22,15 @@ func main() {
 	nopreprocess := flag.Bool("nopreprocess", false, "Disable preprocessing (for debugging)")
 	flag.Parse()
 	
+	var profileFile *os.File
 	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
+		var err error
+		profileFile, err = os.Create(*cpuprofile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating profile: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+		pprof.StartCPUProfile(profileFile)
 	}
 	
 	if flag.NArg() != 1 {
@@ -67,13 +72,25 @@ func main() {
 		if *model {
 			printModel(s)
 		}
-		os.Exit(10)
+		if *cpuprofile != "" {
+			pprof.StopCPUProfile()
+			profileFile.Close()
+		}
+		return 10
 	case solver.UNSAT:
 		fmt.Println("s UNSATISFIABLE")
-		os.Exit(20)
+		if *cpuprofile != "" {
+			pprof.StopCPUProfile()
+			profileFile.Close()
+		}
+		return 20
 	default:
 		fmt.Println("s UNKNOWN")
-		os.Exit(0)
+		if *cpuprofile != "" {
+			pprof.StopCPUProfile()
+			profileFile.Close()
+		}
+		return 0
 	}
 }
 
