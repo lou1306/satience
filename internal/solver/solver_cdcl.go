@@ -941,6 +941,11 @@ func (s *CDCLSolver) restart() {
 	}
 	s.tmpLevelSet = s.tmpLevelSet[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
+	
+	// Rebuild watches after restart to ensure correctness
+	if s.watchInitialized {
+		s.rebuildWatches()
+	}
 }
 
 func (s *CDCLSolver) variableElimination() SolveResult {
@@ -1654,6 +1659,31 @@ func (s *CDCLSolver) initWatches() {
 	}
 }
 
+// rebuildWatches clears and rebuilds all watched literals
+// Called after conflicts to remove stale watches
+func (s *CDCLSolver) rebuildWatches() {
+	if !s.watchInitialized {
+		return
+	}
+	
+	// Clear all watch lists (keep capacity)
+	for i := range s.watchLists {
+		s.watchLists[i] = s.watchLists[i][:0]
+	}
+	
+	// Re-add all original clauses
+	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
+		clause := s.cnf.Clauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, false)
+	}
+	
+	// Re-add all learned clauses
+	for clauseID := 0; clauseID < len(s.learnedClauses); clauseID++ {
+		clause := s.learnedClauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, true)
+	}
+}
+
 // addClauseToWatches adds a clause to the watch lists
 // Watches the first two literals in the clause
 func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, learned bool) {
@@ -1796,6 +1826,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		conflict, clauseIdx := s.propagate()
 		if conflict {
 			s.handleConflict(clauseIdx)
+			// Rebuild watches to remove stale entries (fixes soundness bug)
+			if s.watchInitialized {
+				s.rebuildWatches()
+			}
 			if s.conflicts % 50 == 0 && s.verbose {
 				propsPerDec := 0.0
 				if s.decisions > 0 {
