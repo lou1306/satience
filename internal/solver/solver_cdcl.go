@@ -905,11 +905,12 @@ func (s *CDCLSolver) restart() {
 		}
 		lbd := len(levelSet)
 		
-		// Keep glue clauses (LBD <= 3) - Glucose-style strict threshold
+		// Keep glue clauses (LBD <= 5) - ADAPTED for our 1-UIP implementation
+		// Our 1-UIP produces clauses with LBD 5-8 typically, so LBD<=3 is too strict
 		// LBD <= 2: core glue (most valuable, never delete)
-		// LBD 3: useful glue (keep across restarts)
-		// LBD > 3: trash (delete on restart)
-		if lbd <= 3 {
+		// LBD 3-5: useful glue (keep across restarts)
+		// LBD > 5: trash (delete on restart)
+		if lbd <= 5 {
 			glueCount++
 			isGlue[i] = true
 		}
@@ -2853,6 +2854,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Glue clauses: watched, kept forever, high priority
 	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
 	
+	if s.verbose && s.conflicts <= 50 {
+		fmt.Printf("c [debug] learnClause: conflict=%d, learnedLits=%d, lbd=%d\n", s.conflicts, len(learnedLits), lbd)
+	}
+	
 	if len(learnedLits) > 0 {
 		// DUPLICATE DETECTION: Skip if this clause already exists
 		// Use simple hash-based check for O(n) comparison only when hash matches
@@ -2862,6 +2867,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		
 		isDuplicate := false
+		dupOf := -1
 		for i, existing := range s.learnedClauses {
 			if len(existing.Literals) != len(learnedLits) {
 				continue
@@ -2876,11 +2882,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			if match {
 				isDuplicate = true
+				dupOf = i
 				if s.verbose && s.conflicts <= 100 {
 					fmt.Printf("c [debug] Skipping duplicate learned clause (duplicate of clause %d)\n", i)
 				}
 				break
 			}
+		}
+		
+		if s.verbose && s.conflicts >= 28000 && s.conflicts <= 28100 {
+			fmt.Printf("c [debug] Conflict %d: isDuplicate=%v, dupOf=%d, learnedClauses=%d\n", 
+				s.conflicts, isDuplicate, dupOf, len(s.learnedClauses))
 		}
 		
 		if isDuplicate {
