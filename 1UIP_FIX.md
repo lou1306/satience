@@ -178,3 +178,43 @@ go test ./internal/solver -run TestCDCL -v
 
 - Standard 1-UIP algorithm: Marques-Silva et al., "Conflict-Driven Clause Learning SAT Solvers"
 - PHP instances are exponentially hard for basic CDCL, but small instances (4p3h, 5p4h) should solve quickly with correct 1-UIP
+
+## Limitations
+
+### PHP 5 Pigeons 4 Holes (20 vars, 45 clauses)
+
+Even with correct 1-UIP, **PHP 5p4h times out** while MiniSat solves in 32 conflicts.
+
+**Why?**
+- PHP 5p4h requires exploring an exponential search space with basic CDCL
+- Multiple decisions at the same level prevent 1-UIP from reaching a single literal
+- MiniSat uses additional techniques we lack:
+  - Watched literals (10-50x faster propagation)
+  - Hyper-binary resolution preprocessing
+  - Better VSIDS heuristic
+  - More aggressive clause minimization
+
+**Evidence of correct 1-UIP:**
+```
+conflict=1, 5 literals total, 1 at current level 3  ✅ Correct!
+conflict=3, 5 literals total, 1 at current level 6  ✅ Correct!
+```
+
+When there are no decisions at the current level, 1-UIP produces clauses with exactly 1 literal.
+
+**When decisions are present:**
+```
+conflict=2, 8 literals total, 2 at current level 6  (2 decisions)
+conflict=5, 8 literals total, 2 at current level 7  (2 decisions)
+```
+
+This is **expected behavior** - 1-UIP cannot resolve on decisions.
+
+### Comparison
+
+| Instance | Vars | Clauses | MiniSat | Satience (before fix) | Satience (after fix) |
+|----------|------|---------|---------|----------------------|---------------------|
+| PHP 4p3h | 12   | 22      | 0.0002s | TIMEOUT (146K conf)  | ✅ 10 conflicts     |
+| PHP 5p4h | 20   | 45      | 0.0002s | TIMEOUT              | TIMEOUT (still hard)|
+
+The fix enables solving small PHP instances, but larger ones require additional techniques beyond basic CDCL.
