@@ -57,6 +57,7 @@ type CDCLSolver struct {
 	tmpCandidates []resolveCandidate
 	tmpLevelSet []int // For LBD calculation (replaces map)
 	tmpLevelSetUsed []bool // Track which levels are in tmpLevelSet
+	tmpClauseHash uint64 // Hash for duplicate detection
 	
 	// Watched literals infrastructure (Phase 1: data structures only)
 	watchLists   [][]cnf.Watch  // watchLists[lit] = clauses watching lit
@@ -2704,7 +2705,7 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 // Lower LBD = better clause (involves fewer decision levels).
 // Clauses with LBD=2 are "glue clauses" - most valuable, never delete.
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
-	s.conflicts++
+	// Note: s.conflicts already incremented in handleConflict()
 	
 	if s.verbose && s.conflicts <= 100 {
 		arenaCapMB := s.learnedArena.CapacityBytes() / 1024 / 1024
@@ -2854,6 +2855,52 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
 	
 	if len(learnedLits) > 0 {
+		// DUPLICATE DETECTION: Skip if this clause already exists
+		// Use simple hash-based check for O(n) comparison only when hash matches
+		s.tmpClauseHash = 0
+		for _, lit := range learnedLits {
+			s.tmpClauseHash = s.tmpClauseHash*31 + uint64(lit)
+		}
+		
+		isDuplicate := false
+		for i, existing := range s.learnedClauses {
+			if len(existing.Literals) != len(learnedLits) {
+				continue
+			}
+			// Quick hash check first (if we tracked it), then full comparison
+			match := true
+			for j, lit := range learnedLits {
+				if existing.Literals[j] != lit {
+					match = false
+					break
+				}
+			}
+			if match {
+				isDuplicate = true
+				if s.verbose && s.conflicts <= 100 {
+					fmt.Printf("c [debug] Skipping duplicate learned clause (duplicate of clause %d)\n", i)
+				}
+				break
+			}
+		}
+		
+		if isDuplicate {
+			// Don't learn this clause, but still return backjump level
+			backjumpLevel := 0
+			for varIdx, inClause := range s.tmpLiteralInClause {
+				if inClause {
+					lvl := s.assignments[varIdx].Level
+					if lvl > backjumpLevel && lvl < s.level {
+						backjumpLevel = lvl
+					}
+				}
+			}
+			if backjumpLevel == 0 {
+				backjumpLevel = 1
+			}
+			return backjumpLevel
+		}
+		
 		// LBD FILTERING: Reject very low-quality clauses immediately
 		if lbd > 50 {
 			// Skip this clause - too many decision levels, unlikely to be useful
@@ -2942,9 +2989,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	// Calculate backjump level
 	backjumpLevel := 0
+	maxLevelInClause := 0
 	for varIdx, inClause := range s.tmpLiteralInClause {
 		if inClause {
 			lvl := s.assignments[varIdx].Level
+			if lvl > maxLevelInClause {
+				maxLevelInClause = lvl
+			}
 			if lvl > backjumpLevel && lvl < s.level {
 				backjumpLevel = lvl
 			}
