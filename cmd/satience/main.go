@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"satience/internal/cnf"
 	"satience/internal/parser"
 	"satience/internal/solver"
 	"time"
@@ -16,11 +17,17 @@ func main() {
 
 func run() int {
 	model := flag.Bool("model", false, "Print satisfying assignment")
+	verify := flag.Bool("verify", false, "Verify model is correct (implies -model)")
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	nopreprocess := flag.Bool("nopreprocess", false, "Disable preprocessing (for debugging)")
 	flag.Parse()
+	
+	// -verify implies -model
+	if *verify {
+		*model = true
+	}
 	
 	var profileFile *os.File
 	if *cpuprofile != "" {
@@ -46,13 +53,13 @@ func run() int {
 	}
 	defer f.Close()
 	
-	cnf, err := parser.Parse(f)
+	cnfFormula, err := parser.Parse(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing CNF: %v\n", err)
 		os.Exit(1)
 	}
 	
-	s := solver.NewCDCLSolver(cnf)
+	s := solver.NewCDCLSolver(cnfFormula)
 	s.SetVerbose(*verbose)
 	if *maxIter > 0 {
 		s.SetMaxIter(*maxIter)
@@ -70,7 +77,7 @@ func run() int {
 	case solver.SAT:
 		fmt.Println("s SATISFIABLE")
 		if *model {
-			printModel(s)
+			printModel(s, cnfFormula, *verify)
 		}
 		if *cpuprofile != "" {
 			pprof.StopCPUProfile()
@@ -94,8 +101,10 @@ func run() int {
 	}
 }
 
-func printModel(s *solver.CDCLSolver) {
+func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 	assignments := s.GetAssignments()
+	
+	// Print model
 	for i, assign := range assignments {
 		if assign.Level > 0 {
 			val := int32(i + 1)
@@ -106,4 +115,13 @@ func printModel(s *solver.CDCLSolver) {
 		}
 	}
 	fmt.Println("v 0")
+	
+	// Verify model if requested
+	if verify {
+		if err := solver.VerifySolution(cnf, assignments, false); err != nil {
+			fmt.Fprintf(os.Stderr, "c [ERROR] Model verification failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("c Model verified: all clauses satisfied")
+	}
 }
