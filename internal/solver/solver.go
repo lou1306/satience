@@ -43,7 +43,14 @@ func (s *Solver) Solve() bool {
 		}
 
 		// Check if all variables are assigned
-		if len(s.trail) == int(s.cnf.NumVars) {
+		allAssigned := true
+		for i := uint32(0); i < s.cnf.NumVars; i++ {
+			if s.assignments[i].Level == 0 {
+				allAssigned = false
+				break
+			}
+		}
+		if allAssigned {
 			return true // SAT
 		}
 
@@ -187,16 +194,18 @@ func (s *Solver) backtrack() bool {
 			}
 		}
 
-		// Undo all assignments at current level and higher
+		// Undo all assignments at current level
+		// Only clear assignments made at current level or higher
 		newTrail := make([]int, 0, decisionPoint)
 		for i := 0; i < decisionPoint; i++ {
 			varIdx := uint32(s.trail[i])
+			// Keep assignments from lower levels
 			if s.assignments[varIdx].Level < s.level {
 				newTrail = append(newTrail, s.trail[i])
-			} else {
-				s.assignments[varIdx] = Assignment{}
 			}
+			// Clear assignments at current level (shouldn't be any before decisionPoint)
 		}
+		// Clear all assignments from decision point onwards (all at current level)
 		for i := decisionPoint; i < len(s.trail); i++ {
 			varIdx := uint32(s.trail[i])
 			s.assignments[varIdx] = Assignment{}
@@ -208,15 +217,15 @@ func (s *Solver) backtrack() bool {
 			continue
 		}
 
-		// If the decision was positive (false = negative literal), try negative
-		// If the decision was negative, we need to backtrack further
-		if !decisionValue {
-			// Was positive, now try negative
+		// If the decision was positive, try negative
+		// If the decision was already negative, backtrack further
+		if decisionValue {
+			// Was positive (true), now try negative (false)
 			s.level++
 			s.decisions = append(s.decisions, len(s.trail))
 			s.assignLiteral(cnf.NewLiteral(decisionVar, true), s.level)
 			return true
 		}
-		// Was already negative, continue backtracking to parent level
+		// Was already negative (false), continue backtracking to parent level
 	}
 }

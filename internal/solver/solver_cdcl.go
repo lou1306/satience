@@ -1820,6 +1820,21 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	s.cnf.Clauses = newClauses
 	s.cnf.NumClauses = len(newClauses)
 	
+	// Store eliminated variables for model reconstruction
+	if s.eliminatedVars == nil {
+		s.eliminatedVars = make(map[uint32]eliminationInfo)
+	}
+	for varIdx, subst := range substMap {
+		// Eliminated variable varIdx is equivalent to subst.rep
+		// Model reconstruction: assign varIdx = value of subst.rep
+		s.eliminatedVars[varIdx] = eliminationInfo{
+			posClauseLits: [][]cnf.Literal{{cnf.NewLiteral(subst.rep, false)}},
+			negClauseLits: [][]cnf.Literal{{cnf.NewLiteral(subst.rep, true)}},
+			elimOrder:     s.elimOrder,
+		}
+		s.elimOrder++
+	}
+	
 	// Zero out activity for eliminated variables
 	for varIdx := range substMap {
 		s.vsids.activity[varIdx] = 0.0
@@ -1987,6 +2002,20 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		}
 		if !s.extendModel() {
 			return UNSAT  // Contradiction found during model reconstruction
+		}
+		// Assign all remaining unassigned variables (representatives) arbitrarily
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			if s.assignments[varIdx].Level == 0 {
+				// Use saved phase or default to false
+				varValue := false
+				if varIdx < uint32(len(s.savedPhase)) {
+					varValue = s.savedPhase[varIdx]
+				}
+				s.assignments[varIdx] = Assignment{
+					Value: varValue,
+					Level: 1,
+				}
+			}
 		}
 		return SAT
 	}
