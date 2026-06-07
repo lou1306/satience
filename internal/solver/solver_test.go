@@ -671,3 +671,85 @@ func TestCDCLEquivalenceRich50vUnsat(t *testing.T) {
 		t.Errorf("Expected UNSAT (equivalence-rich 50v), got %v", result)
 	}
 }
+
+func TestDPLLPhp5p4hUnsat(t *testing.T) {
+	// PHP 5 pigeons, 4 holes - UNSAT
+	// Plain DPLL should solve this in seconds
+	c := cnf.CNF{
+		NumVars: 20,
+		Clauses: []cnf.Clause{},
+	}
+	
+	// Pigeon clauses: each pigeon goes to at least one hole
+	for p := 0; p < 5; p++ {
+		lits := []cnf.Literal{}
+		for h := 0; h < 4; h++ {
+			lits = append(lits, cnf.NewLiteral(uint32(p*4+h), false))
+		}
+		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
+	}
+	
+	// Hole clauses: no two pigeons share a hole
+	for h := 0; h < 4; h++ {
+		for p1 := 0; p1 < 5; p1++ {
+			for p2 := p1 + 1; p2 < 5; p2++ {
+				c.Clauses = append(c.Clauses, cnf.Clause{
+					Literals: []cnf.Literal{
+						cnf.NewLiteral(uint32(p1*4+h), true),
+						cnf.NewLiteral(uint32(p2*4+h), true),
+					},
+				})
+			}
+		}
+	}
+	
+	c.NumClauses = len(c.Clauses)
+	
+	// Test with plain DPLL (base solver, no CDCL)
+	s := NewSolver(&c)
+	result := s.Solve()
+	if result {
+		t.Error("Expected UNSAT (pigeonhole 5 pigeons 4 holes)")
+	}
+}
+
+func TestCDCLPhp5p4hUnsat(t *testing.T) {
+	// PHP 5 pigeons, 4 holes - UNSAT
+	// CDCL should solve this faster than plain DPLL
+	c := cnf.CNF{
+		NumVars: 20,
+		Clauses: []cnf.Clause{},
+	}
+	
+	// Pigeon clauses: each pigeon goes to at least one hole
+	for p := 0; p < 5; p++ {
+		lits := []cnf.Literal{}
+		for h := 0; h < 4; h++ {
+			lits = append(lits, cnf.NewLiteral(uint32(p*4+h), false))
+		}
+		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
+	}
+	
+	// Hole clauses: no two pigeons share a hole
+	for h := 0; h < 4; h++ {
+		for p1 := 0; p1 < 5; p1++ {
+			for p2 := p1 + 1; p2 < 5; p2++ {
+				c.Clauses = append(c.Clauses, cnf.Clause{
+					Literals: []cnf.Literal{
+						cnf.NewLiteral(uint32(p1*4+h), true),
+						cnf.NewLiteral(uint32(p2*4+h), true),
+					},
+				})
+			}
+		}
+	}
+	
+	c.NumClauses = len(c.Clauses)
+	
+	// Test with CDCL
+	s := NewCDCLSolver(&c)
+	result := s.Solve()
+	if result {
+		t.Error("Expected UNSAT (pigeonhole 5 pigeons 4 holes)")
+	}
+}

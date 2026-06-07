@@ -2566,7 +2566,8 @@ func (s *CDCLSolver) decide() bool {
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1)
 	s.decisions++
 	if s.verbose {
-		fmt.Printf("c [DECIDE] Level %d: var %d = %v (decision)\n", s.level, varIdx+1, phase)
+		fmt.Printf("c [DECIDE] Level %d (was %d): var %d = %v (decision), trailHead len=%d\n", 
+			s.level, s.level-1, varIdx+1, phase, len(s.trailHead))
 	}
 	return true
 }
@@ -2910,6 +2911,29 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		
 		if isDuplicate {
 			// Don't learn this clause, but still return backjump level
+			backjumpLevel := 0
+			for varIdx, inClause := range s.tmpLiteralInClause {
+				if inClause {
+					lvl := s.assignments[varIdx].Level
+					if lvl > backjumpLevel && lvl < s.level {
+						backjumpLevel = lvl
+					}
+				}
+			}
+			if backjumpLevel == 0 {
+				backjumpLevel = 1
+			}
+			return backjumpLevel
+		}
+		
+		// CLAUSE SIZE FILTERING: Only learn short, useful clauses
+		// Large clauses from 1-UIP with decisions are harmful - they slow down propagation
+		// without adding useful constraints. Skip clauses with >4 literals.
+		if len(learnedLits) > 4 {
+			if s.verbose && s.conflicts <= 100 {
+				fmt.Printf("c [debug] Skipping learned clause: size=%d > 4 (too large, likely from decisions)\n", len(learnedLits))
+			}
+			// Still return backjump level for correct backtracking
 			backjumpLevel := 0
 			for varIdx, inClause := range s.tmpLiteralInClause {
 				if inClause {
