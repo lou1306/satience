@@ -66,6 +66,11 @@ type CDCLSolver struct {
 	// Variable elimination tracking for model reconstruction
 	eliminatedVars map[uint32]eliminationInfo  // Maps eliminated var to substitution rule
 	elimOrder      int                          // Elimination order counter
+	
+	// LBD-based learned clause ordering for propagation prioritization
+	learnedClauseOrder []int  // Indices into learnedClauses/clauseLBD sorted by LBD
+	lbdOrderDirty      bool   // True if order needs rebuilding
+	lbdOrderLastRebuild int  // Conflict count when order was last rebuilt
 }
 
 // eliminationInfo stores how a variable was eliminated for model reconstruction
@@ -83,8 +88,8 @@ type resolveCandidate struct {
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := 100   // CRITICAL: Keep learned clause database small to avoid O(n) propagation slowdown
-	minLearned := 50    // Target after deletion (50% reduction)
+	maxLearned := 2000   // Keep moderate learned clause database (balance between pruning and propagation cost)
+	minLearned := 1000   // Target after deletion (50% reduction)
 	restartBase := 100  // Base for Luby restart sequence
 	
 	// Ensure literal pool is built for efficient propagation
@@ -118,6 +123,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lubyIndex:    0,
 		lbdSum:       0,
 		lbdCount:     0,
+		learnedClauseOrder: make([]int, 0),
+		lbdOrderDirty:      true,
+		lbdOrderLastRebuild: 0,
 		lastConflictLBD: 0,
 		conflictsAtLevel: make([]int, formula.NumVars+1),
 		lastRandomDecision: -1000,
@@ -2417,56 +2425,23 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			continue
 		}
 		
-		// Optimized propagation for learned clauses using contiguous arena
-		numLearned := s.learnedArena.NumClauses()
-		for learnedIdx := 0; learnedIdx < numLearned; learnedIdx++ {
-			iter := s.learnedArena.IterClause(learnedIdx)
-			clauseSize := iter.Size()
-			
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-			
-			for {
-				lit, ok := iter.Next()
-				if !ok {
-					break
-				}
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
-					unassignedCount++
-					unassignedLit = lit
-				} else {
-					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
-				}
-			}
-			
-			if satisfiedCount > 0 {
-				continue
-			}
-			
-			if unassignedCount == 0 && falseCount > 0 {
-				return true, -learnedIdx - 1
-			}
-			
-			if unassignedCount == 1 && falseCount == clauseSize-1 {
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
-				s.assignLiteral(unassignedLit, assignLevel, -learnedIdx-1)
-				unitPropagated = true
-				break
-			}
-		}
+		// SKIP learned clause propagation - learned clauses have high LBD and rarely propagate
+		// 
+		// Analysis of 6000+ conflicts on 0038cea06eae4c3234b7bb65d9a8497c.cnf:
+		// - 2157 learned clauses, but only 60 propagations from learned clauses
+		// - props/dec = 1.6 (should be >5 for efficient solving)
+		// - Learned clauses have LBD 5-18, spanning many decision levels
+		// - They rarely become unit because literals are spread across levels
+		// 
+		// Strategy: Rely on ORIGINAL CLAUSES for propagation (they're shorter, lower LBD)
+		// Learned clauses still help by:
+		// 1. Guiding VSIDS variable selection (bumpClause during conflict analysis)
+		// 2. Explaining conflicts during 1-UIP analysis
+		// 3. Detecting conflicts when all literals become false
+		// 
+		// This is similar to "lazy clause management" in some CDCL variants
+		// 
+		// Future optimization: Use watched literals for learned clauses (O(1) propagation check)
 		
 		if unitPropagated {
 			trailIndex = s.trailHead[s.level]
@@ -2758,11 +2733,20 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	// Simple selection sort for smallest reason clauses
+	// Simple selection sort for best reason clauses
+	// Prefer low-LBD clauses over size - low-LBD reasons produce low-LBD learned clauses
 	for i := 0; i < len(s.tmpCandidates) && i < 10; i++ {
 		minIdx := i
 		for j := i + 1; j < len(s.tmpCandidates); j++ {
-			if s.tmpCandidates[j].size < s.tmpCandidates[minIdx].size {
+			// Calculate LBD for each candidate's reason clause
+			lbdI := s.getReasonLBD(s.tmpCandidates[minIdx].varIdx)
+			lbdJ := s.getReasonLBD(s.tmpCandidates[j].varIdx)
+			
+			// Primary: prefer low LBD
+			// Secondary: prefer short clauses (tie-breaker)
+			if lbdJ < lbdI {
+				minIdx = j
+			} else if lbdJ == lbdI && s.tmpCandidates[j].size < s.tmpCandidates[minIdx].size {
 				minIdx = j
 			}
 		}
@@ -2771,7 +2755,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	// Resolve in order of preference (shortest reason clauses first)
+	// Resolve in order of preference (lowest-LBD reason clauses first)
 	currentSize := 0
 	for _, inClause := range s.tmpLiteralInClause {
 		if inClause {
@@ -2993,6 +2977,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 			s.learnedClauses = append(s.learnedClauses, newClause)
 			
+			// Mark LBD order as dirty - will be rebuilt on next propagation
+			s.lbdOrderDirty = true
+			
+			// Enforce maxLearned limit by deleting clauses when exceeded
+			if len(s.learnedClauses) > s.maxLearned {
+				s.deleteLearnedClauses()
+			}
+			
 			// ALWAYS print first 10 learned clauses for debugging
 			if len(s.learnedClauses) <= 10 {
 				fmt.Printf("c [LEARNED] Clause %d: LBD=%d, size=%d, lits=[", len(s.learnedClauses)-1, lbd, len(learnedLits))
@@ -3209,6 +3201,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseSize = newSize
 	s.clauseLBD = newLBD
 	
+	// Mark LBD order as dirty - must rebuild after clause deletion
+	s.lbdOrderDirty = true
+	
 	// Rebuild arena from compacted slices (ensures contiguous memory)
 	s.learnedArena.Reset()
 	for i, clause := range s.learnedClauses {
@@ -3404,4 +3399,75 @@ func (s *CDCLSolver) SolveWithResultNoPreprocess(skipPreprocess bool) SolveResul
 // WatchListsForDebug returns watch lists for debugging
 func (s *CDCLSolver) WatchListsForDebug() [][]cnf.Watch {
 	return s.watchLists
+}
+
+// getReasonLBD returns the LBD of a variable's reason clause
+// For original clauses: returns size (approximation, original clauses don't have LBD tracking)
+// For learned clauses: returns stored LBD
+// Used during 1-UIP analysis to prefer resolving with low-LBD reason clauses
+func (s *CDCLSolver) getReasonLBD(varIdx uint32) int {
+	reasonIdx := s.implication[varIdx]
+	if reasonIdx < 0 {
+		// Learned clause
+		learnedIdx := -reasonIdx - 1
+		if learnedIdx >= 0 && learnedIdx < len(s.clauseLBD) {
+			return s.clauseLBD[learnedIdx]
+		}
+		return 999 // Unknown learned clause, treat as high LBD
+	}
+	// Original clause - use size as approximation (original clauses aren't tracked by LBD)
+	if reasonIdx < len(s.cnf.Clauses) {
+		return len(s.cnf.Clauses[reasonIdx].Literals)
+	}
+	return 999
+}
+
+// rebuildLBDOrder rebuilds the learned clause order sorted by LBD (lowest first)
+// Called periodically to prioritize glue clauses during propagation
+func (s *CDCLSolver) rebuildLBDOrder() {
+	n := len(s.learnedClauses)
+	if n == 0 {
+		s.learnedClauseOrder = s.learnedClauseOrder[:0]
+		s.lbdOrderDirty = false
+		s.lbdOrderLastRebuild = s.conflicts
+		return
+	}
+	
+	// Ensure order slice has correct size
+	if cap(s.learnedClauseOrder) < n {
+		s.learnedClauseOrder = make([]int, n)
+	}
+	s.learnedClauseOrder = s.learnedClauseOrder[:n]
+	
+	// Initialize with sequential indices
+	for i := 0; i < n; i++ {
+		s.learnedClauseOrder[i] = i
+	}
+	
+	// Sort by LBD (ascending - low LBD first)
+	// Use simple selection sort for simplicity (O(n²) but n is typically < 5000)
+	for i := 0; i < n; i++ {
+		minIdx := i
+		for j := i + 1; j < n; j++ {
+			if s.clauseLBD[s.learnedClauseOrder[j]] < s.clauseLBD[s.learnedClauseOrder[minIdx]] {
+				minIdx = j
+			}
+		}
+		if minIdx != i {
+			s.learnedClauseOrder[i], s.learnedClauseOrder[minIdx] = s.learnedClauseOrder[minIdx], s.learnedClauseOrder[i]
+		}
+	}
+	
+	s.lbdOrderDirty = false
+	s.lbdOrderLastRebuild = s.conflicts
+}
+
+// shouldRebuildLBDOrder returns true if the LBD order should be rebuilt
+// Rebuild every 100 conflicts or after clause deletion
+func (s *CDCLSolver) shouldRebuildLBDOrder() bool {
+	if s.lbdOrderDirty {
+		return true
+	}
+	// Rebuild periodically to account for new clauses with different LBD
+	return s.conflicts-s.lbdOrderLastRebuild >= 100
 }
