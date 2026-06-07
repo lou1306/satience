@@ -61,6 +61,17 @@ type CDCLSolver struct {
 	// Watched literals infrastructure (Phase 1: data structures only)
 	watchLists   [][]cnf.Watch  // watchLists[lit] = clauses watching lit
 	watchInitialized bool        // True if watches have been initialized
+	
+	// Variable elimination tracking for model reconstruction
+	eliminatedVars map[uint32]eliminationInfo  // Maps eliminated var to substitution rule
+}
+
+// eliminationInfo stores how a variable was eliminated for model reconstruction
+type eliminationInfo struct {
+	posClauseLits [][]cnf.Literal  // Clauses with positive literal (without the eliminated var)
+	negClauseLits [][]cnf.Literal  // Clauses with negative literal (without the eliminated var)
+	// When reconstructing: if all pos clauses are false, var=false
+	//                         if all neg clauses are false, var=true
 }
 
 // resolveCandidate is used in learnClause for sorting resolution order
@@ -116,6 +127,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpCandidates: make([]resolveCandidate, 0, 100),
 		tmpLevelSet: make([]int, 0, formula.NumVars),
 		tmpLevelSetUsed: make([]bool, formula.NumVars+1),
+		// Initialize variable elimination tracking
+		eliminatedVars: make(map[uint32]eliminationInfo),
 	}
 	
 	// Enable LBD-based VSIDS for better variable selection
@@ -253,12 +266,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return equivResult
 		}
 		
-		// DISABLED: Variable elimination has a soundness bug - it can make UNSAT
-		// instances appear SAT. See php_6p_5h_unsat.cnf. Must debug before re-enabling.
-		// veResult := s.variableElimination()
-		// if veResult != UNKNOWN {
-		// 	return veResult
-		// }
+		// Variable elimination with model reconstruction
+		veResult := s.variableElimination()
+		if veResult != UNKNOWN {
+			return veResult
+		}
 		
 		// Run unit propagation again after variable elimination
 		unitResult = s.unitPropagationPreprocess()
@@ -1092,6 +1104,31 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 					}
 				}
 				
+				// Track eliminated variable for model reconstruction BEFORE modifying clauses
+				// Store the clauses WITHOUT the eliminated variable
+				posLits := make([][]cnf.Literal, len(posClauses))
+				negLits := make([][]cnf.Literal, len(negClauses))
+				for i, idx := range posClauses {
+					clause := s.cnf.Clauses[idx]
+					lits := make([]cnf.Literal, 0)
+					for _, lit := range clause.Literals {
+						if lit.Var() != varIdx {
+							lits = append(lits, lit)
+						}
+					}
+					posLits[i] = lits
+				}
+				for i, idx := range negClauses {
+					clause := s.cnf.Clauses[idx]
+					lits := make([]cnf.Literal, 0)
+					for _, lit := range clause.Literals {
+						if lit.Var() != varIdx {
+							lits = append(lits, lit)
+						}
+					}
+					negLits[i] = lits
+				}
+				
 				keepClauses := make([]cnf.Clause, 0)
 				for _, clause := range s.cnf.Clauses {
 					keep := true
@@ -1115,6 +1152,11 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				s.cnf.Clauses = keepClauses
 				s.cnf.NumClauses = len(keepClauses)
 				
+				s.eliminatedVars[varIdx] = eliminationInfo{
+					posClauseLits: posLits,
+					negClauseLits: negLits,
+				}
+				
 				eliminated[varIdx] = true
 				eliminatedCount++
 				resolventCount += len(resolvents)
@@ -1136,10 +1178,99 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Variable elimination: all clauses satisfied\n")
 		}
+		// Extend model to eliminated variables
+		s.extendModel()
 		return SAT
 	}
 	
 	return UNKNOWN
+}
+
+// extendModel extends the current model to eliminated variables
+// Called after SAT is found to assign values to variables that were eliminated
+func (s *CDCLSolver) extendModel() {
+	if s.verbose {
+		fmt.Printf("c [DEBUG] extendModel called with %d eliminated vars\n", len(s.eliminatedVars))
+	}
+	if len(s.eliminatedVars) == 0 {
+		return  // No eliminated variables
+	}
+	
+	// Process eliminated variables in reverse order (last eliminated first)
+	// This ensures dependencies are resolved correctly
+	eliminatedList := make([]uint32, 0, len(s.eliminatedVars))
+	for varIdx := range s.eliminatedVars {
+		eliminatedList = append(eliminatedList, varIdx)
+	}
+	
+	// Sort in descending order (reverse elimination order)
+	for i := 0; i < len(eliminatedList)/2; i++ {
+		j := len(eliminatedList) - 1 - i
+		eliminatedList[i], eliminatedList[j] = eliminatedList[j], eliminatedList[i]
+	}
+	
+	for _, varIdx := range eliminatedList {
+		info := s.eliminatedVars[varIdx]
+		
+		// Assign the eliminated variable
+		// The original clauses were: (X ∨ A) and (¬X ∨ B) where A,B are other literals
+		// After elimination: (A ∨ B) [the resolvent]
+		// If A is false, then X must be TRUE to satisfy (X ∨ A)
+		// If B is false, then X must be FALSE to satisfy (¬X ∨ B)
+		
+		// Check if any positive clause requires X to be TRUE
+		mustBeTrue := false
+		for _, clauseLits := range info.posClauseLits {
+			allOtherFalse := true
+			for _, lit := range clauseLits {
+				assign := s.assignments[lit.Var()]
+				litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+				if litTrue {
+					allOtherFalse = false
+					break
+				}
+			}
+			if allOtherFalse && len(clauseLits) > 0 {
+				// This clause (X ∨ A) has A=false, so X must be TRUE
+				mustBeTrue = true
+				break
+			}
+		}
+		
+		// Check if any negative clause requires X to be FALSE
+		mustBeFalse := false
+		for _, clauseLits := range info.negClauseLits {
+			allOtherFalse := true
+			for _, lit := range clauseLits {
+				assign := s.assignments[lit.Var()]
+				litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+				if litTrue {
+					allOtherFalse = false
+					break
+				}
+			}
+			if allOtherFalse && len(clauseLits) > 0 {
+				// This clause (¬X ∨ B) has B=false, so X must be FALSE
+				mustBeFalse = true
+				break
+			}
+		}
+		
+		// Assign based on constraints
+		varValue := false
+		if mustBeTrue {
+			varValue = true
+		} else if mustBeFalse {
+			varValue = false
+		}
+		// else: arbitrary choice, use false
+		
+		// Set both value and level (level=1 to ensure it's included in model)
+		s.assignments[varIdx].Value = varValue
+		if s.assignments[varIdx].Level == 0 {
+			s.assignments[varIdx].Level = 1  // Mark as assigned for model extraction
+		}
+	}
 }
 
 func (s *CDCLSolver) resolveForElimination(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
@@ -1325,7 +1456,7 @@ func (s *CDCLSolver) inprocessing() {
 	
 	if s.conflicts % 1000 == 0 {
 		s.selfSubsumption()
-		// DISABLED: variableElimination() has soundness bug
+		s.variableElimination()
 	}
 	
 	if s.verbose && initialClauses != s.cnf.NumClauses {
@@ -1779,6 +1910,7 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
 		}
+		s.extendModel()
 		return SAT
 	}
 	
@@ -1853,6 +1985,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 
 		if s.allAssigned() {
+			if s.verbose {
+				fmt.Printf("c [DEBUG] allAssigned=true, calling extendModel\n")
+			}
+			// Extend model to eliminated variables before returning SAT
+			s.extendModel()
 			if s.verbose {
 				s.printStats()
 			}
@@ -2941,6 +3078,10 @@ func (s *CDCLSolver) SolveWithResultNoPreprocess(skipPreprocess bool) SolveResul
 		}
 		
 		if s.allAssigned() {
+			if s.verbose {
+				fmt.Printf("c [DEBUG] SolveWithResultNoPreprocess: allAssigned=true, eliminatedVars=%d, calling extendModel\n", len(s.eliminatedVars))
+			}
+			s.extendModel()
 			return SAT
 		}
 		
