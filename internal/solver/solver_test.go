@@ -337,6 +337,52 @@ func TestCDCLPhp3p4hSat(t *testing.T) {
 	}
 }
 
+func TestCDCLPhp4p3hUnsat(t *testing.T) {
+	// Pigeonhole principle: 4 pigeons, 3 holes
+	// Each pigeon must go to at least one hole (4 clauses of size 3)
+	// No two pigeons can share a hole (18 binary clauses)
+	// UNSAT: 4 pigeons cannot fit in 3 holes
+	// Should solve immediately with correct 1-UIP implementation
+	c := cnf.CNF{
+		NumVars: 12,
+		Clauses: []cnf.Clause{
+			// Each pigeon goes to at least one hole
+			newClause(1, 2, 3),    // Pigeon 1
+			newClause(4, 5, 6),    // Pigeon 2
+			newClause(7, 8, 9),    // Pigeon 3
+			newClause(10, 11, 12), // Pigeon 4
+			// No two pigeons share hole 1
+			newClause(-1, -4),
+			newClause(-1, -7),
+			newClause(-1, -10),
+			newClause(-4, -7),
+			newClause(-4, -10),
+			newClause(-7, -10),
+			// No two pigeons share hole 2
+			newClause(-2, -5),
+			newClause(-2, -8),
+			newClause(-2, -11),
+			newClause(-5, -8),
+			newClause(-5, -11),
+			newClause(-8, -11),
+			// No two pigeons share hole 3
+			newClause(-3, -6),
+			newClause(-3, -9),
+			newClause(-3, -12),
+			newClause(-6, -9),
+			newClause(-6, -12),
+			newClause(-9, -12),
+		},
+		NumClauses: 22,
+	}
+
+	s := NewCDCLSolver(&c)
+	result := s.Solve()
+	if result {
+		t.Error("Expected UNSAT (pigeonhole 4 pigeons 3 holes)")
+	}
+}
+
 func TestCDCLSimple50vSat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 60)
 	
