@@ -2926,7 +2926,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			return backjumpLevel
 		}
 		
-		// Learn all clauses from 1-UIP (basic CDCL)
 		// Check if we need to delete clauses
 			// Keep max 5000 normal clauses + all glue clauses
 			maxNormalClauses := 5000
