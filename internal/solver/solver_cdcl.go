@@ -320,10 +320,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		initialClauses = s.cnf.NumClauses
 	}
 	
-	bceResult := s.blockedClauseElimination()
-	if bceResult != UNKNOWN {
-		return bceResult
-	}
+	// DISABLED: BCE is unsound - removes essential clauses (e.g., arg_chain)
+	// bceResult := s.blockedClauseElimination()
+	// if bceResult != UNKNOWN {
+	// 	return bceResult
+	// }
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
@@ -1256,6 +1257,23 @@ func (s *CDCLSolver) extendModel() bool {
 		if s.verbose {
 			fmt.Printf("c [DEBUG] Reconstructing var %d (elimOrder=%d, pos=%d clauses, neg=%d clauses)\n",
 				varIdx+1, info.elimOrder, len(info.posClauseLits), len(info.negClauseLits))
+		}
+		
+		// Special case: equivalence detection stores single-literal clauses
+		// This means X is equivalent to the representative variable
+		// Just copy the representative's value
+		if len(info.posClauseLits) == 1 && len(info.posClauseLits[0]) == 1 &&
+		   len(info.negClauseLits) == 1 && len(info.negClauseLits[0]) == 1 {
+			repVar := info.posClauseLits[0][0].Var()
+			repValue := s.assignments[repVar].Value
+			s.assignments[varIdx] = Assignment{
+				Value: repValue,
+				Level: 1,
+			}
+			if s.verbose {
+				fmt.Printf("c [DEBUG]   Equivalence: var %d = var %d = %v\n", varIdx+1, repVar+1, repValue)
+			}
+			continue
 		}
 		
 		// Check if any positive clause requires X to be TRUE
