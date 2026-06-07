@@ -296,6 +296,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 	
+	// Rebuild literal pool after preprocessing modifications
+	s.cnf.RebuildLiteralPool()
+	
 	return UNKNOWN
 }
 

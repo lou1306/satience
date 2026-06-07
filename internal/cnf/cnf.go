@@ -357,4 +357,22 @@ func (c *CNF) GetLiteralPool() []uint32 {
 	return c.literalPool
 }
 
+// RebuildLiteralPool rebuilds the literal pool from Clauses slice
+// Call this after preprocessing modifies Clauses directly
+func (c *CNF) RebuildLiteralPool() {
+	c.literalPool = make([]uint32, 0, c.NumClauses*4)
+	c.originalClauseOffsets = make([]int, 0, c.NumClauses)
+	c.originalClauseSizes = make([]int, 0, c.NumClauses)
+	
+	for _, clause := range c.Clauses {
+		offset := len(c.literalPool)
+		c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
+		c.originalClauseSizes = append(c.originalClauseSizes, len(clause.Literals))
+		
+		for _, lit := range clause.Literals {
+			c.literalPool = append(c.literalPool, uint32(lit))
+		}
+	}
+}
+
 
