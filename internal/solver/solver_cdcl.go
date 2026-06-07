@@ -2635,15 +2635,14 @@ func (s *CDCLSolver) handleConflict(clauseIdx int) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
-	// Decay clause activity periodically
-	if s.conflicts%100 == 0 {
-		s.vsids.decay()
-		// Also decay LBD bonus
-		s.vsids.decayLBD()
-		// Also decay clause activity
-		for i := range s.clauseActivity {
-			s.clauseActivity[i] *= 0.95
-		}
+	// Decay clause activity EVERY CONFLICT (standard VSIDS)
+	// Previous code decayed every 100 conflicts, causing variables to have
+	// unbounded activity growth and leading to infinite loops on the same variable
+	s.vsids.decay()
+	s.vsids.decayLBD()
+	// Also decay clause activity
+	for i := range s.clauseActivity {
+		s.clauseActivity[i] *= 0.95
 	}
 	
 	// DISABLED: Inprocessing causes soundness bugs with watched literals
@@ -2982,6 +2981,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 			s.learnedClauses = append(s.learnedClauses, newClause)
 			
+			// ALWAYS print first 10 learned clauses for debugging
+			if len(s.learnedClauses) <= 10 {
+				fmt.Printf("c [LEARNED] Clause %d: LBD=%d, size=%d, lits=[", len(s.learnedClauses)-1, lbd, len(learnedLits))
+				for i, lit := range learnedLits {
+					if i > 0 {
+						fmt.Printf(" ")
+					}
+					if lit.IsNegated() {
+						fmt.Printf("-%d", lit.Var()+1)
+					} else {
+						fmt.Printf("%d", lit.Var()+1)
+					}
+				}
+				fmt.Printf("]\n")
+			}
+			
 			// LBD-based VSIDS: bump variables in low-LBD clauses
 			s.vsids.bumpLBD(learnedLits, lbd)
 		}
@@ -3004,6 +3019,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	if backjumpLevel == 0 {
 		backjumpLevel = 1
+	}
+	
+	if s.verbose && s.conflicts <= 20 {
+		fmt.Printf("c [debug] Backjump level calculated: %d (max in clause: %d, current level: %d)\n", 
+			backjumpLevel, maxLevelInClause, s.level)
 	}
 	
 	s.lastConflictLBD = lbd
@@ -3252,17 +3272,28 @@ func (s *CDCLSolver) backtrack() bool {
 		bjLevel = s.level - 1
 	}
 	if bjLevel < 1 {
+		if s.verbose && s.conflicts <= 20 {
+			fmt.Printf("c [BACKTRACK] FAIL: backjump level %d invalid (level=%d)\n", bjLevel, s.level)
+		}
 		return false
 	}
 	
 	// Find the decision point at the backjump level
 	decisionPoint := s.trailHead[bjLevel]
 	if decisionPoint >= len(s.trail) {
+		if s.verbose && s.conflicts <= 20 {
+			fmt.Printf("c [BACKTRACK] FAIL: decision point %d >= trail len %d\n", decisionPoint, len(s.trail))
+		}
 		return false
 	}
 	
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
+	
+	if s.verbose && s.conflicts <= 20 {
+		fmt.Printf("c [BACKTRACK] Backjumping from level %d to %d, var %d, trail[%d:%d]\n", 
+			s.level, bjLevel, decisionVar+1, decisionPoint, len(s.trail))
+	}
 
 	// Clear all assignments from decisionPoint onwards
 	for i := decisionPoint; i < len(s.trail); i++ {
@@ -3285,6 +3316,10 @@ func (s *CDCLSolver) backtrack() bool {
 		Level: bjLevel,
 	}
 	s.trail = append(s.trail, int(decisionVar))
+	
+	// CRITICAL FIX: Update trailHead[bjLevel] to point to the flipped decision
+	// Without this, 1-UIP analysis uses wrong trail range and learns duplicate clauses
+	s.trailHead[bjLevel] = len(s.trail) - 1
 	
 	return true
 }
