@@ -64,6 +64,10 @@ type CDCLSolver struct {
 	eliminatedVars map[uint32]eliminationInfo  // Maps eliminated var to substitution rule
 	elimOrder      int                          // Elimination order counter
 	
+	// Watched literals infrastructure
+	watchLists     [][]cnf.Watch  // watchLists[lit] = clauses watching lit
+	watchInitialized bool         // True if watches have been initialized
+	
 	// LBD-based learned clause ordering for propagation prioritization
 	learnedClauseOrder []int  // Indices into learnedClauses/clauseLBD sorted by LBD
 	lbdOrderDirty      bool   // True if order needs rebuilding
@@ -318,7 +322,65 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// Rebuild literal pool after preprocessing modifications
 	s.cnf.RebuildLiteralPool()
 	
+	// Initialize watched literals after preprocessing completes
+	s.initWatches()
+	
 	return UNKNOWN
+}
+
+// initWatches initializes watched literals for all clauses
+// Called after preprocessing completes (preprocessing modifies clauses)
+func (s *CDCLSolver) initWatches() {
+	if s.watchInitialized {
+		return
+	}
+	
+	numLits := int(s.cnf.NumVars) * 2
+	s.watchLists = make([][]cnf.Watch, numLits)
+	
+	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
+		clause := s.cnf.Clauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, false)
+	}
+	
+	for clauseID := 0; clauseID < len(s.learnedClauses); clauseID++ {
+		clause := s.learnedClauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, true)
+	}
+	
+	s.watchInitialized = true
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Watched literals initialized: %d clauses, %d watch lists\n",
+			s.cnf.NumClauses+len(s.learnedClauses), len(s.watchLists))
+	}
+}
+
+// addClauseToWatches adds a clause to the watch lists
+// Watches the first two literals in the clause
+func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, learned bool) {
+	if len(literals) < 2 {
+		return
+	}
+	
+	lit0 := literals[0]
+	lit1 := literals[1]
+	isBinary := len(literals) == 2
+	
+	idx0 := cnf.LitToIndex(lit0)
+	idx1 := cnf.LitToIndex(lit1)
+	
+	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+		ClauseID: uint32(clauseID),
+		Blit:     uint32(idx1),
+		IsBinary: isBinary,
+	})
+	
+	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+		ClauseID: uint32(clauseID),
+		Blit:     uint32(idx0),
+		IsBinary: isBinary,
+	})
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -1968,7 +2030,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			return UNKNOWN
 		}
 		
-		conflict, clauseIdx := s.propagate()
+		conflict, clauseIdx := s.propagateWatched()
 		if conflict {
 			s.handleConflict(clauseIdx)
 			if s.conflicts % 50 == 0 && s.verbose {
@@ -2077,6 +2139,152 @@ func (s *CDCLSolver) verifyModel() bool {
 		}
 	}
 	return true
+}
+
+// propagateWatched performs unit propagation using watched literals
+// Returns (conflict, conflictClauseIndex) where conflictClauseIndex is:
+// - >= 0 for original clauses
+// - < 0 for learned clauses (encoded as -learnedIdx-1)
+func (s *CDCLSolver) propagateWatched() (bool, int) {
+	if !s.watchInitialized {
+		return s.propagate()
+	}
+	
+
+	
+	trailIndex := s.trailHead[s.level]
+	
+	for trailIndex < len(s.trail) {
+		lit := s.trail[trailIndex]
+		trailIndex++
+		
+		varIdx := uint32(lit)
+		value := s.assignments[varIdx].Value
+		var falseLit cnf.Literal
+		if value {
+			falseLit = cnf.NewLiteral(varIdx, true)
+		} else {
+			falseLit = cnf.NewLiteral(varIdx, false)
+		}
+		
+		watchIdx := cnf.LitToIndex(falseLit)
+		watches := s.watchLists[watchIdx]
+		
+		newWatchCount := 0
+		for i := 0; i < len(watches); i++ {
+			watch := watches[i]
+			clauseID := watch.ClauseID
+			blitIdx := watch.Blit
+			isBinary := watch.IsBinary
+			
+			blit := cnf.IndexToLit(int(blitIdx))
+			
+			if s.literalIsTrue(blit) {
+				watches[newWatchCount] = watch
+				newWatchCount++
+				continue
+			}
+			
+			var clause cnf.Clause
+			var isLearned bool
+			var learnedIdx int
+			if clauseID < uint32(s.cnf.NumClauses) {
+				clause = s.cnf.Clauses[clauseID]
+				isLearned = false
+				learnedIdx = -1
+			} else {
+				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
+				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
+					continue
+				}
+				clause = s.learnedClauses[learnedIdx]
+				isLearned = true
+			}
+			
+			if isBinary {
+				if s.assignments[blit.Var()].Level == 0 {
+					reasonIdx := int(clauseID)
+					if isLearned {
+						reasonIdx = -learnedIdx - 1
+					}
+					s.assignLiteral(blit, s.level, reasonIdx)
+					watches[newWatchCount] = watch
+					newWatchCount++
+					s.watchLists[watchIdx] = watches[:newWatchCount]
+					trailIndex = s.trailHead[s.level]
+					break
+				}
+				if !s.literalIsTrue(blit) {
+					if isLearned {
+						return true, -learnedIdx - 1
+					}
+					return true, int(clauseID)
+				}
+				watches[newWatchCount] = watch
+				newWatchCount++
+				continue
+			}
+			
+			foundReplacement := false
+			for _, clauseLit := range clause.Literals {
+				if clauseLit == falseLit || clauseLit == blit {
+					continue
+				}
+				
+				litLevel := s.assignments[clauseLit.Var()].Level
+				litValue := s.assignments[clauseLit.Var()].Value
+				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
+				
+				if litTrue || litLevel == 0 {
+					newWatchIdx := cnf.LitToIndex(clauseLit)
+					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+						ClauseID: clauseID,
+						Blit:     uint32(watchIdx),
+						IsBinary: false,
+					})
+					foundReplacement = true
+					break
+				}
+			}
+			
+			if foundReplacement {
+				s.watchLists[watchIdx] = watches[:newWatchCount]
+				continue
+			}
+			
+			blitLevel := s.assignments[blit.Var()].Level
+			blitValue := s.assignments[blit.Var()].Value
+			blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
+			
+			if blitLevel == 0 {
+				reasonIdx := int(clauseID)
+				if isLearned {
+					reasonIdx = -learnedIdx - 1
+				}
+				s.assignLiteral(blit, s.level, reasonIdx)
+				watches[newWatchCount] = watch
+				newWatchCount++
+				s.watchLists[watchIdx] = watches[:newWatchCount]
+				trailIndex = s.trailHead[s.level]
+				break
+			}
+			
+			if !blitTrue {
+				if isLearned {
+					return true, -learnedIdx - 1
+				}
+				return true, int(clauseID)
+			}
+			
+			watches[newWatchCount] = watch
+			newWatchCount++
+			s.watchLists[watchIdx] = watches[:newWatchCount]
+		}
+		
+		s.watchLists[watchIdx] = watches[:newWatchCount]
+	}
+	
+	return false, -1
 }
 
 func (s *CDCLSolver) propagate() (bool, int) {

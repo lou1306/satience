@@ -5,6 +5,87 @@ import (
 	"satience/internal/cnf"
 )
 
+// VerifyWatchInvariants checks that watched literals are maintained correctly
+func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
+	if !s.watchInitialized {
+		return nil
+	}
+	
+	clauseWatchCount := make(map[int]int)
+	
+	for litIdx := 0; litIdx < len(s.watchLists); litIdx++ {
+		watches := s.watchLists[litIdx]
+		for i, watch := range watches {
+			clauseID := int(watch.ClauseID)
+
+			blitIdx := int(watch.Blit)
+			
+			if clauseID < 0 {
+				return fmt.Errorf("watch %d at litIdx %d has negative clauseID %d (%s)", i, litIdx, clauseID, reason)
+			}
+			
+			if blitIdx < 0 || blitIdx >= len(s.watchLists) {
+				return fmt.Errorf("watch %d at litIdx %d has invalid blitIdx %d (%s)", i, litIdx, blitIdx, reason)
+			}
+			
+			clauseWatchCount[clauseID]++
+			
+			var clause cnf.Clause
+			if clauseID < s.cnf.NumClauses {
+				clause = s.cnf.Clauses[clauseID]
+			} else {
+				learnedIdx := clauseID - s.cnf.NumClauses
+				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
+					return fmt.Errorf("watch %d at litIdx %d references non-existent learned clause %d (%s)", i, litIdx, learnedIdx, reason)
+				}
+				clause = s.learnedClauses[learnedIdx]
+			}
+			
+			if len(clause.Literals) < 2 {
+				return fmt.Errorf("clause %d has %d literals (need at least 2 for watches) (%s)", clauseID, len(clause.Literals), reason)
+			}
+			
+			found := false
+			for _, lit := range clause.Literals {
+				idx := cnf.LitToIndex(lit)
+				if idx == litIdx {
+					found = true
+					break
+				}
+			}
+			
+			if !found {
+				return fmt.Errorf("watch at litIdx %d doesn't match any literal in clause %d (lits=%v) (%s)", litIdx, clauseID, clause.Literals, reason)
+			}
+			
+			found = false
+			for _, lit := range clause.Literals {
+				idx := cnf.LitToIndex(lit)
+				if idx == blitIdx {
+					found = true
+					break
+				}
+			}
+			
+			if !found {
+				return fmt.Errorf("blitIdx %d doesn't match any literal in clause %d (lits=%v) (%s)", blitIdx, clauseID, clause.Literals, reason)
+			}
+			
+			if litIdx == blitIdx {
+				return fmt.Errorf("watch at litIdx %d has same blitIdx (clause %d) (%s)", litIdx, clauseID, reason)
+			}
+		}
+	}
+	
+	for clauseID, count := range clauseWatchCount {
+		if count != 2 {
+			return fmt.Errorf("clause %d has %d watches instead of 2 (%s)", clauseID, count, reason)
+		}
+	}
+	
+	return nil
+}
+
 // VerificationConfig controls which verification checks are enabled
 type VerificationConfig struct {
 	EnableTrailChecks      bool // Verify trail invariants after every operation
