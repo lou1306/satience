@@ -181,3 +181,18 @@ func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
 	}
 	return false
 }
+
+// resetActivity resets all activity scores to zero
+// Called on restart to prevent choosing the same variables repeatedly
+func (v *VSIDS) resetActivity() {
+	for i := range v.activity {
+		v.activity[i] = 0
+	}
+	for i := range v.lbdBonus {
+		v.lbdBonus[i] = 0
+	}
+	for i := range v.conflictParticipation {
+		v.conflictParticipation[i] = 0
+	}
+	v.conflictCount = 0
+}

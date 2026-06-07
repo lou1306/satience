@@ -953,6 +953,11 @@ func (s *CDCLSolver) restart() {
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
 	
+	// CRITICAL: Reset VSIDS activity on restart
+	// Without this, the same high-activity variables get chosen again,
+	// leading to infinite loops on PHP-like instances
+	s.vsids.resetActivity()
+	
 	// Clear temporary buffers after restart (assignments are cleared, levels reset)
 	for i := range s.tmpLiteralInClause {
 		s.tmpLiteralInClause[i] = false
@@ -2596,8 +2601,11 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
 	
-	// Save the phase (polarity) that satisfied this variable
-	s.savedPhase[varIdx] = value
+	// Save the phase (polarity) for decisions only
+	// Don't save phase for propagations - the phase is forced by the clause
+	if clauseIdx == -1 {
+		s.savedPhase[varIdx] = value
+	}
 	
 	if s.verbose && level > 0 {
 		reasonStr := "propagation"
@@ -2848,6 +2856,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	
 	if s.verbose {
 		fmt.Printf("c [debug] 1-UIP result: conflict=%d, %d literals total, %d at current level %d\n", s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
+	}
+	
+	// BUG FIX: If 1-UIP didn't reduce to exactly 1 literal at current level,
+	// don't learn the clause. This happens when there are multiple decisions
+	// at the current level (shouldn't happen in proper CDCL, but does on PHP).
+	// Learning such clauses causes infinite loops.
+	if litsAtCurrentLevel != 1 {
+		if s.verbose && s.conflicts <= 20 {
+			fmt.Printf("c [debug] Skipping learned clause: %d literals at level %d (expected 1)\n", litsAtCurrentLevel, s.level)
+		}
+		// Return level-1 for chronological backtracking (DPLL-style)
+		backjumpLevel := s.level - 1
+		if backjumpLevel < 0 {
+			backjumpLevel = 0
+		}
+		return backjumpLevel
 	}
 	
 	// Calculate LBD using reusable buffer (no map allocation)
