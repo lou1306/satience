@@ -56,6 +56,10 @@ type CDCLSolver struct {
 	tmpCandidates []resolveCandidate
 	tmpLevelSet []int // For LBD calculation (replaces map)
 	tmpLevelSetUsed []bool // Track which levels are in tmpLevelSet
+	
+	// Watched literals infrastructure (Phase 1: data structures only)
+	watchLists   [][]cnf.Watch  // watchLists[lit] = clauses watching lit
+	watchInitialized bool        // True if watches have been initialized
 }
 
 // resolveCandidate is used in learnClause for sorting resolution order
@@ -1613,6 +1617,69 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	return UNKNOWN
 }
 
+// initWatches initializes watched literals for all clauses
+// Must be called AFTER preprocessing completes (preprocessing modifies clauses)
+// This is Phase 1 of watched literals implementation - data structures only
+func (s *CDCLSolver) initWatches() {
+	if s.watchInitialized {
+		return  // Already initialized
+	}
+	
+	// Initialize watch lists for all literals (2 per variable: positive and negative)
+	numLits := int(s.cnf.NumVars) * 2
+	s.watchLists = make([][]cnf.Watch, numLits)
+	
+	// Add all original clauses to watch lists
+	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
+		clause := s.cnf.Clauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, false)
+	}
+	
+	// Add all learned clauses to watch lists
+	for clauseID := 0; clauseID < len(s.learnedClauses); clauseID++ {
+		clause := s.learnedClauses[clauseID]
+		s.addClauseToWatches(clauseID, clause.Literals, true)
+	}
+	
+	s.watchInitialized = true
+	
+	if s.verbose {
+		fmt.Printf("c [verbose] Watched literals initialized: %d clauses, %d watch lists\n", 
+			s.cnf.NumClauses+len(s.learnedClauses), len(s.watchLists))
+	}
+}
+
+// addClauseToWatches adds a clause to the watch lists
+// Watches the first two literals in the clause
+func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, learned bool) {
+	if len(literals) < 2 {
+		return  // Unit clauses don't need watches
+	}
+	
+	lit0 := literals[0]
+	lit1 := literals[1]
+	
+	isBinary := len(literals) == 2
+	
+	// Convert literals to indices for watch list storage
+	idx0 := cnf.LitToIndex(lit0)
+	idx1 := cnf.LitToIndex(lit1)
+	
+	// Add watch for lit0 (watching lit1 as blocking literal)
+	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+		ClauseID: uint32(clauseID),
+		Blit:     uint32(idx1),
+		IsBinary: isBinary,
+	})
+	
+	// Add watch for lit1 (watching lit0 as blocking literal)
+	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+		ClauseID: uint32(clauseID),
+		Blit:     uint32(idx0),
+		IsBinary: isBinary,
+	})
+}
+
 func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 	changed := true
 	for changed {
@@ -1696,6 +1763,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 		return preprocessResult
 	}
+	
+	// Initialize watched literals AFTER preprocessing
+	// Preprocessing may modify clauses, so watches must be initialized after
+	s.initWatches()
 
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
@@ -1772,6 +1843,163 @@ func (s *CDCLSolver) allAssigned() bool {
 	return true
 }
 
+// propagateWatched performs unit propagation using watched literals
+// Returns (conflict, conflictClauseIndex) where conflictClauseIndex is:
+// - >= 0 for original clauses
+// - < 0 for learned clauses (encoded as -learnedIdx-1)
+func (s *CDCLSolver) propagateWatched() (bool, int) {
+	if !s.watchInitialized {
+		// Fallback to linear propagation if watches not initialized
+		return s.propagate()
+	}
+	
+	trailIndex := s.trailHead[s.level]
+	
+	for trailIndex < len(s.trail) {
+		lit := s.trail[trailIndex]
+		trailIndex++
+		
+		// Get the literal index for watch list lookup
+		// When a literal becomes false, we need to check clauses watching its negation
+		falseLit := cnf.IndexToLit(lit * 2)  // Get positive form
+		if s.assignments[lit].Value {
+			// lit is true, so negation is false
+			falseLit = cnf.NewLiteral(uint32(lit), true)
+		} else {
+			// lit is false
+			falseLit = cnf.NewLiteral(uint32(lit), false)
+		}
+		
+		watchIdx := cnf.LitToIndex(falseLit)
+		watches := s.watchLists[watchIdx]
+		
+		// Process all clauses watching this literal
+		newWatchIdx := 0
+		for _, watch := range watches {
+			clauseID := watch.ClauseID
+			blitIdx := watch.Blit
+			isBinary := watch.IsBinary
+			
+			// Get the blocking literal
+			blit := cnf.IndexToLit(int(blitIdx))
+			
+			// Check if blocking literal is satisfied
+			if s.literalIsTrue(blit) {
+				// Clause is satisfied by blocking literal, keep watch
+				watches[newWatchIdx] = watch
+				newWatchIdx++
+				continue
+			}
+			
+			// Blocking literal not satisfied - need to find new watch
+			var clause cnf.Clause
+			if clauseID < uint32(s.cnf.NumClauses) {
+				clause = s.cnf.Clauses[clauseID]
+			} else {
+				learnedIdx := int(clauseID) - s.cnf.NumClauses
+				if learnedIdx >= len(s.learnedClauses) {
+					continue  // Invalid clause
+				}
+				clause = s.learnedClauses[learnedIdx]
+			}
+			
+			if isBinary {
+				// Binary clause: other literal must propagate or conflict
+				otherLit := blit
+				if s.assignments[otherLit.Var()].Level == 0 {
+					// Propagate the other literal
+					assignLevel := s.level
+					if assignLevel == 0 {
+						assignLevel = 1
+					}
+					s.assignLiteral(otherLit, assignLevel, int(clauseID))
+					return false, -1  // Unit propagated
+				} else if !s.literalIsTrue(otherLit) {
+					// Conflict!
+					if clauseID < uint32(s.cnf.NumClauses) {
+						return true, int(clauseID)
+					} else {
+						learnedIdx := int(clauseID) - s.cnf.NumClauses
+						return true, -learnedIdx - 1
+					}
+				}
+				// Clause is satisfied, keep watch
+				watches[newWatchIdx] = watch
+				newWatchIdx++
+			} else {
+				// Long clause: find new watch position
+				// Scan clause literals to find a new literal to watch
+				newWatchLit := cnf.Literal(0)
+				foundNewWatch := false
+				
+				for _, clauseLit := range clause.Literals {
+					if clauseLit == falseLit || clauseLit == blit {
+						continue  // Skip current watched literals
+					}
+					
+					if s.literalIsTrue(clauseLit) {
+						// Found a true literal - clause is satisfied
+						// Update watch to this literal
+						newWatchLit = clauseLit
+						foundNewWatch = true
+						break
+					}
+				}
+				
+				if !foundNewWatch {
+					// No true literal found - look for unassigned literal
+					for _, clauseLit := range clause.Literals {
+						if clauseLit == falseLit || clauseLit == blit {
+							continue
+						}
+						if s.assignments[clauseLit.Var()].Level == 0 {
+							newWatchLit = clauseLit
+							foundNewWatch = true
+							break
+						}
+					}
+				}
+				
+				if foundNewWatch {
+					// Update watch: replace falseLit with newWatchLit
+					newWatchIdx2 := cnf.LitToIndex(newWatchLit)
+					s.watchLists[newWatchIdx2] = append(s.watchLists[newWatchIdx2], cnf.Watch{
+						ClauseID: clauseID,
+						Blit:     uint32(watchIdx),  // Other watched literal becomes blocking
+						IsBinary: false,
+					})
+					// Don't add to new watches - will be handled by new watch list
+				} else {
+					// No new watch found - clause is unit or conflicting
+					// The other watched literal (blit) is the only candidate
+					if s.assignments[blit.Var()].Level == 0 {
+						// Propagate blit
+						assignLevel := s.level
+						if assignLevel == 0 {
+							assignLevel = 1
+						}
+						s.assignLiteral(blit, assignLevel, int(clauseID))
+						return false, -1  // Unit propagated
+					} else if !s.literalIsTrue(blit) {
+						// Conflict!
+						if clauseID < uint32(s.cnf.NumClauses) {
+							return true, int(clauseID)
+						} else {
+							learnedIdx := int(clauseID) - s.cnf.NumClauses
+							return true, -learnedIdx - 1
+						}
+					}
+				}
+			}
+		}
+		
+		// Compact watch list (lazy removal - only keep valid watches)
+		s.watchLists[watchIdx] = watches[:newWatchIdx]
+	}
+	
+	return false, -1
+}
+
 func (s *CDCLSolver) propagate() (bool, int) {
 	trailIndex := s.trailHead[s.level]
 
@@ -1779,6 +2007,11 @@ func (s *CDCLSolver) propagate() (bool, int) {
 	for firstPass || trailIndex < len(s.trail) {
 		firstPass = false
 		unitPropagated := false
+		
+		// Use watched literals propagation if initialized
+		if s.watchInitialized {
+			return s.propagateWatched()
+		}
 		
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
