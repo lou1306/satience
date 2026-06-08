@@ -352,13 +352,18 @@ func (s *CDCLSolver) initWatches() {
 		s.addClauseToWatches(clauseID, clause.Literals, false)
 	}
 	
-	for clauseID := 0; clauseID < len(s.learnedClauses); clauseID++ {
-		clause := s.learnedClauses[clauseID]
-		s.addClauseToWatches(clauseID, clause.Literals, true)
+	for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
+		clause := s.learnedClauses[learnedIdx]
+		encodedClauseID := s.cnf.NumClauses + learnedIdx
+		s.addClauseToWatches(encodedClauseID, clause.Literals, true)
 	}
 	
 	if s.verbose {
-		fmt.Printf("c [verbose] Watched literals enabled: %d watches initialized\n", len(s.watchLists))
+		totalWatches := 0
+		for _, wl := range s.watchLists {
+			totalWatches += len(wl)
+		}
+		fmt.Printf("c [verbose] Watched literals enabled: %d watch lists, %d total watches\n", len(s.watchLists), totalWatches)
 	}
 }
 
@@ -391,7 +396,7 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	if clauseID == 108 {
 	}
 	
-	// Watched literals DISABLED - has soundness bugs in watch update logic
+	// Watched literals DISABLED - has soundness bugs causing infinite loops
 	// TODO: Fix and re-enable
 	s.watchInitialized = false
 }
@@ -862,6 +867,7 @@ func (s *CDCLSolver) restart() {
 	// Clear trail and assignments
 	s.trail = s.trail[:0]
 	s.trailHead = s.trailHead[:1]
+	s.qhead = 0  // Reset qhead since trail is empty
 	s.level = 0
 	for i := range s.implication {
 		s.implication[i] = -1
@@ -1755,6 +1761,8 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			blitAssign := s.assignments[blit.Var()]
 			blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
 			
+
+			
 			if blitIsTrue {
 				// Clause is satisfied, keep watch
 				watchList[writeIdx] = watch
@@ -1774,7 +1782,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
 				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
 					// Invalid learned clause, skip watch
-					continue
+				continue
 				}
 				clause = s.learnedClauses[learnedIdx]
 				isLearned = true
@@ -2213,16 +2221,25 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	// Clear reusable buffers (O(n) but much faster than allocation)
+	// Ensure buffers are large enough for current level
+	requiredSize := s.level + 1
+	if requiredSize > len(s.tmpLevelCount) {
+		s.tmpLevelCount = make([]int, requiredSize+1)
+	}
+	if requiredSize > len(s.tmpLevelSetUsed) {
+		s.tmpLevelSetUsed = make([]bool, requiredSize+1)
+	}
+	
 	for i := range s.tmpLiteralInClause {
 		s.tmpLiteralInClause[i] = false
 		s.tmpLiteralIsNegated[i] = false
 	}
-	for i := range s.tmpLevelCount[:s.level+1] {
+	for i := 0; i < requiredSize; i++ {
 		s.tmpLevelCount[i] = 0
 	}
 	s.tmpCandidates = s.tmpCandidates[:0]
 	s.tmpLevelSet = s.tmpLevelSet[:0]
-	for i := range s.tmpLevelSetUsed[:s.level+1] {
+	for i := 0; i < requiredSize; i++ {
 		s.tmpLevelSetUsed[i] = false
 	}
 	

@@ -113,8 +113,13 @@ func run() int {
 func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 	assignments := s.GetAssignments()
 	
-	// Print model
-	for i, assign := range assignments {
+	// Print model - only output variables up to cnf.NumVars
+	numVars := int(cnf.NumVars)
+	if len(assignments) < numVars {
+		numVars = len(assignments)
+	}
+	for i := 0; i < numVars; i++ {
+		assign := assignments[i]
 		if assign.Level > 0 {
 			val := int32(i + 1)
 			if !assign.Value {
