@@ -2163,10 +2163,14 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		return s.propagate()
 	}
 	
-	// Process ALL trail elements sequentially (MiniSat-style)
-	// New propagations are appended to trail, so we process them naturally
-	// No need to restart - just continue until we reach the end
-	for trailIndex := 0; trailIndex < len(s.trail); trailIndex++ {
+	// Process trail elements starting from trailHead[s.level]
+	// This matches linear propagation and ensures we only process new elements
+	startIndex := s.trailHead[s.level]
+	if startIndex >= len(s.trail) {
+		return false, -1
+	}
+	
+	for trailIndex := startIndex; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 		
 		varIdx := uint32(lit)
@@ -2222,8 +2226,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					watches[newWatchCount] = watch
 					newWatchCount++
 					s.watchLists[watchIdx] = watches[:newWatchCount]
-					// New propagation added to trail - will be processed naturally
-					break  // Break inner watch loop, continue outer trail loop
+					continue
 				}
 				if !s.literalIsTrue(blit) {
 					if isLearned {
@@ -2276,8 +2279,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				watches[newWatchCount] = watch
 				newWatchCount++
 				s.watchLists[watchIdx] = watches[:newWatchCount]
-				// New propagation added to trail - will be processed naturally
-				break  // Break inner watch loop, continue outer trail loop
+				continue
 			}
 			
 			if !blitTrue {
