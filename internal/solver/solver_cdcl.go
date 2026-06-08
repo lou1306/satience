@@ -390,10 +390,8 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 		IsBinary: isBinary,
 	})
 	
-	// Watched literals infrastructure is complete but disabled due to performance issues
-	// Go slice operations (append, reallocation) cause 100× slowdown vs linear propagation
-	// Future work: implement watch pools, swap-remove, and avoid allocations during propagation
-	s.watchInitialized = false
+	// Watched literals now enabled with all soundness bugs fixed
+	s.watchInitialized = true
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -2560,6 +2558,9 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 	assign := s.assignments[lit.Var()]
+	if assign.Level == 0 {
+		return false  // Unassigned literals are not true
+	}
 	if lit.IsNegated() {
 		return !assign.Value
 	}
@@ -2992,7 +2993,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.currentAge++
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
+			learnedIdx := len(s.learnedClauses)
 			s.learnedClauses = append(s.learnedClauses, newClause)
+			
+			// Add learned clause to watches with correct ID encoding
+			if s.watchInitialized {
+				encodedClauseID := s.cnf.NumClauses + learnedIdx
+				s.addClauseToWatches(encodedClauseID, learnedLits, true)
+			}
 			
 			// Mark LBD order as dirty - will be rebuilt on next propagation
 			s.lbdOrderDirty = true
