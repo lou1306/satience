@@ -2184,33 +2184,18 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			falseLit = cnf.NewLiteral(varIdx, false)
 		}
 		
-		watchIdx := cnf.LitToIndex(falseLit)
-		watches := s.watchLists[watchIdx]
-		
-		if s.verbose && s.level == 6 && trailIndex >= 18 {
-			fmt.Printf("c [PROP-L6] trail[%d]=var%d(val=%v), watchIdx=%d, numWatches=%d\n",
-				trailIndex, varIdx+1, value, watchIdx, len(watches))
-		}
-		
-		newWatchCount := 0
+	watchIdx := cnf.LitToIndex(falseLit)
+	watches := s.watchLists[watchIdx]
+	
+	newWatchCount := 0
 		for i := 0; i < len(watches); i++ {
 			watch := watches[i]
 			clauseID := watch.ClauseID
 			blitIdx := watch.Blit
 			
-			blit := cnf.IndexToLit(int(blitIdx))
-			
-			if s.verbose && clauseID >= uint32(s.cnf.NumClauses) {
-				learnedIdx := int(clauseID - uint32(s.cnf.NumClauses))
-				fmt.Printf("c [WATCH-L%03d] Processing: watchIdx=%d, blitIdx=%d, blit=%d (var%d)\n",
-					learnedIdx, watchIdx, blitIdx, blit, blit.Var()+1)
-			}
-			if s.verbose && false {
-				fmt.Printf("c [WATCH-109] Processing: watchIdx=%d, blitIdx=%d, blit=%d (var%d)\n",
-					watchIdx, blitIdx, blit, blit.Var()+1)
-			}
-			
-			if s.literalIsTrue(blit) {
+		blit := cnf.IndexToLit(int(blitIdx))
+		
+		if s.literalIsTrue(blit) {
 				watches[newWatchCount] = watch
 				newWatchCount++
 				continue
@@ -2232,25 +2217,17 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				isLearned = true
 			}
 			
-			foundReplacement := false
-			if s.verbose && false {
-				fmt.Printf("c [WATCH-109] Looking for replacement, clause has %d literals\n", len(clause.Literals))
-			}
-			for j := 0; j < len(clause.Literals); j++ {
+		foundReplacement := false
+		for j := 0; j < len(clause.Literals); j++ {
 				clauseLit := clause.Literals[j]
 				if clauseLit == falseLit || clauseLit == blit {
 					continue
 				}
 				
-				litLevel := s.assignments[clauseLit.Var()].Level
-				litValue := s.assignments[clauseLit.Var()].Value
-				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
-				
-				if s.verbose && false {
-					fmt.Printf("c [WATCH-109] Checking lit %d (var%d): level=%d, value=%v, litTrue=%v\n",
-						clauseLit, clauseLit.Var()+1, litLevel, litValue, litTrue)
-				}
-				
+			litLevel := s.assignments[clauseLit.Var()].Level
+			litValue := s.assignments[clauseLit.Var()].Value
+			litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
+			
 				if litTrue || litLevel == 0 {
 					newWatchIdx := cnf.LitToIndex(clauseLit)
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
@@ -2259,10 +2236,6 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 						IsBinary: false,
 					})
 					otherWatchIdx := cnf.LitToIndex(blit)
-					if s.verbose && false {
-						fmt.Printf("c [WATCH-109] Found replacement: newWatchIdx=%d, updating other watch at idx %d\n",
-							newWatchIdx, otherWatchIdx)
-					}
 					for k := range s.watchLists[otherWatchIdx] {
 						if s.watchLists[otherWatchIdx][k].ClauseID == clauseID {
 							s.watchLists[otherWatchIdx][k].Blit = uint32(newWatchIdx)
