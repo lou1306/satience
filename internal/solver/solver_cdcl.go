@@ -407,9 +407,11 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 		}
 	}
 	
-	// Watched literals DISABLED - still has issues with UNSAT instances
-	// Fixed learnedClauseBase to use original NumClauses value
-	// But solver still loops on UNSAT instances - needs more debugging
+	// WatchED literals DISABLED - learned clauses don't prevent conflicts on UNSAT instances
+	// Root cause: Solver backtracks, unassigns variables, then same learned clause re-propagates them
+	// This creates an infinite loop: propagate -> conflict -> backtrack -> re-propagate -> ...
+	// The learned clauses (LBD=5) are not strong enough to prune the search space effectively
+	// Need better clause learning (lower LBD clauses) or different restart strategy
 	s.watchInitialized = false
 }
 
