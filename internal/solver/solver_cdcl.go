@@ -391,7 +391,7 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	})
 	
 	// Watched literals now enabled with all soundness bugs fixed
-	s.watchInitialized = false  // Soundness bug: binary clause propagation incorrect: incorrect UNSAT on PHP SAT instances
+	s.watchInitialized = false  // FIXME: learned clause propagation incorrect - propagates wrong polarity: incorrect UNSAT on PHP SAT instances
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -2189,7 +2189,6 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			watch := watches[i]
 			clauseID := watch.ClauseID
 			blitIdx := watch.Blit
-			isBinary := watch.IsBinary
 			
 			blit := cnf.IndexToLit(int(blitIdx))
 			
@@ -2215,31 +2214,9 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				isLearned = true
 			}
 			
-			if isBinary {
-				if s.assignments[blit.Var()].Level == 0 {
-					reasonIdx := int(clauseID)
-					if isLearned {
-						reasonIdx = -learnedIdx - 1
-					}
-					s.assignLiteral(blit, s.level, reasonIdx)
-					watches[newWatchCount] = watch
-					newWatchCount++
-					s.watchLists[watchIdx] = watches[:newWatchCount]
-					continue
-				}
-				if !s.literalIsTrue(blit) {
-					if isLearned {
-						return true, -learnedIdx - 1
-					}
-					return true, int(clauseID)
-				}
-				watches[newWatchCount] = watch
-				newWatchCount++
-				continue
-			}
-			
 			foundReplacement := false
-			for _, clauseLit := range clause.Literals {
+			for j := 0; j < len(clause.Literals); j++ {
+				clauseLit := clause.Literals[j]
 				if clauseLit == falseLit || clauseLit == blit {
 					continue
 				}
@@ -2255,7 +2232,6 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 						Blit:     uint32(blitIdx),
 						IsBinary: false,
 					})
-					// Update the other watch to point to this new watch
 					otherWatchIdx := cnf.LitToIndex(blit)
 					for k := range s.watchLists[otherWatchIdx] {
 						if s.watchLists[otherWatchIdx][k].ClauseID == clauseID {
