@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"satience/internal/cnf"
+	"sort"
 	"time"
 )
 
@@ -914,7 +915,7 @@ func (s *CDCLSolver) restart() {
 // - Otherwise, X can be assigned arbitrarily (use phase saving or false)
 func (s *CDCLSolver) extendModel() bool {
 	if s.verbose {
-		fmt.Printf("c [DEBUG] extendModel called with %d eliminated vars\n", len(s.eliminatedVars))
+
 	}
 	if len(s.eliminatedVars) == 0 {
 		return true  // No eliminated variables, success
@@ -945,8 +946,7 @@ func (s *CDCLSolver) extendModel() bool {
 		info := s.eliminatedVars[varIdx]
 		
 		if s.verbose {
-			fmt.Printf("c [DEBUG] Reconstructing var %d (elimOrder=%d, pos=%d clauses, neg=%d clauses)\n",
-				varIdx+1, info.elimOrder, len(info.posClauseLits), len(info.negClauseLits))
+
 		}
 		
 		// Special case: equivalence detection stores single-literal clauses
@@ -961,7 +961,7 @@ func (s *CDCLSolver) extendModel() bool {
 				Level: 1,
 			}
 			if s.verbose {
-				fmt.Printf("c [DEBUG]   Equivalence: var %d = var %d = %v\n", varIdx+1, repVar+1, repValue)
+
 			}
 			continue
 		}
@@ -985,7 +985,7 @@ func (s *CDCLSolver) extendModel() bool {
 				// This clause (X ∨ A) has all of A=false, so X MUST be TRUE
 				mustBeTrue = true
 				if s.verbose {
-					fmt.Printf("c [DEBUG]   Clause %v requires X=TRUE (all lits false)\n", clauseLits)
+
 				}
 				break
 			}
@@ -996,16 +996,9 @@ func (s *CDCLSolver) extendModel() bool {
 		mustBeFalse := false
 		for _, clauseLits := range info.negClauseLits {
 			allFalse := true
-			if s.verbose {
-				fmt.Printf("c [DEBUG]   Checking neg clause %v:\n", clauseLits)
-			}
 			for _, lit := range clauseLits {
 				assign := s.assignments[lit.Var()]
 				litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-				if s.verbose {
-					fmt.Printf("c [DEBUG]     lit %v (var %d): value=%v, level=%d, litTrue=%v\n",
-						lit, lit.Var()+1, assign.Value, assign.Level, litTrue)
-				}
 				if litTrue {
 					allFalse = false
 					break
@@ -1014,9 +1007,6 @@ func (s *CDCLSolver) extendModel() bool {
 			if allFalse && len(clauseLits) > 0 {
 				// This clause (¬X ∨ B) has all of B=false, so X MUST be FALSE
 				mustBeFalse = true
-				if s.verbose {
-					fmt.Printf("c [DEBUG]   Clause %v requires X=FALSE (all lits false)\n", clauseLits)
-				}
 				break
 			}
 		}
@@ -1043,8 +1033,7 @@ func (s *CDCLSolver) extendModel() bool {
 		}
 		
 		if s.verbose {
-			fmt.Printf("c [DEBUG]   Assigning var %d = %v (mustBeTrue=%v, mustBeFalse=%v)\n",
-				varIdx+1, varValue, mustBeTrue, mustBeFalse)
+
 		}
 		
 		s.assignments[varIdx].Value = varValue
@@ -1637,9 +1626,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 
 		if s.allAssigned() {
-			if s.verbose {
-				fmt.Printf("c [DEBUG] allAssigned=true, calling extendModel\n")
-			}
+
 			// Extend model to eliminated variables before returning SAT
 			if !s.extendModel() {
 				if s.verbose {
@@ -1709,12 +1696,7 @@ func (s *CDCLSolver) verifyModel() bool {
 		}
 		if !clauseSat {
 			if s.verbose {
-				fmt.Printf("c [ERROR] Clause %v is not satisfied!\n", clause.Literals)
-				// Print all variable values for debugging
-				for _, lit := range clause.Literals {
-					assign := s.assignments[lit.Var()]
-					fmt.Printf("c [ERROR]   var %d: value=%v, level=%d\n", lit.Var()+1, assign.Value, assign.Level)
-				}
+				fmt.Printf("c [ERROR] Clause not satisfied!\n")
 			}
 			return false
 		}
@@ -2818,13 +2800,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 	
 	// Sort by score (descending - highest score = delete first)
-	for i := 0; i < len(clauses); i++ {
-		for j := i + 1; j < len(clauses); j++ {
-			if clauses[i].score < clauses[j].score {
-				clauses[i], clauses[j] = clauses[j], clauses[i]
-			}
-		}
-	}
+	sort.Slice(clauses, func(i, j int) bool {
+		return clauses[i].score > clauses[j].score
+	})
 	
 	// Target: reduce to minLearned clauses (aggressive deletion)
 	toKeep := s.minLearned
@@ -3045,18 +3023,9 @@ func (s *CDCLSolver) rebuildLBDOrder() {
 	}
 	
 	// Sort by LBD (ascending - low LBD first)
-	// Use simple selection sort for simplicity (O(n²) but n is typically < 5000)
-	for i := 0; i < n; i++ {
-		minIdx := i
-		for j := i + 1; j < n; j++ {
-			if s.clauseLBD[s.learnedClauseOrder[j]] < s.clauseLBD[s.learnedClauseOrder[minIdx]] {
-				minIdx = j
-			}
-		}
-		if minIdx != i {
-			s.learnedClauseOrder[i], s.learnedClauseOrder[minIdx] = s.learnedClauseOrder[minIdx], s.learnedClauseOrder[i]
-		}
-	}
+	sort.Slice(s.learnedClauseOrder, func(i, j int) bool {
+		return s.clauseLBD[s.learnedClauseOrder[i]] < s.clauseLBD[s.learnedClauseOrder[j]]
+	})
 	
 	s.lbdOrderDirty = false
 	s.lbdOrderLastRebuild = s.conflicts
