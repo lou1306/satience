@@ -55,25 +55,11 @@ type Clause struct {
 	Learned  bool
 }
 
-// ClauseArena manages contiguous memory for clause storage
-// All literals are stored in a single buffer for cache efficiency
-// Clauses are referenced by (offset, length) pairs
-type ClauseArena struct {
-	buffer    []uint32 // Contiguous storage for all literals
-	offsets   []int    // Start offset of each clause in buffer
-	sizes     []int    // Number of literals in each clause
-	learned   []bool   // Whether each clause is learned
-	freeList  []int    // Indices of freed slots for reuse
-}
-
 // CNF represents a CNF formula
 type CNF struct {
 	NumVars    uint32
 	Clauses    []Clause
 	NumClauses int
-	
-	// Arena-based clause storage for cache efficiency
-	Arena *ClauseArena
 	
 	// Contiguous literal storage for original clauses (optimization)
 	// All original clause literals stored in one array for better cache locality
@@ -86,24 +72,10 @@ type CNF struct {
 
 // NewCNF creates a new CNF formula
 func NewCNF(numVars uint32, numClauses int) *CNF {
-	// Pre-allocate arena with estimated capacity
-	arenaCapacity := numClauses * 4 // Average 4 literals per clause
 	return &CNF{
 		NumVars:    numVars,
 		Clauses:    make([]Clause, 0, numClauses),
 		NumClauses: 0,
-		Arena:      NewClauseArena(arenaCapacity),
-	}
-}
-
-// NewClauseArena creates a new clause arena with pre-allocated buffer
-func NewClauseArena(capacity int) *ClauseArena {
-	return &ClauseArena{
-		buffer:   make([]uint32, 0, capacity),
-		offsets:  make([]int, 0, capacity/4),
-		sizes:    make([]int, 0, capacity/4),
-		learned:  make([]bool, 0, capacity/4),
-		freeList: make([]int, 0),
 	}
 }
 
@@ -144,199 +116,6 @@ func IndexToLit(idx int) Literal {
 	return NewLiteral(varIdx, isNegated)
 }
 
-// Arena methods for clause allocation and access
-
-// AllocateClause allocates a clause in the arena and returns its index
-func (ca *ClauseArena) AllocateClause(literals []Literal, learned bool) int {
-	// Reuse freed slot if available
-	var idx int
-	if len(ca.freeList) > 0 {
-		idx = ca.freeList[len(ca.freeList)-1]
-		ca.freeList = ca.freeList[:len(ca.freeList)-1]
-		// Update existing entry
-		ca.offsets[idx] = len(ca.buffer)
-		ca.sizes[idx] = len(literals)
-		ca.learned[idx] = learned
-	} else {
-		// Allocate new slot
-		idx = len(ca.offsets)
-		ca.offsets = append(ca.offsets, len(ca.buffer))
-		ca.sizes = append(ca.sizes, len(literals))
-		ca.learned = append(ca.learned, learned)
-	}
-	
-	// Append literals to buffer
-	for _, lit := range literals {
-		ca.buffer = append(ca.buffer, uint32(lit))
-	}
-	
-	return idx
-}
-
-// GetClauseLiterals returns the literals for a clause at given index
-func (ca *ClauseArena) GetClauseLiterals(idx int) []Literal {
-	offset := ca.offsets[idx]
-	size := ca.sizes[idx]
-	literals := make([]Literal, size)
-	for i := 0; i < size; i++ {
-		literals[i] = Literal(ca.buffer[offset+i])
-	}
-	return literals
-}
-
-// IsLearned returns whether a clause is learned
-func (ca *ClauseArena) IsLearned(idx int) bool {
-	return ca.learned[idx]
-}
-
-// FreeClause marks a clause slot as free for reuse
-func (ca *ClauseArena) FreeClause(idx int) {
-	ca.freeList = append(ca.freeList, idx)
-}
-
-// NumClauses returns the number of allocated clauses
-func (ca *ClauseArena) NumClauses() int {
-	return len(ca.offsets) - len(ca.freeList)
-}
-
-// Compact removes gaps from freed clauses and rebuilds indices
-// Returns a mapping from old indices to new indices
-func (ca *ClauseArena) Compact() []int {
-	if len(ca.freeList) == 0 {
-		return nil // No compaction needed
-	}
-	
-	// Build mapping from old to new indices
-	oldToNew := make([]int, len(ca.offsets))
-	for i := range oldToNew {
-		oldToNew[i] = i
-	}
-	
-	// Create new arrays
-	newBuffer := make([]uint32, 0, len(ca.buffer))
-	newOffsets := make([]int, 0, len(ca.offsets))
-	newSizes := make([]int, 0, len(ca.sizes))
-	newLearned := make([]bool, 0, len(ca.learned))
-	
-	newIdx := 0
-	for oldIdx := range ca.offsets {
-		// Check if this index is in freeList
-		isFree := false
-		for _, freeIdx := range ca.freeList {
-			if freeIdx == oldIdx {
-				isFree = true
-				break
-			}
-		}
-		
-		if !isFree {
-			oldToNew[oldIdx] = newIdx
-			newOffsets = append(newOffsets, len(newBuffer))
-			newSizes = append(newSizes, ca.sizes[oldIdx])
-			newLearned = append(newLearned, ca.learned[oldIdx])
-			
-			// Copy literals
-			offset := ca.offsets[oldIdx]
-			size := ca.sizes[oldIdx]
-			for i := 0; i < size; i++ {
-				newBuffer = append(newBuffer, ca.buffer[offset+i])
-			}
-			newIdx++
-		}
-	}
-	
-	ca.buffer = newBuffer
-	ca.offsets = newOffsets
-	ca.sizes = newSizes
-	ca.learned = newLearned
-	ca.freeList = ca.freeList[:0]
-	
-	return oldToNew
-}
-
-// Reset clears all clauses and resets the arena
-func (ca *ClauseArena) Reset() {
-	ca.buffer = ca.buffer[:0]
-	ca.offsets = ca.offsets[:0]
-	ca.sizes = ca.sizes[:0]
-	ca.learned = ca.learned[:0]
-	ca.freeList = ca.freeList[:0]
-}
-
-// CapacityBytes returns the current buffer capacity in bytes (for debugging)
-func (ca *ClauseArena) CapacityBytes() int {
-	return cap(ca.buffer) * 4  // 4 bytes per uint32
-}
-
-// ClauseRef is a reference to a clause in the arena
-type ClauseRef struct {
-	Offset int
-	Size   int
-}
-
-// GetClauseRef returns a reference to a clause without allocating a slice
-func (ca *ClauseArena) GetClauseRef(idx int) ClauseRef {
-	if idx < 0 || idx >= len(ca.offsets) {
-		return ClauseRef{}
-	}
-	return ClauseRef{
-		Offset: ca.offsets[idx],
-		Size:   ca.sizes[idx],
-	}
-}
-
-// ClauseIter is an iterator for clause literals (avoids slice allocation)
-type ClauseIter struct {
-	buffer []uint32
-	offset int
-	size   int
-	pos    int
-}
-
-// Next returns the next literal in the clause, or false if done
-func (ci *ClauseIter) Next() (Literal, bool) {
-	if ci.pos >= ci.size {
-		return 0, false
-	}
-	lit := Literal(ci.buffer[ci.offset + ci.pos])
-	ci.pos++
-	return lit, true
-}
-
-// Reset resets the iterator to the beginning
-func (ci *ClauseIter) Reset() {
-	ci.pos = 0
-}
-
-// Size returns the number of literals in the clause
-func (ci *ClauseIter) Size() int {
-	return ci.size
-}
-
-// IterClause returns an iterator for a clause (zero-allocation)
-func (ca *ClauseArena) IterClause(idx int) ClauseIter {
-	if idx < 0 || idx >= len(ca.offsets) {
-		return ClauseIter{}
-	}
-	return ClauseIter{
-		buffer: ca.buffer,
-		offset: ca.offsets[idx],
-		size:   ca.sizes[idx],
-		pos:    0,
-	}
-}
-
-// GetClauseLiteralsSlice returns clause literals as a slice (allocates)
-// Use IterClause for zero-allocation iteration
-func (ca *ClauseArena) GetClauseLiteralsSlice(idx int) []Literal {
-	offset := ca.offsets[idx]
-	size := ca.sizes[idx]
-	literals := make([]Literal, size)
-	for i := 0; i < size; i++ {
-		literals[i] = Literal(ca.buffer[offset+i])
-	}
-	return literals
-}
 
 // GetOriginalClauseLiterals returns literals for an original clause (zero-allocation view)
 // Returns offset and size into the literal pool

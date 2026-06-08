@@ -28,8 +28,7 @@ type CDCLSolver struct {
 	implication  []int
 	iterations   int
 	maxIter      int
-	learnedClauses []cnf.Clause      // Original clauses (keep for compatibility)
-	learnedArena *cnf.ClauseArena    // Arena-based learned clause storage
+	learnedClauses []cnf.Clause      // Learned clauses
 	clauseActivity []float64
 	clauseAge    []int
 	clauseSize   []int // Track clause size for deletion
@@ -108,7 +107,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:  0,
 		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
-		learnedArena: cnf.NewClauseArena(50000), // Pre-allocate arena (200 KB)
 		clauseActivity: make([]float64, 0),
 		clauseAge:    make([]int, 0),
 		clauseLBD:    make([]int, 0),
@@ -348,11 +346,10 @@ func (s *CDCLSolver) initWatches() {
 		s.addClauseToWatches(clauseID, clause.Literals, true)
 	}
 	
-	s.watchInitialized = true
+	s.watchInitialized = false  // DISABLED: trail processing bug causes missed conflicts on PHP instances
 	
 	if s.verbose {
-		fmt.Printf("c [verbose] Watched literals initialized: %d clauses, %d watch lists\n",
-			s.cnf.NumClauses+len(s.learnedClauses), len(s.watchLists))
+		fmt.Printf("c [verbose] Watched literals DISABLED (trail processing bug)\n")
 	}
 }
 
@@ -2355,22 +2352,17 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		// CRITICAL: Must check learned clauses during propagation!
 		// Disabling this causes infinite loops: learned clauses don't prevent same conflict
 
-		// Re-enable simple linear scanning of learned clauses (O(n) but correct)
-		numLearned := s.learnedArena.NumClauses()
-		for learnedIdx := 0; learnedIdx < numLearned; learnedIdx++ {
-			iter := s.learnedArena.IterClause(learnedIdx)
-			clauseSize := iter.Size()
+		// Simple linear scanning of learned clauses (O(n) but correct)
+		for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
+			clause := &s.learnedClauses[learnedIdx]
+			clauseSize := len(clause.Literals)
 			
 			satisfiedCount := 0
 			falseCount := 0
 			unassignedCount := 0
 			var unassignedLit cnf.Literal
 			
-			for {
-				lit, ok := iter.Next()
-				if !ok {
-					break
-				}
+			for _, lit := range clause.Literals {
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
 				if litLevel == 0 {
@@ -2635,9 +2627,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Note: s.conflicts already incremented in handleConflict()
 	
 	if s.verbose && s.conflicts <= 100 {
-		arenaCapMB := s.learnedArena.CapacityBytes() / 1024 / 1024
-		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d, arenaCap %dMB\n", 
-			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail), arenaCapMB)
+		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n", 
+			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail))
 	}
 	
 	// Clear reusable buffers (O(n) but much faster than allocation)
@@ -2927,9 +2918,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					}
 				}
 			}
-			
-			// Add the new learned clause
-			s.learnedArena.AllocateClause(learnedLits, true)
 			
 			s.clauseActivity = append(s.clauseActivity, 0.0)
 			s.clauseAge = append(s.clauseAge, s.currentAge)
@@ -3226,12 +3214,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	// Mark LBD order as dirty - must rebuild after clause deletion
 	s.lbdOrderDirty = true
-	
-	// Rebuild arena from compacted slices (ensures contiguous memory)
-	s.learnedArena.Reset()
-	for _, clause := range s.learnedClauses {
-		s.learnedArena.AllocateClause(clause.Literals, true)
-	}
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", deleted, len(s.learnedClauses), toKeep)
