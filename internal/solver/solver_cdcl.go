@@ -3258,10 +3258,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// BONUS: Activity (active clauses are more useful)
 		score -= activity * 20.0
 		
-		// PROTECTION: Only protect truly exceptional clauses
-		// LBD == 2 AND size <= 4 AND age < 100: core glue, never delete
-		if lbd == 2 && size <= 4 && age < 100 {
-			score = -1000.0 // Absolutely never delete
+		// PROTECTION: LBD <= 2 glue clauses are NEVER deleted (Glucose-style)
+		// These are the backbone of the learned clause database
+		if lbd <= 2 {
+			score = -1000.0 // Absolutely never delete, regardless of age or size
 		}
 		
 		// LBD == 3 AND size <= 3 AND age < 50: very good, protect unless very old
@@ -3270,12 +3270,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 		
 		// FORCE DELETION: Very old clauses (age > 500) regardless of LBD
-		if age > 500 {
+		// But NOT glue clauses (LBD <= 2)
+		if age > 500 && lbd > 2 {
 			score += 1000.0 // Force deletion of very old clauses
 		}
 		
 		// FORCE DELETION: Large clauses (size > 15) regardless of LBD
-		if size > 15 {
+		// But NOT glue clauses (LBD <= 2)
+		if size > 15 && lbd > 2 {
 			score += 800.0 // Force deletion of large clauses
 		}
 		
