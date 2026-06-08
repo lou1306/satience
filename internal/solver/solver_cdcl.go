@@ -2195,7 +2195,11 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		
 		blit := cnf.IndexToLit(int(blitIdx))
 		
-		if s.literalIsTrue(blit) {
+		// Inline literalIsTrue check (optimization #4)
+		blitAssign := s.assignments[blit.Var()]
+		blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
+		
+		if blitIsTrue {
 			if newWatchCount != i {
 				watches[newWatchCount] = watch
 			}
@@ -2221,6 +2225,8 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 		foundReplacement := false
 		if len(clause.Literals) > 2 {
+			// Cache blitWatchIdx to avoid repeated LitToIndex calls (optimization #6)
+			blitWatchIdx := cnf.LitToIndex(blit)
 			for j := 0; j < len(clause.Literals); j++ {
 				clauseLit := clause.Literals[j]
 				if clauseLit == falseLit || clauseLit == blit {
@@ -2238,10 +2244,9 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 						Blit:     uint32(blitIdx),
 						IsBinary: false,
 					})
-					otherWatchIdx := cnf.LitToIndex(blit)
-					for k := range s.watchLists[otherWatchIdx] {
-						if s.watchLists[otherWatchIdx][k].ClauseID == clauseID {
-							s.watchLists[otherWatchIdx][k].Blit = uint32(newWatchIdx)
+					for k := range s.watchLists[blitWatchIdx] {
+						if s.watchLists[blitWatchIdx][k].ClauseID == clauseID {
+							s.watchLists[blitWatchIdx][k].Blit = uint32(newWatchIdx)
 							break
 						}
 					}
@@ -2271,6 +2276,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		s.watchLists[watchIdx] = watches[:newWatchCount]
 		
 		// Immediately propagate newly assigned literal (depth-first)
+		// Cache blitWatchIdx to avoid repeated LitToIndex calls (optimization #6)
 		blitWatchIdx := cnf.LitToIndex(blit)
 		blitWatches := s.watchLists[blitWatchIdx]
 		for bi := 0; bi < len(blitWatches); bi++ {
@@ -2279,7 +2285,11 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			blitOtherIdx := blitWatch.Blit
 			blitOther := cnf.IndexToLit(int(blitOtherIdx))
 			
-			if s.literalIsTrue(blitOther) {
+			// Inline literalIsTrue check (optimization #4)
+			blitOtherAssign := s.assignments[blitOther.Var()]
+			blitOtherIsTrue := blitOtherAssign.Level != 0 && ((blitOther.IsNegated() && !blitOtherAssign.Value) || (!blitOther.IsNegated() && blitOtherAssign.Value))
+			
+			if blitOtherIsTrue {
 				continue
 			}
 			
