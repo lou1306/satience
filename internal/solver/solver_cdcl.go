@@ -92,7 +92,7 @@ type resolveCandidate struct {
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := 2000   // Keep moderate learned clause database (balance between pruning and propagation cost)
 	minLearned := 1000   // Target after deletion (50% reduction)
-	restartBase := 100  // Base for Luby restart sequence
+	restartBase := 50  // Base for Luby restart sequence (reduced from 100 for faster VSIDS learning)
 	
 	// Ensure literal pool is built for efficient propagation
 	formula.RebuildLiteralPool()
@@ -875,10 +875,11 @@ func (s *CDCLSolver) restart() {
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
 	
-	// CRITICAL: Reset VSIDS activity on restart
-	// Without this, the same high-activity variables get chosen again,
-	// leading to infinite loops on PHP-like instances
-	s.vsids.resetActivity()
+	// CRITICAL FIX: DO NOT reset VSIDS activity on restart
+	// VSIDS activity MUST persist across restarts to remember important variables
+	// Standard CDCL solvers (MiniSat, Glucose) never reset VSIDS activity
+	// Resetting activity causes solver to repeat same mistakes after each restart
+	// This was causing conflicts at level 50+ and poor quality learned clauses
 	
 	// Clear temporary buffers after restart (assignments are cleared, levels reset)
 	for i := range s.tmpLiteralInClause {

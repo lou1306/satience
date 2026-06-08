@@ -71,26 +71,32 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 		return
 	}
 	
-	// Bonus formula: higher bonus for lower LBD
-	// LBD=2: bonus = 100 (glue clause - very important)
-	// LBD=3: bonus = 50
-	// LBD=4: bonus = 25
-	// etc.
-	bonus := 200.0 / float64(lbd)
+	// Bonus formula: MUCH higher bonus for lower LBD
+	// Glue clauses (LBD<=3) are extremely important - give huge bonus
+	// LBD=2: bonus = 1000 (core glue - most important)
+	// LBD=3: bonus = 500 (glue - very important)
+	// LBD=4: bonus = 250
+	// LBD=5: bonus = 125
+	// LBD=10: bonus = 50
+	// This ensures glue clause variables dominate VSIDS selection
+	bonus := 2000.0 / float64(lbd)
 	
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
 	}
 }
 
-// decayLBD decays LBD bonus scores (called periodically)
+// decayLBD decays LBD bonus scores (called every conflict)
+// Use very slow decay to preserve glue clause importance
 func (v *VSIDS) decayLBD() {
 	if !v.useLBD {
 		return
 	}
 	
+	// Decay very slowly (only 1% per conflict) to preserve glue clause importance
+	// Glue clauses should influence search for thousands of conflicts
 	for i := range v.lbdBonus {
-		v.lbdBonus[i] *= 0.9 // Decay by 10% each time
+		v.lbdBonus[i] *= 0.99
 	}
 }
 
