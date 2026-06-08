@@ -5,30 +5,41 @@ import "satience/internal/cnf"
 // VSIDS implements the VSIDS (Variable State Independent Decaying Sum) heuristic
 // with optional LRB (Learning Rate Based) conflict participation tracking
 // and LBD-based activity (variables in low-LBD clauses get higher activity)
+//
+// Decay factor tuning:
+// - Starts at 0.95 (aggressive decay to explore variables quickly)
+// - Increases toward 0.999 over 10k conflicts (slower decay to focus on important vars)
+// - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
-	activity            []float64 // Activity score for each variable
-	conflictParticipation []int   // Number of conflicts each variable participates in
-	decayFactor         float64   // Decay factor (typically 0.95)
-	inverseDecay        float64   // 1/decay for efficiency
-	useLRB              bool      // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval    int       // Decay every N conflicts
-	conflictCount       int       // Total conflicts for LRB decay timing
-	useLBD              bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
-	lbdBonus            []float64 // Bonus score from appearing in low-LBD clauses
+	activity              []float64 // Activity score for each variable
+	conflictParticipation []int     // Number of conflicts each variable participates in
+	decayFactor           float64   // Decay factor (0.95 -> 0.999)
+	inverseDecay          float64   // 1/decay for efficiency
+	useLRB                bool      // Use LRB heuristic instead of pure VSIDS
+	lrbDecayInterval      int       // Decay every N conflicts
+	conflictCount         int       // Total conflicts for LRB decay timing
+	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
+	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
+	maxDecayFactor        float64   // Maximum decay factor (0.999)
+	decayIncrement        float64   // Increment per conflict
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
+	maxDecay := 0.999
+	initialDecay := 0.95
 	return &VSIDS{
 		activity:              make([]float64, numVars),
 		conflictParticipation: make([]int, numVars),
-		decayFactor:           0.95,
-		inverseDecay:          1.0 / 0.95,
+		decayFactor:           initialDecay,
+		inverseDecay:          1.0 / initialDecay,
 		useLRB:                false, // Default to VSIDS
 		lrbDecayInterval:      1024,  // Decay every 1024 conflicts
 		conflictCount:         0,
 		useLBD:                false, // LBD-based activity disabled by default
 		lbdBonus:              make([]float64, numVars),
+		maxDecayFactor:        maxDecay,
+		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
 	}
 }
 
@@ -111,8 +122,19 @@ func (v *VSIDS) decayLRB() {
 	}
 }
 
-// decay decays all activity scores
+// decay decays all activity scores and gradually increases decay factor
+// This allows aggressive initial exploration (0.95) followed by focused search (0.999)
 func (v *VSIDS) decay() {
+	// Gradually increase decay factor toward max (slower decay = more focus on important variables)
+	if v.decayFactor < v.maxDecayFactor {
+		v.decayFactor += v.decayIncrement
+		if v.decayFactor > v.maxDecayFactor {
+			v.decayFactor = v.maxDecayFactor
+		}
+		v.inverseDecay = 1.0 / v.decayFactor
+	}
+	
+	// Apply decay to all activity scores
 	for i := range v.activity {
 		v.activity[i] *= v.decayFactor
 	}
