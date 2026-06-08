@@ -71,6 +71,8 @@ type CDCLSolver struct {
 	learnedClauseOrder []int  // Indices into learnedClauses/clauseLBD sorted by LBD
 	lbdOrderDirty      bool   // True if order needs rebuilding
 	lbdOrderLastRebuild int  // Conflict count when order was last rebuilt
+	
+	qhead int  // Watched literals: next trail index to process
 }
 
 // eliminationInfo stores how a variable was eliminated for model reconstruction
@@ -100,6 +102,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		assignments: make([]Assignment, formula.NumVars),
 		trail:       make([]int, 0),
 		trailHead:   make([]int, 1),
+		qhead:       0,
 		level:       0,
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
@@ -2163,14 +2166,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		return s.propagate()
 	}
 	
-	// Process trail elements starting from trailHead[s.level]
-	// This matches linear propagation and ensures we only process new elements
-	startIndex := s.trailHead[s.level]
-	if startIndex >= len(s.trail) {
+	// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
+	if s.qhead >= len(s.trail) {
 		return false, -1
 	}
 	
-	for trailIndex := startIndex; trailIndex < len(s.trail); trailIndex++ {
+	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 		
 		varIdx := uint32(lit)
@@ -2296,6 +2297,9 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		
 		s.watchLists[watchIdx] = watches[:newWatchCount]
 	}
+	
+	// Update qhead to end of trail
+	s.qhead = len(s.trail)
 	
 	return false, -1
 }
@@ -3392,6 +3396,10 @@ func (s *CDCLSolver) backtrack() bool {
 		s.implication[varIdx] = -1
 	}
 	s.trail = s.trail[:decisionPoint]
+	// Reset qhead to avoid re-processing backtracked trail elements
+	if s.qhead > decisionPoint {
+		s.qhead = decisionPoint
+	}
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
 	
