@@ -391,7 +391,6 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	})
 	
 	if clauseID == 108 {
-		fmt.Printf("c [WATCH-INIT] Clause 108: watching indices %d and %d\n", idx0, idx1)
 	}
 	
 	// Watched literals now enabled with all soundness bugs fixed
@@ -2289,21 +2288,73 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					blitLevel, blitValue, blitTrue)
 			}
 			
-			if blitLevel == 0 {
-				if s.verbose && false {
-					fmt.Printf("c [WATCH-109] PROPAGATING blit %d (var%d=%v)\n",
-						blit, blit.Var()+1, !blit.IsNegated())
-				}
-				reasonIdx := int(clauseID)
-				if isLearned {
-					reasonIdx = -learnedIdx - 1
-				}
-				s.assignLiteral(blit, s.level, reasonIdx)
-				watches[newWatchCount] = watch
-				newWatchCount++
-				s.watchLists[watchIdx] = watches[:newWatchCount]
-				continue
+		if blitLevel == 0 {
+			reasonIdx := int(clauseID)
+			if isLearned {
+				reasonIdx = -learnedIdx - 1
 			}
+			s.assignLiteral(blit, s.level, reasonIdx)
+			watches[newWatchCount] = watch
+			newWatchCount++
+			s.watchLists[watchIdx] = watches[:newWatchCount]
+			
+			// Immediately propagate newly assigned literal (depth-first)
+			blitWatchIdx := cnf.LitToIndex(blit)
+			blitWatches := s.watchLists[blitWatchIdx]
+			for bi := 0; bi < len(blitWatches); bi++ {
+				blitWatch := blitWatches[bi]
+				blitClauseID := blitWatch.ClauseID
+				blitOtherIdx := blitWatch.Blit
+				blitOther := cnf.IndexToLit(int(blitOtherIdx))
+				
+				if s.literalIsTrue(blitOther) {
+					continue
+				}
+				
+				var blitClause cnf.Clause
+				var blitIsLearned bool
+				var blitLearnedIdx int
+				if blitClauseID < uint32(s.cnf.NumClauses) {
+					blitClause = s.cnf.Clauses[blitClauseID]
+					blitIsLearned = false
+					blitLearnedIdx = -1
+				} else {
+					blitLearnedIdx = int(blitClauseID - uint32(s.cnf.NumClauses))
+					if blitLearnedIdx < 0 || blitLearnedIdx >= len(s.learnedClauses) {
+						continue
+					}
+					blitClause = s.learnedClauses[blitLearnedIdx]
+					blitIsLearned = true
+				}
+				
+				hasReplacement := false
+				for _, cl := range blitClause.Literals {
+					if cl == blit || cl == blitOther {
+						continue
+					}
+					ll := s.assignments[cl.Var()].Level
+					lv := s.assignments[cl.Var()].Value
+					lt := (!cl.IsNegated() && lv) || (cl.IsNegated() && !lv)
+					if lt || ll == 0 {
+						hasReplacement = true
+						break
+					}
+				}
+				
+				if !hasReplacement {
+					otherLevel := s.assignments[blitOther.Var()].Level
+					if otherLevel == 0 {
+						otherReason := int(blitClauseID)
+						if blitIsLearned {
+							otherReason = -blitLearnedIdx - 1
+						}
+						s.assignLiteral(blitOther, s.level, otherReason)
+					}
+				}
+			}
+			
+			continue
+		}
 			
 			if !blitTrue {
 				if isLearned {
