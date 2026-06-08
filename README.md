@@ -13,7 +13,8 @@
 - **1-UIP Conflict Analysis**: Learns asserting clauses from conflicts
 - **Backjumping**: Intelligent backtracking to relevant decision level
 - **LBD Management**: Clause database pruning based on Literal Block Distance
-- **Adaptive Restarts**: Glucose-style restart strategy (LBD > 1.5× average)
+- **Luby Restarts**: Standard restart sequence (1, 1, 2, 1, 1, 2, 4, ...) ✓
+- **Adaptive Restarts**: Glucose-style for extreme LBD spikes only (>3× avg)
 - **Phase Saving**: Remembers satisfying polarity for variables
 - **Watched Literals**: O(1) propagation for binary and large clauses ✓
 

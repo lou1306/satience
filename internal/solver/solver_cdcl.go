@@ -788,37 +788,32 @@ func luby(i int) int {
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
 func (s *CDCLSolver) shouldRestart() bool {
-	// Glucose-style adaptive restarts (PRIMARY)
-	// Luby sequence as fallback (SECONDARY)
+	// Luby sequence (PRIMARY) - standard restart policy
+	// Glucose-style adaptive restarts (SECONDARY) - only for extreme cases
 	
-	// Need at least 50 conflicts for LBD statistics
-	if s.lbdCount >= 50 {
+	// Primary: Luby sequence restarts
+	lubyValue := luby(s.lubyIndex + 1)
+	threshold := lubyValue * s.restartBase
+	
+	if s.conflicts-s.restartCount >= threshold {
+		return true
+	}
+	
+	// Secondary: Glucose-style adaptive restarts for extreme LBD spikes only
+	// Only trigger if LBD is MUCH higher than average (not just 1.5x)
+	if s.lbdCount >= 100 {
 		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
 		
-		if s.verbose && s.conflicts % 1000 == 0 {
-			fmt.Printf("c [verbose] LBD stats: avg=%.2f, last=%d, threshold=%.2f\n", avgLBD, s.lastConflictLBD, 1.5*avgLBD)
-		}
-		
-		// Glucose criterion: restart when current LBD > 1.5× average
-		if s.lastConflictLBD > int(1.5*avgLBD) && s.lastConflictLBD > 3 {
-			if len(s.learnedClauses) >= 50 {
-				return true
-			}
-		}
-		
-		// Also restart if LBD is very high (absolute threshold)
-		if s.lastConflictLBD > 12 {
-			if len(s.learnedClauses) >= 50 {
+		// Only restart if LBD is extremely high (> 3x average AND > 20)
+		// This catches truly pathological cases without over-restarting
+		if s.lastConflictLBD > int(3.0*avgLBD) && s.lastConflictLBD > 20 {
+			if len(s.learnedClauses) >= 100 {
 				return true
 			}
 		}
 	}
 	
-	// Fallback to Luby sequence for regular restarts
-	lubyValue := luby(s.lubyIndex + 1)
-	threshold := lubyValue * s.restartBase
-	
-	return s.conflicts-s.restartCount >= threshold
+	return false
 }
 
 func (s *CDCLSolver) restart() {
