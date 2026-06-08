@@ -67,6 +67,7 @@ type CDCLSolver struct {
 	// Watched literals infrastructure
 	watchLists     [][]cnf.Watch  // watchLists[lit] = clauses watching lit
 	watchInitialized bool         // True if watches have been initialized
+	learnedClauseBase int  // Base ID for learned clause watches (fixed at initialization)
 	
 	// LBD-based learned clause ordering for propagation prioritization
 	learnedClauseOrder []int  // Indices into learnedClauses/clauseLBD sorted by LBD
@@ -142,6 +143,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	tmpResolved: make([]bool, formula.NumVars),
 		// Initialize variable elimination tracking
 		eliminatedVars: make(map[uint32]eliminationInfo),
+		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
+		learnedClauseBase: int(formula.NumClauses),
 	}
 	
 	// Enable LBD-based VSIDS for better variable selection
@@ -352,9 +355,11 @@ func (s *CDCLSolver) initWatches() {
 		s.addClauseToWatches(clauseID, clause.Literals, false)
 	}
 	
+	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
+	
 	for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
 		clause := s.learnedClauses[learnedIdx]
-		encodedClauseID := s.cnf.NumClauses + learnedIdx
+		encodedClauseID := s.learnedClauseBase + learnedIdx
 		s.addClauseToWatches(encodedClauseID, clause.Literals, true)
 	}
 	
@@ -402,10 +407,9 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 		}
 	}
 	
-	// Watched literals DISABLED - works for SAT but loops on UNSAT instances
-	// Bug: Solver repeatedly learns same clauses on UNSAT instances
-	// SAT instances solve correctly, indicating watches are mostly working
-	// Root cause: likely related to restart/backtrack watch management
+	// Watched literals DISABLED - still has issues with UNSAT instances
+	// Fixed learnedClauseBase to use original NumClauses value
+	// But solver still loops on UNSAT instances - needs more debugging
 	s.watchInitialized = false
 }
 
@@ -1798,22 +1802,14 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				isLearned = false
 				learnedIdx = -1
 			} else {
-				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
+				learnedIdx = int(clauseID) - s.learnedClauseBase
 				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
-					// Invalid learned clause, skip watch
-					if s.conflicts < 10 {
-						fmt.Printf("c [WATCH-DEBUG] Invalid learned clause: clauseID=%d, learnedIdx=%d, numLearned=%d\n",
-							clauseID, learnedIdx, len(s.learnedClauses))
-					}
 					continue
 				}
 				clause = s.learnedClauses[learnedIdx]
 				isLearned = true
-				// DEBUG: Trace learned clauses
-				if s.conflicts < 10 {
-					fmt.Printf("c [WATCH-DEBUG] Processing learned clause %d watch: clauseID=%d, falseLit=%v, blit=%v, blitLevel=%d\n",
-						learnedIdx, clauseID, falseLit, blit, s.assignments[blit.Var()].Level)
-				}
+				
+
 			}
 			
 			// Look for replacement watch
@@ -2623,7 +2619,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			// Add learned clause to watches with correct ID encoding
 			if s.watchInitialized {
-				encodedClauseID := s.cnf.NumClauses + learnedIdx
+				encodedClauseID := s.learnedClauseBase + learnedIdx
 				s.addClauseToWatches(encodedClauseID, learnedLits, true)
 			}
 			
@@ -2862,6 +2858,16 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	toKeep := s.minLearned
 	if toKeep > len(s.learnedClauses) {
 		toKeep = len(s.learnedClauses) // Can't keep more than we have
+	}
+	
+	// DEBUG: Log what's being deleted
+	if s.verbose && len(clauses) > toKeep {
+		fmt.Printf("c [DELETE] Deleting %d learned clauses, keeping %d\n", len(clauses)-toKeep, toKeep)
+		for i := 0; i < len(clauses)-toKeep && i < 5; i++ {
+			c := clauses[i]
+			fmt.Printf("c   Deleting learned clause %d: LBD=%d, size=%d, age=%d, score=%.1f\n",
+				c.idx, c.lbd, c.size, c.age, c.score)
+		}
 	}
 	toDelete := len(s.learnedClauses) - toKeep
 	
