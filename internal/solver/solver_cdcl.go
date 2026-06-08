@@ -828,15 +828,21 @@ func (s *CDCLSolver) restart() {
 	isGlue := make([]bool, len(s.learnedClauses))
 	
 	for i, clause := range s.learnedClauses {
-		// Calculate LBD while assignments are still valid
-		levelSet := make(map[int]bool)
+		// Calculate LBD while assignments are still valid using tmpLevelSet (avoid map allocation)
+		lbd := 0
 		for _, lit := range clause.Literals {
 			lvl := s.assignments[lit.Var()].Level
-			if lvl > 0 {
-				levelSet[lvl] = true
+			if lvl > 0 && !s.tmpLevelSetUsed[lvl] {
+				s.tmpLevelSetUsed[lvl] = true
+				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+				lbd++
 			}
 		}
-		lbd := len(levelSet)
+		// Clear tmpLevelSetUsed for next clause
+		for _, lvl := range s.tmpLevelSet {
+			s.tmpLevelSetUsed[lvl] = false
+		}
+		s.tmpLevelSet = s.tmpLevelSet[:0]
 		
 		// Keep glue clauses (LBD <= 5) - ADAPTED for our 1-UIP implementation
 		// Our 1-UIP produces clauses with LBD 5-8 typically, so LBD<=3 is too strict
@@ -1307,13 +1313,13 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 			len(implications), binaryCount)
 	}
 	
-	// Step 2: Build bidirectional graph
+	// Step 2: Build bidirectional graph using 2D slice (faster than map)
 	// hasEdge[a][b] = true if a → b exists
-	hasEdge := make(map[uint32]map[uint32]bool)
+	hasEdge := make([][]bool, s.cnf.NumVars)
+	for i := range hasEdge {
+		hasEdge[i] = make([]bool, s.cnf.NumVars)
+	}
 	for _, imp := range implications {
-		if hasEdge[imp.from] == nil {
-			hasEdge[imp.from] = make(map[uint32]bool)
-		}
 		hasEdge[imp.from][imp.to] = true
 	}
 	
@@ -1339,9 +1345,9 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	}
 	
 	// Find bidirectional implications and union them
-	for a, targets := range hasEdge {
-		for b := range targets {
-			if hasEdge[b] != nil && hasEdge[b][a] {
+	for a := uint32(0); a < s.cnf.NumVars; a++ {
+		for b := uint32(0); b < s.cnf.NumVars; b++ {
+			if hasEdge[a][b] && hasEdge[b][a] {
 				// Found: a → b and b → a, so a ↔ b
 				union(a, b)
 			}
@@ -1735,12 +1741,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		
 		watchIdx := cnf.LitToIndex(falseLit)
 		
-		// Process watches for this literal
-		// IMPORTANT: Don't hold pointer to slice - it may be reallocated
+		// Process watches for this literal using in-place compaction
 		watchList := s.watchLists[watchIdx]
-		newWatchList := make([]cnf.Watch, 0, len(watchList))
+		writeIdx := 0
 		
-		for _, watch := range watchList {
+		for readIdx := 0; readIdx < len(watchList); readIdx++ {
+			watch := watchList[readIdx]
 			clauseID := watch.ClauseID
 			blitIdx := watch.Blit
 			blit := cnf.IndexToLit(int(blitIdx))
@@ -1751,7 +1757,8 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 			if blitIsTrue {
 				// Clause is satisfied, keep watch
-				newWatchList = append(newWatchList, watch)
+				watchList[writeIdx] = watch
+				writeIdx++
 				continue
 			}
 			
@@ -1819,7 +1826,8 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				}
 				s.assignLiteral(blit, s.level, reasonIdx)
 				// Keep the watch - blit is now true
-				newWatchList = append(newWatchList, watch)
+				watchList[writeIdx] = watch
+				writeIdx++
 				continue
 			}
 			
@@ -1836,11 +1844,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			}
 			
 			// blit is true, keep watch
-			newWatchList = append(newWatchList, watch)
+			watchList[writeIdx] = watch
+			writeIdx++
 		}
 		
-		// Update watch list
-		s.watchLists[watchIdx] = newWatchList
+		// Truncate watch list to compacted size
+		s.watchLists[watchIdx] = watchList[:writeIdx]
 	}
 	
 	// Update qhead to end of trail
