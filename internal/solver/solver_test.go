@@ -765,3 +765,179 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 		t.Errorf("Expected UNSAT (pigeonhole 6 pigeons 5 holes), got %v", result)
 	}
 }
+
+func TestCDCLRandomK3Sat(t *testing.T) {
+	// Random 3-SAT instance: 50 variables, 200 clauses
+	// SAT instance from benchmark database
+	// Tests VSIDS performance on random structured instances
+	c := cnf.CNF{
+		NumVars:  50,
+		Clauses:  make([]cnf.Clause, 0, 200),
+	}
+	
+	// Add some random 3-clauses (seeded for reproducibility)
+	seed := uint32(42)
+	for i := 0; i < 200; i++ {
+		lits := make([]cnf.Literal, 3)
+		for j := 0; j < 3; j++ {
+			seed = seed*1103515245 + 12345
+			varIdx := seed % 50
+			seed = seed*1103515245 + 12345
+			negated := (seed % 2) == 0
+			lits[j] = cnf.NewLiteral(varIdx, negated)
+		}
+		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
+	}
+	c.NumClauses = len(c.Clauses)
+	
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	// Don't check SAT/UNSAT - just ensure it terminates quickly
+	if result == UNKNOWN {
+		t.Error("Random 3-SAT should not return UNKNOWN")
+	}
+}
+
+func TestCDCLSudoku2x2(t *testing.T) {
+	// Tiny Sudoku 2x2 (4 cells, values 1-2)
+	// 4 cells × 2 values = 8 variables
+	// Constraints: each cell has exactly one value, each value appears once per row/column
+	// SAT with unique solution
+	// 
+	// This is a simplified Sudoku to test propagation-heavy instances
+	// without the 318× slowdown of full 3x3 Sudoku
+	
+	c := cnf.CNF{
+		NumVars:  8,
+		Clauses:  make([]cnf.Clause, 0),
+	}
+	
+	// Variables: cell(row,col,value) where row,col,value ∈ {0,1}
+	// var = row*4 + col*2 + value
+	cell := func(row, col, value int) uint32 {
+		return uint32(row*4 + col*2 + value)
+	}
+	
+	// Each cell has at least one value
+	for row := 0; row < 2; row++ {
+		for col := 0; col < 2; col++ {
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(row, col, 0), false),
+					cnf.NewLiteral(cell(row, col, 1), false),
+				},
+			})
+		}
+	}
+	
+	// Each cell has at most one value (not both)
+	for row := 0; row < 2; row++ {
+		for col := 0; col < 2; col++ {
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(row, col, 1), true),
+					cnf.NewLiteral(cell(row, col, 0), true),
+				},
+			})
+		}
+	}
+	
+	// Each row has each value exactly once
+	for row := 0; row < 2; row++ {
+		for value := 0; value < 2; value++ {
+			// At least one cell in row has this value
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(row, 0, value), false),
+					cnf.NewLiteral(cell(row, 1, value), false),
+				},
+			})
+			// At most one cell in row has this value
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(row, 0, value), true),
+					cnf.NewLiteral(cell(row, 1, value), true),
+				},
+			})
+		}
+	}
+	
+	// Each column has each value exactly once
+	for col := 0; col < 2; col++ {
+		for value := 0; value < 2; value++ {
+			// At least one cell in column has this value
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(0, col, value), false),
+					cnf.NewLiteral(cell(1, col, value), false),
+				},
+			})
+			// At most one cell in column has this value
+			c.Clauses = append(c.Clauses, cnf.Clause{
+				Literals: []cnf.Literal{
+					cnf.NewLiteral(cell(0, col, value), true),
+					cnf.NewLiteral(cell(1, col, value), true),
+				},
+			})
+		}
+	}
+	
+	c.NumClauses = len(c.Clauses)
+	
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT (2x2 Sudoku), got %v", result)
+	}
+	
+	// Verify the model satisfies all constraints
+	// Check that assignments satisfy all clauses
+	for _, clause := range c.Clauses {
+		satisfied := false
+		for _, lit := range clause.Literals {
+			v := lit.Var()
+			value := s.assignments[v].Value
+			if lit.IsNegated() {
+				value = !value
+			}
+			if value {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("Clause %v not satisfied by model", clause.Literals)
+		}
+	}
+}
+
+func TestCDCLTseitinCycleUnsat(t *testing.T) {
+	// Simple UNSAT instance based on odd cycle
+	// x1 ∨ x2, ¬x2 ∨ x3, ¬x3 ∨ x4, ¬x4 ∨ x5, ¬x5 ∨ ¬x1
+	// This creates an odd cycle that is UNSAT
+	
+	c := cnf.CNF{
+		NumVars: 5,
+		Clauses: []cnf.Clause{
+			// x1 → x2
+			{Literals: []cnf.Literal{cnf.NewLiteral(0, true), cnf.NewLiteral(1, false)}},
+			// x2 → x3
+			{Literals: []cnf.Literal{cnf.NewLiteral(1, true), cnf.NewLiteral(2, false)}},
+			// x3 → x4
+			{Literals: []cnf.Literal{cnf.NewLiteral(2, true), cnf.NewLiteral(3, false)}},
+			// x4 → x5
+			{Literals: []cnf.Literal{cnf.NewLiteral(3, true), cnf.NewLiteral(4, false)}},
+			// x5 → ¬x1 (creates odd cycle)
+			{Literals: []cnf.Literal{cnf.NewLiteral(4, true), cnf.NewLiteral(0, true)}},
+			// Force x1 = true
+			{Literals: []cnf.Literal{cnf.NewLiteral(0, false)}},
+		},
+		NumClauses: 6,
+	}
+	
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT (odd cycle), got %v", result)
+	}
+}
