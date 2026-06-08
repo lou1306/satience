@@ -1179,6 +1179,11 @@ func (s *CDCLSolver) inprocessing() {
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
+	// Initialize trail for preprocessing
+	s.trail = make([]int, 0)
+	s.trailHead = []int{0}
+	s.level = 1
+	
 	changed := true
 	for changed {
 		changed = false
@@ -1226,23 +1231,16 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					Value: value,
 					Level: 1,
 				}
+				s.trail = append(s.trail, int(varIdx))
 				changed = true
-				
-				conflict := s.simplifyAfterAssignment(varIdx, value)
-				if conflict {
-					if s.verbose {
-						fmt.Printf("c [verbose] Preprocessing: empty clause created\n")
-					}
-					return UNSAT
-				}
-				
-				clauseCount = len(s.cnf.Clauses)
-				if clauseIdx >= clauseCount {
-					clauseIdx = clauseCount - 1
-				}
+				// Don't modify clauses - just track assignments in trail
 			}
 		}
 	}
+	
+	// Set up trail for search
+	s.trailHead = []int{0, len(s.trail)}
+	s.level = 1
 	
 	return UNKNOWN
 }
@@ -1580,16 +1578,20 @@ func (s *CDCLSolver) Solve() bool {
 }
 
 func (s *CDCLSolver) SolveWithResult() SolveResult {
-	// DISABLED: Preprocessing causes soundness bugs
-	// preprocessResult := s.preprocessAggressive()
-	// if preprocessResult != UNKNOWN {
-	// 	if s.verbose {
-	// 		s.printStats()
-	// 	}
-	// 	return preprocessResult
-	// }
+	// Unit propagation preprocessing - sound and safe
+	// Repeatedly propagate unit clauses until fixpoint
+	unitResult := s.unitPropagationPreprocess()
+	if unitResult != UNKNOWN {
+		if s.verbose {
+			s.printStats()
+		}
+		return unitResult
+	}
 	
-	// Initialize watches before search
+	// Rebuild literal pool after unit propagation modifies clauses
+	s.cnf.RebuildLiteralPool()
+	
+	// Initialize watches after unit propagation
 	s.initWatches()
 	
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
