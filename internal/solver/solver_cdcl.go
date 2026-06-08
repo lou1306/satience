@@ -390,8 +390,9 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	if clauseID == 108 {
 	}
 	
-	// Watched literals now enabled with all soundness bugs fixed
-	s.watchInitialized = false  // Watch propagation order bug: multiple propagations in same pass violate binary clauses
+	// Watched literals DISABLED - has soundness bugs in watch update logic
+	// TODO: Fix and re-enable
+	s.watchInitialized = false
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -1754,29 +1755,27 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			falseLit = cnf.NewLiteral(varIdx, false)
 		}
 		
-	watchIdx := cnf.LitToIndex(falseLit)
-	watches := s.watchLists[watchIdx]
-	
-	newWatchCount := 0
-	for i := 0; i < len(watches); i++ {
-		watch := watches[i]
-		clauseID := watch.ClauseID
-		blitIdx := watch.Blit
+		watchIdx := cnf.LitToIndex(falseLit)
 		
-		blit := cnf.IndexToLit(int(blitIdx))
-		
-		// Inline literalIsTrue check (optimization #4)
-		blitAssign := s.assignments[blit.Var()]
-		blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
-		
-		if blitIsTrue {
-			if newWatchCount != i {
-				watches[newWatchCount] = watch
-			}
-			newWatchCount++
-			continue
-		}
+		// Process watches for this literal
+		watchList := &s.watchLists[watchIdx]
+		for i := 0; i < len(*watchList); {
+			watch := (*watchList)[i]
+			clauseID := watch.ClauseID
+			blitIdx := watch.Blit
+			blit := cnf.IndexToLit(int(blitIdx))
 			
+			// Check if blit is true
+			blitAssign := s.assignments[blit.Var()]
+			blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
+			
+			if blitIsTrue {
+				// Clause is satisfied, keep watch
+				i++
+				continue
+			}
+			
+			// Get clause
 			var clause cnf.Clause
 			var isLearned bool
 			var learnedIdx int
@@ -1787,16 +1786,16 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			} else {
 				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
 				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
+					// Invalid learned clause, remove watch
+					*watchList = append((*watchList)[:i], (*watchList)[i+1:]...)
 					continue
 				}
 				clause = s.learnedClauses[learnedIdx]
 				isLearned = true
 			}
 			
-		foundReplacement := false
-		if len(clause.Literals) > 2 {
-			// Cache blitWatchIdx to avoid repeated LitToIndex calls (optimization #6)
-			blitWatchIdx := cnf.LitToIndex(blit)
+			// Look for replacement watch
+			foundReplacement := false
 			for j := 0; j < len(clause.Literals); j++ {
 				clauseLit := clause.Literals[j]
 				if clauseLit == falseLit || clauseLit == blit {
@@ -1808,125 +1807,61 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
 				
 				if litTrue || litLevel == 0 {
+					// Found replacement - swap watches
+					// Current watch: watching falseLit, blit is the other watch
+					// New watch: watching clauseLit, falseLit is the other watch
 					newWatchIdx := cnf.LitToIndex(clauseLit)
+					falseLitIdx := uint32(cnf.LitToIndex(falseLit))
+					
+					// Add new watch to clauseLit's watch list
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 						ClauseID: clauseID,
-						Blit:     uint32(blitIdx),
+						Blit:     falseLitIdx,
 						IsBinary: false,
 					})
-					for k := range s.watchLists[blitWatchIdx] {
-						if s.watchLists[blitWatchIdx][k].ClauseID == clauseID {
-							s.watchLists[blitWatchIdx][k].Blit = uint32(newWatchIdx)
-							break
-						}
-					}
+					// Remove old watch from falseLit's watch list
+					*watchList = append((*watchList)[:i], (*watchList)[i+1:]...)
 					foundReplacement = true
 					break
 				}
 			}
-		}
-		
-		if foundReplacement {
-			s.watchLists[watchIdx] = watches[:newWatchCount]
-			continue
-		}
 			
-	blitLevel := s.assignments[blit.Var()].Level
-	
-	if blitLevel == 0 {
-		reasonIdx := int(clauseID)
-		if isLearned {
-			reasonIdx = -learnedIdx - 1
-		}
-		s.assignLiteral(blit, s.level, reasonIdx)
-		if newWatchCount != i {
-			watches[newWatchCount] = watch
-		}
-		newWatchCount++
-		s.watchLists[watchIdx] = watches[:newWatchCount]
-		
-		// Immediately propagate newly assigned literal (depth-first)
-		// Cache blitWatchIdx to avoid repeated LitToIndex calls (optimization #6)
-		blitWatchIdx := cnf.LitToIndex(blit)
-		blitWatches := s.watchLists[blitWatchIdx]
-		for bi := 0; bi < len(blitWatches); bi++ {
-			blitWatch := blitWatches[bi]
-			blitClauseID := blitWatch.ClauseID
-			blitOtherIdx := blitWatch.Blit
-			blitOther := cnf.IndexToLit(int(blitOtherIdx))
-			
-			// Inline literalIsTrue check (optimization #4)
-			blitOtherAssign := s.assignments[blitOther.Var()]
-			blitOtherIsTrue := blitOtherAssign.Level != 0 && ((blitOther.IsNegated() && !blitOtherAssign.Value) || (!blitOther.IsNegated() && blitOtherAssign.Value))
-			
-			if blitOtherIsTrue {
+			if foundReplacement {
 				continue
 			}
 			
-			var blitClause cnf.Clause
-			var blitIsLearned bool
-			var blitLearnedIdx int
-			if blitClauseID < uint32(s.cnf.NumClauses) {
-				blitClause = s.cnf.Clauses[blitClauseID]
-				blitIsLearned = false
-				blitLearnedIdx = -1
-			} else {
-				blitLearnedIdx = int(blitClauseID - uint32(s.cnf.NumClauses))
-				if blitLearnedIdx < 0 || blitLearnedIdx >= len(s.learnedClauses) {
-					continue
+			// No replacement found - blit must be propagated
+			blitLevel := s.assignments[blit.Var()].Level
+			
+			if blitLevel == 0 {
+				// Propagate blit
+				reasonIdx := int(clauseID)
+				if isLearned {
+					reasonIdx = -learnedIdx - 1
 				}
-				blitClause = s.learnedClauses[blitLearnedIdx]
-				blitIsLearned = true
+				s.assignLiteral(blit, s.level, reasonIdx)
+				i++
+				continue
 			}
 			
-			hasReplacement := false
-			for _, cl := range blitClause.Literals {
-				if cl == blit || cl == blitOther {
-					continue
+			// Both literals false - conflict!
+			blitValue := s.assignments[blit.Var()].Value
+			blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
+			
+			if !blitTrue {
+				if isLearned {
+					return true, -learnedIdx - 1
 				}
-				ll := s.assignments[cl.Var()].Level
-				lv := s.assignments[cl.Var()].Value
-				lt := (!cl.IsNegated() && lv) || (cl.IsNegated() && !lv)
-				if lt || ll == 0 {
-					hasReplacement = true
-					break
-				}
+				return true, int(clauseID)
 			}
 			
-			if !hasReplacement {
-				otherLevel := s.assignments[blitOther.Var()].Level
-				if otherLevel == 0 {
-					otherReason := int(blitClauseID)
-					if blitIsLearned {
-						otherReason = -blitLearnedIdx - 1
-					}
-					s.assignLiteral(blitOther, s.level, otherReason)
-				}
-			}
+			// blit is true, keep watch
+			i++
 		}
-		
-		continue
 	}
 	
-	blitValue := s.assignments[blit.Var()].Value
-	blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
-	
-	if !blitTrue {
-		if isLearned {
-			return true, -learnedIdx - 1
-		}
-		return true, int(clauseID)
-	}
-	
-	if newWatchCount != i {
-		watches[newWatchCount] = watch
-	}
-	newWatchCount++
-	s.watchLists[watchIdx] = watches[:newWatchCount]
-}
-		
-		s.watchLists[watchIdx] = watches[:newWatchCount]
-	}
+	// Update qhead to end of trail
+	s.qhead = len(s.trail)
 	
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
