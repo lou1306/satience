@@ -2220,16 +2220,17 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			}
 			
 		foundReplacement := false
-		for j := 0; j < len(clause.Literals); j++ {
+		if len(clause.Literals) > 2 {
+			for j := 0; j < len(clause.Literals); j++ {
 				clauseLit := clause.Literals[j]
 				if clauseLit == falseLit || clauseLit == blit {
 					continue
 				}
 				
-			litLevel := s.assignments[clauseLit.Var()].Level
-			litValue := s.assignments[clauseLit.Var()].Value
-			litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
-			
+				litLevel := s.assignments[clauseLit.Var()].Level
+				litValue := s.assignments[clauseLit.Var()].Value
+				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
+				
 				if litTrue || litLevel == 0 {
 					newWatchIdx := cnf.LitToIndex(clauseLit)
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
@@ -2248,11 +2249,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					break
 				}
 			}
-			
-			if foundReplacement {
-				s.watchLists[watchIdx] = watches[:newWatchCount]
-				continue
-			}
+		}
+		
+		if foundReplacement {
+			s.watchLists[watchIdx] = watches[:newWatchCount]
+			continue
+		}
 			
 	blitLevel := s.assignments[blit.Var()].Level
 	
