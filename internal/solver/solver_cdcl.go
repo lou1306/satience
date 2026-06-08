@@ -412,6 +412,10 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	// This creates an infinite loop: propagate -> conflict -> backtrack -> re-propagate -> ...
 	// The learned clauses (LBD=5) are not strong enough to prune the search space effectively
 	// Need better clause learning (lower LBD clauses) or different restart strategy
+	// Watched literals DISABLED - 1-UIP improvements help but not enough
+	// With improved 1-UIP: learns 30+ clauses vs 2 before, but still loops on UNSAT
+	// Root cause: learned clauses still don't prevent re-propagation after backtrack
+	// Need: Better clause learning OR fix watch update logic after backtrack
 	s.watchInitialized = false
 }
 
