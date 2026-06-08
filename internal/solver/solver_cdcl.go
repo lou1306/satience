@@ -2665,63 +2665,80 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	currentSize := len(conflictLits)
 	resolvedCount := 0
 	
+	// 1-UIP: Resolve until exactly 1 literal remains at current decision level
+	// Uses MiniSat-style trail scanning (backwards from end) to respect temporal order
+	// This ensures we resolve on the most recently assigned literal at each step,
+	// which guarantees finding the true First Unique Implication Point (UIP).
+	
 	// Track which variables we've resolved on to prevent cycles
 	for i := range s.tmpResolved {
 		s.tmpResolved[i] = false
 	}
 	
-	for s.tmpLevelCount[s.level] > 1 {
-		// Find a literal at current level that's in our clause and has a reason
+	// Start from end of trail and scan backwards (MiniSat-style)
+	trailIndex := len(s.trail) - 1
+	pathC := s.tmpLevelCount[s.level]
+	
+	for pathC > 1 {
+		// Find next literal to resolve by scanning trail backwards
 		var foundVar uint32 = 0
 		found := false
 		
-		// CRITICAL FIX: Scan ALL variables at current level, not just trail from decision point!
-		// When resolving, newly added literals may have been assigned earlier at this level.
-		// The old code scanned from trailHead[s.level] onward, missing literals assigned
-		// before the current decision but still at the current level.
-		// This caused 1-UIP to fail with 2+ literals at current level on PHP instances.
-		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
-			if s.assignments[varIdx].Level == s.level && 
-			   s.tmpLiteralInClause[varIdx] && 
-			   !s.tmpResolved[varIdx] {
-				reasonIdx := s.implication[varIdx]
-				if reasonIdx != -1 { // Has a reason (not a decision)
-					foundVar = varIdx
-					found = true
-					break
-				}
+		for trailIndex >= 0 {
+			varIdx := uint32(s.trail[trailIndex])
+			trailIndex--
+			
+			// Skip if not in learned clause or already resolved
+			if !s.tmpLiteralInClause[varIdx] || s.tmpResolved[varIdx] {
+				continue
 			}
-		}
-		
-		if !found {
-			// No more resolvable literals at current level
-			// This means remaining literals are decisions - cannot resolve further
+			
+			// Skip if at lower level (not counted in pathC)
+			if s.assignments[varIdx].Level != s.level {
+				continue
+			}
+			
+			// Found a literal at current level
+			foundVar = varIdx
+			found = true
 			break
 		}
 		
-		reasonIdx := s.implication[foundVar]
+		// Stop early if no resolvable literal found (MiniSat behavior)
+		if !found {
+			break
+		}
 		
+		// Check if this literal has a reason (not a decision)
+		reasonIdx := s.implication[foundVar]
+		if reasonIdx == -1 {
+			// Decision literal - cannot resolve, stop early
+			break
+		}
+		
+		// Get reason clause
 		var reasonLits []cnf.Literal
 		if reasonIdx >= 0 {
 			reasonLits = s.cnf.Clauses[reasonIdx].Literals
 		} else {
 			learnedIdx := -reasonIdx - 1
-			if learnedIdx < len(s.learnedClauses) {
-				reasonLits = s.learnedClauses[learnedIdx].Literals
-			} else {
-				// Learned clause was deleted, remove this literal and continue
+			if learnedIdx >= len(s.learnedClauses) {
+				// Reason clause was deleted, remove this literal and continue
 				s.tmpLiteralInClause[foundVar] = false
 				s.tmpLevelCount[s.level]--
+				pathC--
 				continue
 			}
+			reasonLits = s.learnedClauses[learnedIdx].Literals
 		}
 		
-		// Resolve: remove foundVar from clause, add literals from reason
+		// Resolve: remove foundVar, add reason literals
 		s.tmpLiteralInClause[foundVar] = false
-		s.tmpResolved[foundVar] = true // Mark as resolved to prevent cycles
-		oldLevel := s.assignments[foundVar].Level
-		s.tmpLevelCount[oldLevel]--
+		s.tmpResolved[foundVar] = true
+		s.tmpLevelCount[s.level]--
+		pathC--
 		
+		// Add reason literals (except the one we resolved on)
 		newLiterals := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
@@ -2734,8 +2751,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				lvl := s.assignments[v].Level
 				if lvl <= s.level {
 					s.tmpLevelCount[lvl]++
-					newLiterals++
+					if lvl == s.level {
+						pathC++
+					}
 				}
+				newLiterals++
 			}
 		}
 		
@@ -2755,19 +2775,38 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	if s.verbose {
-		fmt.Printf("c [debug] 1-UIP result: conflict=%d, %d literals total, %d at current level %d\n", s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
+	// INVARIANT CHECK: Verify exactly 1 literal at current level
+	litsAtCurrentLevel = 0
+	for varIdx, inClause := range s.tmpLiteralInClause {
+		if inClause && s.assignments[varIdx].Level == s.level {
+			litsAtCurrentLevel++
+		}
 	}
 	
-	// BUG FIX: If 1-UIP didn't reduce to exactly 1 literal at current level,
-	// don't learn the clause. This happens when there are multiple decisions
-	// at the current level (shouldn't happen in proper CDCL, but does on PHP).
-	// Learning such clauses causes infinite loops.
+	if s.verbose && s.conflicts <= 100 {
+		fmt.Printf("c [1-UIP] Conflict %d: %d literals, %d at level %d (target: 1)\n", 
+			s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
+		
+		if litsAtCurrentLevel != 1 {
+			fmt.Printf("c [1-UIP ERROR] Failed to find UIP! Literals: %d, at level %d\n", len(learnedLits), s.level)
+			for _, lit := range learnedLits {
+				v := lit.Var()
+				sign := ""
+				if lit.IsNegated() {
+					sign = "¬"
+				}
+				fmt.Printf("c   Lit: %sx%d, Level: %d, Reason: %v\n", 
+					sign, v+1, s.assignments[v].Level, s.implication[v])
+			}
+		}
+	}
+	
+	// If 1-UIP didn't reduce to exactly 1 literal at current level,
+	// fall back to DPLL-style backtracking
 	if litsAtCurrentLevel != 1 {
 		if s.verbose && s.conflicts <= 20 {
 			fmt.Printf("c [debug] Skipping learned clause: %d literals at level %d (expected 1)\n", litsAtCurrentLevel, s.level)
 		}
-		// Return level-1 for chronological backtracking (DPLL-style)
 		backjumpLevel := s.level - 1
 		if backjumpLevel < 0 {
 			backjumpLevel = 0
