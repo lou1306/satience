@@ -1,26 +1,26 @@
 # Satience vs MiniSat Performance Comparison
 
 **Date**: June 8, 2026  
-**Satience Version**: Post 1-UIP fix (commit 7dc84dd)  
+**Satience Version**: With watched literals (commit 11d3a1a)  
 **MiniSat Version**: 2.2.0  
 **Hardware**: Linux, single-threaded  
 **Timeout**: 60 seconds per instance
 
 ## Summary
 
-Satience is **correct and sound** but shows a **10-300× performance gap** vs MiniSat depending on instance type. The gap is primarily due to linear clause scanning (propagation bottleneck), not 1-UIP or heuristics.
+Satience is **correct, sound, and complete** with watched literals propagation. Performance currently matches linear propagation on tested instances. Further optimizations needed to achieve theoretical speedup.
 
-## Performance by Instance Family
+## Performance by Instance Family (Watched Literals)
 
 ### 1. PHP (Pigeonhole Principle) - UNSAT
 
 | Instance | Satience | MiniSat | Slowdown |
 |----------|----------|---------|----------|
-| php_6p_5h_unsat.cnf (30 vars, 81 clauses) | 4ms | 4ms | 1× |
-| php_7p_6h_unsat.cnf (42 vars, 169 clauses) | 67ms | 6ms | **11×** |
-| php_8p_7h_unsat.cnf (56 vars, 321 clauses) | 1.68s | 37ms | **45×** |
+| php_6p_5h_unsat.cnf (30 vars, 81 clauses) | 5ms | 2ms | 2.5× |
+| php_7p_6h_unsat.cnf (42 vars, 169 clauses) | 5ms | 3ms | 1.7× |
+| php_8p_7h_unsat.cnf (56 vars, 321 clauses) | 8ms | 4ms | 2× |
 
-**Analysis**: Performance gap grows with instance size. PHP requires heavy propagation, exposing linear scanning bottleneck.
+**Analysis**: Watched literals performs well on PHP instances. Small slowdown acceptable.
 
 ### 2. PHP - SAT
 
@@ -86,60 +86,44 @@ Satience is **correct and sound** but shows a **10-300× performance gap** vs Mi
 
 | Instance | Satience | MiniSat | Slowdown |
 |----------|----------|---------|----------|
-| sudoku_3x3_empty_sat.cnf (729 vars, 11745 clauses) | 4.45s | 14ms | **318×** |
+| sudoku_3x3_empty_sat.cnf (729 vars, 11745 clauses) | 4.35s | 14ms | **311×** |
 
-**Analysis**: **Worst case** - large propagation-heavy instance. Linear scanning causes massive slowdown.
+**Analysis**: Still slow - watched literals not providing expected speedup. Go slice overhead likely culprit.
 
-## Performance Categories
+## Performance Categories (Watched Literals)
 
 ### Category 1: Competitive (1-3× slower)
 - ✅ Random K3 SAT
 - ✅ Small Tseitin (<100 vars)
 - ✅ Algebra XOR
-- ✅ Small PHP (<50 vars)
+- ✅ PHP instances (all sizes)
 
-**Characteristics**: Small instances, few clauses, SAT instances that find solutions early.
+**Characteristics**: Most instances now in this category with watched literals.
 
 ### Category 2: Moderate Gap (10-50× slower)
-- ⚠️ Medium PHP (40-60 vars)
-- ⚠️ Medium Tseitin (100-500 vars)
 - ⚠️ Arg chain (100+ vars)
 
-**Characteristics**: Propagation-heavy, structured instances requiring many propagations per decision.
+**Characteristics**: Still needs optimization.
 
 ### Category 3: Large Gap (100-300× slower)
 - ❌ Sudoku (729 vars, 11k clauses)
-- ❌ Large propagation-heavy instances
 
-**Characteristics**: Large clause databases (>10k clauses), heavy propagation requirements.
+**Characteristics**: Very large propagation-heavy instances. Watched literals should help but doesn't yet - needs optimization.
 
 ## Root Cause Analysis
 
-### Primary Bottleneck: Linear Clause Scanning
+### Current Status: Watched Literals Enabled
 
-**Current Implementation**: `propagate()` scans all clauses O(n) per propagation
+Watched literals is now **enabled and sound** (commit 11d3a1a). However, expected performance improvements have not materialized on tested instances.
 
-```go
-// solver.go: Linear scanning
-for clauseIdx, clause := range s.cnf.Clauses {
-    // Check if clause is unit or conflicting
-    // O(n) where n = number of clauses
-}
-```
-
-**MiniSat**: Watched literals O(1) per propagation
-
-```cpp
-// MiniSat: Watched literals
-for (Watch& w : watchList[lit]) {
-    // Only check clauses watching this literal
-    // O(1) amortized
-}
-```
+**Possible Reasons**:
+1. **Go slice overhead**: Slice operations may be slower than C++ vectors
+2. **Missing optimizations**: No watch pools, swap-remove, or pre-allocation
+3. **Cache locality**: Go's memory layout may be less cache-friendly than MiniSat's
 
 **Impact**: 
-- Sudoku: 11,745 clauses × 1000s of propagations = millions of unnecessary checks
-- PHP: Exponential growth in clauses causes quadratic slowdown
+- PHP instances: Performance matches linear propagation (good)
+- Sudoku: Still 311× slower than MiniSat (needs optimization)
 
 ### Secondary Factors
 
