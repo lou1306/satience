@@ -303,11 +303,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			return unitResult
 		}
 		
-		// RE-ENABLED: Failed literal elimination with strict safeguards
-		failedResult := s.failedLiteralElimination()
-		if failedResult != UNKNOWN {
-			return failedResult
-		}
+		// DISABLED: Failed literal elimination causes soundness bugs
+		// failedResult := s.failedLiteralElimination()
+		// if failedResult != UNKNOWN {
+		// 	return failedResult
+		// }
 		
 		// Stop if no progress made for 2 consecutive passes
 		if s.cnf.NumClauses == initialClauses && pass >= 1 {
@@ -2017,13 +2017,17 @@ func (s *CDCLSolver) Solve() bool {
 }
 
 func (s *CDCLSolver) SolveWithResult() SolveResult {
-	preprocessResult := s.preprocessAggressive()
-	if preprocessResult != UNKNOWN {
-		if s.verbose {
-			s.printStats()
-		}
-		return preprocessResult
-	}
+	// DISABLED: Preprocessing causes soundness bugs
+	// preprocessResult := s.preprocessAggressive()
+	// if preprocessResult != UNKNOWN {
+	// 	if s.verbose {
+	// 		s.printStats()
+	// 	}
+	// 	return preprocessResult
+	// }
+	
+	// Initialize watches before search
+	s.initWatches()
 	
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
@@ -3417,26 +3421,6 @@ func (s *CDCLSolver) backtrack() bool {
 	bjLevel := s.backjumpLevel
 	if bjLevel <= 0 || bjLevel >= s.level {
 		bjLevel = s.level - 1
-	}
-	
-	// FIX: If backjumping to the same level as current max, we've already tried both polarities
-	// This happens when 1-UIP fails repeatedly and we keep backjumping to the same level
-	// In this case, backtrack one more level to avoid infinite flipping
-	if bjLevel == s.level-1 && len(s.trailHead) > bjLevel {
-		decisionPoint := s.trailHead[bjLevel]
-		if decisionPoint < len(s.trail) {
-			decisionVar := uint32(s.trail[decisionPoint])
-			// Check if this variable was already flipped (has implication from this level)
-			// If trailHead at this level points to same var, we're flipping repeatedly
-			if len(s.trail) > decisionPoint && uint32(s.trail[decisionPoint]) == decisionVar {
-				// Already at this decision, backtrack further
-				if bjLevel > 1 {
-					bjLevel--
-				} else {
-					return false // Can't backtrack further
-				}
-			}
-		}
 	}
 	if bjLevel < 1 {
 		if s.verbose && s.conflicts <= 20 {
