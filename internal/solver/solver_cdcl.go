@@ -2188,18 +2188,20 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 	watches := s.watchLists[watchIdx]
 	
 	newWatchCount := 0
-		for i := 0; i < len(watches); i++ {
-			watch := watches[i]
-			clauseID := watch.ClauseID
-			blitIdx := watch.Blit
-			
+	for i := 0; i < len(watches); i++ {
+		watch := watches[i]
+		clauseID := watch.ClauseID
+		blitIdx := watch.Blit
+		
 		blit := cnf.IndexToLit(int(blitIdx))
 		
 		if s.literalIsTrue(blit) {
+			if newWatchCount != i {
 				watches[newWatchCount] = watch
-				newWatchCount++
-				continue
 			}
+			newWatchCount++
+			continue
+		}
 			
 			var clause cnf.Clause
 			var isLearned bool
@@ -2260,7 +2262,9 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			reasonIdx = -learnedIdx - 1
 		}
 		s.assignLiteral(blit, s.level, reasonIdx)
-		watches[newWatchCount] = watch
+		if newWatchCount != i {
+			watches[newWatchCount] = watch
+		}
 		newWatchCount++
 		s.watchLists[watchIdx] = watches[:newWatchCount]
 		
@@ -2332,7 +2336,9 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		return true, int(clauseID)
 	}
 	
-	watches[newWatchCount] = watch
+	if newWatchCount != i {
+		watches[newWatchCount] = watch
+	}
 	newWatchCount++
 	s.watchLists[watchIdx] = watches[:newWatchCount]
 }
