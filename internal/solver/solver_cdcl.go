@@ -1758,9 +1758,11 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		watchIdx := cnf.LitToIndex(falseLit)
 		
 		// Process watches for this literal
-		watchList := &s.watchLists[watchIdx]
-		for i := 0; i < len(*watchList); {
-			watch := (*watchList)[i]
+		// IMPORTANT: Don't hold pointer to slice - it may be reallocated
+		watchList := s.watchLists[watchIdx]
+		newWatchList := make([]cnf.Watch, 0, len(watchList))
+		
+		for _, watch := range watchList {
 			clauseID := watch.ClauseID
 			blitIdx := watch.Blit
 			blit := cnf.IndexToLit(int(blitIdx))
@@ -1771,7 +1773,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 			if blitIsTrue {
 				// Clause is satisfied, keep watch
-				i++
+				newWatchList = append(newWatchList, watch)
 				continue
 			}
 			
@@ -1786,8 +1788,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			} else {
 				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
 				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
-					// Invalid learned clause, remove watch
-					*watchList = append((*watchList)[:i], (*watchList)[i+1:]...)
+					// Invalid learned clause, skip watch
 					continue
 				}
 				clause = s.learnedClauses[learnedIdx]
@@ -1819,18 +1820,17 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 						Blit:     falseLitIdx,
 						IsBinary: false,
 					})
-					// Remove old watch from falseLit's watch list
-					*watchList = append((*watchList)[:i], (*watchList)[i+1:]...)
 					foundReplacement = true
 					break
 				}
 			}
 			
 			if foundReplacement {
+				// Don't add to newWatchList - watch has been moved
 				continue
 			}
 			
-			// No replacement found - blit must be propagated
+			// No replacement found - check if we can propagate or have conflict
 			blitLevel := s.assignments[blit.Var()].Level
 			
 			if blitLevel == 0 {
@@ -1840,15 +1840,17 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					reasonIdx = -learnedIdx - 1
 				}
 				s.assignLiteral(blit, s.level, reasonIdx)
-				i++
+				// Keep the watch - blit is now true
+				newWatchList = append(newWatchList, watch)
 				continue
 			}
 			
-			// Both literals false - conflict!
+			// blit is already assigned - check if it's false (conflict) or true (satisfied)
 			blitValue := s.assignments[blit.Var()].Value
 			blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
 			
 			if !blitTrue {
+				// Both watched literals are false - conflict!
 				if isLearned {
 					return true, -learnedIdx - 1
 				}
@@ -1856,12 +1858,12 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			}
 			
 			// blit is true, keep watch
-			i++
+			newWatchList = append(newWatchList, watch)
 		}
+		
+		// Update watch list
+		s.watchLists[watchIdx] = newWatchList
 	}
-	
-	// Update qhead to end of trail
-	s.qhead = len(s.trail)
 	
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
