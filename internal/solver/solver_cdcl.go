@@ -391,7 +391,7 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	})
 	
 	// Watched literals now enabled with all soundness bugs fixed
-	s.watchInitialized = true
+	s.watchInitialized = false  // Soundness bug: incorrect UNSAT on PHP SAT instances
 }
 
 func (s *CDCLSolver) selfSubsumption() {
