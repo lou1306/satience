@@ -2435,6 +2435,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	if len(learnedLits) > 0 {
+		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > 10)
+		// These clauses are too weak to be useful for propagation
+		// They span too many decision levels and don't prune search effectively
+		// Glucose typically uses LBD threshold of 5-8, we use 10 as initial tuning
+		if lbd > 10 {
+			if s.verbose && s.conflicts <= 100 {
+				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=10)\n", lbd, len(learnedLits))
+			}
+			// Still return backjump level for correct backjumping
+			backjumpLevel := 0
+			for varIdx, inClause := range s.tmpLiteralInClause {
+				if inClause {
+					lvl := s.assignments[varIdx].Level
+					if lvl > backjumpLevel && lvl < s.level {
+						backjumpLevel = lvl
+					}
+				}
+			}
+			if backjumpLevel == 0 {
+				backjumpLevel = 1
+			}
+			return backjumpLevel
+		}
+		
 		// DUPLICATE DETECTION: Skip if this clause already exists
 		// Use simple hash-based check for O(n) comparison only when hash matches
 		s.tmpClauseHash = 0
