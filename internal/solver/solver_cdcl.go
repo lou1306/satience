@@ -396,10 +396,10 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	if clauseID == 108 {
 	}
 	
-	// Watched literals DISABLED - infinite loop bug in propagation
-	// The qhead reset in restart() is correct, but there's still a bug causing
-	// repeated processing of the same trail elements after backtracking/restart
-	// TODO: Debug by checking if watches are being processed multiple times for same literal
+	// Watched literals DISABLED - causes infinite search loops
+	// Bug: Solver repeatedly encounters same conflicts and learns same clauses
+	// even though learned clauses are in the database. Indicates watches are not
+	// triggering correct propagations. Root cause not yet identified.
 	s.watchInitialized = false
 }
 
@@ -851,12 +851,13 @@ func (s *CDCLSolver) restart() {
 		}
 		s.tmpLevelSet = s.tmpLevelSet[:0]
 		
-		// Keep glue clauses (LBD <= 5) - ADAPTED for our 1-UIP implementation
-		// Our 1-UIP produces clauses with LBD 5-8 typically, so LBD<=3 is too strict
-		// LBD <= 2: core glue (most valuable, never delete)
-		// LBD 3-5: useful glue (keep across restarts)
-		// LBD > 5: trash (delete on restart)
-		if lbd <= 5 {
+	// Keep glue clauses (LBD <= 10) - INCREASED to prevent re-learning same clauses
+	// Our 1-UIP produces clauses with LBD 5-8 typically on PHP instances
+	// Deleting these causes the solver to re-encounter the same conflicts
+	// LBD <= 2: core glue (most valuable, never delete)
+	// LBD 3-10: useful glue (keep across restarts)
+	// LBD > 10: trash (delete on restart)
+	if lbd <= 10 {
 			glueCount++
 			isGlue[i] = true
 		}
@@ -2981,10 +2982,9 @@ func (s *CDCLSolver) backtrack() bool {
 		s.implication[varIdx] = -1
 	}
 	s.trail = s.trail[:decisionPoint]
-	// Reset qhead to avoid re-processing backtracked trail elements
-	if s.qhead > decisionPoint {
-		s.qhead = decisionPoint
-	}
+	// Reset qhead to decisionPoint - the flipped decision needs to be propagated
+	// and all subsequent trail elements have been cleared
+	s.qhead = decisionPoint
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
 	
