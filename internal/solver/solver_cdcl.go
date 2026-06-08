@@ -396,8 +396,10 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	if clauseID == 108 {
 	}
 	
-	// Watched literals DISABLED - has soundness bugs causing infinite loops
-	// TODO: Fix and re-enable
+	// Watched literals DISABLED - infinite loop bug in propagation
+	// The qhead reset in restart() is correct, but there's still a bug causing
+	// repeated processing of the same trail elements after backtracking/restart
+	// TODO: Debug by checking if watches are being processed multiple times for same literal
 	s.watchInitialized = false
 }
 
