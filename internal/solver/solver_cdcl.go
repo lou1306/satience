@@ -340,10 +340,11 @@ func (s *CDCLSolver) initWatches() {
 	s.watchLists = make([][]cnf.Watch, numLits)
 	
 	// Pre-allocate watch lists with estimated capacity to avoid reallocations
-	// Estimate: average 3-4 watches per literal for typical instances
+	// Formula: 2 watches per clause (one per watched literal) / num literals
+	// Minimum 8 to handle uneven distribution (some literals appear in many clauses)
 	avgWatchesPerLit := (s.cnf.NumClauses * 2) / numLits
-	if avgWatchesPerLit < 4 {
-		avgWatchesPerLit = 4
+	if avgWatchesPerLit < 8 {
+		avgWatchesPerLit = 8
 	}
 	for i := range s.watchLists {
 		s.watchLists[i] = make([]cnf.Watch, 0, avgWatchesPerLit)
