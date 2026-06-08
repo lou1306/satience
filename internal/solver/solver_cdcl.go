@@ -391,7 +391,7 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	})
 	
 	// Watched literals now enabled with all soundness bugs fixed
-	s.watchInitialized = false  // Soundness bug: incorrect UNSAT on PHP SAT instances
+	s.watchInitialized = false  // Soundness bug: binary clause propagation incorrect: incorrect UNSAT on PHP SAT instances
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -2252,9 +2252,17 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					newWatchIdx := cnf.LitToIndex(clauseLit)
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 						ClauseID: clauseID,
-						Blit:     uint32(watchIdx),
+						Blit:     uint32(blitIdx),
 						IsBinary: false,
 					})
+					// Update the other watch to point to this new watch
+					otherWatchIdx := cnf.LitToIndex(blit)
+					for k := range s.watchLists[otherWatchIdx] {
+						if s.watchLists[otherWatchIdx][k].ClauseID == clauseID {
+							s.watchLists[otherWatchIdx][k].Blit = uint32(newWatchIdx)
+							break
+						}
+					}
 					foundReplacement = true
 					break
 				}
