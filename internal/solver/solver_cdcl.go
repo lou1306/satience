@@ -393,13 +393,19 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 		IsBinary: isBinary,
 	})
 	
-	if clauseID == 108 {
+	// DEBUG: Print when learned clauses are added
+	if learned {
+		learnedIdx := clauseID - int(s.cnf.NumClauses)
+		if learnedIdx >= 0 && learnedIdx < 3 {
+			fmt.Printf("c [WATCH-ADD] Added learned clause %d (clauseID=%d) to watches: watching lit0=%v (idx=%d) and lit1=%v (idx=%d)\n",
+				learnedIdx, clauseID, lit0, idx0, lit1, idx1)
+		}
 	}
 	
-	// Watched literals DISABLED - causes infinite search loops
-	// Bug: Solver repeatedly encounters same conflicts and learns same clauses
-	// even though learned clauses are in the database. Indicates watches are not
-	// triggering correct propagations. Root cause not yet identified.
+	// Watched literals DISABLED - works for SAT but loops on UNSAT instances
+	// Bug: Solver repeatedly learns same clauses on UNSAT instances
+	// SAT instances solve correctly, indicating watches are mostly working
+	// Root cause: likely related to restart/backtrack watch management
 	s.watchInitialized = false
 }
 
@@ -1754,6 +1760,16 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		watchList := s.watchLists[watchIdx]
 		writeIdx := 0
 		
+		// DEBUG: Check if we're processing watch list 12 (learned clause 0)
+		if watchIdx == 12 && s.conflicts < 10 {
+			fmt.Printf("c [WATCH-PROCESS] watchIdx=%d, falseLit=%v, len=%d, cap=%d\n", 
+				watchIdx, falseLit, len(watchList), cap(watchList))
+			if len(watchList) > 0 {
+				w := watchList[0]
+				fmt.Printf("c   Watch 0: clauseID=%d, blit=%d\n", w.ClauseID, w.Blit)
+			}
+		}
+		
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 			clauseID := watch.ClauseID
@@ -1785,10 +1801,19 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				learnedIdx = int(clauseID - uint32(s.cnf.NumClauses))
 				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
 					// Invalid learned clause, skip watch
-				continue
+					if s.conflicts < 10 {
+						fmt.Printf("c [WATCH-DEBUG] Invalid learned clause: clauseID=%d, learnedIdx=%d, numLearned=%d\n",
+							clauseID, learnedIdx, len(s.learnedClauses))
+					}
+					continue
 				}
 				clause = s.learnedClauses[learnedIdx]
 				isLearned = true
+				// DEBUG: Trace learned clauses
+				if s.conflicts < 10 {
+					fmt.Printf("c [WATCH-DEBUG] Processing learned clause %d watch: clauseID=%d, falseLit=%v, blit=%v, blitLevel=%d\n",
+						learnedIdx, clauseID, falseLit, blit, s.assignments[blit.Var()].Level)
+				}
 			}
 			
 			// Look for replacement watch
