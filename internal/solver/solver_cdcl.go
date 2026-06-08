@@ -866,7 +866,7 @@ func (s *CDCLSolver) restart() {
 	// Keep glue clauses (LBD <= 10) - INCREASED to prevent re-learning same clauses
 	// Our 1-UIP produces clauses with LBD 5-8 typically on PHP instances
 	// Deleting these causes the solver to re-encounter the same conflicts
-	// LBD <= 2: core glue (most valuable, never delete)
+	// LBD <= 3: core glue (most valuable, never delete)
 	// LBD 3-10: useful glue (keep across restarts)
 	// LBD > 10: trash (delete on restart)
 	if lbd <= 10 {
@@ -2474,9 +2474,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// These clauses are too weak to be useful for propagation
 		// They span too many decision levels and don't prune search effectively
 		// Glucose typically uses LBD threshold of 5-8, we use 10 as initial tuning
-		if lbd > 10 {
+		if lbd > 15 {
 			if s.verbose && s.conflicts <= 100 {
-				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=10)\n", lbd, len(learnedLits))
+				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(learnedLits))
 			}
 			// Still return backjump level for correct backjumping
 			backjumpLevel := 0
@@ -2730,6 +2730,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		return learnedLits
 	}
 	
+	// Mark all literals in learned clause
 	for i := range s.tmpLiteralInClause {
 		s.tmpLiteralInClause[i] = false
 	}
@@ -2737,43 +2738,64 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		s.tmpLiteralInClause[lit.Var()] = true
 	}
 	
-	minimized := make([]cnf.Literal, 0, len(learnedLits))
-	
-	for _, lit := range learnedLits {
-		varIdx := lit.Var()
-		canRemove := false
+	// IMPROVED: Multi-pass minimization to catch transitive implications
+	// Keep trying to remove literals until no more can be removed
+	changed := true
+	for changed {
+		changed = false
 		
-		reasonIdx := s.implication[varIdx]
-		if reasonIdx != -1 {
-			var reasonLits []cnf.Literal
-			if reasonIdx >= 0 {
-				reasonLits = s.cnf.Clauses[reasonIdx].Literals
-			} else {
-				learnedIdx := -reasonIdx - 1
-				if learnedIdx < len(s.learnedClauses) {
-					reasonLits = s.learnedClauses[learnedIdx].Literals
-				}
+		for _, lit := range learnedLits {
+			varIdx := lit.Var()
+			
+			// Skip if already removed
+			if !s.tmpLiteralInClause[varIdx] {
+				continue
 			}
 			
-			if reasonLits != nil {
-				allCovered := true
-				for _, reasonLit := range reasonLits {
-					if reasonLit.Var() == varIdx {
-						continue
-					}
-					if !s.tmpLiteralInClause[reasonLit.Var()] {
-						allCovered = false
-						break
+			canRemove := false
+			reasonIdx := s.implication[varIdx]
+			if reasonIdx != -1 {
+				var reasonLits []cnf.Literal
+				if reasonIdx >= 0 {
+					reasonLits = s.cnf.Clauses[reasonIdx].Literals
+				} else {
+					learnedIdx := -reasonIdx - 1
+					if learnedIdx < len(s.learnedClauses) {
+						reasonLits = s.learnedClauses[learnedIdx].Literals
 					}
 				}
 				
-				if allCovered {
-					canRemove = true
+				if reasonLits != nil {
+					// Check if all reason literals (except varIdx) are in the clause
+					allCovered := true
+					for _, reasonLit := range reasonLits {
+						if reasonLit.Var() == varIdx {
+							continue
+						}
+						if !s.tmpLiteralInClause[reasonLit.Var()] {
+							allCovered = false
+							break
+						}
+					}
+					
+					if allCovered && len(reasonLits) > 1 {
+						canRemove = true
+						changed = true
+					}
 				}
 			}
+			
+			if canRemove {
+				// Remove literal - update tmpLiteralInClause so other literals can use this
+				s.tmpLiteralInClause[varIdx] = false
+			}
 		}
-		
-		if !canRemove {
+	}
+	
+	// Build final minimized clause from remaining literals
+	minimized := make([]cnf.Literal, 0, len(learnedLits))
+	for _, lit := range learnedLits {
+		if s.tmpLiteralInClause[lit.Var()] {
 			minimized = append(minimized, lit)
 		}
 	}
@@ -2818,9 +2840,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// BONUS: Activity (active clauses are more useful)
 		score -= activity * 20.0
 		
-		// PROTECTION: LBD <= 2 glue clauses are NEVER deleted (Glucose-style)
+		// PROTECTION: LBD <= 3 glue clauses are NEVER deleted (Glucose-style)
 		// These are the backbone of the learned clause database
-		if lbd <= 2 {
+		if lbd <= 3 {
 			score = -1000.0 // Absolutely never delete, regardless of age or size
 		}
 		
@@ -2830,13 +2852,13 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 		
 		// FORCE DELETION: Very old clauses (age > 500) regardless of LBD
-		// But NOT glue clauses (LBD <= 2)
+		// But NOT glue clauses (LBD <= 3)
 		if age > 500 && lbd > 2 {
 			score += 1000.0 // Force deletion of very old clauses
 		}
 		
 		// FORCE DELETION: Large clauses (size > 15) regardless of LBD
-		// But NOT glue clauses (LBD <= 2)
+		// But NOT glue clauses (LBD <= 3)
 		if size > 15 && lbd > 2 {
 			score += 800.0 // Force deletion of large clauses
 		}
