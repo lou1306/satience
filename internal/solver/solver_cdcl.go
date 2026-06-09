@@ -75,6 +75,7 @@ type CDCLSolver struct {
 	lbdOrderLastRebuild int  // Conflict count when order was last rebuilt
 	
 	qhead int  // Watched literals: next trail index to process
+	clauseToIndex map[*cnf.Clause]int  // Cache for clause index lookup
 }
 
 // eliminationInfo stores how a variable was eliminated for model reconstruction
@@ -145,6 +146,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		eliminatedVars: make(map[uint32]eliminationInfo),
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
+		clauseToIndex: make(map[*cnf.Clause]int),
 	}
 	
 	// Enable LBD-based VSIDS for better variable selection
@@ -1856,19 +1858,24 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			
 			if !blitTrue {
 				// Both watched literals are false - conflict!
-				// Find clause index for return value
-				clauseIdx := -1
-				for i := range s.learnedClauses {
-					if &s.learnedClauses[i] == clause {
-						clauseIdx = -i - 1
-						break
-					}
-				}
-				if clauseIdx == -1 {
-					for i := 0; i < s.cnf.NumClauses; i++ {
-						if &s.cnf.Clauses[i] == clause {
-							clauseIdx = i
+				// Use cache for O(1) clause index lookup
+				clauseIdx, ok := s.clauseToIndex[clause]
+				if !ok {
+					// Not in cache, search and cache it
+					for i := range s.learnedClauses {
+						if &s.learnedClauses[i] == clause {
+							clauseIdx = -i - 1
+							s.clauseToIndex[clause] = clauseIdx
 							break
+						}
+					}
+					if clauseIdx == 0 {
+						for i := 0; i < s.cnf.NumClauses; i++ {
+							if &s.cnf.Clauses[i] == clause {
+								clauseIdx = i
+								s.clauseToIndex[clause] = clauseIdx
+								break
+							}
 						}
 					}
 				}
@@ -2615,6 +2622,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 			s.learnedClauses = append(s.learnedClauses, newClause)
+			s.clauseToIndex[&s.learnedClauses[len(s.learnedClauses)-1]] = len(s.learnedClauses) - 1
 			
 			// Add learned clause to watches with correct ID encoding
 			if s.watchInitialized {
