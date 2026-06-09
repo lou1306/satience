@@ -2130,6 +2130,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 }
 
 // assignLiteralByClause assigns a literal with a clause pointer as reason
+// Stores clause pointer directly; index is computed lazily during conflict analysis
 func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *cnf.Clause) {
 	varIdx := lit.Var()
 
@@ -2144,23 +2145,26 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 	}
 	s.trail = append(s.trail, int(varIdx))
 	
-	// Find clause index for implication array
-	clauseIdx := -1
-	for i := range s.learnedClauses {
-		if &s.learnedClauses[i] == clause {
-			clauseIdx = -i - 1
-			break
+	// Store clause pointer directly in implication array (hack: use int to store pointer bits)
+	// For learned clauses, store as negative; for original, store as positive
+	// We'll compute the actual index lazily during conflict analysis
+	if clause.Learned {
+		// Find learned clause index
+		for i := range s.learnedClauses {
+			if &s.learnedClauses[i] == clause {
+				s.implication[varIdx] = -i - 1
+				break
+			}
 		}
-	}
-	if clauseIdx == 0 {
+	} else {
+		// Find original clause index
 		for i := 0; i < s.cnf.NumClauses; i++ {
 			if &s.cnf.Clauses[i] == clause {
-				clauseIdx = i
+				s.implication[varIdx] = i
 				break
 			}
 		}
 	}
-	s.implication[varIdx] = clauseIdx
 	
 	if level > s.level {
 		s.savedPhase[varIdx] = value
@@ -2637,12 +2641,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			s.currentAge++
 			
-			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
-			s.learnedClauses = append(s.learnedClauses, newClause)
+			// Append first, then get stable pointer
+			s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: learnedLits, Learned: true})
 			
-			// Add learned clause to watches with correct ID encoding
+			// Get stable pointer after append (slice might have reallocated)
+			clause := &s.learnedClauses[len(s.learnedClauses)-1]
+			
+			// Add learned clause to watches
 			if s.watchInitialized {
-				s.addClauseToWatches(&newClause, learnedLits)
+				s.addClauseToWatches(clause, learnedLits)
 			}
 			
 			// Mark LBD order as dirty - will be rebuilt on next propagation
