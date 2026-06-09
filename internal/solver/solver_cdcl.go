@@ -1801,25 +1801,45 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
 				
 				if litTrue || litLevel == 0 {
-					// Found replacement - swap watches
-					// Current watch: watching falseLit, blit is the other watch
-					// New watch: watching clauseLit, falseLit is the other watch
+					// Found replacement - move watch from falseLit to clauseLit
 					newWatchIdx := cnf.LitToIndex(clauseLit)
-					falseLitIdx := uint32(cnf.LitToIndex(falseLit))
+					blitIdx := uint32(cnf.LitToIndex(blit))
 					
-					// Add new watch to clauseLit's watch list
-					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
-						Clause:   clause,
-						Blit:     falseLitIdx,
-						IsBinary: false,
-					})
+					// Check if watch already exists at newWatchIdx (prevent duplicates)
+					alreadyExists := false
+					for k := range s.watchLists[newWatchIdx] {
+						if s.watchLists[newWatchIdx][k].Clause == clause {
+							alreadyExists = true
+							break
+						}
+					}
+					
+					if !alreadyExists {
+						// Add new watch to clauseLit's watch list
+						s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+							Clause:   clause,
+							Blit:     blitIdx,
+							IsBinary: false,
+						})
+						
+						// CRITICAL: Update symmetric watch at blit's index
+						// The watch at blit's index currently points to falseLit
+						// It must now point to clauseLit instead
+						for k := range s.watchLists[blitIdx] {
+							if s.watchLists[blitIdx][k].Clause == clause {
+								s.watchLists[blitIdx][k].Blit = uint32(newWatchIdx)
+								break
+							}
+						}
+					}
+					
 					foundReplacement = true
 					break
 				}
 			}
 			
 			if foundReplacement {
-				// Don't add to newWatchList - watch has been moved
+				// Watch moved successfully - don't keep old watch
 				continue
 			}
 			
