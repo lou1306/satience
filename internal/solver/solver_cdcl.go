@@ -1737,7 +1737,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		return s.propagate()
 	}
 	
-	// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
+// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
 	if s.qhead >= len(s.trail) {
 		return false, nil
 	}
