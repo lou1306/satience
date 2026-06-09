@@ -26,7 +26,7 @@ type CDCLSolver struct {
 	level        int
 	vsids        *VSIDS
 	conflicts    int
-	implication  []int
+	implication  []*cnf.Clause  // Clause pointer (nil for decisions)
 	iterations   int
 	maxIter      int
 	learnedClauses []cnf.Clause      // Learned clauses
@@ -108,7 +108,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		level:       0,
 		vsids:       NewVSIDS(formula.NumVars),
 		conflicts:   0,
-		implication: make([]int, formula.NumVars),
+		implication: make([]*cnf.Clause, formula.NumVars),
 		iterations:  0,
 		maxIter:     0,
 		learnedClauses: make([]cnf.Clause, 0),
@@ -879,7 +879,7 @@ func (s *CDCLSolver) restart() {
 	s.qhead = 0  // Reset qhead since trail is empty
 	s.level = 0
 	for i := range s.implication {
-		s.implication[i] = -1
+		s.implication[i] = nil
 	}
 	for i := range s.assignments {
 		s.assignments[i] = Assignment{}
@@ -1843,7 +1843,7 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 						}
 					}
 				}
-				s.assignLiteral(blit, s.level, reasonIdx)
+				s.assignLiteralByClause(blit, s.level, clause)
 				// Keep the watch - blit is now true
 				watchList[writeIdx] = watch
 				writeIdx++
@@ -1987,7 +1987,7 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				if assignLevel == 0 {
 					assignLevel = 1
 				}
-				s.assignLiteral(unassignedLit, assignLevel, -learnedIdx-1)
+				s.assignLiteralByClause(unassignedLit, assignLevel, clause)
 				unitPropagated = true
 				break
 			}
@@ -2075,7 +2075,7 @@ func (s *CDCLSolver) decide() bool {
 
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
-	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1)
+	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, nil)
 	s.decisions++
 	if s.verbose {
 		fmt.Printf("c [DECIDE] Level %d (was %d): var %d = %v (decision), trailHead len=%d\n", 
@@ -2084,14 +2084,13 @@ func (s *CDCLSolver) decide() bool {
 	return true
 }
 
-func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
+func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Clause) {
 	varIdx := lit.Var()
 
 	if s.assignments[varIdx].Level != 0 {
-		// Variable already assigned - this could be a bug if we're trying to propagate
 		if s.verbose && level > 0 {
 			reasonStr := "propagation"
-			if clauseIdx == -1 {
+			if clause == nil {
 				reasonStr = "decision"
 			}
 			fmt.Printf("c [ALERT] assignLiteral: var %d already assigned at level %d, trying to assign at level %d (%s)\n",
@@ -2106,31 +2105,33 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 		Level: level,
 	}
 	s.trail = append(s.trail, int(varIdx))
-	s.implication[varIdx] = clauseIdx
+	s.implication[varIdx] = clause
 	
 	// Save the phase (polarity) for decisions only
 	// Don't save phase for propagations - the phase is forced by the clause
-	if clauseIdx == -1 {
+	if clause == nil {
 		s.savedPhase[varIdx] = value
 	}
 	
 	if s.verbose && level > 0 {
 		reasonStr := "propagation"
-		if clauseIdx == -1 {
+		if clause == nil {
 			reasonStr = "decision"
 		}
 		fmt.Printf("c [ASSIGN] Level %d: var %d = %v (%s)", level, varIdx+1, value, reasonStr)
-		if clauseIdx >= 0 {
-			fmt.Printf(" from clause %d", clauseIdx)
-		} else if clauseIdx < -1 {
-			fmt.Printf(" from learned clause %d", -clauseIdx-1)
+		if clause != nil {
+			if clause.Learned {
+				fmt.Printf(" from learned clause")
+			} else {
+				fmt.Printf(" from original clause")
+			}
 		}
 		fmt.Printf("\n")
 	}
 }
 
 // assignLiteralByClause assigns a literal with a clause pointer as reason
-// Stores clause pointer directly; index is computed lazily during conflict analysis
+// O(1) - just stores the pointer directly
 func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *cnf.Clause) {
 	varIdx := lit.Var()
 
@@ -2145,26 +2146,8 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 	}
 	s.trail = append(s.trail, int(varIdx))
 	
-	// Store clause pointer directly in implication array (hack: use int to store pointer bits)
-	// For learned clauses, store as negative; for original, store as positive
-	// We'll compute the actual index lazily during conflict analysis
-	if clause.Learned {
-		// Find learned clause index
-		for i := range s.learnedClauses {
-			if &s.learnedClauses[i] == clause {
-				s.implication[varIdx] = -i - 1
-				break
-			}
-		}
-	} else {
-		// Find original clause index
-		for i := 0; i < s.cnf.NumClauses; i++ {
-			if &s.cnf.Clauses[i] == clause {
-				s.implication[varIdx] = i
-				break
-			}
-		}
-	}
+	// Store clause pointer directly - O(1), no lookup needed!
+	s.implication[varIdx] = clause
 	
 	if level > s.level {
 		s.savedPhase[varIdx] = value
@@ -2360,27 +2343,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		
 		// Check if this literal has a reason (not a decision)
-		reasonIdx := s.implication[foundVar]
-		if reasonIdx == -1 {
+		reasonClause := s.implication[foundVar]
+		if reasonClause == nil {
 			// Decision literal - cannot resolve, stop early
 			break
 		}
 		
-		// Get reason clause
-		var reasonLits []cnf.Literal
-		if reasonIdx >= 0 {
-			reasonLits = s.cnf.Clauses[reasonIdx].Literals
-		} else {
-			learnedIdx := -reasonIdx - 1
-			if learnedIdx >= len(s.learnedClauses) {
-				// Reason clause was deleted, remove this literal and continue
-				s.tmpLiteralInClause[foundVar] = false
-				s.tmpLevelCount[s.level]--
-				pathC--
-				continue
-			}
-			reasonLits = s.learnedClauses[learnedIdx].Literals
-		}
+		// Get reason clause literals directly from pointer
+		reasonLits := reasonClause.Literals
 		
 		// Resolve: remove foundVar, add reason literals
 		s.tmpLiteralInClause[foundVar] = false
@@ -2780,17 +2750,9 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			}
 			
 			canRemove := false
-			reasonIdx := s.implication[varIdx]
-			if reasonIdx != -1 {
-				var reasonLits []cnf.Literal
-				if reasonIdx >= 0 {
-					reasonLits = s.cnf.Clauses[reasonIdx].Literals
-				} else {
-					learnedIdx := -reasonIdx - 1
-					if learnedIdx < len(s.learnedClauses) {
-						reasonLits = s.learnedClauses[learnedIdx].Literals
-					}
-				}
+			reasonClause := s.implication[varIdx]
+			if reasonClause != nil {
+				reasonLits := reasonClause.Literals
 				
 				if reasonLits != nil {
 					// Check if all reason literals (except varIdx) are in the clause
@@ -3061,7 +3023,7 @@ func (s *CDCLSolver) backtrack() bool {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{}
-		s.implication[varIdx] = -1
+		s.implication[varIdx] = nil
 	}
 	s.trail = s.trail[:decisionPoint]
 	// Reset qhead to decisionPoint - the flipped decision needs to be propagated
@@ -3094,20 +3056,26 @@ func (s *CDCLSolver) backtrack() bool {
 // For learned clauses: returns stored LBD
 // Used during 1-UIP analysis to prefer resolving with low-LBD reason clauses
 func (s *CDCLSolver) getReasonLBD(varIdx uint32) int {
-	reasonIdx := s.implication[varIdx]
-	if reasonIdx < 0 {
-		// Learned clause
-		learnedIdx := -reasonIdx - 1
-		if learnedIdx >= 0 && learnedIdx < len(s.clauseLBD) {
-			return s.clauseLBD[learnedIdx]
+	reasonClause := s.implication[varIdx]
+	if reasonClause == nil {
+		return 0  // Decision, no reason
+	}
+	
+	if reasonClause.Learned {
+		// Find learned clause to get LBD
+		for i := range s.learnedClauses {
+			if &s.learnedClauses[i] == reasonClause {
+				if i < len(s.clauseLBD) {
+					return s.clauseLBD[i]
+				}
+				break
+			}
 		}
-		return 999 // Unknown learned clause, treat as high LBD
+		return 999
 	}
-	// Original clause - use size as approximation (original clauses aren't tracked by LBD)
-	if reasonIdx < len(s.cnf.Clauses) {
-		return len(s.cnf.Clauses[reasonIdx].Literals)
-	}
-	return 999
+	
+	// Original clause - use size as approximation
+	return len(reasonClause.Literals)
 }
 
 // rebuildLBDOrder rebuilds the learned clause order sorted by LBD (lowest first)
