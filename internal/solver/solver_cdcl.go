@@ -75,7 +75,6 @@ type CDCLSolver struct {
 	lbdOrderLastRebuild int  // Conflict count when order was last rebuilt
 	
 	qhead int  // Watched literals: next trail index to process
-	clauseToIndex map[*cnf.Clause]int  // Cache for clause index lookup
 }
 
 // eliminationInfo stores how a variable was eliminated for model reconstruction
@@ -146,7 +145,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		eliminatedVars: make(map[uint32]eliminationInfo),
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
-		clauseToIndex: make(map[*cnf.Clause]int),
 	}
 	
 	// Enable LBD-based VSIDS for better variable selection
@@ -1623,9 +1621,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			return UNKNOWN
 		}
 		
-		conflict, clauseIdx := s.propagate()
+		conflict, conflictClause := s.propagate()
 		if conflict {
-			s.handleConflict(clauseIdx)
+			s.handleConflict(conflictClause)
 			if s.conflicts % 50 == 0 && s.verbose {
 				propsPerDec := 0.0
 				if s.decisions > 0 {
@@ -1734,14 +1732,14 @@ func (s *CDCLSolver) verifyModel() bool {
 //
 // CRITICAL: Process ALL trail elements (trailIndex starts at 0), not just current level.
 // Skipping trail elements from lower levels causes missed conflicts and unsoundness.
-func (s *CDCLSolver) propagateWatched() (bool, int) {
+func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	if !s.watchInitialized {
 		return s.propagate()
 	}
 	
 	// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
 	if s.qhead >= len(s.trail) {
-		return false, -1
+		return false, nil
 	}
 	
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
@@ -1858,28 +1856,7 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			
 			if !blitTrue {
 				// Both watched literals are false - conflict!
-				// Use cache for O(1) clause index lookup
-				clauseIdx, ok := s.clauseToIndex[clause]
-				if !ok {
-					// Not in cache, search and cache it
-					for i := range s.learnedClauses {
-						if &s.learnedClauses[i] == clause {
-							clauseIdx = -i - 1
-							s.clauseToIndex[clause] = clauseIdx
-							break
-						}
-					}
-					if clauseIdx == 0 {
-						for i := 0; i < s.cnf.NumClauses; i++ {
-							if &s.cnf.Clauses[i] == clause {
-								clauseIdx = i
-								s.clauseToIndex[clause] = clauseIdx
-								break
-							}
-						}
-					}
-				}
-				return true, clauseIdx
+				return true, clause
 			}
 			
 			// blit is true, keep watch
@@ -1894,10 +1871,10 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
 	
-	return false, -1
+	return false, nil
 }
 
-func (s *CDCLSolver) propagate() (bool, int) {
+func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 	// Use watched literals propagation if enabled
 	if s.watchInitialized {
 		return s.propagateWatched()
@@ -1914,6 +1891,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		// Optimized propagation for original clauses using contiguous literal pool
 	numOriginalClauses := s.cnf.NumOriginalClauses()
 	for clauseIdx := 0; clauseIdx < numOriginalClauses; clauseIdx++ {
+		clause := &s.cnf.Clauses[clauseIdx]
 		offset, size := s.cnf.GetOriginalClauseInfo(clauseIdx)
 		pool := s.cnf.GetLiteralPool()
 		
@@ -1947,7 +1925,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		}
 		
 		if unassignedCount == 0 && falseCount > 0 {
-			return true, clauseIdx
+			return true, clause
 		}
 		
 		if unassignedCount == 1 && falseCount == size-1 {
@@ -1955,7 +1933,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			if assignLevel == 0 {
 				assignLevel = 1
 			}
-			s.assignLiteral(unassignedLit, assignLevel, clauseIdx)
+			s.assignLiteralByClause(unassignedLit, assignLevel, clause)
 			unitPropagated = true
 			break
 		}
@@ -2001,7 +1979,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 			}
 			
 			if unassignedCount == 0 && falseCount > 0 {
-				return true, -learnedIdx - 1
+				return true, clause
 			}
 			
 			if unassignedCount == 1 && falseCount == clauseSize-1 {
@@ -2023,7 +2001,7 @@ func (s *CDCLSolver) propagate() (bool, int) {
 		trailIndex++
 	}
 
-	return false, -1
+	return false, nil
 }
 
 // selectRandomUnassigned selects a random unassigned variable
@@ -2151,6 +2129,44 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	}
 }
 
+// assignLiteralByClause assigns a literal with a clause pointer as reason
+func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *cnf.Clause) {
+	varIdx := lit.Var()
+
+	if s.assignments[varIdx].Level != 0 {
+		return
+	}
+
+	value := !lit.IsNegated()
+	s.assignments[varIdx] = Assignment{
+		Value: value,
+		Level: level,
+	}
+	s.trail = append(s.trail, int(varIdx))
+	
+	// Find clause index for implication array
+	clauseIdx := -1
+	for i := range s.learnedClauses {
+		if &s.learnedClauses[i] == clause {
+			clauseIdx = -i - 1
+			break
+		}
+	}
+	if clauseIdx == 0 {
+		for i := 0; i < s.cnf.NumClauses; i++ {
+			if &s.cnf.Clauses[i] == clause {
+				clauseIdx = i
+				break
+			}
+		}
+	}
+	s.implication[varIdx] = clauseIdx
+	
+	if level > s.level {
+		s.savedPhase[varIdx] = value
+	}
+}
+
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 	assign := s.assignments[lit.Var()]
 	if assign.Level == 0 {
@@ -2162,20 +2178,21 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 	return assign.Value
 }
 
-func (s *CDCLSolver) handleConflict(clauseIdx int) {
+func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
 	
-	// Get the conflicting clause
-	var conflictLits []cnf.Literal
-	if clauseIdx >= 0 {
-		conflictLits = s.cnf.Clauses[clauseIdx].Literals
-	} else {
-		// Learned clause (encoded as negative index)
-		learnedIdx := -clauseIdx - 1
-		conflictLits = s.learnedClauses[learnedIdx].Literals
-		// Bump activity for learned clause involved in conflict
-		if learnedIdx < len(s.clauseActivity) {
-			s.clauseActivity[learnedIdx] += 1.0
+	// Get the conflicting clause literals directly
+	conflictLits := conflictClause.Literals
+	
+	// Bump activity for learned clause involved in conflict
+	if conflictClause.Learned {
+		for i := range s.learnedClauses {
+			if &s.learnedClauses[i] == conflictClause {
+				if i < len(s.clauseActivity) {
+					s.clauseActivity[i] += 1.0
+				}
+				break
+			}
 		}
 	}
 	
@@ -2622,7 +2639,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
 			s.learnedClauses = append(s.learnedClauses, newClause)
-			s.clauseToIndex[&s.learnedClauses[len(s.learnedClauses)-1]] = len(s.learnedClauses) - 1
 			
 			// Add learned clause to watches with correct ID encoding
 			if s.watchInitialized {
