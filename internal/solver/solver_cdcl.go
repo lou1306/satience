@@ -17,6 +17,20 @@ const (
 	UNKNOWN
 )
 
+// Solver configuration constants
+const (
+	DefaultMaxLearned     = 2000  // Maximum learned clauses before deletion
+	DefaultMinLearned     = 1000  // Target clauses after deletion (50% reduction)
+	DefaultRestartBase    = 50    // Base for Luby restart sequence
+	VSIDSDecayFactor      = 0.95  // VSIDS activity decay factor
+	ClauseActivityDecay   = 0.95  // Clause activity decay factor
+	GlueLBDThreshold      = 3     // LBD ≤ 3 considered glue clauses (protected)
+	CoreGlueLBDThreshold  = 2     // LBD ≤ 2 are core glue (never delete)
+	MaxClauseAge          = 500   // Age threshold for forced deletion
+	LargeClauseSize       = 15    // Size threshold for forced deletion
+	IterationReportInterval = 10000 // Report progress every N iterations
+)
+
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
 type CDCLSolver struct {
 	cnf          *cnf.CNF
@@ -92,9 +106,9 @@ type resolveCandidate struct {
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := 2000   // Keep moderate learned clause database (balance between pruning and propagation cost)
-	minLearned := 1000   // Target after deletion (50% reduction)
-	restartBase := 50  // Base for Luby restart sequence (reduced from 100 for faster VSIDS learning)
+	maxLearned := DefaultMaxLearned
+	minLearned := DefaultMinLearned
+	restartBase := DefaultRestartBase
 	
 	// Ensure literal pool is built for efficient propagation
 	formula.RebuildLiteralPool()
@@ -1605,7 +1619,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	for {
 		s.iterations++
-		if s.iterations % 10000 == 0 && s.verbose {
+		if s.iterations % IterationReportInterval == 0 && s.verbose {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n", 
@@ -1704,10 +1718,6 @@ func (s *CDCLSolver) verifyModel() bool {
 		for _, lit := range clause.Literals {
 			assign := s.assignments[lit.Var()]
 			litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-			if s.verbose {
-				fmt.Printf("c [DEBUG] verifyModel: clause %v, lit %v (var %d): value=%v, level=%d, litTrue=%v\n",
-					clause.Literals, lit, lit.Var()+1, assign.Value, assign.Level, litTrue)
-			}
 			if litTrue {
 				clauseSat = true
 				break
@@ -2214,7 +2224,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.vsids.decayLBD()
 	// Also decay clause activity
 	for i := range s.clauseActivity {
-		s.clauseActivity[i] *= 0.95
+		s.clauseActivity[i] *= ClauseActivityDecay
 	}
 	
 	// Inprocessing disabled (causes soundness bugs with watched literals)
@@ -2842,9 +2852,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// BONUS: Activity (active clauses are more useful)
 		score -= activity * 20.0
 		
-		// PROTECTION: LBD <= 3 glue clauses are NEVER deleted (Glucose-style)
+		// PROTECTION: Glue clauses (LBD ≤ GlueLBDThreshold) are NEVER deleted
 		// These are the backbone of the learned clause database
-		if lbd <= 3 {
+		if lbd <= GlueLBDThreshold {
 			score = -1000.0 // Absolutely never delete, regardless of age or size
 		}
 		
@@ -2853,15 +2863,15 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			score = -500.0 // Protect unless very old
 		}
 		
-		// FORCE DELETION: Very old clauses (age > 500) regardless of LBD
-		// But NOT glue clauses (LBD <= 3)
-		if age > 500 && lbd > 2 {
+		// FORCE DELETION: Very old clauses (age > MaxClauseAge) regardless of LBD
+		// But NOT core glue clauses (LBD ≤ CoreGlueLBDThreshold)
+		if age > MaxClauseAge && lbd > CoreGlueLBDThreshold {
 			score += 1000.0 // Force deletion of very old clauses
 		}
 		
-		// FORCE DELETION: Large clauses (size > 15) regardless of LBD
-		// But NOT glue clauses (LBD <= 3)
-		if size > 15 && lbd > 2 {
+		// FORCE DELETION: Large clauses (size > LargeClauseSize) regardless of LBD
+		// But NOT core glue clauses (LBD ≤ CoreGlueLBDThreshold)
+		if size > LargeClauseSize && lbd > CoreGlueLBDThreshold {
 			score += 800.0 // Force deletion of large clauses
 		}
 		
@@ -2886,15 +2896,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		toKeep = len(s.learnedClauses) // Can't keep more than we have
 	}
 	
-	// DEBUG: Log what's being deleted
-	if s.verbose && len(clauses) > toKeep {
-		fmt.Printf("c [DELETE] Deleting %d learned clauses, keeping %d\n", len(clauses)-toKeep, toKeep)
-		for i := 0; i < len(clauses)-toKeep && i < 5; i++ {
-			c := clauses[i]
-			fmt.Printf("c   Deleting learned clause %d: LBD=%d, size=%d, age=%d, score=%.1f\n",
-				c.idx, c.lbd, c.size, c.age, c.score)
-		}
-	}
 	toDelete := len(s.learnedClauses) - toKeep
 	
 	// Mark clauses to delete
