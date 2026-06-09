@@ -385,27 +385,25 @@ func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Liter
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 	
+	// Get positions before appending
+	pos0 := len(s.watchLists[idx0])
+	pos1 := len(s.watchLists[idx1])
+	
+	// Add watches with symmetric position tracking
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		Clause:   clause,
 		Blit:     uint32(idx1),
+		SymPos:   int32(pos1),
 		IsBinary: isBinary,
 	})
 	
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		Clause:   clause,
 		Blit:     uint32(idx0),
+		SymPos:   int32(pos0),
 		IsBinary: isBinary,
 	})
 	
-	// Watched literals enabled - learned clauses don't prevent conflicts on UNSAT instances
-	// Root cause: Solver backtracks, unassigns variables, then same learned clause re-propagates them
-	// This creates an infinite loop: propagate -> conflict -> backtrack -> re-propagate -> ...
-	// The learned clauses (LBD=5) are not strong enough to prune the search space effectively
-	// Need better clause learning (lower LBD clauses) or different restart strategy
-	// Watched literals DISABLED - 1-UIP improvements help but not enough
-	// With improved 1-UIP: learns 30+ clauses vs 2 before, but still loops on UNSAT
-	// Root cause: learned clauses still don't prevent re-propagation after backtrack
-	// Need: Better clause learning OR fix watch update logic after backtrack
 	s.watchInitialized = true
 }
 
@@ -1756,12 +1754,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		
 		watchIdx := cnf.LitToIndex(falseLit)
 		
-		// Process watches for this literal using in-place compaction
+		// Process watches for this literal using swap-with-last deletion
 		watchList := s.watchLists[watchIdx]
-		writeIdx := 0
 		
-		// DEBUG: Check if we're processing watch list 12 (learned clause 0)
-for readIdx := 0; readIdx < len(watchList); readIdx++ {
+		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 			
 			// Skip deleted clauses
@@ -1777,12 +1773,8 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			blitAssign := s.assignments[blit.Var()]
 			blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
 			
-
-			
 			if blitIsTrue {
-				// Clause is satisfied, keep watch
-				watchList[writeIdx] = watch
-				writeIdx++
+				// Clause is satisfied, keep watch in place
 				continue
 			}
 			
@@ -1803,34 +1795,24 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 				if litTrue || litLevel == 0 {
 					// Found replacement - move watch from falseLit to clauseLit
 					newWatchIdx := cnf.LitToIndex(clauseLit)
-					blitIdx := uint32(cnf.LitToIndex(blit))
+					blitIdxU := uint32(cnf.LitToIndex(blit))
 					
-					// Check if watch already exists at newWatchIdx (prevent duplicates)
-					alreadyExists := false
-					for k := range s.watchLists[newWatchIdx] {
-						if s.watchLists[newWatchIdx][k].Clause == clause {
-							alreadyExists = true
-							break
-						}
-					}
+					// Get position of new watch before adding
+					newPos := len(s.watchLists[newWatchIdx])
 					
-					if !alreadyExists {
-						// Add new watch to clauseLit's watch list
-						s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
-							Clause:   clause,
-							Blit:     blitIdx,
-							IsBinary: false,
-						})
-						
-						// CRITICAL: Update symmetric watch at blit's index
-						// The watch at blit's index currently points to falseLit
-						// It must now point to clauseLit instead
-						for k := range s.watchLists[blitIdx] {
-							if s.watchLists[blitIdx][k].Clause == clause {
-								s.watchLists[blitIdx][k].Blit = uint32(newWatchIdx)
-								break
-							}
-						}
+					// Add new watch to clauseLit's watch list
+					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+						Clause:   clause,
+						Blit:     blitIdxU,
+						SymPos:   watch.SymPos,  // Points to symmetric watch position
+						IsBinary: false,
+					})
+					
+					// O(1) Update symmetric watch at blit's index
+					symPos := watch.SymPos
+					if symPos >= 0 && int(symPos) < len(s.watchLists[blitIdx]) {
+						s.watchLists[blitIdx][symPos].Blit = uint32(newWatchIdx)
+						s.watchLists[blitIdx][symPos].SymPos = int32(newPos)
 					}
 					
 					foundReplacement = true
@@ -1839,7 +1821,22 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			}
 			
 			if foundReplacement {
-				// Watch moved successfully - don't keep old watch
+				// Watch moved successfully - remove old watch using swap-with-last
+				lastIdx := len(watchList) - 1
+				if readIdx != lastIdx {
+					// Move last watch to current position
+					watchList[readIdx] = watchList[lastIdx]
+					// Update symmetric position of the moved watch
+					movedWatch := watchList[readIdx]
+					movedSymPos := movedWatch.SymPos
+					if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
+						s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+					}
+					// Don't increment readIdx - need to process the moved watch
+					readIdx--
+				}
+				// Truncate (remove last element which is now duplicated)
+				watchList = watchList[:lastIdx]
 				continue
 			}
 			
@@ -1864,9 +1861,7 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 					}
 				}
 				s.assignLiteralByClause(blit, s.level, clause)
-				// Keep the watch - blit is now true
-				watchList[writeIdx] = watch
-				writeIdx++
+				// Keep the watch in place - blit is now true
 				continue
 			}
 			
@@ -1879,13 +1874,11 @@ for readIdx := 0; readIdx < len(watchList); readIdx++ {
 				return true, clause
 			}
 			
-			// blit is true, keep watch
-			watchList[writeIdx] = watch
-			writeIdx++
+			// blit is true, keep watch in place
 		}
 		
-		// Truncate watch list to compacted size
-		s.watchLists[watchIdx] = watchList[:writeIdx]
+		// Store the modified watch list back
+		s.watchLists[watchIdx] = watchList
 	}
 	
 	// Update qhead to end of trail

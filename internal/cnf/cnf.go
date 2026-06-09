@@ -46,6 +46,7 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 type Watch struct {
 	Clause   *Clause // Direct pointer to clause (nil if deleted)
 	Blit     uint32  // Blocking literal index (the other watched literal)
+	SymPos   int32   // Position of symmetric watch in the other watch list
 	IsBinary bool    // True if binary clause (no watch updates needed)
 }
 
