@@ -351,16 +351,15 @@ func (s *CDCLSolver) initWatches() {
 	}
 	
 	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
-		clause := s.cnf.Clauses[clauseID]
-		s.addClauseToWatches(clauseID, clause.Literals, false)
+		clause := &s.cnf.Clauses[clauseID]
+		s.addClauseToWatches(clause, clause.Literals)
 	}
 	
 	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
 	
 	for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
-		clause := s.learnedClauses[learnedIdx]
-		encodedClauseID := s.learnedClauseBase + learnedIdx
-		s.addClauseToWatches(encodedClauseID, clause.Literals, true)
+		clause := &s.learnedClauses[learnedIdx]
+		s.addClauseToWatches(clause, clause.Literals)
 	}
 	
 	if s.verbose {
@@ -374,7 +373,7 @@ func (s *CDCLSolver) initWatches() {
 
 // addClauseToWatches adds a clause to the watch lists
 // Watches the first two literals in the clause
-func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, learned bool) {
+func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Literal) {
 	if len(literals) < 2 {
 		return
 	}
@@ -387,27 +386,18 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	idx1 := cnf.LitToIndex(lit1)
 	
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
-		ClauseID: uint32(clauseID),
+		Clause:   clause,
 		Blit:     uint32(idx1),
 		IsBinary: isBinary,
 	})
 	
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-		ClauseID: uint32(clauseID),
+		Clause:   clause,
 		Blit:     uint32(idx0),
 		IsBinary: isBinary,
 	})
 	
-	// DEBUG: Print when learned clauses are added
-	if learned {
-		learnedIdx := clauseID - int(s.cnf.NumClauses)
-		if learnedIdx >= 0 && learnedIdx < 3 {
-			fmt.Printf("c [WATCH-ADD] Added learned clause %d (clauseID=%d) to watches: watching lit0=%v (idx=%d) and lit1=%v (idx=%d)\n",
-				learnedIdx, clauseID, lit0, idx0, lit1, idx1)
-		}
-	}
-	
-	// WatchED literals DISABLED - learned clauses don't prevent conflicts on UNSAT instances
+	// Watched literals enabled - learned clauses don't prevent conflicts on UNSAT instances
 	// Root cause: Solver backtracks, unassigns variables, then same learned clause re-propagates them
 	// This creates an infinite loop: propagate -> conflict -> backtrack -> re-propagate -> ...
 	// The learned clauses (LBD=5) are not strong enough to prune the search space effectively
@@ -416,7 +406,7 @@ func (s *CDCLSolver) addClauseToWatches(clauseID int, literals []cnf.Literal, le
 	// With improved 1-UIP: learns 30+ clauses vs 2 before, but still loops on UNSAT
 	// Root cause: learned clauses still don't prevent re-propagation after backtrack
 	// Need: Better clause learning OR fix watch update logic after backtrack
-	s.watchInitialized = false
+	s.watchInitialized = true
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -1771,18 +1761,15 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 		writeIdx := 0
 		
 		// DEBUG: Check if we're processing watch list 12 (learned clause 0)
-		if watchIdx == 12 && s.conflicts < 10 {
-			fmt.Printf("c [WATCH-PROCESS] watchIdx=%d, falseLit=%v, len=%d, cap=%d\n", 
-				watchIdx, falseLit, len(watchList), cap(watchList))
-			if len(watchList) > 0 {
-				w := watchList[0]
-				fmt.Printf("c   Watch 0: clauseID=%d, blit=%d\n", w.ClauseID, w.Blit)
-			}
-		}
-		
-		for readIdx := 0; readIdx < len(watchList); readIdx++ {
+for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
-			clauseID := watch.ClauseID
+			
+			// Skip deleted clauses
+			if watch.Clause == nil {
+				continue
+			}
+			
+			clause := watch.Clause
 			blitIdx := watch.Blit
 			blit := cnf.IndexToLit(int(blitIdx))
 			
@@ -1799,24 +1786,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 				continue
 			}
 			
-			// Get clause
-			var clause cnf.Clause
-			var isLearned bool
-			var learnedIdx int
-			if clauseID < uint32(s.cnf.NumClauses) {
-				clause = s.cnf.Clauses[clauseID]
-				isLearned = false
-				learnedIdx = -1
-			} else {
-				learnedIdx = int(clauseID) - s.learnedClauseBase
-				if learnedIdx < 0 || learnedIdx >= len(s.learnedClauses) {
-					continue
-				}
-				clause = s.learnedClauses[learnedIdx]
-				isLearned = true
-				
-
-			}
+			// Clause accessed via pointer
 			
 			// Look for replacement watch
 			foundReplacement := false
@@ -1839,7 +1809,7 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 					
 					// Add new watch to clauseLit's watch list
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
-						ClauseID: clauseID,
+						Clause:   clause,
 						Blit:     falseLitIdx,
 						IsBinary: false,
 					})
@@ -1858,9 +1828,20 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 			if blitLevel == 0 {
 				// Propagate blit
-				reasonIdx := int(clauseID)
-				if isLearned {
-					reasonIdx = -learnedIdx - 1
+				reasonIdx := -1
+				for i := range s.learnedClauses {
+					if &s.learnedClauses[i] == clause {
+						reasonIdx = -i - 1
+						break
+					}
+				}
+				if reasonIdx == -1 {
+					for i := 0; i < s.cnf.NumClauses; i++ {
+						if &s.cnf.Clauses[i] == clause {
+							reasonIdx = i
+							break
+						}
+					}
 				}
 				s.assignLiteral(blit, s.level, reasonIdx)
 				// Keep the watch - blit is now true
@@ -1875,10 +1856,23 @@ func (s *CDCLSolver) propagateWatched() (bool, int) {
 			
 			if !blitTrue {
 				// Both watched literals are false - conflict!
-				if isLearned {
-					return true, -learnedIdx - 1
+				// Find clause index for return value
+				clauseIdx := -1
+				for i := range s.learnedClauses {
+					if &s.learnedClauses[i] == clause {
+						clauseIdx = -i - 1
+						break
+					}
 				}
-				return true, int(clauseID)
+				if clauseIdx == -1 {
+					for i := 0; i < s.cnf.NumClauses; i++ {
+						if &s.cnf.Clauses[i] == clause {
+							clauseIdx = i
+							break
+						}
+					}
+				}
+				return true, clauseIdx
 			}
 			
 			// blit is true, keep watch
@@ -2620,13 +2614,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.currentAge++
 			
 			newClause := cnf.Clause{Literals: learnedLits, Learned: true}
-			learnedIdx := len(s.learnedClauses)
 			s.learnedClauses = append(s.learnedClauses, newClause)
 			
 			// Add learned clause to watches with correct ID encoding
 			if s.watchInitialized {
-				encodedClauseID := s.learnedClauseBase + learnedIdx
-				s.addClauseToWatches(encodedClauseID, learnedLits, true)
+				s.addClauseToWatches(&newClause, learnedLits)
 			}
 			
 			// Mark LBD order as dirty - will be rebuilt on next propagation
