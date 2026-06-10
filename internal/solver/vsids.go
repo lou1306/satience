@@ -1,6 +1,44 @@
 package solver
 
-import "satience/internal/cnf"
+import (
+	"container/heap"
+	"satience/internal/cnf"
+)
+
+// vsidsHeapItem represents a variable in the activity heap
+type vsidsHeapItem struct {
+	varIdx   uint32
+	activity float64
+	index    int // index in the heap
+}
+
+// vsidsHeap implements heap.Interface for activity-based variable selection
+type vsidsHeap []vsidsHeapItem
+
+func (h vsidsHeap) Len() int           { return len(h) }
+func (h vsidsHeap) Less(i, j int) bool { return h[i].activity > h[j].activity } // Max-heap
+func (h vsidsHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+
+func (h *vsidsHeap) Push(x interface{}) {
+	n := len(*h)
+	item := x.(vsidsHeapItem)
+	item.index = n
+	*h = append(*h, item)
+}
+
+func (h *vsidsHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = vsidsHeapItem{} // avoid memory leak
+	item.index = -1
+	*h = old[0 : n-1]
+	return item
+}
 
 // VSIDS implements the VSIDS (Variable State Independent Decaying Sum) heuristic
 // with optional LRB (Learning Rate Based) conflict participation tracking
@@ -11,24 +49,23 @@ import "satience/internal/cnf"
 // - Increases toward 0.999 over 10k conflicts (slower decay to focus on important vars)
 // - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
-	activity              []float64 // Activity score for each variable
-	conflictParticipation []int     // Number of conflicts each variable participates in
-	decayFactor           float64   // Decay factor (0.95 -> 0.999)
-	inverseDecay          float64   // 1/decay for efficiency
-	useLRB                bool      // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval      int       // Decay every N conflicts
-	conflictCount         int       // Total conflicts for LRB decay timing
-	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
-	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
-	maxDecayFactor        float64   // Maximum decay factor (0.999)
-	decayIncrement        float64   // Increment per conflict
+	activity              []float64   // Activity score for each variable
+	conflictParticipation []int       // Number of conflicts each variable participates in
+	decayFactor           float64     // Decay factor (0.95 -> 0.999)
+	inverseDecay          float64     // 1/decay for efficiency
+	useLRB                bool        // Use LRB heuristic instead of pure VSIDS
+	lrbDecayInterval      int         // Decay every N conflicts
+	conflictCount         int         // Total conflicts for LRB decay timing
+	useLBD                bool        // Use LBD-based activity (variables in low-LBD clauses prioritized)
+	lbdBonus              []float64   // Bonus score from appearing in low-LBD clauses
+	maxDecayFactor        float64     // Maximum decay factor (0.999)
+	decayIncrement        float64     // Increment per conflict
+	heap                  vsidsHeap   // Activity heap for O(log n) selection
+	heapValid             bool        // True if heap is up-to-date
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
-	// Standard MiniSat/GLUCOSE decay parameters
-	// Start with 0.95 decay (aggressive) and increase toward 0.999
-	// But we'll use PERIODIC decay to prevent activity from vanishing
 	maxDecay := 0.99
 	initialDecay := 0.90
 	return &VSIDS{
@@ -36,13 +73,15 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		conflictParticipation: make([]int, numVars),
 		decayFactor:           initialDecay,
 		inverseDecay:          1.0 / initialDecay,
-		useLRB:                false, // Default to VSIDS
-		lrbDecayInterval:      1024,  // Decay every 1024 conflicts
+		useLRB:                false,
+		lrbDecayInterval:      1024,
 		conflictCount:         0,
-		useLBD:                true,  // Enable LBD-based activity by default
+		useLBD:                true,
 		lbdBonus:              make([]float64, numVars),
 		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 5000.0,  // Faster increase
+		decayIncrement:        (maxDecay - initialDecay) / 5000.0,
+		heap:                  make(vsidsHeap, 0, numVars),
+		heapValid:             false,
 	}
 }
 
@@ -51,11 +90,8 @@ func NewVSIDS(numVars uint32) *VSIDS {
 // Binary clauses get 100x base weight to strongly bias initial variable selection
 func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	for _, clause := range clauses {
-		// Exponential weighting: binary clauses get 100x more weight than linear
-		// This ensures variables in binary clauses are chosen first
 		baseWeight := 100.0
 		if len(clause.Literals) == 2 {
-			// Binary clause: very high weight
 			baseWeight = 1000.0
 		}
 		weight := baseWeight / float64(len(clause.Literals))
@@ -64,6 +100,26 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 			v.activity[lit.Var()] += weight
 		}
 	}
+	v.heapValid = false // Invalidate heap after modifying activities
+}
+
+// buildHeap rebuilds the activity heap from current activity scores
+// Only includes unassigned variables
+func (v *VSIDS) buildHeap(assignments []Assignment) {
+	v.heap = make(vsidsHeap, 0, len(v.activity))
+	
+	for i, act := range v.activity {
+		if assignments[i].Level == 0 {
+			v.heap = append(v.heap, vsidsHeapItem{
+				varIdx:   uint32(i),
+				activity: act,
+				index:    -1,
+			})
+		}
+	}
+	
+	heap.Init(&v.heap)
+	v.heapValid = true
 }
 
 // EnableLRB enables LRB (Learning Rate Based) heuristic
@@ -175,9 +231,42 @@ func (v *VSIDS) decay() {
 	for i := range v.activity {
 		v.activity[i] *= v.decayFactor
 	}
+	
+	// Invalidate heap since all activities changed
+	// Heap will be rebuilt on next selectVariableWithHeap call
+	v.heapValid = false
 }
 
-// selectVariable returns the unassigned variable with highest activity
+// selectVariableWithHeap returns the unassigned variable with highest activity using a heap
+// This provides O(log n) selection instead of O(n) linear scan
+func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
+	// Rebuild heap if invalid or empty
+	if !v.heapValid || v.heap.Len() == 0 {
+		v.buildHeap(assignments)
+	}
+	
+	// Pop variables until we find an unassigned one
+	for v.heap.Len() > 0 {
+		item := heap.Pop(&v.heap).(vsidsHeapItem)
+		varIdx := int(item.varIdx)
+		
+		// Skip if variable is now assigned (stale heap entry)
+		if varIdx >= len(assignments) || assignments[varIdx].Level != 0 {
+			continue
+		}
+		
+		// Push it back with updated activity
+		item.activity = v.activity[varIdx]
+		heap.Push(&v.heap, item)
+		
+		return uint32(varIdx)
+	}
+	
+	// Fallback to linear scan if heap is empty
+	return v.selectVariable(assignments)
+}
+
+// selectVariable returns the unassigned variable with highest activity (linear scan)
 func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 	bestVar := uint32(0)
 	bestActivity := -1.0
@@ -194,37 +283,22 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 
 // selectVariableWithPhase returns the unassigned variable with highest activity
 // and the phase to assign (true=positive, false=negative) based on saved phase
-// Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity)
+// Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity) with heap
 // Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
 func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
-	bestVar := uint32(0)
-	bestScore := -1.0
-
-	for i := range assignments {
-		if assignments[i].Level != 0 {
-			continue
-		}
-		
-		// Calculate score based on enabled heuristics
-		var score float64
-		if v.useLRB {
-			score = float64(v.conflictParticipation[i])
-		} else if v.useLBD {
-			// Combine base activity with LBD bonus
-			score = v.activity[i] + v.lbdBonus[i]
-		} else {
-			score = v.activity[i]
-		}
-		
-		if score > bestScore {
-			bestScore = score
-			bestVar = uint32(i)
-		}
+	var bestVar uint32
+	
+	// Use heap for fast selection when using standard VSIDS or LBD
+	if !v.useLRB {
+		bestVar = v.selectVariableWithHeap(assignments)
+	} else {
+		// Use linear scan for LRB (would need separate heap for conflict participation)
+		bestVar = v.selectVariable(assignments)
 	}
-
+	
 	// Use saved phase if available, otherwise default to true (positive literal)
 	phase := true
-	if savedPhase != nil {
+	if savedPhase != nil && int(bestVar) < len(savedPhase) {
 		phase = savedPhase[bestVar]
 	}
 
