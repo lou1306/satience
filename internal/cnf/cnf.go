@@ -44,9 +44,10 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 // Watch represents a watched literal reference for a clause
 // Used in the watched literals scheme for efficient propagation
 type Watch struct {
-	Clause *Clause // Direct pointer to clause (nil if deleted)
-	Blit   uint32  // Blocking literal index (the other watched literal)
-	SymPos int32   // Position of symmetric watch in the other watch list
+	Clause    *Clause // Direct pointer to clause (nil if deleted)
+	ClauseIdx int     // Clause index: >=0 for original, <0 for learned (-learnedIdx-1)
+	Blit      uint32  // Blocking literal index (the other watched literal)
+	SymPos    int32   // Position of symmetric watch in the other watch list
 }
 
 // Clause represents a disjunction of literals

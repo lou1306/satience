@@ -519,14 +519,14 @@ func (s *CDCLSolver) initWatches() {
 
 	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
 		clause := &s.cnf.Clauses[clauseID]
-		s.addClauseToWatches(clause, clause.Literals)
+		s.addOriginalClauseToWatches(clauseID, clause, clause.Literals)
 	}
 
 	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
 
 	for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
 		clause := &s.learnedClauses[learnedIdx]
-		s.addClauseToWatches(clause, clause.Literals)
+		s.addLearnedClauseToWatches(learnedIdx, clause, clause.Literals)
 	}
 
 	if s.verbose {
@@ -538,9 +538,9 @@ func (s *CDCLSolver) initWatches() {
 	}
 }
 
-// addClauseToWatches adds a clause to the watch lists
+// addOriginalClauseToWatches adds an original clause to the watch lists
 // Watches the first two literals in the clause
-func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Literal) {
+func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Clause, literals []cnf.Literal) {
 	if len(literals) < 2 {
 		return
 	}
@@ -557,18 +557,56 @@ func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Liter
 
 	// Add watches with symmetric position tracking
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
-		Clause: clause,
-		Blit:   uint32(idx1),
-		SymPos: int32(pos1),
+		Clause:    clause,
+		ClauseIdx: clauseIdx,
+		Blit:      uint32(idx1),
+		SymPos:    int32(pos1),
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-		Clause: clause,
-		Blit:   uint32(idx0),
-		SymPos: int32(pos0),
+		Clause:    clause,
+		ClauseIdx: clauseIdx,
+		Blit:      uint32(idx0),
+		SymPos:    int32(pos0),
 	})
 
 	s.watchInitialized = true
+}
+
+// addLearnedClauseToWatches adds a learned clause to the watch lists
+// Watches the first two literals in the clause
+func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Clause, literals []cnf.Literal) {
+	if len(literals) < 2 {
+		return
+	}
+
+	lit0 := literals[0]
+	lit1 := literals[1]
+
+	idx0 := cnf.LitToIndex(lit0)
+	idx1 := cnf.LitToIndex(lit1)
+
+	// Get positions before appending
+	pos0 := len(s.watchLists[idx0])
+	pos1 := len(s.watchLists[idx1])
+
+	// Learned clause index is stored as negative: -learnedIdx-1
+	clauseIdx := -learnedIdx - 1
+
+	// Add watches with symmetric position tracking
+	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+		Clause:    clause,
+		ClauseIdx: clauseIdx,
+		Blit:      uint32(idx1),
+		SymPos:    int32(pos1),
+	})
+
+	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+		Clause:    clause,
+		ClauseIdx: clauseIdx,
+		Blit:      uint32(idx0),
+		SymPos:    int32(pos0),
+	})
 }
 
 func (s *CDCLSolver) selfSubsumption() {
@@ -1933,22 +1971,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitLevel := s.assignments[blit.Var()].Level
 
 			if blitLevel == 0 {
-				// Propagate blit
-				reasonIdx := -1
-				for i := range s.learnedClauses {
-					if &s.learnedClauses[i] == clause {
-						reasonIdx = -i - 1
-						break
-					}
-				}
-				if reasonIdx == -1 {
-					for i := 0; i < s.cnf.NumClauses; i++ {
-						if &s.cnf.Clauses[i] == clause {
-							reasonIdx = i
-							break
-						}
-					}
-				}
+				// Propagate blit - use ClauseIdx directly from watch (O(1) instead of O(n) search)
 				s.assignLiteralByClause(blit, s.level, clause)
 				propagationCount++
 				s.propagations++
@@ -2755,11 +2778,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
 
 		// Get stable pointer after append (slice might have reallocated)
-		clause := &s.learnedClauses[len(s.learnedClauses)-1]
+		learnedIdx := len(s.learnedClauses) - 1
+		clause := &s.learnedClauses[learnedIdx]
 
 		// Add learned clause to watches
 		if s.watchInitialized {
-			s.addClauseToWatches(clause, s.tmpLearnedLits)
+			s.addLearnedClauseToWatches(learnedIdx, clause, s.tmpLearnedLits)
 		}
 
 		// Mark LBD order as dirty - will be rebuilt on next propagation
