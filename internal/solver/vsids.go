@@ -47,10 +47,19 @@ func NewVSIDS(numVars uint32) *VSIDS {
 }
 
 // InitializeFromClauses initializes VSIDS activity based on clause participation
-// Variables in shorter clauses get higher activity (more constrained = more important)
+// Variables in shorter clauses get MUCH higher activity (more constrained = more important)
+// Binary clauses get 100x base weight to strongly bias initial variable selection
 func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	for _, clause := range clauses {
-		weight := 1.0 / float64(len(clause.Literals)) // Shorter clauses = higher weight
+		// Exponential weighting: binary clauses get 100x more weight than linear
+		// This ensures variables in binary clauses are chosen first
+		baseWeight := 100.0
+		if len(clause.Literals) == 2 {
+			// Binary clause: very high weight
+			baseWeight = 1000.0
+		}
+		weight := baseWeight / float64(len(clause.Literals))
+		
 		for _, lit := range clause.Literals {
 			v.activity[lit.Var()] += weight
 		}

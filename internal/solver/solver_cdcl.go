@@ -2098,7 +2098,7 @@ func (s *CDCLSolver) decide() bool {
 		stuckThreshold := 1000 // conflicts at same level before forcing random
 		forceRandom := false
 		
-		if s.level > 0 && s.conflictsAtLevel[s.level] > stuckThreshold {
+		if s.level > 0 && s.level < len(s.conflictsAtLevel) && s.conflictsAtLevel[s.level] > stuckThreshold {
 			// Severely stuck - force random decision
 			if s.conflicts - s.lastRandomDecision > 500 { // At least 500 conflicts since last random
 				forceRandom = true
