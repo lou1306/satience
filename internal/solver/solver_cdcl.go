@@ -263,19 +263,51 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c \n")
 }
 
+// PreprocessingConfig controls which preprocessing techniques are enabled
+// Used for debugging soundness issues
+type PreprocessingConfig struct {
+	EnableUnitProp         bool
+	EnableEquivalence      bool
+	EnablePureLiteral      bool
+	EnableSubsumption      bool
+	EnableSelfSubsumption  bool
+	EnableHyperBinary      bool
+}
+
+// DefaultPreprocessingConfig returns the default configuration
+// NOTE: Preprocessing is currently DISABLED due to soundness bug on PHP instances
+// All techniques return SAT instead of UNSAT. Bug investigation in progress.
+// To enable for testing: set EnableUnitProp = true and others = false
+func DefaultPreprocessingConfig() PreprocessingConfig {
+	return PreprocessingConfig{
+		EnableUnitProp:        false,  // DISABLED: Causes soundness bug
+		EnableEquivalence:     false,  // DISABLED
+		EnablePureLiteral:     false,  // DISABLED
+		EnableSubsumption:     false,  // DISABLED
+		EnableSelfSubsumption: false,  // DISABLED
+		EnableHyperBinary:     false,  // DISABLED
+	}
+}
+
+// preprocessConfig controls which techniques are enabled (for debugging)
+var preprocessConfig = DefaultPreprocessingConfig()
+
+// SetPreprocessingConfig sets the global preprocessing configuration
+// Used for debugging to enable/disable individual techniques
+func SetPreprocessingConfig(config PreprocessingConfig) {
+	preprocessConfig = config
+}
+
+// GetPreprocessingConfig returns the current preprocessing configuration
+func GetPreprocessingConfig() PreprocessingConfig {
+	return preprocessConfig
+}
+
 func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	if s.verbose {
 		fmt.Printf("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
-	// Skip aggressive preprocessing on large instances to avoid OOM and timeouts
-	// Modern solvers use memory/time limits; we use conservative thresholds
-	// Aggressive preprocessing is most effective on small/medium structured instances
-	// 
-	// DISABLED: Soundness bug detected on PHP instances (returns SAT instead of UNSAT)
-	// TODO: Debug and fix equivalence detection or other preprocessing techniques
-	return UNKNOWN
-	
 	if s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000 {
 		if s.verbose {
 			fmt.Printf("c [verbose] Skipping aggressive preprocessing: instance too large (%d vars, %d clauses)\n", 
@@ -298,40 +330,55 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 		
 		// Run unit propagation first to catch any existing units
-		unitResult := s.unitPropagationPreprocess()
-		if unitResult != UNKNOWN {
-			return unitResult
+		if preprocessConfig.EnableUnitProp {
+			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
+				return unitResult
+			}
 		}
 		
 		// Equivalence detection: find a↔b patterns and substitute (BEFORE VE destroys binary clauses)
-		equivResult := s.equivalenceDetection()
-		if equivResult != UNKNOWN {
-			return equivResult
+		if preprocessConfig.EnableEquivalence {
+			if equivResult := s.equivalenceDetection(); equivResult != UNKNOWN {
+				return equivResult
+			}
 		}
 		
 		// Variable elimination disabled (causes model reconstruction bugs)
 		
 		// Run unit propagation again after variable elimination
-		unitResult = s.unitPropagationPreprocess()
-		if unitResult != UNKNOWN {
-			return unitResult
+		if preprocessConfig.EnableUnitProp {
+			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
+				return unitResult
+			}
 		}
 		
-		pureResult := s.pureLiteralElimination()
-		if pureResult != UNKNOWN {
-			return pureResult
+		// Pure literal elimination
+		if preprocessConfig.EnablePureLiteral {
+			if pureResult := s.pureLiteralElimination(); pureResult != UNKNOWN {
+				return pureResult
+			}
 		}
 		
-		s.subsumptionElimination()
+		// Subsumption elimination
+		if preprocessConfig.EnableSubsumption {
+			s.subsumptionElimination()
+		}
 		
-		s.selfSubsumption()
+		// Self-subsumption
+		if preprocessConfig.EnableSelfSubsumption {
+			s.selfSubsumption()
+		}
 		
-		s.hyperBinaryResolution()
+		// Hyper-binary resolution
+		if preprocessConfig.EnableHyperBinary {
+			s.hyperBinaryResolution()
+		}
 		
 		// Run unit propagation after hyper-binary resolution
-		unitResult = s.unitPropagationPreprocess()
-		if unitResult != UNKNOWN {
-			return unitResult
+		if preprocessConfig.EnableUnitProp {
+			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
+				return unitResult
+			}
 		}
 		
 
@@ -345,6 +392,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	
 	if s.verbose {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+	}
+	
+	// CRITICAL FIX: Clear assignments made during preprocessing
+	// These assignments would otherwise persist and interfere with search
+	// Preprocessing only simplifies clauses, it doesn't make permanent assignments
+	for i := range s.assignments {
+		s.assignments[i] = Assignment{}
+	}
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.level = 0
+	s.qhead = 0
+	for i := range s.implication {
+		s.implication[i] = nil
 	}
 	
 	// Rebuild literal pool after preprocessing modifications
