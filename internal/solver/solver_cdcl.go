@@ -70,6 +70,8 @@ type CDCLSolver struct {
 	conflictsAtLevel []int  // Track conflicts per decision level
 	lastRandomDecision int  // Last conflict where we made random decision
 	randomDecisionRate float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
+	lastDecisionVar    uint32  // Last variable chosen for decision
+	consecutiveFlips   int     // Count of consecutive decisions on same variable
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause []bool
 	tmpLiteralIsNegated []bool
@@ -2133,8 +2135,29 @@ func (s *CDCLSolver) decide() bool {
 		if s.level > 0 && s.level < len(s.conflictsAtLevel) {
 			s.conflictsAtLevel[s.level] = 0
 		}
+		
+		// Reset flip tracking
+		s.consecutiveFlips = 0
 	} else {
 		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+		
+		// Detect variable flipping (same variable chosen consecutively)
+		if s.conflicts > 0 && varIdx == s.lastDecisionVar {
+			s.consecutiveFlips++
+			
+			// If flipping for 10+ conflicts, trigger diversification
+			if s.consecutiveFlips >= 10 {
+				s.vsids.diversify()
+				s.consecutiveFlips = 0
+				if s.verbose {
+					fmt.Printf("c [DIVERSIFY] Conflict %d: triggered after %d flips on var %d\n", 
+						s.conflicts, 10, varIdx+1)
+				}
+			}
+		} else {
+			s.consecutiveFlips = 0
+		}
+		s.lastDecisionVar = varIdx
 	}
 
 	s.level++

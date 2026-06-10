@@ -66,8 +66,8 @@ type VSIDS struct {
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
-	maxDecay := 0.99
-	initialDecay := 0.90
+	maxDecay := 0.999
+	initialDecay := 0.95
 	return &VSIDS{
 		activity:              make([]float64, numVars),
 		conflictParticipation: make([]int, numVars),
@@ -79,7 +79,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		useLBD:                true,
 		lbdBonus:              make([]float64, numVars),
 		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 5000.0,
+		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapValid:             false,
 	}
@@ -90,9 +90,9 @@ func NewVSIDS(numVars uint32) *VSIDS {
 // Binary clauses get 100x base weight to strongly bias initial variable selection
 func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	for _, clause := range clauses {
-		baseWeight := 100.0
+		baseWeight := 10.0
 		if len(clause.Literals) == 2 {
-			baseWeight = 1000.0
+			baseWeight = 100.0
 		}
 		weight := baseWeight / float64(len(clause.Literals))
 		
@@ -105,14 +105,17 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 
 // buildHeap rebuilds the activity heap from current activity scores
 // Only includes unassigned variables
+// Includes LBD bonus in activity score for selection
 func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heap = make(vsidsHeap, 0, len(v.activity))
 	
 	for i, act := range v.activity {
 		if assignments[i].Level == 0 {
+			// Add LBD bonus to activity for selection
+			effectiveActivity := act + v.lbdBonus[i]
 			v.heap = append(v.heap, vsidsHeapItem{
 				varIdx:   uint32(i),
-				activity: act,
+				activity: effectiveActivity,
 				index:    -1,
 			})
 		}
@@ -139,15 +142,15 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 		return
 	}
 	
-	// Bonus formula: MUCH higher bonus for lower LBD
+	// Bonus formula: EXPONENTIAL bonus for lower LBD
 	// Glue clauses (LBD<=3) are extremely important - give huge bonus
-	// LBD=2: bonus = 1000 (core glue - most important)
-	// LBD=3: bonus = 500 (glue - very important)
-	// LBD=4: bonus = 250
-	// LBD=5: bonus = 125
-	// LBD=10: bonus = 50
+	// LBD=2: bonus = 10000 (core glue - most important)
+	// LBD=3: bonus = 3333 (glue - very important)
+	// LBD=4: bonus = 1250
+	// LBD=5: bonus = 500
+	// LBD=10: bonus = 100
 	// This ensures glue clause variables dominate VSIDS selection
-	bonus := 2000.0 / float64(lbd)
+	bonus := 20000.0 / float64(lbd*lbd)
 	
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
@@ -161,10 +164,10 @@ func (v *VSIDS) decayLBD() {
 		return
 	}
 	
-	// Decay very slowly (only 1% per conflict) to preserve glue clause importance
-	// Glue clauses should influence search for thousands of conflicts
+	// Decay extremely slowly (only 0.1% per conflict) to preserve glue clause importance
+	// Glue clauses should influence search for tens of thousands of conflicts
 	for i := range v.lbdBonus {
-		v.lbdBonus[i] *= 0.99
+		v.lbdBonus[i] *= 0.999
 	}
 }
 
@@ -183,19 +186,23 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 // Also tracks conflict participation for LRB heuristic
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 func (v *VSIDS) bumpClause(literals []cnf.Literal) {
-	// Scale bump by clause size: smaller clauses get larger bumps
-	// Binary clauses: bump = 5.0
-	// Ternary clauses: bump = 3.33
-	// 10-literal clauses: bump = 1.0
+	// Scale bump by clause size: AGGRESSIVE bumps for better differentiation
+	// Binary clauses: bump = 200.0
+	// Ternary clauses: bump = 133.3
+	// 5-literal clauses: bump = 80.0
+	// 10-literal clauses: bump = 20.0
 	// This focuses search on variables in constrained clauses
-	baseBump := 10.0
+	baseBump := 400.0
 	bumpAmount := baseBump / float64(len(literals))
-	if bumpAmount < 0.5 {
-		bumpAmount = 0.5 // Minimum bump for very large clauses
+	if bumpAmount < 10.0 {
+		bumpAmount = 10.0 // Minimum bump for very large clauses
 	}
 	
 	for _, lit := range literals {
-		v.bumpLarge(lit.Var(), bumpAmount)
+		// Extra boost for variables that appear in conflicts frequently
+		// This creates positive feedback: conflicted vars get chosen more
+		conflictBoost := 1.0 + float64(v.conflictParticipation[lit.Var()])*0.1
+		v.bumpLarge(lit.Var(), bumpAmount*conflictBoost)
 		// Track conflict participation for LRB
 		v.conflictParticipation[lit.Var()]++
 	}
@@ -255,8 +262,8 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 			continue
 		}
 		
-		// Push it back with updated activity
-		item.activity = v.activity[varIdx]
+		// Push it back with updated activity (including LBD bonus)
+		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx]
 		heap.Push(&v.heap, item)
 		
 		return uint32(varIdx)
@@ -267,14 +274,18 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 }
 
 // selectVariable returns the unassigned variable with highest activity (linear scan)
+// Uses effective activity (activity + LBD bonus) for selection
 func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 	bestVar := uint32(0)
-	bestActivity := -1.0
+	bestEffectiveActivity := -1.0
 
 	for i, act := range v.activity {
-		if assignments[i].Level == 0 && act > bestActivity {
-			bestActivity = act
-			bestVar = uint32(i)
+		if assignments[i].Level == 0 {
+			effectiveActivity := act + v.lbdBonus[i]
+			if effectiveActivity > bestEffectiveActivity {
+				bestEffectiveActivity = effectiveActivity
+				bestVar = uint32(i)
+			}
 		}
 	}
 
@@ -352,4 +363,27 @@ func (v *VSIDS) resetActivity() {
 		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
 	}
 	// Don't reset conflictCount - it's used for decay timing
+}
+
+// diversify performs aggressive diversification when stuck in local minima
+// Completely resets activity while preserving conflict history
+func (v *VSIDS) diversify() {
+	// Reset activity to initial values (small uniform values)
+	for i := range v.activity {
+		v.activity[i] = 1.0
+	}
+	
+	// Reset LBD bonus completely
+	for i := range v.lbdBonus {
+		v.lbdBonus[i] = 0
+	}
+	
+	// Keep conflict participation - it's still valuable
+	// Scale down more aggressively
+	for i := range v.conflictParticipation {
+		v.conflictParticipation[i] = v.conflictParticipation[i] / 4
+	}
+	
+	// Invalidate heap - needs rebuild with new activities
+	v.heapValid = false
 }
