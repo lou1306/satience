@@ -274,18 +274,15 @@ type PreprocessingConfig struct {
 	EnableHyperBinary      bool
 }
 
-// DefaultPreprocessingConfig returns the default configuration
-// NOTE: Preprocessing is currently DISABLED due to soundness bug on PHP instances
-// All techniques return SAT instead of UNSAT. Bug investigation in progress.
-// To enable for testing: set EnableUnitProp = true and others = false
+// DefaultPreprocessingConfig returns the default (all enabled) configuration
 func DefaultPreprocessingConfig() PreprocessingConfig {
 	return PreprocessingConfig{
-		EnableUnitProp:        false,  // DISABLED: Causes soundness bug
-		EnableEquivalence:     false,  // DISABLED
-		EnablePureLiteral:     false,  // DISABLED
-		EnableSubsumption:     false,  // DISABLED
-		EnableSelfSubsumption: false,  // DISABLED
-		EnableHyperBinary:     false,  // DISABLED
+		EnableUnitProp:        true,
+		EnableEquivalence:     true,
+		EnablePureLiteral:     true,
+		EnableSubsumption:     true,
+		EnableSelfSubsumption: true,
+		EnableHyperBinary:     true,
 	}
 }
 
@@ -320,6 +317,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 
 	initialClauses := s.cnf.NumClauses
+	modified := false  // Track if any technique actually modified the formula
 	
 	// Increase to 5 passes for more thorough preprocessing
 	// Modern solvers (CaDiCaL) use 10+ passes
@@ -328,6 +326,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
 		}
+		
+		// Track clause count before each technique to detect modifications
+		beforeClauses := s.cnf.NumClauses
 		
 		// Run unit propagation first to catch any existing units
 		if preprocessConfig.EnableUnitProp {
@@ -381,7 +382,10 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 		
-
+		// Track if anything changed
+		if s.cnf.NumClauses != beforeClauses {
+			modified = true
+		}
 		
 		// Stop if no progress made for 2 consecutive passes
 		if s.cnf.NumClauses == initialClauses && pass >= 1 {
@@ -394,25 +398,31 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 	
-	// CRITICAL FIX: Clear assignments made during preprocessing
-	// These assignments would otherwise persist and interfere with search
-	// Preprocessing only simplifies clauses, it doesn't make permanent assignments
-	for i := range s.assignments {
-		s.assignments[i] = Assignment{}
+	// CRITICAL FIX: Only clear state and reinitialize watches if preprocessing actually modified the formula
+	// Previously, we checked if techniques were ENABLED, not if they MODIFIED anything.
+	// This caused state corruption when techniques ran but found nothing to simplify.
+	// Bug discovered: PHP instances returned SAT instead of UNSAT with preprocessing enabled.
+	if modified {
+		// Clear assignments made during preprocessing
+		// These assignments would otherwise persist and interfere with search
+		// Preprocessing only simplifies clauses, it doesn't make permanent assignments
+		for i := range s.assignments {
+			s.assignments[i] = Assignment{}
+		}
+		s.trail = s.trail[:0]
+		s.trailHead = []int{0}  // Reset to initial state
+		s.level = 0
+		s.qhead = 0
+		for i := range s.implication {
+			s.implication[i] = nil
+		}
+		
+		// Rebuild literal pool after preprocessing modifications
+		s.cnf.RebuildLiteralPool()
+		
+		// Initialize watched literals after preprocessing completes
+		s.initWatches()
 	}
-	s.trail = s.trail[:0]
-	s.trailHead = s.trailHead[:1]
-	s.level = 0
-	s.qhead = 0
-	for i := range s.implication {
-		s.implication[i] = nil
-	}
-	
-	// Rebuild literal pool after preprocessing modifications
-	s.cnf.RebuildLiteralPool()
-	
-	// Initialize watched literals after preprocessing completes
-	s.initWatches()
 	
 	return UNKNOWN
 }
@@ -1151,6 +1161,12 @@ func (s *CDCLSolver) inprocessing() {
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
+	// Clear any previous assignments before starting unit propagation
+	// This is critical when called multiple times in preprocessing loop
+	for i := range s.assignments {
+		s.assignments[i] = Assignment{}
+	}
+	
 	// Initialize trail for preprocessing
 	s.trail = make([]int, 0)
 	s.trailHead = []int{0}
