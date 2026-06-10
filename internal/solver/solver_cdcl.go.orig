@@ -271,11 +271,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// Skip aggressive preprocessing on large instances to avoid OOM and timeouts
 	// Modern solvers use memory/time limits; we use conservative thresholds
 	// Aggressive preprocessing is most effective on small/medium structured instances
-	// 
-	// DISABLED: Soundness bug detected on PHP instances (returns SAT instead of UNSAT)
-	// TODO: Debug and fix equivalence detection or other preprocessing techniques
-	return UNKNOWN
-	
 	if s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000 {
 		if s.verbose {
 			fmt.Printf("c [verbose] Skipping aggressive preprocessing: instance too large (%d vars, %d clauses)\n", 
