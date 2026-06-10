@@ -23,6 +23,7 @@ func run() int {
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
+	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence)")
 	flag.Parse()
 	
 	// -verify implies -model
@@ -71,7 +72,9 @@ func run() int {
 	
 	start := time.Now()
 	var result solver.SolveResult
-	if *dpll {
+	if *preprocess {
+		result = s.SolveWithPreprocessing()
+	} else if *dpll {
 		result = s.SolveDPLL()
 	} else {
 		result = s.SolveWithResult()

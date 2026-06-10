@@ -75,10 +75,6 @@ type CDCLSolver struct {
 	tmpClauseHash uint64 // Hash for duplicate detection
 	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
 	
-	// Variable elimination tracking for model reconstruction
-	eliminatedVars map[uint32]eliminationInfo  // Maps eliminated var to substitution rule
-	elimOrder      int                          // Elimination order counter
-	
 	// Watched literals infrastructure
 	watchLists     [][]cnf.Watch  // watchLists[lit] = clauses watching lit
 	watchInitialized bool         // True if watches have been initialized
@@ -90,13 +86,6 @@ type CDCLSolver struct {
 	lbdOrderLastRebuild int  // Conflict count when order was last rebuilt
 	
 	qhead int  // Watched literals: next trail index to process
-}
-
-// eliminationInfo stores how a variable was eliminated for model reconstruction
-type eliminationInfo struct {
-	posClauseLits [][]cnf.Literal  // Clauses with positive literal X: stored as (X ∨ A) -> store A
-	negClauseLits [][]cnf.Literal  // Clauses with negative literal ¬X: stored as (¬X ∨ B) -> store B
-	elimOrder     int              // Elimination order (0 = first eliminated)
 }
 
 // resolveCandidate is used in learnClause for sorting resolution order
@@ -157,8 +146,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	tmpLevelSetUsed: make([]bool, formula.NumVars+1),
 	tmpResolved: make([]bool, formula.NumVars),
 	tmpFlippedVars: make([]bool, formula.NumVars),
-		// Initialize variable elimination tracking
-		eliminatedVars: make(map[uint32]eliminationInfo),
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
 	}
@@ -956,153 +943,6 @@ func (s *CDCLSolver) restart() {
 	
 }
 
-// variableElimination REMOVED - causes model reconstruction bugs
-
-// extendModel extends the current model to eliminated variables
-// Called after SAT is found to assign values to variables that were eliminated
-// Returns true if model extension succeeded, false if contradiction found (UNSAT)
-
-// Model reconstruction logic:
-// Original clauses: (X ∨ A₁), (X ∨ A₂), ... and (¬X ∨ B₁), (¬X ∨ B₂), ...
-// Stored as: A₁, A₂, ... (without X) and B₁, B₂, ... (without ¬X)
-
-// To satisfy the original clauses:
-// - If ANY (X ∨ Aᵢ) has Aᵢ=false, we MUST set X=TRUE to satisfy it
-// - If ANY (¬X ∨ Bⱼ) has Bⱼ=false, we MUST set X=FALSE to satisfy it
-// - If both constraints exist, the formula is UNSAT (contradiction)
-// - Otherwise, X can be assigned arbitrarily (use phase saving or false)
-func (s *CDCLSolver) extendModel() bool {
-	if s.verbose {
-
-	}
-	if len(s.eliminatedVars) == 0 {
-		return true  // No eliminated variables, success
-	}
-	
-	// Process eliminated variables in reverse elimination order (last eliminated first)
-	// This ensures that when we assign X, any variables eliminated AFTER X
-	// (which may appear in X's clauses) are already assigned
-	eliminatedList := make([]uint32, 0, len(s.eliminatedVars))
-	for varIdx := range s.eliminatedVars {
-		eliminatedList = append(eliminatedList, varIdx)
-	}
-	
-	// Sort by elimination order (descending = reverse order)
-	// Variables eliminated later should be processed first
-	for i := 0; i < len(eliminatedList); i++ {
-		for j := i + 1; j < len(eliminatedList); j++ {
-			infoI := s.eliminatedVars[eliminatedList[i]]
-			infoJ := s.eliminatedVars[eliminatedList[j]]
-			if infoI.elimOrder < infoJ.elimOrder {
-				// j was eliminated later, should come first
-				eliminatedList[i], eliminatedList[j] = eliminatedList[j], eliminatedList[i]
-			}
-		}
-	}
-	
-	for _, varIdx := range eliminatedList {
-		info := s.eliminatedVars[varIdx]
-		
-		if s.verbose {
-
-		}
-		
-		// Special case: equivalence detection stores single-literal clauses
-		// This means X is equivalent to the representative variable
-		// Just copy the representative's value
-		if len(info.posClauseLits) == 1 && len(info.posClauseLits[0]) == 1 &&
-		   len(info.negClauseLits) == 1 && len(info.negClauseLits[0]) == 1 {
-			repVar := info.posClauseLits[0][0].Var()
-			repValue := s.assignments[repVar].Value
-			s.assignments[varIdx] = Assignment{
-				Value: repValue,
-				Level: 1,
-			}
-			if s.verbose {
-
-			}
-			continue
-		}
-		
-		// Check if any positive clause requires X to be TRUE
-		// A clause (X ∨ A) requires X=TRUE if all literals in A are FALSE
-		mustBeTrue := false
-		for _, clauseLits := range info.posClauseLits {
-			allFalse := true
-			for _, lit := range clauseLits {
-				// Get assignment for this literal's variable
-				assign := s.assignments[lit.Var()]
-				// Check if literal is true in current model
-				litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-				if litTrue {
-					allFalse = false  // Clause is satisfied by this literal
-					break
-				}
-			}
-			if allFalse && len(clauseLits) > 0 {
-				// This clause (X ∨ A) has all of A=false, so X MUST be TRUE
-				mustBeTrue = true
-				if s.verbose {
-
-				}
-				break
-			}
-		}
-		
-		// Check if any negative clause requires X to be FALSE
-		// A clause (¬X ∨ B) requires X=FALSE if all literals in B are FALSE
-		mustBeFalse := false
-		for _, clauseLits := range info.negClauseLits {
-			allFalse := true
-			for _, lit := range clauseLits {
-				assign := s.assignments[lit.Var()]
-				litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
-				if litTrue {
-					allFalse = false
-					break
-				}
-			}
-			if allFalse && len(clauseLits) > 0 {
-				// This clause (¬X ∨ B) has all of B=false, so X MUST be FALSE
-				mustBeFalse = true
-				break
-			}
-		}
-		
-		// Check for contradiction - this means the formula is UNSAT!
-		if mustBeTrue && mustBeFalse {
-			if s.verbose {
-				fmt.Printf("c [verbose] extendModel: CONTRADICTION for var %d - formula is UNSAT!\n", varIdx+1)
-			}
-			return false  // UNSAT detected during model reconstruction
-		}
-		
-		// Assign the variable
-		varValue := false
-		if mustBeTrue {
-			varValue = true
-		} else if mustBeFalse {
-			varValue = false
-		} else {
-			// No constraints - use saved phase or default to false
-			if varIdx < uint32(len(s.savedPhase)) {
-				varValue = s.savedPhase[varIdx]
-			}
-		}
-		
-		if s.verbose {
-
-		}
-		
-		s.assignments[varIdx].Value = varValue
-		if s.assignments[varIdx].Level == 0 {
-			s.assignments[varIdx].Level = 1  // Mark as assigned for model output
-		}
-	}
-	
-	return true  // Success
-}
-
 func (s *CDCLSolver) isTautology(clause *cnf.Clause) bool {
 	seen := make(map[uint32]bool)
 	
@@ -1501,28 +1341,13 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	s.cnf.Clauses = newClauses
 	s.cnf.NumClauses = len(newClauses)
 	
-	// Store eliminated variables for model reconstruction
-	if s.eliminatedVars == nil {
-		s.eliminatedVars = make(map[uint32]eliminationInfo)
-	}
-	for varIdx, subst := range substMap {
-		// Eliminated variable varIdx is equivalent to subst.rep
-		// Model reconstruction: assign varIdx = value of subst.rep
-		s.eliminatedVars[varIdx] = eliminationInfo{
-			posClauseLits: [][]cnf.Literal{{cnf.NewLiteral(subst.rep, false)}},
-			negClauseLits: [][]cnf.Literal{{cnf.NewLiteral(subst.rep, true)}},
-			elimOrder:     s.elimOrder,
-		}
-		s.elimOrder++
-	}
-	
 	// Zero out activity for eliminated variables
 	for varIdx := range substMap {
 		s.vsids.activity[varIdx] = 0.0
 	}
 	
 	if s.verbose {
-		fmt.Printf("c [verbose] Equivalence detection: eliminated %d variables, resulting in %d clauses\n", 
+		fmt.Printf("c [verbose] Equivalence detection: substituted %d variables, resulting in %d clauses\n", 
 			len(substMap), s.cnf.NumClauses)
 	}
 	
@@ -1593,10 +1418,7 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
 		}
-		if !s.extendModel() {
-			return UNSAT  // Contradiction found during model reconstruction
-		}
-		// Assign all remaining unassigned variables (representatives) arbitrarily
+		// Assign all remaining unassigned variables arbitrarily
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			if s.assignments[varIdx].Level == 0 {
 				// Use saved phase or default to false
@@ -1619,6 +1441,78 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 func (s *CDCLSolver) Solve() bool {
 	result := s.SolveWithResult()
 	return result == SAT
+}
+
+// SolveWithPreprocessing runs aggressive preprocessing before solving
+func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
+	// Run aggressive preprocessing pipeline
+	preprocResult := s.preprocessAggressive()
+	if preprocResult != UNKNOWN {
+		if s.verbose {
+			s.printStats()
+		}
+		return preprocResult
+	}
+	
+	// Initialize VSIDS with clause-length weighted activity BEFORE search
+	// Variables in shorter clauses get higher activity (more constrained = more important)
+	s.vsids.InitializeFromClauses(s.cnf.Clauses)
+	
+	for {
+		s.iterations++
+		if s.iterations % IterationReportInterval == 0 && s.verbose {
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n", 
+				s.iterations, s.conflicts, s.level, len(s.learnedClauses), mem.Alloc/1024/1024)
+		}
+		if s.maxIter > 0 && s.iterations > s.maxIter {
+			if s.verbose {
+				fmt.Printf("c [verbose] Iteration limit reached (%d)\n", s.maxIter)
+				s.printStats()
+			}
+			return UNKNOWN
+		}
+		
+		conflict, conflictClause := s.propagate()
+		if conflict {
+			s.handleConflict(conflictClause)
+			if s.conflicts % 50 == 0 && s.verbose {
+				propsPerDec := 0.0
+				if s.decisions > 0 {
+					propsPerDec = float64(s.iterations) / float64(s.decisions)
+				}
+				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, props/dec %.1f\n", 
+					s.conflicts, s.level, len(s.learnedClauses), s.decisions, propsPerDec)
+			}
+			if !s.backtrack() {
+				if s.verbose {
+					s.printStats()
+				}
+				return UNSAT
+			}
+			s.backjumpLevel = 0
+			
+			if s.shouldRestart() {
+				s.restart()
+			}
+			continue
+		}
+
+		if s.allAssigned() {
+			if s.verbose {
+				s.printStats()
+			}
+			return SAT
+		}
+
+		if !s.decide() {
+			if s.verbose {
+				s.printStats()
+			}
+			return UNSAT
+		}
+	}
 }
 
 func (s *CDCLSolver) SolveWithResult() SolveResult {
@@ -1684,15 +1578,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 
 		if s.allAssigned() {
-
-			// Extend model to eliminated variables before returning SAT
-			if !s.extendModel() {
-				if s.verbose {
-					fmt.Printf("c [verbose] extendModel returned UNSAT - contradiction found\n")
-					s.printStats()
-				}
-				return UNSAT
-			}
 			// Verify model satisfies all clauses
 			if !s.verifyModel() {
 				if s.verbose {
@@ -1724,10 +1609,6 @@ func (s *CDCLSolver) GetAssignments() []Assignment {
 
 func (s *CDCLSolver) allAssigned() bool {
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
-		// Skip eliminated variables - they will be assigned by extendModel()
-		if _, eliminated := s.eliminatedVars[i]; eliminated {
-			continue
-		}
 		if s.assignments[i].Level == 0 {
 			return false
 		}
