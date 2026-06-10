@@ -2003,7 +2003,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	// Debug: report propagations
 	if s.verbose && propagationCount > 0 {
-		fmt.Printf("c [PROPAGATE] Processed trail[%d:%d], found %d propagations\n", s.qhead-propagationCount, len(s.trail), propagationCount)
+		s.DebugPropagateLog(s.qhead-propagationCount, len(s.trail), propagationCount)
 	}
 
 	return false, nil
@@ -2604,26 +2604,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// INVARIANT CHECK: Verify exactly 1 literal at current level
 	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [1-UIP] Conflict %d: %d literals, %d at level %d (target: 1)\n",
-			s.conflicts, len(s.tmpLearnedLits), litsAtCurrentLevel, s.level)
+		s.Debug1UIPLog(s.conflicts, len(s.tmpLearnedLits), litsAtCurrentLevel, s.level)
 	}
 
 	// If 1-UIP didn't reduce to exactly 1 literal at current level, log error and handle
 	if litsAtCurrentLevel != 1 {
 		if s.verbose {
-			fmt.Printf("c [1-UIP ERROR] Conflict %d: Failed to find UIP! Literals: %d, at level %d\n",
-				s.conflicts, len(s.tmpLearnedLits), s.level)
-			if s.conflicts <= DebugConflictLimit {
-				for _, lit := range s.tmpLearnedLits {
-					v := lit.Var()
-					sign := ""
-					if lit.IsNegated() {
-						sign = "¬"
-					}
-					fmt.Printf("c   Lit: %sx%d, Level: %d, Reason: %v\n",
-						sign, v+1, s.assignments[v].Level, s.implication[v])
-				}
-			}
+			s.Debug1UIPErrorLog(s.conflicts, len(s.tmpLearnedLits), s.level, s.tmpLearnedLits)
 		}
 		if s.level == 1 {
 			return 1
@@ -2810,18 +2797,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		// ALWAYS print first 10 learned clauses for debugging
 		if len(s.learnedClauses) <= 10 {
-			fmt.Printf("c [LEARNED] Clause %d: LBD=%d, size=%d, lits=[", len(s.learnedClauses)-1, lbd, len(s.tmpLearnedLits))
-			for i, lit := range s.tmpLearnedLits {
-				if i > 0 {
-					fmt.Printf(" ")
-				}
-				if lit.IsNegated() {
-					fmt.Printf("-%d", lit.Var()+1)
-				} else {
-					fmt.Printf("%d", lit.Var()+1)
-				}
-			}
-			fmt.Printf("]\n")
+			s.DebugClauseLog(len(s.learnedClauses)-1, lbd, s.tmpLearnedLits)
 		}
 
 		// LBD-based VSIDS: bump variables in low-LBD clauses
