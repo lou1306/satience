@@ -73,6 +73,7 @@ type CDCLSolver struct {
 	tmpLevelSetUsed []bool // Track which levels are in tmpLevelSet
 	tmpResolved []bool // Track resolved variables in 1-UIP to prevent cycles
 	tmpClauseHash uint64 // Hash for duplicate detection
+	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
 	
 	// Variable elimination tracking for model reconstruction
 	eliminatedVars map[uint32]eliminationInfo  // Maps eliminated var to substitution rule
@@ -155,6 +156,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	tmpLevelSet: make([]int, 0, formula.NumVars),
 	tmpLevelSetUsed: make([]bool, formula.NumVars+1),
 	tmpResolved: make([]bool, formula.NumVars),
+	tmpFlippedVars: make([]bool, formula.NumVars),
 		// Initialize variable elimination tracking
 		eliminatedVars: make(map[uint32]eliminationInfo),
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
@@ -928,6 +930,29 @@ func (s *CDCLSolver) restart() {
 	}
 	s.tmpLevelSet = s.tmpLevelSet[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
+	
+	// CRITICAL FIX: Re-propagate unit clauses after restart
+	// Unit clauses (length 1) are NOT watched, so they won't be re-propagated
+	// by the watched literals scheme. We must re-assign them manually.
+	s.level = 1
+	s.trailHead = []int{0}
+	for i := 0; i < s.cnf.NumClauses; i++ {
+		clause := &s.cnf.Clauses[i]
+		if len(clause.Literals) == 1 {
+			lit := clause.Literals[0]
+			varIdx := lit.Var()
+			if s.assignments[varIdx].Level == 0 {
+				value := !lit.IsNegated()
+				s.assignments[varIdx] = Assignment{
+					Value: value,
+					Level: 1,
+				}
+				s.trail = append(s.trail, int(varIdx))
+				s.implication[varIdx] = clause
+			}
+		}
+	}
+	s.trailHead = append(s.trailHead, len(s.trail))
 	
 }
 
@@ -2445,14 +2470,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	// If 1-UIP didn't reduce to exactly 1 literal at current level,
-	// fall back to DPLL-style backtracking
+	// handle specially to avoid spurious conflicts at level 1
 	if litsAtCurrentLevel != 1 {
-		if s.verbose && s.conflicts <= 20 {
-			fmt.Printf("c [debug] Skipping learned clause: %d literals at level %d (expected 1)\n", litsAtCurrentLevel, s.level)
+		if s.level == 1 {
+			// At level 1, skip learning and just flip the decision
+			return 1
 		}
+		// For higher levels, use normal backjump
 		backjumpLevel := s.level - 1
-		if backjumpLevel < 0 {
-			backjumpLevel = 0
+		if backjumpLevel < 1 {
+			backjumpLevel = 1
 		}
 		return backjumpLevel
 	}
@@ -2521,12 +2548,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		
 		isDuplicate := false
-		dupOf := -1
-		for i, existing := range s.learnedClauses {
+		for _, existing := range s.learnedClauses {
 			if len(existing.Literals) != len(learnedLits) {
 				continue
 			}
-			// Quick hash check first (if we tracked it), then full comparison
 			match := true
 			for j, lit := range learnedLits {
 				if existing.Literals[j] != lit {
@@ -2536,34 +2561,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			if match {
 				isDuplicate = true
-				dupOf = i
-				if s.verbose && s.conflicts <= 100 {
-					fmt.Printf("c [debug] Skipping duplicate learned clause (duplicate of clause %d)\n", i)
-				}
 				break
 			}
 		}
 		
-		if s.verbose && s.conflicts >= 28000 && s.conflicts <= 28100 {
-			fmt.Printf("c [debug] Conflict %d: isDuplicate=%v, dupOf=%d, learnedClauses=%d\n", 
-				s.conflicts, isDuplicate, dupOf, len(s.learnedClauses))
-		}
-		
 		if isDuplicate {
 			// Don't learn this clause, but still return backjump level
-			backjumpLevel := 0
-			for varIdx, inClause := range s.tmpLiteralInClause {
-				if inClause {
-					lvl := s.assignments[varIdx].Level
-					if lvl > backjumpLevel && lvl < s.level {
-						backjumpLevel = lvl
-					}
-				}
-			}
-			if backjumpLevel == 0 {
-				backjumpLevel = 1
-			}
-			return backjumpLevel
+			return s.level - 1
 		}
 		
 		// Check if we need to delete clauses
@@ -2758,49 +2762,41 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		s.tmpLiteralInClause[lit.Var()] = true
 	}
 	
-	// IMPROVED: Multi-pass minimization to catch transitive implications
-	// Keep trying to remove literals until no more can be removed
-	changed := true
-	for changed {
-		changed = false
+	// Single-pass minimization (multi-pass causes infinite loops)
+	for _, lit := range learnedLits {
+		varIdx := lit.Var()
 		
-		for _, lit := range learnedLits {
-			varIdx := lit.Var()
+		// Skip if already removed
+		if !s.tmpLiteralInClause[varIdx] {
+			continue
+		}
+		
+		canRemove := false
+		reasonClause := s.implication[varIdx]
+		if reasonClause != nil {
+			reasonLits := reasonClause.Literals
 			
-			// Skip if already removed
-			if !s.tmpLiteralInClause[varIdx] {
-				continue
-			}
-			
-			canRemove := false
-			reasonClause := s.implication[varIdx]
-			if reasonClause != nil {
-				reasonLits := reasonClause.Literals
-				
-				if reasonLits != nil {
-					// Check if all reason literals (except varIdx) are in the clause
-					allCovered := true
-					for _, reasonLit := range reasonLits {
-						if reasonLit.Var() == varIdx {
-							continue
-						}
-						if !s.tmpLiteralInClause[reasonLit.Var()] {
-							allCovered = false
-							break
-						}
+			if reasonLits != nil {
+				// Check if all reason literals (except varIdx) are in the clause
+				allCovered := true
+				for _, reasonLit := range reasonLits {
+					if reasonLit.Var() == varIdx {
+						continue
 					}
-					
-					if allCovered && len(reasonLits) > 1 {
-						canRemove = true
-						changed = true
+					if !s.tmpLiteralInClause[reasonLit.Var()] {
+						allCovered = false
+						break
 					}
 				}
+				
+				if allCovered && len(reasonLits) > 1 {
+					canRemove = true
+				}
 			}
-			
-			if canRemove {
-				// Remove literal - update tmpLiteralInClause so other literals can use this
-				s.tmpLiteralInClause[varIdx] = false
-			}
+		}
+		
+		if canRemove {
+			s.tmpLiteralInClause[varIdx] = false
 		}
 	}
 	
@@ -3010,8 +3006,35 @@ func (s *CDCLSolver) backtrack() bool {
 		bjLevel = s.level - 1
 	}
 	if bjLevel < 1 {
-		if s.verbose && s.conflicts <= 20 {
-			fmt.Printf("c [BACKTRACK] FAIL: backjump level %d invalid (level=%d)\n", bjLevel, s.level)
+		// Backjump level calculation failed - this indicates a problem with 1-UIP
+		// Don't flip at arbitrary levels - only at level 1
+		if s.level == 1 && len(s.trail) > 1 {
+			decisionPoint := s.trailHead[1]
+			if decisionPoint < len(s.trail) {
+				decisionVar := uint32(s.trail[decisionPoint])
+				// Check if we already flipped this variable
+				if s.tmpFlippedVars[decisionVar] {
+					return false
+				}
+				s.tmpFlippedVars[decisionVar] = true
+				decisionValue := s.assignments[decisionVar].Value
+				for i := decisionPoint + 1; i < len(s.trail); i++ {
+					varIdx := uint32(s.trail[i])
+					s.assignments[varIdx] = Assignment{}
+					s.implication[varIdx] = nil
+				}
+				s.trail = s.trail[:decisionPoint+1]
+				s.qhead = decisionPoint + 1
+				s.assignments[decisionVar] = Assignment{
+					Value: !decisionValue,
+					Level: 1,
+				}
+				return true
+			}
+		}
+		// For level > 1, something is wrong with 1-UIP - return UNSAT
+		if s.verbose {
+			fmt.Printf("c [BACKTRACK] bjLevel=%d invalid at level %d - returning UNSAT\n", bjLevel, s.level)
 		}
 		return false
 	}
