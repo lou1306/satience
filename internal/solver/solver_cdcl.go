@@ -19,12 +19,12 @@ const (
 
 // Solver configuration constants
 const (
-	DefaultMaxLearned       = 2000  // Maximum learned clauses before deletion
-	DefaultMinLearned       = 1000  // Target clauses after deletion (50% reduction)
+	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
+	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
 	DefaultRestartBase      = 50    // Base for Luby restart sequence
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
-	GlueLBDThreshold        = 3     // LBD ≤ 3 considered glue clauses (protected)
+	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
 	CoreGlueLBDThreshold    = 2     // LBD ≤ 2 are core glue (never delete)
 	MaxClauseAge            = 500   // Age threshold for forced deletion
 	LargeClauseSize         = 15    // Size threshold for forced deletion
@@ -2704,10 +2704,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 
 		// Check if we need to delete clauses
-		// Keep max 5000 normal clauses + all glue clauses
-		maxNormalClauses := 5000
+		// Keep max normal clauses consistent with maxLearned threshold
+		maxNormalClauses := 2000  // Allow some headroom below maxLearned
 
-		if s.normalClauseCount >= maxNormalClauses && lbd > 3 {
+		if s.normalClauseCount >= maxNormalClauses && lbd > GlueLBDThreshold {
 			// Delete oldest 50% of normal clauses (by age)
 			if s.verbose {
 				fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", s.normalClauseCount, maxNormalClauses)
@@ -2978,17 +2978,24 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		score += float64(size) * 5.0
 
 		// BONUS: Activity (active clauses are more useful)
-		score -= activity * 20.0
+		// INCREASED WEIGHT: Activity now 2.5× more important in deletion decisions
+		score -= activity * 50.0
 
-		// PROTECTION: Glue clauses (LBD ≤ GlueLBDThreshold) are NEVER deleted
+		// PROTECTION: Core glue clauses (LBD ≤ 2) are NEVER deleted
 		// These are the backbone of the learned clause database
 		if lbd <= GlueLBDThreshold {
-			score = -1000.0 // Absolutely never delete, regardless of age or size
+			score = -10000.0 // Absolutely never delete, regardless of age or size
 		}
 
-		// LBD == 3 AND size <= 3 AND age < 50: very good, protect unless very old
-		if lbd == 3 && size <= 3 && age < 50 {
-			score = -500.0 // Protect unless very old
+		// NEAR-GLUE PROTECTION: LBD = 3 with small size and young age
+		// These are valuable but not critical - protect unless old
+		if lbd == 3 && size <= 4 && age < 100 {
+			score = -500.0 // Strong protection
+		}
+		
+		// LBD = 4 with very small size and young age - moderate protection
+		if lbd == 4 && size <= 4 && age < 50 {
+			score = -100.0 // Weak protection
 		}
 
 		// FORCE DELETION: Very old clauses (age > MaxClauseAge) regardless of LBD
@@ -3018,8 +3025,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		return clauses[i].score > clauses[j].score
 	})
 
-	// Target: reduce to minLearned clauses (aggressive deletion)
-	toKeep := s.minLearned
+	// Target: reduce by 30% (gradual deletion instead of 50%)
+	// Keep 70% of clauses, delete 30%
+	toKeep := int(float64(len(s.learnedClauses)) * 0.70)
+	if toKeep < s.minLearned {
+		toKeep = s.minLearned // Don't go below minLearned
+	}
 	if toKeep > len(s.learnedClauses) {
 		toKeep = len(s.learnedClauses) // Can't keep more than we have
 	}
