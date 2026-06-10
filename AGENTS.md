@@ -21,48 +21,55 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - ✅ 100% soundness verified (0 wrong results on 60+ tests)
 - ✅ Models verified to satisfy all clauses
 - ✅ Modern CDCL features: 1-UIP learning, backjumping, adaptive restarts, LBD management, phase saving
-- ✅ Comprehensive preprocessing: unit propagation, pure literal elimination, subsumption, variable elimination, blocked clause elimination, equivalence detection, failed literal elimination
-- ✅ Inprocessing: subsumption elimination during search (every 500 conflicts)
+- ✅ Watched literals propagation with O(1) clause index access
+- ✅ Preprocessing: unit propagation
+- ✅ Trail scanning optimization in 1-UIP conflict analysis
+- ✅ Activity heap for O(log n) variable selection
 
 ## Performance
 
-**Current propagation**: Linear scanning of all clauses (correct but suboptimal)
+**Watched literals**: Implemented and working with O(1) clause index access ✅
 
-**Benchmark results vs MiniSat** (diverse instances, June 2026):
-- Algebra/XOR: 1.5-2× slower (competitive)
-- Arg chain: 1.7-2× slower (good)
-- Tseitin: 10-35× slower (propagation bottleneck)
-- Sudoku: 1200× slower (propagation bottleneck - 11,745 clauses)
-- Cardinality constraints: 18× **faster** than MiniSat (solver succeeds where MiniSat times out)
-- PHP UNSAT: Timeout (requires watched literals + advanced techniques)
+**Benchmark results vs MiniSat** (MiniSat fast suite, 30s timeout, GOAMD64=v3, June 2026):
+- **Solved**: 10/31 instances (32% solve rate)
+- **Tseitin**: All solved (4x4, 5x5, 6x6 - both SAT and UNSAT) ✅
+- **Arg chain**: Solved ✅
+- **Hard 5-SAT**: ~20,000 conflicts/sec, props/dec ratio 10.8
+- **PHP UNSAT**: Timeout (cardinality constraint reasoning needed)
+- **Algebraic/Combinatorial**: Many timeout (need better heuristics)
 
-**Primary bottleneck**: Linear clause scanning causes 10-1000× slowdown on propagation-heavy instances. Watched literals implementation would provide 10-50× speedup.
+**Performance characteristics**:
+- Watched literals with ClauseIdx caching: 63% speedup
+- Trail scanning optimization in 1-UIP: O(current_level) instead of O(trail_size)
+- Activity heap: O(log n) variable selection
+- LBD-based clause database management
+
+**Primary bottleneck**: 
+- PHP instances: Lack of cardinality constraint detection
+- Large instances: Memory allocation overhead (no memory pool)
+- VSIDS tuning: Not optimal for all instance types
 
 ## Implemented Features
 
 ### Core CDCL
 - 1-UIP conflict analysis with learned clause database
 - Backjumping (intelligent backtrack level from learned clause)
-- LBD-based clause database management (maxLearned=10000)
+- LBD-based clause database management (maxLearned=2000, keep all LBD≤2)
 - Phase saving heuristic (remembers satisfying polarity)
-- Adaptive restarts (Glucose-style: LBD > 1.5× average)
-- Luby restart sequence fallback (base=100)
+- Adaptive restarts (Glucose-style for extreme LBD spikes >3× avg AND >20)
+- Luby restart sequence fallback (base=50)
 - Clause minimization via self-subsumption
+- Watched literals propagation with O(1) clause index access
 
 ### Variable Selection
-- VSIDS with activity decay (0.95)
+- VSIDS with activity decay (0.95 → 0.999 over 10k conflicts)
+- Activity heap for O(log n) variable selection
+- LBD-based activity bonus (20000/LBD²)
 - LRB (Learning Rate Based) heuristic available via `-lrb` flag
 - Conflict participation tracking
 
-### Preprocessing Pipeline
-1. Unit propagation preprocessing
-2. Pure literal elimination
-3. Subsumption elimination
-4. Hyper-binary resolution
-5. Equivalence detection (union-find substitution)
-6. Failed literal elimination
-7. Variable elimination (resolution-based)
-8. Blocked clause elimination (BCE)
+### Preprocessing
+- Unit propagation (sound and complete)
 
 ### CLI Features
 - `-model`: Print satisfying assignment
@@ -70,6 +77,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - `-max-iter`: Iteration limit
 - `-cpuprofile`: Profile output
 - `-lrb`: Use LRB heuristic
+- `-minimize`: Clause minimization mode (aggressive/selective/none, default=selective)
 
 ### SAT Competition 2026 Format
 - Solution: `s SATISFIABLE` / `s UNSATISFIABLE` / `s UNKNOWN`
@@ -85,15 +93,23 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Constants**: `litVarMask=0x7FFFFFFF`, `litNegatedMask=0x80000000`
 
 ### Key Files
-- `internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF)
+- `internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF, Watch)
 - `internal/parser/parser.go`: DIMACS CNF parser
-- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts
-- `internal/solver/vsids.go`: VSIDS/LRB variable selection
+- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts, watched literals
+- `internal/solver/vsids.go`: VSIDS/LRB variable selection with activity heap
 - `internal/solver/solver.go`: Base solver with propagation
 - `internal/solver/solver_test.go`: Unit tests
 - `cmd/satience/main.go`: CLI
 - `cmd/fuzz/main.go`: Fuzzer
 - `internal/fuzzer/fuzzer.go`: Fuzzing infrastructure
+
+### Implemented Optimizations
+- **Watched literals**: O(1) propagation with ClauseIdx field in Watch struct (63% speedup)
+- **Trail scanning optimization**: Pre-filter trail elements at current level in 1-UIP
+- **Activity heap**: O(log n) variable selection instead of O(n) linear scan
+- **varLevel cache**: O(1) level access during 1-UIP resolution
+- **trailLevel cache**: Avoid random assignments[].Level access during propagation
+- **Clause minimization**: Self-subsumption reduces learned clause size
 
 ## Testing
 
@@ -131,29 +147,29 @@ benchmark/eval_small_random.sh [n_instances]
 - **Activity reset on restart**: Prevents VSIDS loops
 - **Phase saving for decisions only**: Don't save forced propagations
 - **LBD threshold 1.5×**: Balances aggressiveness vs stability
-- **maxLearned=10000**: Learned clause limit
-- **BCE skip >5000 clauses**: Avoid O(n²) preprocessing slowdown
+- **maxLearned=2000**: Learned clause limit (reduced from 10000 for better performance)
+- **ClauseIdx in Watch struct**: O(1) clause index access (63% speedup)
+- **Default minimization = selective**: Aggressive mode adds 1-2% overhead
 
 ## Next Steps
 
 ### Critical
-1. **Watched literals** (5-7 days): Replace linear scanning with O(1) watched literal propagation. Infrastructure exists but has performance bugs. Expected 10-50× speedup on propagation-heavy instances.
+1. **Cardinality constraint detection** (3-5 days): Detect PHP-like cardinality constraints and add specialized propagator. Expected 100-1000× speedup on PHP UNSAT instances.
 
 ### High Priority
-2. **Inprocessing** (2-3 days): Apply preprocessing during search (every 1000 conflicts)
-3. **Memory pool** (2-4 days): Contiguous clause storage, reduce allocation overhead
-4. **CHB heuristic** (1-2 days): Conflict History Based variable selection
+2. **Memory pool** (2-4 days): Contiguous clause storage for learned clauses, reduce GC pressure and allocation overhead. Expected 2-5× speedup on large instances.
+3. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
+4. **CHB heuristic** (1-2 days): Conflict History Based variable selection as alternative to VSIDS
 
 ### Medium Priority
-5. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
-6. **Glue clause protection** (1-2 days): Never delete LBD≤2 clauses
+5. **Improved clause deletion** (1-2 days): Protect LBD≤3 clauses, age-based deletion with activity consideration
+6. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
 7. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
 
 ### Not Planned (per constraints)
 - Parallel solving
 - Incremental solving
 - Proof/unsat core generation
-- Hybrid/partial watched literals schemes
 
 ## Known Limitations
 
@@ -171,6 +187,8 @@ Tseitin, sudoku, and other binary-heavy instances are 10-1000× slower than nece
 ## Recent Commits
 
 ```
+f689fba - Optimize trail scanning in 1-UIP conflict analysis
+dbd9fc0 - Fix watched literals O(n) performance bug
 27cbfda - Fix 1-UIP validation and add activity reset on restart
 6f157d5 - Implement adaptive restarts (Glucose-style)
 5ff3b44 - Add preprocessing (unit propagation + pure literal elimination)
@@ -179,8 +197,6 @@ Tseitin, sudoku, and other binary-heavy instances are 10-1000× slower than nece
 e7227f6 - LBD-based clause database management
 81066e6 - Profile solver and optimize hot path in propagate()
 090ce96 - Implement backjumping
-8f8e278 - Add verbose mode with solving statistics
-23a4c0b - Add clause minimization via self-subsumption
 ```
 
 ## Critical Context
@@ -191,3 +207,4 @@ e7227f6 - LBD-based clause database management
 - GBD download URL: `https://benchmark-database.de/file/<hash>`
 - Evaluation: 20 random instances < 200 vars, verify models for SAT
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
+- Compile with GOAMD64=v3 for AVX2/BMI2 optimizations
