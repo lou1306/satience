@@ -42,12 +42,13 @@ const (
 
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
 type CDCLSolver struct {
-	cnf          *cnf.CNF
-	assignments  []Assignment
-	trail        []int
-	trailLevel   []int  // Cache of assignment levels for trail elements (avoids random assignments[] access)
-	trailHead    []int
-	level        int
+	cnf                 *cnf.CNF
+	assignments         []Assignment
+	trail               []int
+	trailLevel          []int  // Cache of assignment levels for trail elements
+	varLevel            []int  // Cache of variable levels (avoids random assignments[].Level access)
+	trailHead           []int
+	level               int
 	vsids              *VSIDS
 	conflicts          int
 	implication        []*cnf.Clause // Clause pointer (nil for decisions)
@@ -127,6 +128,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		assignments:         make([]Assignment, formula.NumVars),
 		trail:               make([]int, 0),
 		trailLevel:          make([]int, 0),
+		varLevel:            make([]int, formula.NumVars),
 		trailHead:           make([]int, 1),
 		qhead:               0,
 		level:               0,
@@ -473,6 +475,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// Preprocessing only simplifies clauses, it doesn't make permanent assignments
 		for i := range s.assignments {
 			s.assignments[i] = Assignment{}
+			s.varLevel[i] = 0
 		}
 		s.trail = s.trail[:0]
 		s.trailLevel = s.trailLevel[:0]
@@ -1041,6 +1044,7 @@ func (s *CDCLSolver) restart() {
 	}
 	for i := range s.assignments {
 		s.assignments[i] = Assignment{}
+		s.varLevel[i] = 0
 	}
 	// Reset conflicts at all levels
 	for i := range s.conflictsAtLevel {
@@ -1091,6 +1095,7 @@ func (s *CDCLSolver) restart() {
 					Value: value,
 					Level: 1,
 				}
+				s.varLevel[varIdx] = 1
 				s.trail = append(s.trail, int(varIdx))
 				s.trailLevel = append(s.trailLevel, 1)
 				s.implication[varIdx] = clause
@@ -1282,6 +1287,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					Value: value,
 					Level: 1,
 				}
+				s.varLevel[varIdx] = 1
 				s.trail = append(s.trail, int(varIdx))
 				s.trailLevel = append(s.trailLevel, 1)
 				changed = true
@@ -2248,6 +2254,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Claus
 		Value: value,
 		Level: level,
 	}
+	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.trailLevel = append(s.trailLevel, level)
 	s.implication[varIdx] = clause
@@ -2289,6 +2296,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 		Value: value,
 		Level: level,
 	}
+	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.trailLevel = append(s.trailLevel, level)
 
@@ -2523,7 +2531,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = lit.IsNegated()
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
-				lvl := s.assignments[v].Level
+				lvl := s.varLevel[v]  // Use cached level instead of assignments[v].Level
 				if lvl <= s.level {
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
@@ -3131,6 +3139,7 @@ func (s *CDCLSolver) backtrack() bool {
 				for i := decisionPoint + 1; i < len(s.trail); i++ {
 					varIdx := uint32(s.trail[i])
 					s.assignments[varIdx] = Assignment{}
+					s.varLevel[varIdx] = 0
 					s.implication[varIdx] = nil
 				}
 				s.trail = s.trail[:decisionPoint+1]
@@ -3140,6 +3149,7 @@ func (s *CDCLSolver) backtrack() bool {
 					Value: !decisionValue,
 					Level: 1,
 				}
+				s.varLevel[decisionVar] = 1
 				return true
 			}
 		}
@@ -3171,6 +3181,7 @@ func (s *CDCLSolver) backtrack() bool {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{}
+		s.varLevel[varIdx] = 0
 		s.implication[varIdx] = nil
 	}
 	s.trail = s.trail[:decisionPoint]
@@ -3191,6 +3202,7 @@ func (s *CDCLSolver) backtrack() bool {
 		Value: !decisionValue,
 		Level: bjLevel,
 	}
+	s.varLevel[decisionVar] = bjLevel
 	s.trail = append(s.trail, int(decisionVar))
 	s.trailLevel = append(s.trailLevel, bjLevel)
 
