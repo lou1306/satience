@@ -30,3 +30,5 @@ benchmark/*.txt
 
 # Logs
 *.log
+*.db
+satience_v3

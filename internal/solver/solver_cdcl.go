@@ -41,11 +41,12 @@ const (
 
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
 type CDCLSolver struct {
-	cnf                *cnf.CNF
-	assignments        []Assignment
-	trail              []int
-	trailHead          []int
-	level              int
+	cnf          *cnf.CNF
+	assignments  []Assignment
+	trail        []int
+	trailLevel   []int  // Cache of assignment levels for trail elements (avoids random assignments[] access)
+	trailHead    []int
+	level        int
 	vsids              *VSIDS
 	conflicts          int
 	implication        []*cnf.Clause // Clause pointer (nil for decisions)
@@ -84,9 +85,10 @@ type CDCLSolver struct {
 	tmpLevelSet         []int    // For LBD calculation (replaces map)
 	tmpLevelSetUsed     []bool   // Track which levels are in tmpLevelSet
 	tmpResolved         []bool   // Track resolved variables in 1-UIP to prevent cycles
-	tmpClauseHash       uint64   // Hash for duplicate detection
-	tmpFlippedVars      []bool   // Track flipped variables at level 1 to prevent infinite loops
-	tmpTouchedVars      []uint32 // Track which variables were modified (for fast reset)
+	tmpClauseHash uint64 // Hash for duplicate detection
+	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
+	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
+	tmpLearnedLits []cnf.Literal // Reusable buffer for learned clause literals
 
 	// Watched literals infrastructure
 	watchLists        [][]cnf.Watch // watchLists[lit] = clauses watching lit
@@ -120,6 +122,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		cnf:                 formula,
 		assignments:         make([]Assignment, formula.NumVars),
 		trail:               make([]int, 0),
+		trailLevel:          make([]int, 0),
 		trailHead:           make([]int, 1),
 		qhead:               0,
 		level:               0,
@@ -161,6 +164,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpResolved:         make([]bool, formula.NumVars),
 		tmpFlippedVars:      make([]bool, formula.NumVars),
 		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
+		tmpLearnedLits:      make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
 	}
@@ -453,6 +457,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			s.assignments[i] = Assignment{}
 		}
 		s.trail = s.trail[:0]
+		s.trailLevel = s.trailLevel[:0]
 		s.trailHead = []int{0} // Reset to initial state
 		s.level = 0
 		s.qhead = 0
@@ -1009,6 +1014,7 @@ func (s *CDCLSolver) restart() {
 
 	// Clear trail and assignments
 	s.trail = s.trail[:0]
+	s.trailLevel = s.trailLevel[:0]
 	s.trailHead = s.trailHead[:1]
 	s.qhead = 0 // Reset qhead since trail is empty
 	s.level = 0
@@ -1068,6 +1074,7 @@ func (s *CDCLSolver) restart() {
 					Level: 1,
 				}
 				s.trail = append(s.trail, int(varIdx))
+				s.trailLevel = append(s.trailLevel, 1)
 				s.implication[varIdx] = clause
 			}
 		}
@@ -1258,6 +1265,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					Level: 1,
 				}
 				s.trail = append(s.trail, int(varIdx))
+				s.trailLevel = append(s.trailLevel, 1)
 				changed = true
 				// Don't modify clauses - just track assignments in trail
 			}
@@ -2223,6 +2231,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Claus
 		Level: level,
 	}
 	s.trail = append(s.trail, int(varIdx))
+	s.trailLevel = append(s.trailLevel, level)
 	s.implication[varIdx] = clause
 
 	// Save the phase (polarity) for decisions only
@@ -2263,6 +2272,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 		Level: level,
 	}
 	s.trail = append(s.trail, int(varIdx))
+	s.trailLevel = append(s.trailLevel, level)
 
 	// Store clause pointer directly - O(1), no lookup needed!
 	s.implication[varIdx] = clause
@@ -2440,6 +2450,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		for trailIndex >= 0 {
 			varIdx := uint32(s.trail[trailIndex])
+			trailLevel := s.trailLevel[trailIndex]
 			trailIndex--
 
 			// Skip if not in learned clause or already resolved
@@ -2448,7 +2459,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 
 			// Skip if at lower level (not counted in pathC)
-			if s.assignments[varIdx].Level != s.level {
+			if trailLevel != s.level {
 				continue
 			}
 
@@ -2509,15 +2520,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		currentSize = currentSize - 1 + newLiterals
 	}
 
-	// Build the learned clause from remaining literals (using touched vars for efficiency)
-	learnedLits := make([]cnf.Literal, 0, len(s.tmpTouchedVars))
+	// Build the learned clause from remaining literals (using reusable buffer)
+	s.tmpLearnedLits = s.tmpLearnedLits[:0] // Clear but keep capacity
 	litsAtCurrentLevel := 0
 	maxLevel := 0 // For backjump level calculation
 
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lit := cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx])
-			learnedLits = append(learnedLits, lit)
+			s.tmpLearnedLits = append(s.tmpLearnedLits, lit)
 			lvl := s.assignments[varIdx].Level
 			if lvl == s.level {
 				litsAtCurrentLevel++
@@ -2531,16 +2542,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// INVARIANT CHECK: Verify exactly 1 literal at current level
 	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [1-UIP] Conflict %d: %d literals, %d at level %d (target: 1)\n",
-			s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
+			s.conflicts, len(s.tmpLearnedLits), litsAtCurrentLevel, s.level)
 	}
 
 	// If 1-UIP didn't reduce to exactly 1 literal at current level, log error and handle
 	if litsAtCurrentLevel != 1 {
 		if s.verbose {
 			fmt.Printf("c [1-UIP ERROR] Conflict %d: Failed to find UIP! Literals: %d, at level %d\n",
-				s.conflicts, len(learnedLits), s.level)
+				s.conflicts, len(s.tmpLearnedLits), s.level)
 			if s.conflicts <= DebugConflictLimit {
-				for _, lit := range learnedLits {
+				for _, lit := range s.tmpLearnedLits {
 					v := lit.Var()
 					sign := ""
 					if lit.IsNegated() {
@@ -2578,11 +2589,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Try to remove literals from the learned clause by resolving with reason clauses
 	// This produces smaller, more general learned clauses
 	// OPTIMIZATION: Skip minimization on large or high-LBD clauses (diminishing returns)
-	originalSize := len(learnedLits)
+	originalSize := len(s.tmpLearnedLits)
 	if originalSize <= MinimizationMaxSize && lbd <= MinimizationMaxLBD {
-		learnedLits = s.minimizeLearnedClause(learnedLits)
-		if s.verbose && len(learnedLits) < originalSize {
-			fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(learnedLits))
+		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
+		if s.verbose && len(s.tmpLearnedLits) < originalSize {
+			fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(s.tmpLearnedLits))
 		}
 	}
 
@@ -2592,10 +2603,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
 
 	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [debug] learnClause: conflict=%d, learnedLits=%d, lbd=%d\n", s.conflicts, len(learnedLits), lbd)
+		fmt.Printf("c [debug] learnClause: conflict=%d, s.tmpLearnedLits=%d, lbd=%d\n", s.conflicts, len(s.tmpLearnedLits), lbd)
 	}
 
-	if len(learnedLits) > 0 {
+	if len(s.tmpLearnedLits) > 0 {
 		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > LowQualityLBDThreshold)
 		// These clauses are too weak to be useful for propagation
 		// They span too many decision levels and don't prune search effectively
@@ -2603,7 +2614,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		LowQualityLBDThreshold := 15
 		if lbd > LowQualityLBDThreshold {
 			if s.verbose && s.conflicts <= DebugConflictLimit {
-				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(learnedLits))
+				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(s.tmpLearnedLits))
 			}
 			// Use precomputed maxLevel from single pass above
 			backjumpLevel := maxLevel
@@ -2616,17 +2627,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// DUPLICATE DETECTION: Skip if this clause already exists
 		// Use simple hash-based check for O(n) comparison only when hash matches
 		s.tmpClauseHash = 0
-		for _, lit := range learnedLits {
+		for _, lit := range s.tmpLearnedLits {
 			s.tmpClauseHash = s.tmpClauseHash*31 + uint64(lit)
 		}
 
 		isDuplicate := false
 		for _, existing := range s.learnedClauses {
-			if len(existing.Literals) != len(learnedLits) {
+			if len(existing.Literals) != len(s.tmpLearnedLits) {
 				continue
 			}
 			match := true
-			for j, lit := range learnedLits {
+			for j, lit := range s.tmpLearnedLits {
 				if existing.Literals[j] != lit {
 					match = false
 					break
@@ -2704,22 +2715,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
-		s.clauseSize = append(s.clauseSize, len(learnedLits))
+		s.clauseSize = append(s.clauseSize, len(s.tmpLearnedLits))
 		s.clauseLBD = append(s.clauseLBD, lbd)
 		if lbd > 3 {
 			s.normalClauseCount++
 		}
 		s.currentAge++
 
+		// Make a copy of learned literals since tmpLearnedLits is reused
+		literalsCopy := make([]cnf.Literal, len(s.tmpLearnedLits))
+		copy(literalsCopy, s.tmpLearnedLits)
+
 		// Append first, then get stable pointer
-		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: learnedLits, Learned: true})
+		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
 
 		// Get stable pointer after append (slice might have reallocated)
 		clause := &s.learnedClauses[len(s.learnedClauses)-1]
 
 		// Add learned clause to watches
 		if s.watchInitialized {
-			s.addClauseToWatches(clause, learnedLits)
+			s.addClauseToWatches(clause, s.tmpLearnedLits)
 		}
 
 		// Mark LBD order as dirty - will be rebuilt on next propagation
@@ -2732,8 +2747,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		// ALWAYS print first 10 learned clauses for debugging
 		if len(s.learnedClauses) <= 10 {
-			fmt.Printf("c [LEARNED] Clause %d: LBD=%d, size=%d, lits=[", len(s.learnedClauses)-1, lbd, len(learnedLits))
-			for i, lit := range learnedLits {
+			fmt.Printf("c [LEARNED] Clause %d: LBD=%d, size=%d, lits=[", len(s.learnedClauses)-1, lbd, len(s.tmpLearnedLits))
+			for i, lit := range s.tmpLearnedLits {
 				if i > 0 {
 					fmt.Printf(" ")
 				}
@@ -2747,7 +2762,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 
 		// LBD-based VSIDS: bump variables in low-LBD clauses
-		s.vsids.bumpLBD(learnedLits, lbd)
+		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
 	}
 
 	// Calculate backjump level
@@ -3102,6 +3117,7 @@ func (s *CDCLSolver) backtrack() bool {
 					s.implication[varIdx] = nil
 				}
 				s.trail = s.trail[:decisionPoint+1]
+				s.trailLevel = s.trailLevel[:decisionPoint+1]
 				s.qhead = decisionPoint + 1
 				s.assignments[decisionVar] = Assignment{
 					Value: !decisionValue,
@@ -3141,6 +3157,7 @@ func (s *CDCLSolver) backtrack() bool {
 		s.implication[varIdx] = nil
 	}
 	s.trail = s.trail[:decisionPoint]
+	s.trailLevel = s.trailLevel[:decisionPoint]
 	// Reset qhead to decisionPoint - the flipped decision needs to be propagated
 	// and all subsequent trail elements have been cleared
 	s.qhead = decisionPoint
@@ -3158,6 +3175,7 @@ func (s *CDCLSolver) backtrack() bool {
 		Level: bjLevel,
 	}
 	s.trail = append(s.trail, int(decisionVar))
+	s.trailLevel = append(s.trailLevel, bjLevel)
 
 	// CRITICAL FIX: Update trailHead[bjLevel] to point to the flipped decision
 	// Without this, 1-UIP analysis uses wrong trail range and learns duplicate clauses
