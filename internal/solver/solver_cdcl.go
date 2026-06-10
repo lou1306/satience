@@ -75,9 +75,12 @@ type CDCLSolver struct {
 	lastConflictLBD    int
 	conflictsAtLevel   []int   // Track conflicts per decision level
 	lastRandomDecision int     // Last conflict where we made random decision
-	randomDecisionRate float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
-	lastDecisionVar    uint32  // Last variable chosen for decision
-	consecutiveFlips   int     // Count of consecutive decisions on same variable
+	randomDecisionRate      float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
+	lastDecisionVar         uint32  // Last variable chosen for decision
+	consecutiveFlips        int     // Count of consecutive decisions on same variable
+	minimizationMaxSize     int     // Skip minimization for clauses > this size (0=all)
+	minimizationMaxLBD      int     // Skip minimization for clauses with LBD > this (0=all)
+	minimizationMaxReasonSize int   // Skip resolution with reason clauses > this size
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause  []bool
 	tmpLiteralIsNegated []bool
@@ -164,10 +167,14 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLevelSetUsed:     make([]bool, formula.NumVars+1),
 		tmpResolved:         make([]bool, formula.NumVars),
 		tmpFlippedVars:      make([]bool, formula.NumVars),
-		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
-		tmpLearnedLits:      make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
+		tmpTouchedVars:        make([]uint32, 0, formula.NumVars),
+		tmpLearnedLits:        make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
+		// Initialize minimization thresholds to aggressive defaults
+		minimizationMaxSize:     10000,
+		minimizationMaxLBD:      10000,
+		minimizationMaxReasonSize: 100,
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -203,6 +210,16 @@ func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
 // EnableLRB enables LRB (Learning Rate Based) heuristic
 func (s *CDCLSolver) EnableLRB() {
 	s.vsids.EnableLRB()
+}
+
+// SetMinimizationThresholds configures clause minimization behavior
+// size: skip minimization for clauses larger than this (0=all clauses)
+// lbd: skip minimization for clauses with LBD larger than this (0=all clauses)
+// reasonSize: skip resolution with reason clauses larger than this
+func (s *CDCLSolver) SetMinimizationThresholds(size, lbd, reasonSize int) {
+	s.minimizationMaxSize = size
+	s.minimizationMaxLBD = lbd
+	s.minimizationMaxReasonSize = reasonSize
 }
 
 // GetStats returns solving statistics
@@ -2589,9 +2606,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// CLAUSE MINIMIZATION via self-subsumption
 	// Try to remove literals from the learned clause by resolving with reason clauses
 	// This produces smaller, more general learned clauses
-	// AGGRESSIVE: Thresholds set to extremely high values to minimize all clauses
 	originalSize := len(s.tmpLearnedLits)
-	if originalSize <= MinimizationMaxSize && lbd <= MinimizationMaxLBD {
+	if originalSize <= s.minimizationMaxSize && lbd <= s.minimizationMaxLBD {
 		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
 		if s.verbose && len(s.tmpLearnedLits) < originalSize {
 			fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(s.tmpLearnedLits))
@@ -2867,7 +2883,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 
 			if reasonLits != nil {
 				// OPTIMIZATION: Skip large reason clauses (diminishing returns)
-				if len(reasonLits) > MinimizationMaxReasonSize {
+				if len(reasonLits) > s.minimizationMaxReasonSize {
 					continue
 				}
 

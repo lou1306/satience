@@ -25,6 +25,7 @@ func run() int {
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence)")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
+	minimize := flag.String("minimize", "aggressive", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5), none")
 	flag.Parse()
 
 	// -verify implies -model
@@ -72,6 +73,21 @@ func run() int {
 	}
 	if *randomRate > 0.0 {
 		s.SetRandomDecisionRate(*randomRate)
+	}
+
+	// Configure clause minimization
+	switch *minimize {
+	case "aggressive":
+		// Default: minimize all clauses (thresholds set high in solver_cdcl.go)
+	case "selective":
+		// Old behavior: minimize only small/low-LBD clauses
+		s.SetMinimizationThresholds(15, 5, 10)
+	case "none":
+		// Disable minimization
+		s.SetMinimizationThresholds(0, 0, 0)
+	default:
+		fmt.Fprintf(os.Stderr, "Invalid minimize option: %s (use aggressive, selective, or none)\n", *minimize)
+		os.Exit(1)
 	}
 
 	start := time.Now()
