@@ -478,6 +478,7 @@ func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Liter
 	
 	lit0 := literals[0]
 	lit1 := literals[1]
+	isBinary := len(literals) == 2
 	
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
@@ -491,12 +492,14 @@ func (s *CDCLSolver) addClauseToWatches(clause *cnf.Clause, literals []cnf.Liter
 		Clause:   clause,
 		Blit:     uint32(idx1),
 		SymPos:   int32(pos1),
+		IsBinary: isBinary,
 	})
 	
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		Clause:   clause,
 		Blit:     uint32(idx0),
 		SymPos:   int32(pos0),
+		IsBinary: isBinary,
 	})
 	
 	s.watchInitialized = true
@@ -1822,6 +1825,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						Clause:   clause,
 						Blit:     blitIdxU,
 						SymPos:   watch.SymPos,  // Points to symmetric watch position
+						IsBinary: false,
 					})
 					
 					// O(1) Update symmetric watch at blit's index

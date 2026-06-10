@@ -26,8 +26,11 @@ type VSIDS struct {
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
-	maxDecay := 0.999
-	initialDecay := 0.95
+	// Standard MiniSat/GLUCOSE decay parameters
+	// Start with 0.95 decay (aggressive) and increase toward 0.999
+	// But we'll use PERIODIC decay to prevent activity from vanishing
+	maxDecay := 0.99
+	initialDecay := 0.90
 	return &VSIDS{
 		activity:              make([]float64, numVars),
 		conflictParticipation: make([]int, numVars),
@@ -36,10 +39,10 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		useLRB:                false, // Default to VSIDS
 		lrbDecayInterval:      1024,  // Decay every 1024 conflicts
 		conflictCount:         0,
-		useLBD:                false, // LBD-based activity disabled by default
+		useLBD:                true,  // Enable LBD-based activity by default
 		lbdBonus:              make([]float64, numVars),
 		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
+		decayIncrement:        (maxDecay - initialDecay) / 5000.0,  // Faster increase
 	}
 }
 
@@ -105,11 +108,21 @@ func (v *VSIDS) bump(varIdx uint32) {
 	v.activity[varIdx] += 1.0
 }
 
+// bumpLarge increases the activity of a variable by a larger amount
+// Used for variables in conflict clauses to make them more likely to be chosen
+func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
+	v.activity[varIdx] += amount
+}
+
 // bumpClause increases activity for all variables in a clause
 // Also tracks conflict participation for LRB heuristic
 func (v *VSIDS) bumpClause(literals []cnf.Literal) {
+	// Standard MiniSat: bump by 1.0, then decay by 0.95
+	// This creates activity differences that drive variable selection
+	bumpAmount := 1.0
+	
 	for _, lit := range literals {
-		v.bump(lit.Var())
+		v.bumpLarge(lit.Var(), bumpAmount)
 		// Track conflict participation for LRB
 		v.conflictParticipation[lit.Var()]++
 	}
@@ -128,10 +141,22 @@ func (v *VSIDS) decayLRB() {
 	}
 }
 
-// decay decays all activity scores and gradually increases decay factor
-// This allows aggressive initial exploration (0.95) followed by focused search (0.999)
+// decayConflictCounter tracks conflicts since last decay
+var decayConflictCounter int = 0
+
+// decay decays all activity scores periodically
+// Called every conflict but only applies decay every 100 conflicts
+// This allows activity scores to accumulate and create meaningful differences
 func (v *VSIDS) decay() {
-	// Gradually increase decay factor toward max (slower decay = more focus on important variables)
+	decayConflictCounter++
+	
+	// Only decay every 100 conflicts
+	if decayConflictCounter < 100 {
+		return
+	}
+	decayConflictCounter = 0
+	
+	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
 		v.decayFactor += v.decayIncrement
 		if v.decayFactor > v.maxDecayFactor {
@@ -210,17 +235,41 @@ func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
 	return false
 }
 
-// resetActivity resets all activity scores to zero
-// Called on restart to prevent choosing the same variables repeatedly
-func (v *VSIDS) resetActivity() {
-	for i := range v.activity {
-		v.activity[i] = 0
+// ActivityForDebug returns the activity score for a variable (for debugging)
+func (v *VSIDS) ActivityForDebug(varIdx uint32) float64 {
+	if int(varIdx) >= len(v.activity) {
+		return 0
 	}
+	return v.activity[varIdx]
+}
+
+// ConflictParticipationForDebug returns the conflict participation count (for debugging)
+func (v *VSIDS) ConflictParticipationForDebug(varIdx uint32) int {
+	if int(varIdx) >= len(v.conflictParticipation) {
+		return 0
+	}
+	return v.conflictParticipation[varIdx]
+}
+
+// resetActivity resets activity scores to prevent choosing the same variables repeatedly
+// Called on restart. We scale down activity rather than zeroing it completely,
+// which preserves some learned information while allowing exploration of new variables.
+func (v *VSIDS) resetActivity() {
+	// Scale down activity by 50% instead of zeroing - preserves important variables
+	// but allows other variables to compete
+	for i := range v.activity {
+		v.activity[i] *= 0.5
+	}
+	
+	// Reset LBD bonus completely - glue clause importance changes after restart
 	for i := range v.lbdBonus {
 		v.lbdBonus[i] = 0
 	}
+	
+	// Keep conflict participation for LRB - it's valuable long-term information
+	// Scale it down too
 	for i := range v.conflictParticipation {
-		v.conflictParticipation[i] = 0
+		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
 	}
-	v.conflictCount = 0
+	// Don't reset conflictCount - it's used for decay timing
 }
