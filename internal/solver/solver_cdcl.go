@@ -83,6 +83,7 @@ type CDCLSolver struct {
 	tmpResolved []bool // Track resolved variables in 1-UIP to prevent cycles
 	tmpClauseHash uint64 // Hash for duplicate detection
 	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
+	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
 	
 	// Watched literals infrastructure
 	watchLists     [][]cnf.Watch  // watchLists[lit] = clauses watching lit
@@ -156,6 +157,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	tmpLevelSetUsed: make([]bool, formula.NumVars+1),
 	tmpResolved: make([]bool, formula.NumVars),
 	tmpFlippedVars: make([]bool, formula.NumVars),
+	tmpTouchedVars: make([]uint32, 0, formula.NumVars),
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
 	}
@@ -2352,7 +2354,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail))
 	}
 	
-	// Clear reusable buffers (O(n) but much faster than allocation)
+	// Fast cleanup from previous conflict: reset only touched variables (O(k) instead of O(n))
+	for _, varIdx := range s.tmpTouchedVars {
+		s.tmpLiteralInClause[varIdx] = false
+		s.tmpLiteralIsNegated[varIdx] = false
+		s.tmpResolved[varIdx] = false
+	}
+	for _, lvl := range s.tmpLevelSet {
+		s.tmpLevelCount[lvl] = 0
+		s.tmpLevelSetUsed[lvl] = false
+	}
+	
+	// Reset for new conflict
+	s.tmpTouchedVars = s.tmpTouchedVars[:0]
+	s.tmpCandidates = s.tmpCandidates[:0]
+	s.tmpLevelSet = s.tmpLevelSet[:0]
+	
 	// Ensure buffers are large enough for current level
 	requiredSize := s.level + 1
 	if requiredSize > len(s.tmpLevelCount) {
@@ -2362,25 +2379,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpLevelSetUsed = make([]bool, requiredSize+1)
 	}
 	
-	for i := range s.tmpLiteralInClause {
-		s.tmpLiteralInClause[i] = false
-		s.tmpLiteralIsNegated[i] = false
-	}
-	for i := 0; i < requiredSize; i++ {
-		s.tmpLevelCount[i] = 0
-	}
-	s.tmpCandidates = s.tmpCandidates[:0]
-	s.tmpLevelSet = s.tmpLevelSet[:0]
-	for i := 0; i < requiredSize; i++ {
-		s.tmpLevelSetUsed[i] = false
-	}
-	
 	// Add all literals from the conflicting clause
 	for _, lit := range conflictLits {
 		varIdx := lit.Var()
 		if !s.tmpLiteralInClause[varIdx] {
 			s.tmpLiteralInClause[varIdx] = true
 			s.tmpLiteralIsNegated[varIdx] = lit.IsNegated()
+			s.tmpTouchedVars = append(s.tmpTouchedVars, varIdx)
 			lvl := s.assignments[varIdx].Level
 			if lvl <= s.level {
 				s.tmpLevelCount[lvl]++
@@ -2465,6 +2470,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			if !s.tmpLiteralInClause[v] {
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = lit.IsNegated()
+				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
 				lvl := s.assignments[v].Level
 				if lvl <= s.level {
 					s.tmpLevelCount[lvl]++
@@ -2480,26 +2486,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		currentSize = currentSize - 1 + newLiterals
 	}
 	
-	// Build the learned clause from remaining literals
-	learnedLits := make([]cnf.Literal, 0)
+	// Build the learned clause from remaining literals (using touched vars for efficiency)
+	learnedLits := make([]cnf.Literal, 0, len(s.tmpTouchedVars))
 	litsAtCurrentLevel := 0
-	for varIdx, inClause := range s.tmpLiteralInClause {
-		if inClause {
-			learnedLits = append(learnedLits, cnf.NewLiteral(uint32(varIdx), s.tmpLiteralIsNegated[varIdx]))
-			if s.assignments[varIdx].Level == s.level {
+	maxLevel := 0 // For backjump level calculation
+	
+	for _, varIdx := range s.tmpTouchedVars {
+		if s.tmpLiteralInClause[varIdx] {
+			lit := cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx])
+			learnedLits = append(learnedLits, lit)
+			lvl := s.assignments[varIdx].Level
+			if lvl == s.level {
 				litsAtCurrentLevel++
+			}
+			if lvl > maxLevel && lvl < s.level {
+				maxLevel = lvl
 			}
 		}
 	}
 	
 	// INVARIANT CHECK: Verify exactly 1 literal at current level
-	litsAtCurrentLevel = 0
-	for varIdx, inClause := range s.tmpLiteralInClause {
-		if inClause && s.assignments[varIdx].Level == s.level {
-			litsAtCurrentLevel++
-		}
-	}
-	
 	if s.verbose && s.conflicts <= 100 {
 		fmt.Printf("c [1-UIP] Conflict %d: %d literals, %d at level %d (target: 1)\n", 
 			s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
@@ -2522,10 +2528,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// handle specially to avoid spurious conflicts at level 1
 	if litsAtCurrentLevel != 1 {
 		if s.level == 1 {
-			// At level 1, skip learning and just flip the decision
 			return 1
 		}
-		// For higher levels, use normal backjump
 		backjumpLevel := s.level - 1
 		if backjumpLevel < 1 {
 			backjumpLevel = 1
@@ -2533,10 +2537,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		return backjumpLevel
 	}
 	
-	// Calculate LBD using reusable buffer (no map allocation)
+	// Calculate LBD using touched vars (single pass, already computed maxLevel)
 	lbd := 0
-	for varIdx, inClause := range s.tmpLiteralInClause {
-		if inClause {
+	for _, varIdx := range s.tmpTouchedVars {
+		if s.tmpLiteralInClause[varIdx] {
 			lvl := s.assignments[varIdx].Level
 			if lvl > 0 && !s.tmpLevelSetUsed[lvl] {
 				s.tmpLevelSetUsed[lvl] = true
@@ -2576,16 +2580,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			if s.verbose && s.conflicts <= 100 {
 				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(learnedLits))
 			}
-			// Still return backjump level for correct backjumping
-			backjumpLevel := 0
-			for varIdx, inClause := range s.tmpLiteralInClause {
-				if inClause {
-					lvl := s.assignments[varIdx].Level
-					if lvl > backjumpLevel && lvl < s.level {
-						backjumpLevel = lvl
-					}
-				}
-			}
+			// Use precomputed maxLevel from single pass above
+			backjumpLevel := maxLevel
 			if backjumpLevel == 0 {
 				backjumpLevel = 1
 			}
