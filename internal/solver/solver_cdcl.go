@@ -47,6 +47,7 @@ type CDCLSolver struct {
 	conflicts    int
 	implication  []*cnf.Clause  // Clause pointer (nil for decisions)
 	iterations   int
+	propagations int  // Total propagations (assignments by unit propagation)
 	maxIter      int
 	learnedClauses []cnf.Clause      // Learned clauses
 	clauseActivity []float64
@@ -1598,10 +1599,10 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			if s.conflicts % 50 == 0 && s.verbose {
 				propsPerDec := 0.0
 				if s.decisions > 0 {
-					propsPerDec = float64(s.iterations) / float64(s.decisions)
+					propsPerDec = float64(s.propagations) / float64(s.decisions)
 				}
-				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, props/dec %.1f\n", 
-					s.conflicts, s.level, len(s.learnedClauses), s.decisions, propsPerDec)
+				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n", 
+					s.conflicts, s.level, len(s.learnedClauses), s.decisions, s.propagations, propsPerDec)
 			}
 			if !s.backtrack() {
 				if s.verbose {
@@ -1676,10 +1677,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			if s.conflicts % 50 == 0 && s.verbose {
 				propsPerDec := 0.0
 				if s.decisions > 0 {
-					propsPerDec = float64(s.iterations) / float64(s.decisions)
+					propsPerDec = float64(s.propagations) / float64(s.decisions)
 				}
-				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, props/dec %.1f\n", 
-					s.conflicts, s.level, len(s.learnedClauses), s.decisions, propsPerDec)
+				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n", 
+					s.conflicts, s.level, len(s.learnedClauses), s.decisions, s.propagations, propsPerDec)
 			}
 			if !s.backtrack() {
 				if s.verbose {
@@ -1773,6 +1774,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	if s.qhead >= len(s.trail) {
 		return false, nil
 	}
+	
+	propagationCount := 0
 	
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
@@ -1894,6 +1897,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					}
 				}
 				s.assignLiteralByClause(blit, s.level, clause)
+				propagationCount++
+				s.propagations++
 				// Keep the watch in place - blit is now true
 				continue
 			}
@@ -1919,6 +1924,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
+	
+	// Debug: report propagations
+	if s.verbose && propagationCount > 0 {
+		fmt.Printf("c [PROPAGATE] Processed trail[%d:%d], found %d propagations\n", s.qhead-propagationCount, len(s.trail), propagationCount)
+	}
 	
 	return false, nil
 }
