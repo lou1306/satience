@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 package main
@@ -26,10 +27,10 @@ type MiniSatStats struct {
 func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 	stats := &MiniSatStats{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
-	
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		
+
 		// Parse conflicts
 		if strings.Contains(line, "Conflicts") {
 			parts := strings.Fields(line)
@@ -39,7 +40,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse decisions
 		if strings.Contains(line, "Decisions") {
 			parts := strings.Fields(line)
@@ -49,7 +50,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse propagations
 		if strings.Contains(line, "Propagations") {
 			parts := strings.Fields(line)
@@ -59,7 +60,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse variables
 		if strings.Contains(line, "Variables") {
 			parts := strings.Fields(line)
@@ -69,7 +70,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse clauses
 		if strings.Contains(line, "Clauses") {
 			parts := strings.Fields(line)
@@ -79,7 +80,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse CPU time
 		if strings.Contains(line, "CPU time") {
 			parts := strings.Fields(line)
@@ -89,7 +90,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 				}
 			}
 		}
-		
+
 		// Parse result
 		if strings.Contains(line, "SATISFIABLE") {
 			stats.Result = "SAT"
@@ -98,7 +99,7 @@ func parseMiniSatOutput(output string) (*MiniSatStats, error) {
 			stats.Result = "UNSAT"
 		}
 	}
-	
+
 	return stats, nil
 }
 
@@ -108,19 +109,19 @@ func runMiniSat(instancePath string, verbose bool) (*MiniSatStats, error) {
 		args = append(args, "-verb=2")
 	}
 	args = append(args, instancePath, "/tmp/minisat_out.txt")
-	
+
 	cmd := exec.Command("/home/luca/bin/minisat", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("MiniSat failed: %v\n%s", err, string(output))
 	}
-	
+
 	// Read output file for result
 	resultFile, err := os.ReadFile("/tmp/minisat_out.txt")
 	if err != nil {
 		return nil, err
 	}
-	
+
 	outputStr := string(output) + "\n" + string(resultFile)
 	return parseMiniSatOutput(outputStr)
 }
@@ -130,12 +131,12 @@ func main() {
 		fmt.Println("Usage: go run compare_with_minisat.go <instance.cnf> [verbose]")
 		os.Exit(1)
 	}
-	
+
 	instancePath := os.Args[1]
 	verbose := len(os.Args) > 2 && os.Args[2] == "verbose"
-	
+
 	fmt.Printf("Comparing MiniSat vs Satience on: %s\n\n", instancePath)
-	
+
 	// Run MiniSat
 	fmt.Println("Running MiniSat...")
 	miniSat, err := runMiniSat(instancePath, verbose)
@@ -143,7 +144,7 @@ func main() {
 		fmt.Printf("MiniSat error: %v\n", err)
 		return
 	}
-	
+
 	fmt.Printf("MiniSat Result: %s\n", miniSat.Result)
 	fmt.Printf("MiniSat Conflicts: %d\n", miniSat.Conflicts)
 	fmt.Printf("MiniSat Decisions: %d\n", miniSat.Decisions)
@@ -153,7 +154,7 @@ func main() {
 		fmt.Printf("MiniSat Propagations/sec: %.0f\n", float64(miniSat.Propagations)/miniSat.CPUTime)
 	}
 	fmt.Println()
-	
+
 	// Run Satience with verbose
 	fmt.Println("Running Satience...")
 	satienceCmd := exec.Command("./satience", "-verbose", instancePath)
@@ -161,9 +162,9 @@ func main() {
 	if err != nil && !strings.Contains(string(satienceOutput), "Exit: ") {
 		fmt.Printf("Satience error: %v\n", err)
 	}
-	
+
 	fmt.Println(string(satienceOutput))
-	
+
 	// Parse Satience output (simple parsing)
 	outputStr := string(satienceOutput)
 	if strings.Contains(outputStr, "Conflicts:") {
@@ -174,7 +175,7 @@ func main() {
 				if len(parts) >= 2 {
 					conflicts, _ := strconv.Atoi(parts[1])
 					fmt.Printf("\n=== Comparison ===\n")
-					fmt.Printf("Conflicts: MiniSat=%d, Satience=%d (ratio: %.2fx)\n", 
+					fmt.Printf("Conflicts: MiniSat=%d, Satience=%d (ratio: %.2fx)\n",
 						miniSat.Conflicts, conflicts, float64(conflicts)/float64(miniSat.Conflicts))
 				}
 			}
@@ -182,7 +183,7 @@ func main() {
 				parts := strings.Fields(line)
 				if len(parts) >= 2 {
 					decisions, _ := strconv.Atoi(parts[1])
-					fmt.Printf("Decisions: MiniSat=%d, Satience=%d (ratio: %.2fx)\n", 
+					fmt.Printf("Decisions: MiniSat=%d, Satience=%d (ratio: %.2fx)\n",
 						miniSat.Decisions, decisions, float64(decisions)/float64(miniSat.Decisions))
 				}
 			}

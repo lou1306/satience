@@ -44,9 +44,9 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 // Watch represents a watched literal reference for a clause
 // Used in the watched literals scheme for efficient propagation
 type Watch struct {
-	Clause   *Clause // Direct pointer to clause (nil if deleted)
-	Blit     uint32  // Blocking literal index (the other watched literal)
-	SymPos   int32   // Position of symmetric watch in the other watch list
+	Clause *Clause // Direct pointer to clause (nil if deleted)
+	Blit   uint32  // Blocking literal index (the other watched literal)
+	SymPos int32   // Position of symmetric watch in the other watch list
 }
 
 // Clause represents a disjunction of literals
@@ -60,15 +60,13 @@ type CNF struct {
 	NumVars    uint32
 	Clauses    []Clause
 	NumClauses int
-	
+
 	// Contiguous literal storage for original clauses (optimization)
 	// All original clause literals stored in one array for better cache locality
-	originalClauseOffsets []int // Start offset of each clause
-	originalClauseSizes   []int // Number of literals in each clause
+	originalClauseOffsets []int    // Start offset of each clause
+	originalClauseSizes   []int    // Number of literals in each clause
 	literalPool           []uint32 // Contiguous storage for all original clause literals
 }
-
-
 
 // NewCNF creates a new CNF formula
 func NewCNF(numVars uint32, numClauses int) *CNF {
@@ -86,16 +84,16 @@ func (c *CNF) AddClause(literals []Literal, learned bool) {
 		Literals: literals,
 		Learned:  learned,
 	})
-	
+
 	// Also store in contiguous literal pool for cache efficiency
 	offset := len(c.literalPool)
 	c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
 	c.originalClauseSizes = append(c.originalClauseSizes, len(literals))
-	
+
 	for _, lit := range literals {
 		c.literalPool = append(c.literalPool, uint32(lit))
 	}
-	
+
 	c.NumClauses++
 }
 
@@ -115,7 +113,6 @@ func IndexToLit(idx int) Literal {
 	isNegated := (idx % 2) == 1
 	return NewLiteral(varIdx, isNegated)
 }
-
 
 // GetOriginalClauseLiterals returns literals for an original clause (zero-allocation view)
 // Returns offset and size into the literal pool
@@ -150,16 +147,14 @@ func (c *CNF) RebuildLiteralPool() {
 	c.literalPool = make([]uint32, 0, c.NumClauses*4)
 	c.originalClauseOffsets = make([]int, 0, c.NumClauses)
 	c.originalClauseSizes = make([]int, 0, c.NumClauses)
-	
+
 	for _, clause := range c.Clauses {
 		offset := len(c.literalPool)
 		c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
 		c.originalClauseSizes = append(c.originalClauseSizes, len(clause.Literals))
-		
+
 		for _, lit := range clause.Literals {
 			c.literalPool = append(c.literalPool, uint32(lit))
 		}
 	}
 }
-
-

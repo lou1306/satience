@@ -27,10 +27,10 @@ type FuzzResult struct {
 }
 
 type Fuzzer struct {
-	rng       *rand.Rand
-	tempDir   string
-	seed      int64
-	verbose   bool
+	rng     *rand.Rand
+	tempDir string
+	seed    int64
+	verbose bool
 }
 
 func New(seed int64, verbose bool) *Fuzzer {

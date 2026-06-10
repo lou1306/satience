@@ -26,12 +26,12 @@ func run() int {
 	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence)")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	flag.Parse()
-	
+
 	// -verify implies -model
 	if *verify {
 		*model = true
 	}
-	
+
 	var profileFile *os.File
 	if *cpuprofile != "" {
 		var err error
@@ -42,12 +42,12 @@ func run() int {
 		}
 		pprof.StartCPUProfile(profileFile)
 	}
-	
+
 	if flag.NArg() != 1 {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <file.cnf>\n", os.Args[0])
 		os.Exit(1)
 	}
-	
+
 	filename := flag.Arg(0)
 	f, err := os.Open(filename)
 	if err != nil {
@@ -55,13 +55,13 @@ func run() int {
 		os.Exit(1)
 	}
 	defer f.Close()
-	
+
 	cnfFormula, err := parser.Parse(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing CNF: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	s := solver.NewCDCLSolver(cnfFormula)
 	s.SetVerbose(*verbose)
 	if *maxIter > 0 {
@@ -73,7 +73,7 @@ func run() int {
 	if *randomRate > 0.0 {
 		s.SetRandomDecisionRate(*randomRate)
 	}
-	
+
 	start := time.Now()
 	var result solver.SolveResult
 	if *preprocess {
@@ -84,11 +84,11 @@ func run() int {
 		result = s.SolveWithResult()
 	}
 	elapsed := time.Since(start)
-	
+
 	if *verbose {
 		fmt.Printf("c Time: %.3fs\n", elapsed.Seconds())
 	}
-	
+
 	switch result {
 	case solver.SAT:
 		fmt.Println("s SATISFIABLE")
@@ -119,7 +119,7 @@ func run() int {
 
 func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 	assignments := s.GetAssignments()
-	
+
 	// Print model - only output variables up to cnf.NumVars
 	numVars := int(cnf.NumVars)
 	if len(assignments) < numVars {
@@ -136,7 +136,7 @@ func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 		}
 	}
 	fmt.Println("v 0")
-	
+
 	// Verify model if requested
 	if verify {
 		if err := solver.VerifySolution(cnf, assignments, false); err != nil {

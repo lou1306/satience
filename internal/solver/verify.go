@@ -10,9 +10,9 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 	if !s.watchInitialized {
 		return nil
 	}
-	
+
 	clauseWatchCount := make(map[*cnf.Clause]int)
-	
+
 	for litIdx := 0; litIdx < len(s.watchLists); litIdx++ {
 		watches := s.watchLists[litIdx]
 		for i, watch := range watches {
@@ -20,20 +20,20 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 			if watch.Clause == nil {
 				continue
 			}
-			
+
 			clause := watch.Clause
 			blitIdx := int(watch.Blit)
-			
+
 			if blitIdx < 0 || blitIdx >= len(s.watchLists) {
 				return fmt.Errorf("watch %d at litIdx %d has invalid blitIdx %d (%s)", i, litIdx, blitIdx, reason)
 			}
-			
+
 			clauseWatchCount[clause]++
-			
+
 			if len(clause.Literals) < 2 {
 				return fmt.Errorf("clause has %d literals (need at least 2 for watches) (%s)", len(clause.Literals), reason)
 			}
-			
+
 			found := false
 			for _, lit := range clause.Literals {
 				idx := cnf.LitToIndex(lit)
@@ -42,11 +42,11 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 					break
 				}
 			}
-			
+
 			if !found {
 				return fmt.Errorf("watch at litIdx %d doesn't match any literal in clause (lits=%v) (%s)", litIdx, clause.Literals, reason)
 			}
-			
+
 			found = false
 			for _, lit := range clause.Literals {
 				idx := cnf.LitToIndex(lit)
@@ -55,45 +55,45 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 					break
 				}
 			}
-			
+
 			if !found {
 				return fmt.Errorf("blitIdx %d doesn't match any literal in clause (lits=%v) (%s)", blitIdx, clause.Literals, reason)
 			}
-			
+
 			if litIdx == blitIdx {
 				return fmt.Errorf("watch at litIdx %d has same blitIdx (clause) (%s)", litIdx, reason)
 			}
 		}
 	}
-	
+
 	for clause, count := range clauseWatchCount {
 		if count != 2 {
 			return fmt.Errorf("clause %p has %d watches instead of 2 (%s)", clause, count, reason)
 		}
 	}
-	
+
 	return nil
 }
 
 // VerificationConfig controls which verification checks are enabled
 type VerificationConfig struct {
-	EnableTrailChecks      bool
-	Enable1UIPChecks       bool
+	EnableTrailChecks         bool
+	Enable1UIPChecks          bool
 	EnableLearnedClauseChecks bool
-	EnableLBDChecks        bool
-	EnablePhaseChecks      bool
-	Verbose                bool
+	EnableLBDChecks           bool
+	EnablePhaseChecks         bool
+	Verbose                   bool
 }
 
 // DefaultVerificationConfig returns a config with all checks enabled
 func DefaultVerificationConfig() VerificationConfig {
 	return VerificationConfig{
-		EnableTrailChecks:       true,
-		Enable1UIPChecks:        true,
+		EnableTrailChecks:         true,
+		Enable1UIPChecks:          true,
 		EnableLearnedClauseChecks: true,
-		EnableLBDChecks:         true,
-		EnablePhaseChecks:       true,
-		Verbose:                 true,
+		EnableLBDChecks:           true,
+		EnablePhaseChecks:         true,
+		Verbose:                   true,
 	}
 }
 
@@ -111,7 +111,7 @@ func (s *CDCLSolver) VerifyTrail(reason string) error {
 	for _, varIdx := range s.trail {
 		level := s.assignments[varIdx].Level
 		if level < prevLevel {
-			return fmt.Errorf("trail level decreased: var %d at level %d, prev was %d (%s)", 
+			return fmt.Errorf("trail level decreased: var %d at level %d, prev was %d (%s)",
 				varIdx, level, prevLevel, reason)
 		}
 		prevLevel = level
@@ -135,7 +135,7 @@ func (s *CDCLSolver) Verify1UIP(learnedClause cnf.Clause, conflictLevel int, rea
 	}
 
 	if literalsAtCurrentLevel != 1 {
-		return fmt.Errorf("1-UIP violation: learned clause has %d literals at level %d, expected 1 (%s)", 
+		return fmt.Errorf("1-UIP violation: learned clause has %d literals at level %d, expected 1 (%s)",
 			literalsAtCurrentLevel, conflictLevel, reason)
 	}
 
@@ -157,7 +157,7 @@ func (s *CDCLSolver) VerifyLBD(clause cnf.Clause, expectedLBD int, reason string
 
 	calculatedLBD := len(levels)
 	if calculatedLBD != expectedLBD {
-		return fmt.Errorf("LBD mismatch: calculated %d, stored %d (%s)", 
+		return fmt.Errorf("LBD mismatch: calculated %d, stored %d (%s)",
 			calculatedLBD, expectedLBD, reason)
 	}
 
@@ -184,7 +184,7 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 			return fmt.Errorf("clause is falsified by current assignments (%s)", reason)
 		}
 	}
-	
+
 	for _, clause := range s.learnedClauses {
 		allFalse := true
 		for _, lit := range clause.Literals {
@@ -203,7 +203,7 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 			return fmt.Errorf("learned clause is falsified by current assignments (%s)", reason)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -214,7 +214,7 @@ func (s *CDCLSolver) VerifyModel(reason string) error {
 			return fmt.Errorf("variable %d is unassigned in model (%s)", varIdx, reason)
 		}
 	}
-	
+
 	for _, clause := range s.cnf.Clauses {
 		satisfied := false
 		for _, lit := range clause.Literals {
@@ -229,7 +229,7 @@ func (s *CDCLSolver) VerifyModel(reason string) error {
 			return fmt.Errorf("clause is not satisfied by model (%s)", reason)
 		}
 	}
-	
+
 	for _, clause := range s.learnedClauses {
 		satisfied := false
 		for _, lit := range clause.Literals {
@@ -244,7 +244,7 @@ func (s *CDCLSolver) VerifyModel(reason string) error {
 			return fmt.Errorf("learned clause is not satisfied by model (%s)", reason)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -255,11 +255,11 @@ func (s *CDCLSolver) RunAllVerifications(config VerificationConfig, context stri
 			return err
 		}
 	}
-	
+
 	if err := s.VerifyNoContradictions(context); err != nil {
 		return err
 	}
-	
+
 	return nil
 }
 
@@ -270,7 +270,7 @@ func VerifySolution(cnfFormula *cnf.CNF, assignments []Assignment, verbose bool)
 			return fmt.Errorf("variable %d is unassigned", varIdx)
 		}
 	}
-	
+
 	for clauseID, clause := range cnfFormula.Clauses {
 		satisfied := false
 		for _, lit := range clause.Literals {
@@ -285,10 +285,10 @@ func VerifySolution(cnfFormula *cnf.CNF, assignments []Assignment, verbose bool)
 			return fmt.Errorf("clause %d is not satisfied", clauseID)
 		}
 	}
-	
+
 	if verbose {
 		fmt.Printf("c [verify] All %d clauses satisfied\n", cnfFormula.NumClauses)
 	}
-	
+
 	return nil
 }

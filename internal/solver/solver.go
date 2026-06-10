@@ -183,7 +183,7 @@ func (s *Solver) backtrack() bool {
 		var decisionVar uint32 = 0
 		var decisionValue bool = false
 		foundDecision := false
-		
+
 		for i := decisionPoint; i < len(s.trail); i++ {
 			varIdx := uint32(s.trail[i])
 			if s.assignments[varIdx].Level == s.level {

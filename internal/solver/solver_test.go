@@ -175,7 +175,7 @@ func TestCDCLSolve3SAT(t *testing.T) {
 
 func TestCDCLSolveUnsat3SAT(t *testing.T) {
 	c := cnf.CNF{
-		NumVars:  3,
+		NumVars: 3,
 		Clauses: []cnf.Clause{
 			newClause(1, 2, 3),
 			newClause(1, 2, -3),
@@ -289,11 +289,11 @@ func TestCDCLTseitin4x4Unsat(t *testing.T) {
 
 func TestCDCLAlgebra20Sat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 30)
-	
+
 	for i := int32(1); i <= 20; i += 2 {
 		clauses = append(clauses, newClause(i))
 	}
-	
+
 	c := cnf.CNF{
 		NumVars:    20,
 		Clauses:    clauses,
@@ -385,13 +385,13 @@ func TestCDCLPhp4p3hUnsat(t *testing.T) {
 
 func TestCDCLSimple50vSat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 60)
-	
+
 	for i := int32(1); i <= 50; i += 2 {
 		clauses = append(clauses, newClause(i, i+1))
 		clauses = append(clauses, newClause(-i, i+1))
 		clauses = append(clauses, newClause(i, -(i+1)))
 	}
-	
+
 	c := cnf.CNF{
 		NumVars:    50,
 		Clauses:    clauses,
@@ -407,12 +407,12 @@ func TestCDCLSimple50vSat(t *testing.T) {
 
 func TestCDCLArgChain20Sat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 30)
-	
+
 	for i := int32(1); i <= 19; i++ {
 		clauses = append(clauses, newClause(-i, i+1))
 	}
 	clauses = append(clauses, newClause(1))
-	
+
 	c := cnf.CNF{
 		NumVars:    20,
 		Clauses:    clauses,
@@ -428,7 +428,7 @@ func TestCDCLArgChain20Sat(t *testing.T) {
 
 func TestCDCLAlgebraXor20Sat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 38)
-	
+
 	for i := int32(1); i <= 20; i++ {
 		if i%2 == 1 {
 			clauses = append(clauses, newClause(i))
@@ -436,7 +436,7 @@ func TestCDCLAlgebraXor20Sat(t *testing.T) {
 			clauses = append(clauses, newClause(-i))
 		}
 	}
-	
+
 	c := cnf.CNF{
 		NumVars:    20,
 		Clauses:    clauses,
@@ -632,12 +632,12 @@ func TestCDCLTseitin5x5Unsat(t *testing.T) {
 
 func TestCDCLArgChain50Sat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 98)
-	
+
 	for i := int32(1); i <= 49; i++ {
 		clauses = append(clauses, newClause(-i, i+1))
 	}
 	clauses = append(clauses, newClause(1))
-	
+
 	c := cnf.CNF{
 		NumVars:    50,
 		Clauses:    clauses,
@@ -653,12 +653,12 @@ func TestCDCLArgChain50Sat(t *testing.T) {
 
 func TestCDCLEquivalenceRich50vUnsat(t *testing.T) {
 	clauses := make([]cnf.Clause, 0, 159)
-	
+
 	for i := int32(1); i <= 50; i++ {
 		clauses = append(clauses, newClause(i))
 	}
 	clauses = append(clauses, newClause(-25))
-	
+
 	c := cnf.CNF{
 		NumVars:    50,
 		Clauses:    clauses,
@@ -679,7 +679,7 @@ func TestDPLLPhp5p4hUnsat(t *testing.T) {
 		NumVars: 20,
 		Clauses: []cnf.Clause{},
 	}
-	
+
 	// Pigeon clauses: each pigeon goes to at least one hole
 	for p := 0; p < 5; p++ {
 		lits := []cnf.Literal{}
@@ -688,7 +688,7 @@ func TestDPLLPhp5p4hUnsat(t *testing.T) {
 		}
 		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
 	}
-	
+
 	// Hole clauses: no two pigeons share a hole
 	for h := 0; h < 4; h++ {
 		for p1 := 0; p1 < 5; p1++ {
@@ -702,9 +702,9 @@ func TestDPLLPhp5p4hUnsat(t *testing.T) {
 			}
 		}
 	}
-	
+
 	c.NumClauses = len(c.Clauses)
-	
+
 	// Test with plain DPLL (base solver, no CDCL)
 	s := NewSolver(&c)
 	result := s.Solve()
@@ -724,7 +724,7 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 	// Each pigeon must go to at least one hole (6 clauses of size 5)
 	// No two pigeons can share a hole (75 binary clauses)
 	// UNSAT: 6 pigeons cannot fit in 5 holes
-	// 
+	//
 	// This test validates the 1-UIP conflict analysis fix (commit 050befe).
 	// Before the fix, 1-UIP would fail with 2+ literals at current level,
 	// causing timeouts. After the fix, solves in <0.01s with proper learning.
@@ -732,7 +732,7 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 		NumVars: 30,
 		Clauses: []cnf.Clause{},
 	}
-	
+
 	// Each pigeon goes to at least one hole
 	for p := 0; p < 6; p++ {
 		lits := []cnf.Literal{}
@@ -741,7 +741,7 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 		}
 		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
 	}
-	
+
 	// No two pigeons share a hole
 	for h := 0; h < 5; h++ {
 		for p1 := 0; p1 < 6; p1++ {
@@ -755,9 +755,9 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 			}
 		}
 	}
-	
+
 	c.NumClauses = len(c.Clauses)
-	
+
 	s := NewCDCLSolver(&c)
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
@@ -771,10 +771,10 @@ func TestCDCLRandomK3Sat(t *testing.T) {
 	// SAT instance from benchmark database
 	// Tests VSIDS performance on random structured instances
 	c := cnf.CNF{
-		NumVars:  50,
-		Clauses:  make([]cnf.Clause, 0, 200),
+		NumVars: 50,
+		Clauses: make([]cnf.Clause, 0, 200),
 	}
-	
+
 	// Add some random 3-clauses (seeded for reproducibility)
 	seed := uint32(42)
 	for i := 0; i < 200; i++ {
@@ -789,7 +789,7 @@ func TestCDCLRandomK3Sat(t *testing.T) {
 		c.Clauses = append(c.Clauses, cnf.Clause{Literals: lits})
 	}
 	c.NumClauses = len(c.Clauses)
-	
+
 	s := NewCDCLSolver(&c)
 	result := s.SolveWithResult()
 	// Don't check SAT/UNSAT - just ensure it terminates quickly
@@ -803,21 +803,21 @@ func TestCDCLSudoku2x2(t *testing.T) {
 	// 4 cells × 2 values = 8 variables
 	// Constraints: each cell has exactly one value, each value appears once per row/column
 	// SAT with unique solution
-	// 
+	//
 	// This is a simplified Sudoku to test propagation-heavy instances
 	// without the 318× slowdown of full 3x3 Sudoku
-	
+
 	c := cnf.CNF{
-		NumVars:  8,
-		Clauses:  make([]cnf.Clause, 0),
+		NumVars: 8,
+		Clauses: make([]cnf.Clause, 0),
 	}
-	
+
 	// Variables: cell(row,col,value) where row,col,value ∈ {0,1}
 	// var = row*4 + col*2 + value
 	cell := func(row, col, value int) uint32 {
 		return uint32(row*4 + col*2 + value)
 	}
-	
+
 	// Each cell has at least one value
 	for row := 0; row < 2; row++ {
 		for col := 0; col < 2; col++ {
@@ -829,7 +829,7 @@ func TestCDCLSudoku2x2(t *testing.T) {
 			})
 		}
 	}
-	
+
 	// Each cell has at most one value (not both)
 	for row := 0; row < 2; row++ {
 		for col := 0; col < 2; col++ {
@@ -841,7 +841,7 @@ func TestCDCLSudoku2x2(t *testing.T) {
 			})
 		}
 	}
-	
+
 	// Each row has each value exactly once
 	for row := 0; row < 2; row++ {
 		for value := 0; value < 2; value++ {
@@ -861,7 +861,7 @@ func TestCDCLSudoku2x2(t *testing.T) {
 			})
 		}
 	}
-	
+
 	// Each column has each value exactly once
 	for col := 0; col < 2; col++ {
 		for value := 0; value < 2; value++ {
@@ -881,15 +881,15 @@ func TestCDCLSudoku2x2(t *testing.T) {
 			})
 		}
 	}
-	
+
 	c.NumClauses = len(c.Clauses)
-	
+
 	s := NewCDCLSolver(&c)
 	result := s.SolveWithResult()
 	if result != SAT {
 		t.Errorf("Expected SAT (2x2 Sudoku), got %v", result)
 	}
-	
+
 	// Verify the model satisfies all constraints
 	// Check that assignments satisfy all clauses
 	for _, clause := range c.Clauses {
@@ -915,7 +915,7 @@ func TestCDCLTseitinCycleUnsat(t *testing.T) {
 	// Simple UNSAT instance based on odd cycle
 	// x1 ∨ x2, ¬x2 ∨ x3, ¬x3 ∨ x4, ¬x4 ∨ x5, ¬x5 ∨ ¬x1
 	// This creates an odd cycle that is UNSAT
-	
+
 	c := cnf.CNF{
 		NumVars: 5,
 		Clauses: []cnf.Clause{
@@ -934,7 +934,7 @@ func TestCDCLTseitinCycleUnsat(t *testing.T) {
 		},
 		NumClauses: 6,
 	}
-	
+
 	s := NewCDCLSolver(&c)
 	result := s.SolveWithResult()
 	if result != UNSAT {

@@ -49,19 +49,19 @@ func (h *vsidsHeap) Pop() interface{} {
 // - Increases toward 0.999 over 10k conflicts (slower decay to focus on important vars)
 // - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
-	activity              []float64   // Activity score for each variable
-	conflictParticipation []int       // Number of conflicts each variable participates in
-	decayFactor           float64     // Decay factor (0.95 -> 0.999)
-	inverseDecay          float64     // 1/decay for efficiency
-	useLRB                bool        // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval      int         // Decay every N conflicts
-	conflictCount         int         // Total conflicts for LRB decay timing
-	useLBD                bool        // Use LBD-based activity (variables in low-LBD clauses prioritized)
-	lbdBonus              []float64   // Bonus score from appearing in low-LBD clauses
-	maxDecayFactor        float64     // Maximum decay factor (0.999)
-	decayIncrement        float64     // Increment per conflict
-	heap                  vsidsHeap   // Activity heap for O(log n) selection
-	heapValid             bool        // True if heap is up-to-date
+	activity              []float64 // Activity score for each variable
+	conflictParticipation []int     // Number of conflicts each variable participates in
+	decayFactor           float64   // Decay factor (0.95 -> 0.999)
+	inverseDecay          float64   // 1/decay for efficiency
+	useLRB                bool      // Use LRB heuristic instead of pure VSIDS
+	lrbDecayInterval      int       // Decay every N conflicts
+	conflictCount         int       // Total conflicts for LRB decay timing
+	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
+	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
+	maxDecayFactor        float64   // Maximum decay factor (0.999)
+	decayIncrement        float64   // Increment per conflict
+	heap                  vsidsHeap // Activity heap for O(log n) selection
+	heapValid             bool      // True if heap is up-to-date
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -95,7 +95,7 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 			baseWeight = 100.0
 		}
 		weight := baseWeight / float64(len(clause.Literals))
-		
+
 		for _, lit := range clause.Literals {
 			v.activity[lit.Var()] += weight
 		}
@@ -108,7 +108,7 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 // Includes LBD bonus in activity score for selection
 func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heap = make(vsidsHeap, 0, len(v.activity))
-	
+
 	for i, act := range v.activity {
 		if assignments[i].Level == 0 {
 			// Add LBD bonus to activity for selection
@@ -120,7 +120,7 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 			})
 		}
 	}
-	
+
 	heap.Init(&v.heap)
 	v.heapValid = true
 }
@@ -141,7 +141,7 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 	if !v.useLBD {
 		return
 	}
-	
+
 	// Bonus formula: EXPONENTIAL bonus for lower LBD
 	// Glue clauses (LBD<=3) are extremely important - give huge bonus
 	// LBD=2: bonus = 10000 (core glue - most important)
@@ -151,7 +151,7 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 	// LBD=10: bonus = 100
 	// This ensures glue clause variables dominate VSIDS selection
 	bonus := 20000.0 / float64(lbd*lbd)
-	
+
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
 	}
@@ -163,7 +163,7 @@ func (v *VSIDS) decayLBD() {
 	if !v.useLBD {
 		return
 	}
-	
+
 	// Decay extremely slowly (only 0.1% per conflict) to preserve glue clause importance
 	// Glue clauses should influence search for tens of thousands of conflicts
 	for i := range v.lbdBonus {
@@ -197,7 +197,7 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 	if bumpAmount < 10.0 {
 		bumpAmount = 10.0 // Minimum bump for very large clauses
 	}
-	
+
 	for _, lit := range literals {
 		// Extra boost for variables that appear in conflicts frequently
 		// This creates positive feedback: conflicted vars get chosen more
@@ -207,7 +207,7 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 		v.conflictParticipation[lit.Var()]++
 	}
 	v.conflictCount++
-	
+
 	// Periodic decay for LRB scores
 	if v.useLRB && v.conflictCount%v.lrbDecayInterval == 0 {
 		v.decayLRB()
@@ -233,12 +233,12 @@ func (v *VSIDS) decay() {
 		}
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
-	
+
 	// Apply decay to all activity scores EVERY CONFLICT
 	for i := range v.activity {
 		v.activity[i] *= v.decayFactor
 	}
-	
+
 	// Invalidate heap since all activities changed
 	// Heap will be rebuilt on next selectVariableWithHeap call
 	v.heapValid = false
@@ -251,24 +251,24 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	if !v.heapValid || v.heap.Len() == 0 {
 		v.buildHeap(assignments)
 	}
-	
+
 	// Pop variables until we find an unassigned one
 	for v.heap.Len() > 0 {
 		item := heap.Pop(&v.heap).(vsidsHeapItem)
 		varIdx := int(item.varIdx)
-		
+
 		// Skip if variable is now assigned (stale heap entry)
 		if varIdx >= len(assignments) || assignments[varIdx].Level != 0 {
 			continue
 		}
-		
+
 		// Push it back with updated activity (including LBD bonus)
 		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx]
 		heap.Push(&v.heap, item)
-		
+
 		return uint32(varIdx)
 	}
-	
+
 	// Fallback to linear scan if heap is empty
 	return v.selectVariable(assignments)
 }
@@ -298,7 +298,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 // Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
 func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
 	var bestVar uint32
-	
+
 	// Use heap for fast selection when using standard VSIDS or LBD
 	if !v.useLRB {
 		bestVar = v.selectVariableWithHeap(assignments)
@@ -306,7 +306,7 @@ func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []b
 		// Use linear scan for LRB (would need separate heap for conflict participation)
 		bestVar = v.selectVariable(assignments)
 	}
-	
+
 	// Use saved phase if available, otherwise default to true (positive literal)
 	phase := true
 	if savedPhase != nil && int(bestVar) < len(savedPhase) {
@@ -351,12 +351,12 @@ func (v *VSIDS) resetActivity() {
 	for i := range v.activity {
 		v.activity[i] *= 0.5
 	}
-	
+
 	// Reset LBD bonus completely - glue clause importance changes after restart
 	for i := range v.lbdBonus {
 		v.lbdBonus[i] = 0
 	}
-	
+
 	// Keep conflict participation for LRB - it's valuable long-term information
 	// Scale it down too
 	for i := range v.conflictParticipation {
@@ -372,18 +372,18 @@ func (v *VSIDS) diversify() {
 	for i := range v.activity {
 		v.activity[i] = 1.0
 	}
-	
+
 	// Reset LBD bonus completely
 	for i := range v.lbdBonus {
 		v.lbdBonus[i] = 0
 	}
-	
+
 	// Keep conflict participation - it's still valuable
 	// Scale down more aggressively
 	for i := range v.conflictParticipation {
 		v.conflictParticipation[i] = v.conflictParticipation[i] / 4
 	}
-	
+
 	// Invalidate heap - needs rebuild with new activities
 	v.heapValid = false
 }
