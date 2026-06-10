@@ -940,6 +940,9 @@ func (s *CDCLSolver) restart() {
 		}
 	}
 	s.trailHead = append(s.trailHead, len(s.trail))
+	// CRITICAL: Update qhead to skip the unit propagations we just added
+	// Otherwise propagateWatched() will re-process them, causing massive slowdown
+	s.qhead = len(s.trail)
 	
 }
 
