@@ -21,7 +21,7 @@ const (
 const (
 	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
-	DefaultRestartBase      = 50    // Base for Luby restart sequence
+	DefaultRestartBase      = 25    // Base for Luby restart sequence (optimized from 50)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
 	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
