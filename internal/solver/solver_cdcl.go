@@ -263,6 +263,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
+	// Skip aggressive preprocessing on large instances to avoid OOM and timeouts
+	// Modern solvers use memory/time limits; we use conservative thresholds
+	// Aggressive preprocessing is most effective on small/medium structured instances
+	if s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Skipping aggressive preprocessing: instance too large (%d vars, %d clauses)\n", 
+				s.cnf.NumVars, s.cnf.NumClauses)
+		}
+		// Still initialize watches and do basic setup
+		s.cnf.RebuildLiteralPool()
+		s.initWatches()
+		return UNKNOWN
+	}
+
 	initialClauses := s.cnf.NumClauses
 	
 	// Increase to 5 passes for more thorough preprocessing
