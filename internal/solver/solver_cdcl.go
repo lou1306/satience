@@ -2465,58 +2465,53 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpResolved[i] = false
 	}
 
-	// Start from end of trail and scan backwards (MiniSat-style)
-	trailIndex := len(s.trail) - 1
+	// OPTIMIZATION: Build list of trail positions at current level
+	// This avoids scanning lower-level trail elements on every resolution step
+	// Only done once per conflict, saves O(trail_size) work per resolution
+	s.tmpCandidates = s.tmpCandidates[:0]
+	for i := len(s.trail) - 1; i >= 0; i-- {
+		if s.trailLevel[i] == s.level {
+			varIdx := uint32(s.trail[i])
+			if s.tmpLiteralInClause[varIdx] {
+				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
+					varIdx: varIdx,
+					size:   0, // Will be set if needed
+				})
+			}
+		}
+	}
+
+	// Start from end of trail and scan backwards through current-level literals only
+	candidateIdx := 0
 	pathC := s.tmpLevelCount[s.level]
 
-	for pathC > 1 {
-		// Find next literal to resolve by scanning trail backwards
-		var foundVar uint32 = 0
-		found := false
+	for pathC > 1 && candidateIdx < len(s.tmpCandidates) {
+		// Get next candidate from pre-filtered list
+		candidate := s.tmpCandidates[candidateIdx]
+		candidateIdx++
+		varIdx := candidate.varIdx
 
-		for trailIndex >= 0 {
-			varIdx := uint32(s.trail[trailIndex])
-			trailLevel := s.trailLevel[trailIndex]
-			trailIndex--
-
-			// Skip if not in learned clause or already resolved
-			if !s.tmpLiteralInClause[varIdx] || s.tmpResolved[varIdx] {
-				continue
-			}
-
-			// Skip if at lower level (not counted in pathC)
-			if trailLevel != s.level {
-				continue
-			}
-
-			// Found a literal at current level
-			foundVar = varIdx
-			found = true
-			break
-		}
-
-		// Stop early if no resolvable literal found (MiniSat behavior)
-		if !found {
-			break
+		// Skip if already resolved
+		if s.tmpResolved[varIdx] {
+			continue
 		}
 
 		// Check if this literal has a reason (not a decision)
-		if int(foundVar) >= len(s.implication) {
-			// Out of bounds - should not happen, but defend against corruption
+		if int(varIdx) >= len(s.implication) {
 			break
 		}
-		reasonClause := s.implication[foundVar]
+		reasonClause := s.implication[varIdx]
 		if reasonClause == nil {
-			// Decision literal - cannot resolve, stop early
-			break
+			// Decision literal - cannot resolve
+			continue
 		}
 
 		// Get reason clause literals directly from pointer
 		reasonLits := reasonClause.Literals
 
-		// Resolve: remove foundVar, add reason literals
-		s.tmpLiteralInClause[foundVar] = false
-		s.tmpResolved[foundVar] = true
+		// Resolve: remove varIdx, add reason literals
+		s.tmpLiteralInClause[varIdx] = false
+		s.tmpResolved[varIdx] = true
 		s.tmpLevelCount[s.level]--
 		pathC--
 
@@ -2524,7 +2519,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		newLiterals := 0
 		for _, lit := range reasonLits {
 			v := lit.Var()
-			if v == foundVar {
+			if v == varIdx {
 				continue
 			}
 			if !s.tmpLiteralInClause[v] {
@@ -2536,6 +2531,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
 						pathC++
+						// Add to candidate list for resolution (at end, will be processed)
+						s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
+							varIdx: v,
+							size:   0,
+						})
 					}
 				}
 				newLiterals++
