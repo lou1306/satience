@@ -34,6 +34,9 @@ const (
 	MinimizationMaxSize   = 15    // Skip minimization for clauses > 15 literals
 	MinimizationMaxLBD    = 5     // Skip minimization for clauses with LBD > 5
 	MinimizationMaxReasonSize = 10 // Skip resolution with reason clauses > 10 literals
+	
+	// Debugging thresholds
+	DebugConflictLimit    = 100   // Verbose debug output for first N conflicts
 )
 
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
@@ -1817,8 +1820,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				continue
 			}
 			
-			// Clause accessed via pointer
-			
 			// Look for replacement watch
 			foundReplacement := false
 			for j := 0; j < len(clause.Literals); j++ {
@@ -2349,7 +2350,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Note: s.conflicts already incremented in handleConflict()
 	
-	if s.verbose && s.conflicts <= 100 {
+	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n", 
 			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail))
 	}
@@ -2445,6 +2446,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		
 		// Check if this literal has a reason (not a decision)
+		if int(foundVar) >= len(s.implication) {
+			// Out of bounds - should not happen, but defend against corruption
+			break
+		}
 		reasonClause := s.implication[foundVar]
 		if reasonClause == nil {
 			// Decision literal - cannot resolve, stop early
@@ -2506,27 +2511,28 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	
 	// INVARIANT CHECK: Verify exactly 1 literal at current level
-	if s.verbose && s.conflicts <= 100 {
+	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [1-UIP] Conflict %d: %d literals, %d at level %d (target: 1)\n", 
 			s.conflicts, len(learnedLits), litsAtCurrentLevel, s.level)
-		
-		if litsAtCurrentLevel != 1 {
-			fmt.Printf("c [1-UIP ERROR] Failed to find UIP! Literals: %d, at level %d\n", len(learnedLits), s.level)
-			for _, lit := range learnedLits {
-				v := lit.Var()
-				sign := ""
-				if lit.IsNegated() {
-					sign = "¬"
-				}
-				fmt.Printf("c   Lit: %sx%d, Level: %d, Reason: %v\n", 
-					sign, v+1, s.assignments[v].Level, s.implication[v])
-			}
-		}
 	}
 	
-	// If 1-UIP didn't reduce to exactly 1 literal at current level,
-	// handle specially to avoid spurious conflicts at level 1
+	// If 1-UIP didn't reduce to exactly 1 literal at current level, log error and handle
 	if litsAtCurrentLevel != 1 {
+		if s.verbose {
+			fmt.Printf("c [1-UIP ERROR] Conflict %d: Failed to find UIP! Literals: %d, at level %d\n", 
+				s.conflicts, len(learnedLits), s.level)
+			if s.conflicts <= DebugConflictLimit {
+				for _, lit := range learnedLits {
+					v := lit.Var()
+					sign := ""
+					if lit.IsNegated() {
+						sign = "¬"
+					}
+					fmt.Printf("c   Lit: %sx%d, Level: %d, Reason: %v\n", 
+						sign, v+1, s.assignments[v].Level, s.implication[v])
+				}
+			}
+		}
 		if s.level == 1 {
 			return 1
 		}
@@ -2567,17 +2573,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Glue clauses: watched, kept forever, high priority
 	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
 	
-	if s.verbose && s.conflicts <= 50 {
+	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] learnClause: conflict=%d, learnedLits=%d, lbd=%d\n", s.conflicts, len(learnedLits), lbd)
 	}
 	
 	if len(learnedLits) > 0 {
-		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > 10)
+		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > LowQualityLBDThreshold)
 		// These clauses are too weak to be useful for propagation
 		// They span too many decision levels and don't prune search effectively
-		// Glucose typically uses LBD threshold of 5-8, we use 10 as initial tuning
-		if lbd > 15 {
-			if s.verbose && s.conflicts <= 100 {
+		// Glucose typically uses LBD threshold of 5-8, we use 15 as initial tuning
+		LowQualityLBDThreshold := 15
+		if lbd > LowQualityLBDThreshold {
+			if s.verbose && s.conflicts <= DebugConflictLimit {
 				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(learnedLits))
 			}
 			// Use precomputed maxLevel from single pass above
@@ -2744,7 +2751,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		backjumpLevel = 1
 	}
 	
-	if s.verbose && s.conflicts <= 20 {
+	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] Backjump level calculated: %d (max in clause: %d, current level: %d)\n", 
 			backjumpLevel, maxLevelInClause, s.level)
 	}
@@ -3095,7 +3102,7 @@ func (s *CDCLSolver) backtrack() bool {
 	// Find the decision point at the backjump level
 	decisionPoint := s.trailHead[bjLevel]
 	if decisionPoint >= len(s.trail) {
-		if s.verbose && s.conflicts <= 20 {
+		if s.verbose && s.conflicts <= DebugConflictLimit {
 			fmt.Printf("c [BACKTRACK] FAIL: decision point %d >= trail len %d\n", decisionPoint, len(s.trail))
 		}
 		return false
@@ -3104,7 +3111,7 @@ func (s *CDCLSolver) backtrack() bool {
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
 	
-	if s.verbose && s.conflicts <= 20 {
+	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [BACKTRACK] Backjumping from level %d to %d, var %d, trail[%d:%d]\n", 
 			s.level, bjLevel, decisionVar+1, decisionPoint, len(s.trail))
 	}
