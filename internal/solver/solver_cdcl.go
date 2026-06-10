@@ -29,6 +29,11 @@ const (
 	MaxClauseAge          = 500   // Age threshold for forced deletion
 	LargeClauseSize       = 15    // Size threshold for forced deletion
 	IterationReportInterval = 10000 // Report progress every N iterations
+	
+	// Clause minimization thresholds
+	MinimizationMaxSize   = 15    // Skip minimization for clauses > 15 literals
+	MinimizationMaxLBD    = 5     // Skip minimization for clauses with LBD > 5
+	MinimizationMaxReasonSize = 10 // Skip resolution with reason clauses > 10 literals
 )
 
 // CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
@@ -2382,15 +2387,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		return backjumpLevel
 	}
 	
-	// CLAUSE MINIMIZATION via self-subsumption
-	// Try to remove literals from the learned clause by resolving with reason clauses
-	// This produces smaller, more general learned clauses
-	originalSize := len(learnedLits)
-	learnedLits = s.minimizeLearnedClause(learnedLits)
-	if s.verbose && len(learnedLits) < originalSize {
-		fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(learnedLits))
-	}
-	
 	// Calculate LBD using reusable buffer (no map allocation)
 	lbd := 0
 	for varIdx, inClause := range s.tmpLiteralInClause {
@@ -2401,6 +2397,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
 				lbd++
 			}
+		}
+	}
+	
+	// CLAUSE MINIMIZATION via self-subsumption
+	// Try to remove literals from the learned clause by resolving with reason clauses
+	// This produces smaller, more general learned clauses
+	// OPTIMIZATION: Skip minimization on large or high-LBD clauses (diminishing returns)
+	originalSize := len(learnedLits)
+	if originalSize <= MinimizationMaxSize && lbd <= MinimizationMaxLBD {
+		learnedLits = s.minimizeLearnedClause(learnedLits)
+		if s.verbose && len(learnedLits) < originalSize {
+			fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(learnedLits))
 		}
 	}
 	
@@ -2675,6 +2683,11 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			reasonLits := reasonClause.Literals
 			
 			if reasonLits != nil {
+				// OPTIMIZATION: Skip large reason clauses (diminishing returns)
+				if len(reasonLits) > MinimizationMaxReasonSize {
+					continue
+				}
+				
 				// Check if all reason literals (except varIdx) are in the clause
 				allCovered := true
 				for _, reasonLit := range reasonLits {
