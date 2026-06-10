@@ -31,9 +31,10 @@ const (
 	IterationReportInterval = 10000 // Report progress every N iterations
 
 	// Clause minimization thresholds
-	MinimizationMaxSize       = 15 // Skip minimization for clauses > 15 literals
-	MinimizationMaxLBD        = 5  // Skip minimization for clauses with LBD > 5
-	MinimizationMaxReasonSize = 10 // Skip resolution with reason clauses > 10 literals
+	// Set to extremely high values to enable aggressive minimization on ALL clauses
+	MinimizationMaxSize       = 10000 // Minimize clauses up to 10K literals (effectively all)
+	MinimizationMaxLBD        = 10000 // Minimize clauses up to LBD 10K (effectively all)
+	MinimizationMaxReasonSize = 100   // Allow reason clauses up to 100 literals (more aggressive)
 
 	// Debugging thresholds
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
@@ -2588,7 +2589,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// CLAUSE MINIMIZATION via self-subsumption
 	// Try to remove literals from the learned clause by resolving with reason clauses
 	// This produces smaller, more general learned clauses
-	// OPTIMIZATION: Skip minimization on large or high-LBD clauses (diminishing returns)
+	// AGGRESSIVE: Thresholds set to extremely high values to minimize all clauses
 	originalSize := len(s.tmpLearnedLits)
 	if originalSize <= MinimizationMaxSize && lbd <= MinimizationMaxLBD {
 		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
