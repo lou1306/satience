@@ -1887,6 +1887,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			
 			if !blitTrue {
 				// Both watched literals are false - conflict!
+				// CRITICAL: Write back watch list modifications before returning
+				// Otherwise, watch list modifications from earlier in this loop are lost
+				s.watchLists[watchIdx] = watchList
 				return true, clause
 			}
 			
