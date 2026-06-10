@@ -1971,7 +1971,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitLevel := s.assignments[blit.Var()].Level
 
 			if blitLevel == 0 {
-				// Propagate blit - use ClauseIdx directly from watch (O(1) instead of O(n) search)
+				// Propagate blit
 				s.assignLiteralByClause(blit, s.level, clause)
 				propagationCount++
 				s.propagations++
@@ -2488,10 +2488,24 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpResolved[i] = false
 	}
 
-	// OPTIMIZATION: Build list of trail positions at current level
+	// OPTIMIZATION: Count current-level trail elements first to pre-allocate candidate list
+	// This avoids reallocations during resolution when new literals are added
+	currentLevelCount := 0
+	for i := len(s.trail) - 1; i >= 0; i-- {
+		if s.trailLevel[i] == s.level {
+			currentLevelCount++
+		}
+	}
+
+	// Pre-allocate candidate list to exact size needed
+	if cap(s.tmpCandidates) < currentLevelCount {
+		s.tmpCandidates = make([]resolveCandidate, currentLevelCount)
+	}
+	s.tmpCandidates = s.tmpCandidates[:0]
+
+	// Build list of trail positions at current level
 	// This avoids scanning lower-level trail elements on every resolution step
 	// Only done once per conflict, saves O(trail_size) work per resolution
-	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
 		if s.trailLevel[i] == s.level {
 			varIdx := uint32(s.trail[i])
