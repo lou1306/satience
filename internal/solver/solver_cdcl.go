@@ -173,10 +173,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLearnedLits:        make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
-		// Initialize minimization thresholds to aggressive defaults
-		minimizationMaxSize:     10000,
-		minimizationMaxLBD:      10000,
-		minimizationMaxReasonSize: 100,
+		// Initialize minimization thresholds to selective defaults (balanced performance)
+		minimizationMaxSize:       15,  // Minimize clauses ≤15 literals
+		minimizationMaxLBD:        5,   // Minimize clauses with LBD ≤5
+		minimizationMaxReasonSize: 10,  // Skip reason clauses >10 literals
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
