@@ -24,6 +24,7 @@ func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence)")
+	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	flag.Parse()
 	
 	// -verify implies -model
@@ -68,6 +69,9 @@ func run() int {
 	}
 	if *useLRB {
 		s.EnableLRB()
+	}
+	if *randomRate > 0.0 {
+		s.SetRandomDecisionRate(*randomRate)
 	}
 	
 	start := time.Now()

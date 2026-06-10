@@ -69,6 +69,7 @@ type CDCLSolver struct {
 	lastConflictLBD int
 	conflictsAtLevel []int  // Track conflicts per decision level
 	lastRandomDecision int  // Last conflict where we made random decision
+	randomDecisionRate float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause []bool
 	tmpLiteralIsNegated []bool
@@ -136,6 +137,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lubyIndex:    0,
 		lbdSum:       0,
 		lbdCount:     0,
+		randomDecisionRate: 0.0, // Default: no random decisions
 		learnedClauseOrder: make([]int, 0),
 		lbdOrderDirty:      true,
 		lbdOrderLastRebuild: 0,
@@ -170,6 +172,19 @@ func (s *CDCLSolver) SetMaxIter(limit int) {
 // SetVerbose enables/disables verbose output
 func (s *CDCLSolver) SetVerbose(v bool) {
 	s.verbose = v
+}
+
+// SetRandomDecisionRate sets the probability of making a random decision
+// rate should be in [0.0, 1.0] where 0.0 = never random, 1.0 = always random
+// Recommended: 0.01-0.05 for most instances
+func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
+	if rate < 0.0 {
+		rate = 0.0
+	}
+	if rate > 1.0 {
+		rate = 1.0
+	}
+	s.randomDecisionRate = rate
 }
 
 // EnableLRB enables LRB (Learning Rate Based) heuristic
@@ -2065,28 +2080,45 @@ func (s *CDCLSolver) decide() bool {
 		s.conflictsAtLevel[s.level]++
 	}
 	
-	// Diversification: force random decision ONLY if severely stuck
-	// Modern solvers (MiniSat, Glucose) use <1% random decisions
-	// Rely on VSIDS/LRB heuristics for most decisions
-	stuckThreshold := 1000 // conflicts at same level before forcing random
-	forceRandom := false
+	// Determine if we should make a random decision
+	// Two modes:
+	// 1. Configurable random rate (s.randomDecisionRate) - only after 100 conflicts
+	// 2. Diversification when stuck (existing logic)
+	makeRandom := false
 	
-	if s.level > 0 && s.conflictsAtLevel[s.level] > stuckThreshold {
-		// Severely stuck - force random decision
-		if s.conflicts - s.lastRandomDecision > 500 { // At least 500 conflicts since last random
-			forceRandom = true
+	// Check configurable random rate (only after initial search phase)
+	if s.randomDecisionRate > 0.0 && s.conflicts >= 100 {
+		if float64(s.conflicts%1000)/1000.0 < s.randomDecisionRate {
+			makeRandom = true
 		}
 	}
 	
-	// Add 0.5% random decisions (every 200 conflicts) - much reduced from 5%
-	if !forceRandom && s.conflicts > 0 && s.conflicts % 200 == 0 {
-		forceRandom = true
+	// Diversification: force random decision if severely stuck
+	if !makeRandom {
+		stuckThreshold := 1000 // conflicts at same level before forcing random
+		forceRandom := false
+		
+		if s.level > 0 && s.conflictsAtLevel[s.level] > stuckThreshold {
+			// Severely stuck - force random decision
+			if s.conflicts - s.lastRandomDecision > 500 { // At least 500 conflicts since last random
+				forceRandom = true
+			}
+		}
+		
+		// Add periodic random decisions as fallback
+		if !forceRandom && s.conflicts > 0 && s.conflicts % 200 == 0 {
+			forceRandom = true
+		}
+		
+		if forceRandom {
+			makeRandom = true
+		}
 	}
 	
 	var varIdx uint32
 	var phase bool
 	
-	if forceRandom {
+	if makeRandom {
 		// Select random unassigned variable
 		varIdx = s.selectRandomUnassigned()
 		// Random phase
@@ -2094,7 +2126,7 @@ func (s *CDCLSolver) decide() bool {
 		s.lastRandomDecision = s.conflicts
 		
 		if s.verbose && s.conflicts % 1000 == 0 {
-			fmt.Printf("c [verbose] Diversification: random decision at conflict %d, level %d\n", s.conflicts, s.level)
+			fmt.Printf("c [verbose] Random decision at conflict %d, level %d (rate=%.2f)\n", s.conflicts, s.level, s.randomDecisionRate)
 		}
 		
 		// Reset conflicts at this level after random decision

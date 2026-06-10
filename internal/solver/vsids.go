@@ -116,10 +116,18 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 
 // bumpClause increases activity for all variables in a clause
 // Also tracks conflict participation for LRB heuristic
+// Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 func (v *VSIDS) bumpClause(literals []cnf.Literal) {
-	// Standard MiniSat: bump by 1.0, then decay by 0.95
-	// This creates activity differences that drive variable selection
-	bumpAmount := 1.0
+	// Scale bump by clause size: smaller clauses get larger bumps
+	// Binary clauses: bump = 5.0
+	// Ternary clauses: bump = 3.33
+	// 10-literal clauses: bump = 1.0
+	// This focuses search on variables in constrained clauses
+	baseBump := 10.0
+	bumpAmount := baseBump / float64(len(literals))
+	if bumpAmount < 0.5 {
+		bumpAmount = 0.5 // Minimum bump for very large clauses
+	}
 	
 	for _, lit := range literals {
 		v.bumpLarge(lit.Var(), bumpAmount)
@@ -141,21 +149,10 @@ func (v *VSIDS) decayLRB() {
 	}
 }
 
-// decayConflictCounter tracks conflicts since last decay
-var decayConflictCounter int = 0
-
-// decay decays all activity scores periodically
-// Called every conflict but only applies decay every 100 conflicts
-// This allows activity scores to accumulate and create meaningful differences
+// decay decays all activity scores every conflict (MiniSat-style)
+// This creates strong differentiation between important and unimportant variables
+// Decay factor starts at 0.95 and increases toward max for focused search
 func (v *VSIDS) decay() {
-	decayConflictCounter++
-	
-	// Only decay every 100 conflicts
-	if decayConflictCounter < 100 {
-		return
-	}
-	decayConflictCounter = 0
-	
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
 		v.decayFactor += v.decayIncrement
@@ -165,7 +162,7 @@ func (v *VSIDS) decay() {
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
 	
-	// Apply decay to all activity scores
+	// Apply decay to all activity scores EVERY CONFLICT
 	for i := range v.activity {
 		v.activity[i] *= v.decayFactor
 	}
