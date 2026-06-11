@@ -1255,9 +1255,10 @@ func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Litera
 }
 
 func (s *CDCLSolver) inprocessing() {
-	// Skip inprocessing on very small instances - overhead outweighs benefits
-	// Small instances (< 100 clauses) solve quickly without simplification
-	if s.cnf.NumClauses < 100 {
+	// Skip inprocessing on small/medium instances - overhead outweighs benefits
+	// Small instances (< 500 clauses) solve quickly without simplification
+	// Inprocessing O(n*m) subsumption check is too expensive on small formulas
+	if s.cnf.NumClauses < 500 {
 		return
 	}
 
@@ -1785,9 +1786,9 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			s.backjumpLevel = 0
 
 			// Inprocessing: apply simplification techniques during search
-			// Run every 500 conflicts on medium/large instances (>100 clauses)
-			// Skip on small instances where overhead outweighs benefits
-			if s.conflicts > 0 && s.conflicts%500 == 0 && s.cnf.NumClauses >= 100 {
+			// Run every 2000 conflicts on large instances (>500 clauses)
+			// Skip on small/medium instances where overhead outweighs benefits
+			if s.conflicts > 0 && s.conflicts%2000 == 0 && s.cnf.NumClauses >= 500 {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d\n", s.conflicts)
 				}
