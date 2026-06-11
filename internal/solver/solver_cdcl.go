@@ -440,25 +440,39 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNKNOWN
 	}
 
-	if s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000 {
+	if s.cnf.NumVars > 50000 || s.cnf.NumClauses > 500000 {
+		// Skip on VERY large instances (>50K vars or >500K clauses) - preprocessing too slow
+		// But DO run basic preprocessing on medium-large instances (10K-50K vars)
 		if s.verbose {
-			fmt.Printf("c [verbose] Skipping aggressive preprocessing: instance too large (%d vars, %d clauses)\n",
+			fmt.Printf("c [verbose] Skipping preprocessing: instance too large (%d vars, %d clauses)\n",
 				s.cnf.NumVars, s.cnf.NumClauses)
 		}
-		// Still initialize watches and do basic setup
 		s.cnf.RebuildLiteralPool()
 		s.initWatches()
 		return UNKNOWN
 	}
+	
+	// For large instances (10K-50K vars or 50K-500K clauses), use lightweight preprocessing
+	isLargeInstance := s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000
+	if isLargeInstance && s.verbose {
+		fmt.Printf("c [verbose] Running lightweight preprocessing on large instance (%d vars, %d clauses)\n",
+			s.cnf.NumVars, s.cnf.NumClauses)
+	}
 
 	initialClauses := s.cnf.NumClauses
+
+	// For large instances, use fewer passes and skip expensive techniques
+	maxPasses := 5
+	if isLargeInstance {
+		maxPasses = 2 // Fewer passes on large instances
+	}
 
 	// Increase to 5 passes for more thorough preprocessing
 	// Modern solvers (CaDiCaL) use 10+ passes
 	// Safeguards: time limits in each technique prevent explosion
-	for pass := 0; pass < 5; pass++ {
+	for pass := 0; pass < maxPasses; pass++ {
 		if s.verbose {
-			fmt.Printf("c [verbose] Preprocessing pass %d: %d clauses\n", pass+1, s.cnf.NumClauses)
+			fmt.Printf("c [verbose] Preprocessing pass %d/%d: %d clauses\n", pass+1, maxPasses, s.cnf.NumClauses)
 		}
 
 		// Run unit propagation first to catch any existing units
@@ -469,7 +483,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 
 		// Equivalence detection: find a↔b patterns and substitute
-		if preprocessConfig.EnableEquivalence {
+		// Skip on very large instances (>20K vars) - O(n^2) complexity
+		if preprocessConfig.EnableEquivalence && !isLargeInstance {
 			if equivResult := s.equivalenceDetection(); equivResult != UNKNOWN {
 				return equivResult
 			}
@@ -485,25 +500,25 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Pure literal elimination
+		// Pure literal elimination - cheap, run on all instances
 		if preprocessConfig.EnablePureLiteral {
 			if pureResult := s.pureLiteralElimination(); pureResult != UNKNOWN {
 				return pureResult
 			}
 		}
 
-		// Subsumption elimination
-		if preprocessConfig.EnableSubsumption {
+		// Subsumption elimination - skip on large instances (O(n^2))
+		if preprocessConfig.EnableSubsumption && !isLargeInstance {
 			s.subsumptionElimination()
 		}
 
-		// Self-subsumption
-		if preprocessConfig.EnableSelfSubsumption {
+		// Self-subsumption - skip on large instances (expensive)
+		if preprocessConfig.EnableSelfSubsumption && !isLargeInstance {
 			s.selfSubsumption()
 		}
 
-		// Hyper-binary resolution
-		if preprocessConfig.EnableHyperBinary {
+		// Hyper-binary resolution - skip on large instances (expensive)
+		if preprocessConfig.EnableHyperBinary && !isLargeInstance {
 			s.hyperBinaryResolution()
 		}
 

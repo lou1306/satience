@@ -68,6 +68,13 @@ type VSIDS struct {
 func NewVSIDS(numVars uint32) *VSIDS {
 	maxDecay := 0.999
 	initialDecay := 0.95
+	
+	// For large instances (>10K vars), start with slower decay to preserve activity differences
+	// This prevents premature convergence on suboptimal variable orderings
+	if numVars > 10000 {
+		initialDecay = 0.90 // Slower initial decay for large instances
+	}
+	
 	return &VSIDS{
 		activity:              make([]float64, numVars),
 		conflictParticipation: make([]int, numVars),
@@ -87,19 +94,49 @@ func NewVSIDS(numVars uint32) *VSIDS {
 
 // InitializeFromClauses initializes VSIDS activity based on clause participation
 // Variables in shorter clauses get MUCH higher activity (more constrained = more important)
-// Binary clauses get 100x base weight to strongly bias initial variable selection
+// Uses aggressive exponential weighting for better differentiation on large instances
 func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
-	for _, clause := range clauses {
-		baseWeight := 10.0
-		if len(clause.Literals) == 2 {
-			baseWeight = 100.0
+	// For very large instances (>100K clauses), use sampling to avoid O(n) initialization cost
+	sampleRate := 1.0
+	if len(clauses) > 100000 {
+		sampleRate = 100000.0 / float64(len(clauses)) // Sample ~100K clauses
+	}
+	
+	// Count occurrences with strong exponential weighting
+	for clauseIdx, clause := range clauses {
+		// Sampling for very large instances
+		if sampleRate < 1.0 && float64(clauseIdx)*sampleRate < float64(clauseIdx+1)*sampleRate - 1.0 {
+			continue // Skip some clauses based on sample rate
 		}
-		weight := baseWeight / float64(len(clause.Literals))
-
+		
+		clauseLen := len(clause.Literals)
+		
+		// VERY aggressive exponential weighting for better differentiation
+		// Binary: 10000, Ternary: 1000, 4-ary: 100, 5-ary: 50, etc.
+		var baseWeight float64
+		if clauseLen <= 2 {
+			baseWeight = 10000.0
+		} else if clauseLen == 3 {
+			baseWeight = 1000.0
+		} else if clauseLen == 4 {
+			baseWeight = 100.0
+		} else if clauseLen == 5 {
+			baseWeight = 50.0
+		} else {
+			baseWeight = 25.0 / float64(clauseLen-5) // Still significant weight for long clauses
+		}
+		
+		// Weight inversely proportional to clause length (squared for more differentiation)
+		weight := baseWeight / float64(clauseLen*clauseLen)
+		
 		for _, lit := range clause.Literals {
-			v.activity[lit.Var()] += weight
+			varIdx := lit.Var()
+			if int(varIdx) < len(v.activity) {
+				v.activity[varIdx] += weight
+			}
 		}
 	}
+	
 	v.heapValid = false // Invalidate heap after modifying activities
 }
 
@@ -144,13 +181,14 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 
 	// Bonus formula: EXPONENTIAL bonus for lower LBD
 	// Glue clauses (LBD<=3) are extremely important - give huge bonus
-	// LBD=2: bonus = 10000 (core glue - most important)
-	// LBD=3: bonus = 3333 (glue - very important)
-	// LBD=4: bonus = 1250
-	// LBD=5: bonus = 500
-	// LBD=10: bonus = 100
+	// LBD=2: bonus = 15000 (core glue - most important)
+	// LBD=3: bonus = 5000 (glue - very important)
+	// LBD=4: bonus = 1875
+	// LBD=5: bonus = 750
+	// LBD=10: bonus = 150
 	// This ensures glue clause variables dominate VSIDS selection
-	bonus := 20000.0 / float64(lbd*lbd)
+	// Increased base from 20000 to 30000 for stronger LBD influence
+	bonus := 30000.0 / float64(lbd*lbd)
 
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
@@ -224,10 +262,18 @@ func (v *VSIDS) decayLRB() {
 // decay decays all activity scores every conflict (MiniSat-style)
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
+// Adapts decay rate based on search progress
 func (v *VSIDS) decay() {
+	// Adaptive decay: increase decay factor more slowly for large instances
+	// This preserves activity differences longer and prevents premature convergence
+	decaySpeed := 1.0
+	if len(v.activity) > 10000 {
+		decaySpeed = 0.5 // Slower adaptation for large instances
+	}
+	
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
-		v.decayFactor += v.decayIncrement
+		v.decayFactor += v.decayIncrement * decaySpeed
 		if v.decayFactor > v.maxDecayFactor {
 			v.decayFactor = v.maxDecayFactor
 		}
