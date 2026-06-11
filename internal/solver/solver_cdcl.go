@@ -3274,17 +3274,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	newSize := make([]int, 0, len(keepIndices))
 	newLBD := make([]int, 0, len(keepIndices))
 
-	// Collect literals for clauses to keep
-	allLiterals := make([][]cnf.Literal, 0, len(keepIndices))
-	for _, idx := range keepIndices {
-		allLiterals = append(allLiterals, s.learnedClauses[idx].Literals)
-	}
-
-	// Rebuild pool with only kept clauses
+	// Rebuild pool with only kept clauses (direct copy, no intermediate allocation)
 	s.learnedClausePool.Clear()
-	for _, lits := range allLiterals {
-		clauseLits, _ := s.learnedClausePool.AddClause(lits)
-		_ = clauseLits // Will refresh below
+	for _, idx := range keepIndices {
+		s.learnedClausePool.AddClause(s.learnedClauses[idx].Literals)
 	}
 
 	// Build new arrays from kept clauses
