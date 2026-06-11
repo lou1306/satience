@@ -92,7 +92,8 @@ type CDCLSolver struct {
 	iterations         int
 	propagations       int // Total propagations (assignments by unit propagation)
 	maxIter            int
-	learnedClauses     []cnf.Clause // Learned clauses
+	learnedClauses     []cnf.Clause    // Learned clauses (metadata only, literals in learnedClausePool)
+	learnedClausePool  *LearnedClausePool // Memory pool for learned clause literals
 	clauseActivity     []float64
 	clauseAge          []int
 	clauseSize         []int // Track clause size for deletion
@@ -176,6 +177,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:          0,
 		maxIter:             0,
 		learnedClauses:      make([]cnf.Clause, 0),
+		learnedClausePool:   NewLearnedClausePool(maxLearned, 6), // Pre-allocate for expected clauses
 		clauseActivity:      make([]float64, 0),
 		clauseAge:           make([]int, 0),
 		clauseLBD:           make([]int, 0),
@@ -312,6 +314,16 @@ func (s *CDCLSolver) GetIterations() int {
 // GetLearnedCount returns the number of learned clauses
 func (s *CDCLSolver) GetLearnedCount() int {
 	return len(s.learnedClauses)
+}
+
+// GetMemoryPoolStats returns memory pool statistics
+func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemoryKB int) {
+	if s.learnedClausePool == nil {
+		return 0, 0, 0
+	}
+	return s.learnedClausePool.NumActiveClauses(), 
+		   len(s.learnedClausePool.literals), 
+		   s.learnedClausePool.MemoryUsage() / 1024
 }
 
 func (s *CDCLSolver) getDetailedStats() SolverStats {
@@ -2978,14 +2990,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		s.currentAge++
 
-		// Make a copy of learned literals since tmpLearnedLits is reused
-		literalsCopy := make([]cnf.Literal, len(s.tmpLearnedLits))
-		copy(literalsCopy, s.tmpLearnedLits)
+		// Add clause to memory pool (avoids per-clause allocation)
+		_, clauseLits := s.learnedClausePool.AddClause(s.tmpLearnedLits)
 
-		// Append first, then get stable pointer
-		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
+		// Create clause metadata with pointer to pool storage
+		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: clauseLits, Learned: true})
 
-		// Get stable pointer after append (slice might have reallocated)
+		// Get index and stable pointer after append (slice might have reallocated)
 		learnedIdx := len(s.learnedClauses) - 1
 		clause := &s.learnedClauses[learnedIdx]
 
@@ -3242,41 +3253,52 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		toKeep = len(s.learnedClauses) // Can't keep more than we have
 	}
 
-	toDelete := len(s.learnedClauses) - toKeep
-
-	// Mark clauses to delete
-	keep := make([]bool, len(s.learnedClauses))
-	deleted := 0
-
-	for i := range keep {
-		keep[i] = true // Default: keep all
-	}
-
-	for i := 0; i < len(clauses) && deleted < toDelete; i++ {
-		idx := clauses[i].idx
+	// Build list of clause indices to keep (not deleted)
+	keepIndices := make([]int, 0, toKeep)
+	for i := range clauses {
 		// Skip protected clauses (score < 0 means protected)
 		if clauses[i].score < 0 {
+			keepIndices = append(keepIndices, clauses[i].idx)
 			continue
 		}
-		keep[idx] = false
-		deleted++
+		// Keep highest quality clauses until we reach toKeep
+		if len(keepIndices) < toKeep {
+			keepIndices = append(keepIndices, clauses[i].idx)
+		}
 	}
 
-	// Compact the slices
-	newClauses := make([]cnf.Clause, 0, toKeep)
-	newActivity := make([]float64, 0, toKeep)
-	newAge := make([]int, 0, toKeep)
-	newSize := make([]int, 0, toKeep)
-	newLBD := make([]int, 0, toKeep)
+	// Rebuild all arrays to keep only non-deleted clauses
+	newClauses := make([]cnf.Clause, 0, len(keepIndices))
+	newActivity := make([]float64, 0, len(keepIndices))
+	newAge := make([]int, 0, len(keepIndices))
+	newSize := make([]int, 0, len(keepIndices))
+	newLBD := make([]int, 0, len(keepIndices))
 
-	for i := range s.learnedClauses {
-		if keep[i] {
-			newClauses = append(newClauses, s.learnedClauses[i])
-			newActivity = append(newActivity, s.clauseActivity[i])
-			newAge = append(newAge, s.clauseAge[i])
-			newSize = append(newSize, s.clauseSize[i])
-			newLBD = append(newLBD, s.clauseLBD[i])
+	// Collect literals for clauses to keep
+	allLiterals := make([][]cnf.Literal, 0, len(keepIndices))
+	for _, idx := range keepIndices {
+		allLiterals = append(allLiterals, s.learnedClauses[idx].Literals)
+	}
+
+	// Rebuild pool with only kept clauses
+	s.learnedClausePool.Clear()
+	for _, lits := range allLiterals {
+		clauseLits, _ := s.learnedClausePool.AddClause(lits)
+		_ = clauseLits // Will refresh below
+	}
+
+	// Build new arrays from kept clauses
+	for i, idx := range keepIndices {
+		// Refresh literal pointer from pool
+		if clauseLits := s.learnedClausePool.GetClause(i); clauseLits != nil {
+			newClauses = append(newClauses, cnf.Clause{Literals: clauseLits, Learned: true})
+		} else {
+			newClauses = append(newClauses, s.learnedClauses[idx])
 		}
+		newActivity = append(newActivity, s.clauseActivity[idx])
+		newAge = append(newAge, s.clauseAge[idx])
+		newSize = append(newSize, s.clauseSize[idx])
+		newLBD = append(newLBD, s.clauseLBD[idx])
 	}
 
 	s.learnedClauses = newClauses
@@ -3289,8 +3311,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.lbdOrderDirty = true
 
 	if s.verbose {
-		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", deleted, len(s.learnedClauses), toKeep)
-		if deleted == 0 && len(s.learnedClauses) > 300 {
+		actualDeleted := len(s.learnedClauses) - len(keepIndices)
+		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", actualDeleted, len(s.learnedClauses), toKeep)
+		if actualDeleted == 0 && len(s.learnedClauses) > 300 {
 			// Debug: show why clauses are protected
 			protectedLBD := 0
 			protectedSize := 0
