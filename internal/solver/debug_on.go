@@ -89,3 +89,52 @@ func (s *CDCLSolver) Debug1UIPErrorLog(conflict, literals, atLevel int, learnedL
 		}
 	}
 }
+
+// DebugPreprocessingLog logs preprocessing info in debug builds
+func (s *CDCLSolver) DebugPreprocessingLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugRestartLog logs restart info in debug builds
+func (s *CDCLSolver) DebugRestartLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugInprocessLog logs inprocessing info in debug builds
+func (s *CDCLSolver) DebugInprocessLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugEquivalenceLog logs equivalence detection in debug builds
+func (s *CDCLSolver) DebugEquivalenceLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugPureLiteralLog logs pure literal elimination in debug builds
+func (s *CDCLSolver) DebugPureLiteralLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugSubsumptionLog logs subsumption elimination in debug builds
+func (s *CDCLSolver) DebugSubsumptionLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// DebugIterationLog logs iteration progress in debug builds
+func (s *CDCLSolver) DebugIterationLog(format string, args ...interface{}) {
+	if s.verbose {
+		fmt.Printf(format, args...)
+	}
+}
