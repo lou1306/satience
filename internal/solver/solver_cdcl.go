@@ -77,6 +77,7 @@ type CDCLSolver struct {
 	conflictsAtLevel   []int   // Track conflicts per decision level
 	lastRandomDecision int     // Last conflict where we made random decision
 	randomDecisionRate      float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
+	randomSeed            uint64  // Seed for deterministic random selection
 	lastDecisionVar         uint32  // Last variable chosen for decision
 	consecutiveFlips        int     // Count of consecutive decisions on same variable
 	minimizationMaxSize     int     // Skip minimization for clauses > this size (0=all)
@@ -154,6 +155,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lbdSum:              0,
 		lbdCount:            0,
 		randomDecisionRate:  0.0, // Default: no random decisions
+		randomSeed:          0,   // Default seed for deterministic randomness
 		learnedClauseOrder:  make([]int, 0),
 		lbdOrderDirty:       true,
 		lbdOrderLastRebuild: 0,
@@ -207,6 +209,12 @@ func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
 		rate = 1.0
 	}
 	s.randomDecisionRate = rate
+}
+
+// SetRandomSeed sets the seed for deterministic random selection
+// Default seed is 0
+func (s *CDCLSolver) SetRandomSeed(seed uint64) {
+	s.randomSeed = seed
 }
 
 // EnableLRB enables LRB (Learning Rate Based) heuristic
@@ -2152,9 +2160,16 @@ func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 		return 0
 	}
 
-	// Simple deterministic "random" selection based on conflict count
-	// This ensures reproducibility while providing diversification
-	idx := s.conflicts % len(unassigned)
+	// Use XORShift64 PRNG for deterministic random selection
+	// Update seed: x ^= x << 13; x ^= x >> 7; x ^= x << 17
+	seed := s.randomSeed
+	seed ^= seed << 13
+	seed ^= seed >> 7
+	seed ^= seed << 17
+	s.randomSeed = seed
+
+	// Use lower bits to select index
+	idx := int(seed % uint64(len(unassigned)))
 	return unassigned[idx]
 }
 
