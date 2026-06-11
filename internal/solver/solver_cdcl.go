@@ -1,3 +1,24 @@
+// Package solver implements a CDCL SAT solver with modern techniques.
+//
+// This package provides a sound and complete CDCL (Conflict-Driven Clause Learning)
+// SAT solver implementing:
+//   - 1-UIP conflict analysis with backjumping
+//   - VSIDS variable selection with activity heap
+//   - LBD-based clause database management
+//   - Watched literals propagation
+//   - Adaptive restarts (Luby sequence + Glucose-style)
+//   - Phase saving heuristic
+//   - Clause minimization via self-subsumption
+//   - Preprocessing and inprocessing
+//
+// Basic usage:
+//
+//	cnf := parseCNF("formula.cnf")
+//	solver := solver.NewCDCLSolver(cnf)
+//	result := solver.Solve()
+//	if result == solver.SAT {
+//	    model := solver.GetAssignments()
+//	}
 package solver
 
 import (
@@ -8,16 +29,22 @@ import (
 	"time"
 )
 
-// SolveResult represents the result of solving
+// SolveResult represents the result of SAT solving.
 type SolveResult int
 
 const (
+	// SAT indicates the formula is satisfiable.
 	SAT SolveResult = iota
+	// UNSAT indicates the formula is unsatisfiable.
 	UNSAT
+	// UNKNOWN indicates the solver couldn't determine satisfiability (timeout, etc.).
 	UNKNOWN
 )
 
-// Solver configuration constants
+// Solver configuration constants.
+//
+// These defaults balance performance and memory usage for typical instances.
+// Tuning may be beneficial for specific instance families.
 const (
 	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
@@ -30,17 +57,27 @@ const (
 	LargeClauseSize         = 15    // Size threshold for forced deletion
 	IterationReportInterval = 10000 // Report progress every N iterations
 
-	// Clause minimization thresholds
-	// Set to extremely high values to enable aggressive minimization on ALL clauses
+	// Clause minimization thresholds.
+	// Set to extremely high values to enable aggressive minimization on ALL clauses.
 	MinimizationMaxSize       = 10000 // Minimize clauses up to 10K literals (effectively all)
 	MinimizationMaxLBD        = 10000 // Minimize clauses up to LBD 10K (effectively all)
 	MinimizationMaxReasonSize = 100   // Allow reason clauses up to 100 literals (more aggressive)
 
-	// Debugging thresholds
+	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
 )
 
-// CDCLSolver implements a CDCL solver (DPLL with VSIDS + clause learning)
+// CDCLSolver implements a CDCL SAT solver with modern techniques.
+//
+// The solver uses:
+//   - Watched literals for O(1) propagation
+//   - 1-UIP conflict analysis with clause minimization
+//   - VSIDS variable selection with activity heap
+//   - LBD-based clause database management
+//   - Adaptive restarts
+//   - Phase saving
+//
+// Fields are mostly private; use provided methods for interaction.
 type CDCLSolver struct {
 	cnf                 *cnf.CNF
 	assignments         []Assignment
@@ -419,16 +456,17 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Equivalence detection: find a↔b patterns and substitute (BEFORE VE destroys binary clauses)
+		// Equivalence detection: find a↔b patterns and substitute
 		if preprocessConfig.EnableEquivalence {
 			if equivResult := s.equivalenceDetection(); equivResult != UNKNOWN {
 				return equivResult
 			}
 		}
 
-		// Variable elimination disabled (causes model reconstruction bugs)
+		// Variable elimination: disabled (causes model reconstruction bugs)
+		// TODO: Fix variable elimination with proper model reconstruction
 
-		// Run unit propagation again after variable elimination
+		// Run unit propagation to catch new units from equivalence substitution
 		if preprocessConfig.EnableUnitProp {
 			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
 				return unitResult
@@ -1730,12 +1768,45 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 	return UNKNOWN
 }
 
+// Solve determines if the CNF formula is satisfiable.
+//
+// Returns true if SAT, false if UNSAT or UNKNOWN.
+// For detailed results, use SolveWithResult().
+//
+// This is the main solving interface. The solver uses CDCL with:
+//   - Watched literals propagation
+//   - 1-UIP conflict analysis
+//   - VSIDS variable selection
+//   - Clause learning and deletion
+//
+// Example:
+//
+//	solver := solver.NewCDCLSolver(cnf)
+//	if solver.Solve() {
+//	    fmt.Println("SAT")
+//	} else {
+//	    fmt.Println("UNSAT or UNKNOWN")
+//	}
 func (s *CDCLSolver) Solve() bool {
 	result := s.SolveWithResult()
 	return result == SAT
 }
 
-// SolveWithPreprocessing runs aggressive preprocessing before solving
+// SolveWithPreprocessing runs aggressive preprocessing before solving.
+//
+// Preprocessing techniques include:
+//   - Unit propagation
+//   - Equivalence detection and substitution
+//   - Pure literal elimination
+//   - Subsumption elimination
+//   - Self-subsumption
+//   - Hyper-binary resolution
+//
+// Preprocessing is skipped on very small (<50 clauses) or very large
+// (>10K vars, >50K clauses) instances.
+//
+// Returns SAT, UNSAT, or UNKNOWN. Use GetAssignments() to retrieve
+// the model if SAT.
 func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	// Run aggressive preprocessing pipeline
 	preprocResult := s.preprocessAggressive()
@@ -1818,6 +1889,25 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	}
 }
 
+// SolveWithResult determines satisfiability with detailed result.
+//
+// Returns:
+//   - SAT: Formula is satisfiable, use GetAssignments() to get model
+//   - UNSAT: Formula is unsatisfiable
+//   - UNKNOWN: Timeout, iteration limit, or inconclusive
+//
+// This is the primary solving method. It performs:
+//  1. Unit propagation preprocessing
+//  2. Watch initialization
+//  3. VSIDS activity initialization
+//  4. Main CDCL search loop with:
+//     - Watched literals propagation
+//     - 1-UIP conflict analysis
+//     - Clause learning and deletion
+//     - Adaptive restarts
+//     - Inprocessing (on large instances)
+//
+// The solver maintains internal state; create a new solver for each formula.
 func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Unit propagation preprocessing - sound and safe
 	// Repeatedly propagate unit clauses until fixpoint
@@ -1905,7 +1995,25 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	}
 }
 
-// GetAssignments returns the current assignments for model extraction
+// GetAssignments returns the satisfying assignment if Solve() returned SAT.
+//
+// Returns a slice of Assignment structs where:
+//   - assignments[i].Level > 0: Variable i+1 is assigned
+//   - assignments[i].Value: The truth value (true/false)
+//
+// The model can be printed in DIMACS format:
+//
+//	model := solver.GetAssignments()
+//	for i, assign := range model {
+//	    if assign.Level > 0 {
+//	        val := i + 1
+//	        if !assign.Value {
+//	            val = -(i + 1)
+//	        }
+//	        fmt.Printf("%d ", val)
+//	    }
+//	}
+//	fmt.Println("0")
 func (s *CDCLSolver) GetAssignments() []Assignment {
 	return s.assignments
 }
@@ -2479,7 +2587,8 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 		s.clauseActivity[i] *= ClauseActivityDecay
 	}
 
-	// Inprocessing disabled (causes soundness bugs with watched literals)
+	// Inprocessing runs every 2000 conflicts on large instances (>500 clauses)
+	// See inprocessing() method and solve loop integration
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause
