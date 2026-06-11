@@ -380,6 +380,17 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
+	// Skip on very small instances (< 50 clauses) - overhead outweighs benefits
+	// Small instances solve faster with direct CDCL search
+	if s.cnf.NumClauses < 50 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Skipping preprocessing: instance too small (%d clauses)\n", s.cnf.NumClauses)
+		}
+		s.cnf.RebuildLiteralPool()
+		s.initWatches()
+		return UNKNOWN
+	}
+
 	if s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000 {
 		if s.verbose {
 			fmt.Printf("c [verbose] Skipping aggressive preprocessing: instance too large (%d vars, %d clauses)\n",
@@ -1256,6 +1267,12 @@ func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Litera
 }
 
 func (s *CDCLSolver) inprocessing() {
+	// Skip inprocessing on very small instances - overhead outweighs benefits
+	// Small instances (< 100 clauses) solve quickly without simplification
+	if s.cnf.NumClauses < 100 {
+		return
+	}
+
 	if s.verbose {
 		fmt.Printf("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
 	}
@@ -1780,9 +1797,9 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			s.backjumpLevel = 0
 
 			// Inprocessing: apply simplification techniques during search
-			// Run every 500 conflicts to reduce formula size and catch new units
-			// Check BEFORE restart to ensure it runs even if restart triggers
-			if s.conflicts > 0 && s.conflicts%500 == 0 {
+			// Run every 500 conflicts on medium/large instances (>100 clauses)
+			// Skip on small instances where overhead outweighs benefits
+			if s.conflicts > 0 && s.conflicts%500 == 0 && s.cnf.NumClauses >= 100 {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d\n", s.conflicts)
 				}
