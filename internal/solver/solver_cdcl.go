@@ -1257,20 +1257,43 @@ func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Litera
 
 func (s *CDCLSolver) inprocessing() {
 	if s.verbose {
-		fmt.Printf("c [verbose] Inprocessing: %d conflicts, %d clauses\n", s.conflicts, s.cnf.NumClauses)
+		fmt.Printf("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
 	}
 
 	initialClauses := s.cnf.NumClauses
+	startTime := time.Now()
+	timeLimit := 500 * time.Millisecond // Limit inprocessing time
 
-	s.subsumptionElimination()
-
-	if s.conflicts%1000 == 0 {
-		s.selfSubsumption()
-		// variableElimination disabled - causes model reconstruction bugs
+	// 1. Subsumption elimination (original clauses only, safe during search)
+	s.inprocessSubsumption()
+	if time.Since(startTime) > timeLimit {
+		return
 	}
 
-	if s.verbose && initialClauses != s.cnf.NumClauses {
-		fmt.Printf("c [verbose] Inprocessing: reduced from %d to %d clauses\n", initialClauses, s.cnf.NumClauses)
+	// 2. Self-subsumption (every 1000 conflicts, more expensive)
+	if s.conflicts%1000 == 0 {
+		s.selfSubsumption()
+	}
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	// 3. Unit propagation on learned clauses (safe, can find new units)
+	// This catches units created by clause learning and deletion
+	s.inprocessUnitPropagation()
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	// 4. Hyper-binary resolution (cheap, adds binary clauses)
+	if s.conflicts%500 == 0 {
+		s.hyperBinaryResolution()
+	}
+
+	removed := initialClauses - s.cnf.NumClauses
+	if s.verbose && removed != 0 {
+		elapsed := time.Since(startTime)
+		fmt.Printf("c [inprocess] Inprocessing complete: removed %d clauses in %.1fms\n", removed, float64(elapsed.Nanoseconds())/1e6)
 	}
 }
 
@@ -1347,6 +1370,49 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	s.level = 1
 
 	return UNKNOWN
+}
+
+// inprocessUnitPropagation performs unit propagation during search
+// Unlike unitPropagationPreprocess, this runs on the current trail state
+// and doesn't reset assignments. It's safe to call during search.
+func (s *CDCLSolver) inprocessUnitPropagation() {
+	// Only process original clauses (learned clauses change too frequently)
+	// and only if we have few enough clauses to make it worthwhile
+	if s.cnf.NumClauses > 10000 {
+		return
+	}
+
+	// Scan for unit clauses and propagate them
+	// This catches units created by clause deletion and subsumption
+	for i := 0; i < s.cnf.NumClauses && i < len(s.cnf.Clauses); i++ {
+		clause := &s.cnf.Clauses[i]
+		if len(clause.Literals) != 1 {
+			continue
+		}
+
+		lit := clause.Literals[0]
+		varIdx := lit.Var()
+
+		// Check if already assigned
+		if s.assignments[varIdx].Level != 0 {
+			continue
+		}
+
+		// Propagate the unit
+		value := !lit.IsNegated()
+		s.assignments[varIdx] = Assignment{
+			Value: value,
+			Level: s.level,
+		}
+		s.varLevel[varIdx] = s.level
+		s.trail = append(s.trail, int(varIdx))
+		s.trailLevel = append(s.trailLevel, s.level)
+		s.implication[varIdx] = clause
+
+		if s.verbose {
+			fmt.Printf("c [inprocess] Unit propagation: var %d = %v\n", varIdx, value)
+		}
+	}
 }
 
 func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
@@ -1713,9 +1779,20 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
+			// Inprocessing: apply simplification techniques during search
+			// Run every 500 conflicts to reduce formula size and catch new units
+			// Check BEFORE restart to ensure it runs even if restart triggers
+			if s.conflicts > 0 && s.conflicts%500 == 0 {
+				if s.verbose {
+					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d\n", s.conflicts)
+				}
+				s.inprocessing()
+			}
+
 			if s.shouldRestart() {
 				s.restart()
 			}
+
 			continue
 		}
 
