@@ -256,6 +256,14 @@ func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
 }
 
+// SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
+// Higher values = fewer heap rebuilds but slower activity differentiation
+// Lower values = more frequent decay but more heap rebuilds
+// Default is 10, which provides good balance for most instances
+func (s *CDCLSolver) SetDecayInterval(interval int) {
+	s.vsids.SetDecayInterval(interval)
+}
+
 // EnableLRB enables LRB (Learning Rate Based) heuristic
 func (s *CDCLSolver) EnableLRB() {
 	s.vsids.EnableLRB()

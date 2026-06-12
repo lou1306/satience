@@ -4,12 +4,9 @@ import (
 	"satience/internal/cnf"
 )
 
-// DecayInterval controls how often VSIDS activity decay occurs
-// Decay every N conflicts instead of every conflict to reduce heap rebuild overhead
-// Higher values = fewer heap rebuilds but slower activity differentiation
-// Lower values = more frequent decay but more heap rebuilds
+// DefaultDecayInterval is the default number of conflicts between VSIDS activity decays
 // Value of 10 provides good balance: 10× fewer heap rebuilds with minimal quality loss
-const DecayInterval = 10
+const DefaultDecayInterval = 10
 
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
@@ -106,6 +103,7 @@ type VSIDS struct {
 	decayIncrement        float64   // Increment per conflict
 	heap                  vsidsHeap // Activity heap for O(log n) selection
 	heapValid             bool      // True if heap is up-to-date
+	decayInterval         int       // Number of conflicts between activity decays
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -126,6 +124,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapValid:             false,
+		decayInterval:         DefaultDecayInterval,
 	}
 }
 
@@ -177,6 +176,17 @@ func (v *VSIDS) EnableLRB() {
 // EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
 func (v *VSIDS) EnableLBD() {
 	v.useLBD = true
+}
+
+// SetDecayInterval sets the number of conflicts between activity decays
+// Higher values = fewer heap rebuilds but slower activity differentiation
+// Lower values = more frequent decay but more heap rebuilds
+// Default is 10, which provides good balance for most instances
+func (v *VSIDS) SetDecayInterval(interval int) {
+	if interval < 1 {
+		interval = 1
+	}
+	v.decayInterval = interval
 }
 
 // bumpLBD adds LBD bonus to variables in a learned clause
@@ -268,13 +278,13 @@ func (v *VSIDS) decayLRB() {
 // decay decays all activity scores periodically (MiniSat-style)
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
-// Only decays every DecayInterval conflicts to reduce heap rebuild overhead
+// Only decays every v.decayInterval conflicts to reduce heap rebuild overhead
 func (v *VSIDS) decay() {
 	v.conflictCount++
 	
-	// Lazy decay: only decay every DecayInterval conflicts
-	// This reduces heap rebuilds by 10× while maintaining good variable selection quality
-	if v.conflictCount%DecayInterval != 0 {
+	// Lazy decay: only decay every decayInterval conflicts
+	// This reduces heap rebuilds while maintaining good variable selection quality
+	if v.conflictCount%v.decayInterval != 0 {
 		return
 	}
 	
