@@ -165,8 +165,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	solver := &CDCLSolver{
 		cnf:                 formula,
 		assignments:         make([]Assignment, formula.NumVars),
-		trail:               make([]int, 0),
-		trailLevel:          make([]int, 0),
+		trail:               make([]int, 0, formula.NumVars),      // Pre-allocate to avoid growth allocations
+		trailLevel:          make([]int, 0, formula.NumVars),      // Pre-allocate to avoid growth allocations
 		varLevel:            make([]int, formula.NumVars),
 		trailHead:           make([]int, 1),
 		qhead:               0,
