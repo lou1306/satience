@@ -2457,7 +2457,16 @@ func (s *CDCLSolver) decide() bool {
 		// Reset flip tracking
 		s.consecutiveFlips = 0
 	} else {
-		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+		// Select variable using VSIDS heuristic
+		varIdx, _ = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+		
+		// Use saved phase from previous decisions (phase saving heuristic)
+		// This remembers the polarity that worked well in previous search attempts
+		if int(varIdx) < len(s.savedPhase) {
+			phase = s.savedPhase[varIdx]
+		} else {
+			phase = true // Default to positive phase
+		}
 
 		// Detect variable flipping (same variable chosen consecutively)
 		if s.conflicts > 0 && varIdx == s.lastDecisionVar {
