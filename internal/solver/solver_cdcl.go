@@ -2937,8 +2937,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 
 		// Check if we need to delete clauses
-		// Keep max normal clauses consistent with maxLearned threshold
-		maxNormalClauses := 2000  // Allow some headroom below maxLearned
+		// Aggressive deletion: trigger when we have too many non-glue clauses
+		maxNormalClauses := 1500  // Reduced from 2000 for tighter database
+
+		// Immediate deletion trigger for high-LBD clauses
+		if lbd > 10 && len(s.learnedClauses) > 1000 {
+			// Learned a very high-LBD clause and database is large - delete now
+			s.deleteLearnedClauses()
+		}
 
 		if s.normalClauseCount >= maxNormalClauses && lbd > GlueLBDThreshold {
 			// Delete oldest 50% of normal clauses (by age)
@@ -3176,9 +3182,9 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// Aggressive clause deletion - keep only the absolute best clauses
-	// Strategy: Delete by age first, then by quality
-	// Rationale: Old clauses, even with good LBD, may not be relevant to current search
+	// LBD-based clause deletion - keep only high-quality learned clauses
+	// Strategy: PRIMARY factor is LBD quality, SECONDARY is age
+	// Rationale: High-LBD clauses are weak constraints that don't prune search effectively
 
 	type clauseInfo struct {
 		idx      int
@@ -3192,54 +3198,50 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
 
 	for i, clause := range s.learnedClauses {
-		// Use stored LBD (calculated at learning time)
 		lbd := s.clauseLBD[i]
-
 		size := len(clause.Literals)
 		age := s.currentAge - s.clauseAge[i]
 		activity := s.clauseActivity[i]
 
 		// Calculate deletion score (higher = delete first)
-		// PRIMARY FACTOR: Age (old clauses are less relevant)
-		score := float64(age) * 10.0
+		// PRIMARY FACTOR: LBD (higher LBD = much more likely to delete)
+		// This is the key change: LBD weight increased from 50 to 200
+		score := float64(lbd) * 200.0
 
-		// SECONDARY FACTOR: LBD (higher LBD = less useful)
-		score += float64(lbd) * 50.0
+		// SECONDARY FACTOR: Age (old clauses less relevant)
+		// Reduced weight since LBD is now primary
+		score += float64(age) * 5.0
 
-		// TERTIARY FACTOR: Size (larger clauses are less useful)
-		score += float64(size) * 5.0
+		// TERTIARY FACTOR: Size (larger clauses less useful)
+		score += float64(size) * 10.0
 
-		// BONUS: Activity (active clauses are more useful)
-		// INCREASED WEIGHT: Activity now 2.5× more important in deletion decisions
-		score -= activity * 50.0
+		// BONUS: Activity (active clauses more useful)
+		score -= activity * 100.0
 
 		// PROTECTION: Core glue clauses (LBD ≤ 2) are NEVER deleted
-		// These are the backbone of the learned clause database
-		if lbd <= GlueLBDThreshold {
-			score = -10000.0 // Absolutely never delete, regardless of age or size
+		if lbd <= 2 {
+			score = -10000.0 // Absolutely never delete
 		}
 
-		// NEAR-GLUE PROTECTION: LBD = 3 with small size and young age
-		// These are valuable but not critical - protect unless old
-		if lbd == 3 && size <= 4 && age < 100 {
-			score = -500.0 // Strong protection
-		}
-		
-		// LBD = 4 with very small size and young age - moderate protection
-		if lbd == 4 && size <= 4 && age < 50 {
-			score = -100.0 // Weak protection
+		// NEAR-GLUE PROTECTION: LBD = 3 - strong protection
+		if lbd == 3 {
+			score = -5000.0 // Very strong protection
 		}
 
-		// FORCE DELETION: Very old clauses (age > MaxClauseAge) regardless of LBD
-		// But NOT core glue clauses (LBD ≤ CoreGlueLBDThreshold)
-		if age > MaxClauseAge && lbd > CoreGlueLBDThreshold {
-			score += 1000.0 // Force deletion of very old clauses
+		// MODERATE PROTECTION: LBD = 4 with small size
+		if lbd == 4 && size <= 5 {
+			score = -1000.0 // Moderate protection
 		}
 
-		// FORCE DELETION: Large clauses (size > LargeClauseSize) regardless of LBD
-		// But NOT core glue clauses (LBD ≤ CoreGlueLBDThreshold)
-		if size > LargeClauseSize && lbd > CoreGlueLBDThreshold {
-			score += 800.0 // Force deletion of large clauses
+		// FORCE DELETION: High-LBD clauses (LBD > 8) regardless of age
+		// These are the clauses causing poor performance on random instances
+		if lbd > 8 {
+			score += 2000.0 // Strong push toward deletion
+		}
+
+		// FORCE DELETION: Very high-LBD clauses (LBD > 12) - almost certain deletion
+		if lbd > 12 {
+			score += 3000.0 // Very strong push toward deletion
 		}
 
 		clauses = append(clauses, clauseInfo{
@@ -3257,20 +3259,20 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		return clauses[i].score > clauses[j].score
 	})
 
-	// Target: reduce by 30% (gradual deletion instead of 50%)
-	// Keep 70% of clauses, delete 30%
-	toKeep := int(float64(len(s.learnedClauses)) * 0.70)
+	// Target: Keep only the best 50% of clauses (aggressive deletion)
+	// This ensures database stays high-quality
+	toKeep := int(float64(len(s.learnedClauses)) * 0.50)
 	if toKeep < s.minLearned {
-		toKeep = s.minLearned // Don't go below minLearned
+		toKeep = s.minLearned
 	}
 	if toKeep > len(s.learnedClauses) {
-		toKeep = len(s.learnedClauses) // Can't keep more than we have
+		toKeep = len(s.learnedClauses)
 	}
 
-	// Build list of clause indices to keep (not deleted)
+	// Build list of clause indices to keep
 	keepIndices := make([]int, 0, toKeep)
 	for i := range clauses {
-		// Skip protected clauses (score < 0 means protected)
+		// Always keep protected clauses (negative score)
 		if clauses[i].score < 0 {
 			keepIndices = append(keepIndices, clauses[i].idx)
 			continue
