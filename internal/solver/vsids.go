@@ -5,6 +5,13 @@ import (
 	"satience/internal/cnf"
 )
 
+// DecayInterval controls how often VSIDS activity decay occurs
+// Decay every N conflicts instead of every conflict to reduce heap rebuild overhead
+// Higher values = fewer heap rebuilds but slower activity differentiation
+// Lower values = more frequent decay but more heap rebuilds
+// Value of 10 provides good balance: 10× fewer heap rebuilds with minimal quality loss
+const DecayInterval = 10
+
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
 	varIdx   uint32
@@ -221,10 +228,19 @@ func (v *VSIDS) decayLRB() {
 	}
 }
 
-// decay decays all activity scores every conflict (MiniSat-style)
+// decay decays all activity scores periodically (MiniSat-style)
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
+// Only decays every DecayInterval conflicts to reduce heap rebuild overhead
 func (v *VSIDS) decay() {
+	v.conflictCount++
+	
+	// Lazy decay: only decay every DecayInterval conflicts
+	// This reduces heap rebuilds by 10× while maintaining good variable selection quality
+	if v.conflictCount%DecayInterval != 0 {
+		return
+	}
+	
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
 		v.decayFactor += v.decayIncrement
@@ -234,7 +250,7 @@ func (v *VSIDS) decay() {
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
 
-	// Apply decay to all activity scores EVERY CONFLICT
+	// Apply decay to all activity scores
 	for i := range v.activity {
 		v.activity[i] *= v.decayFactor
 	}
