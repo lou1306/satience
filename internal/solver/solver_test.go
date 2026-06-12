@@ -911,6 +911,68 @@ func TestCDCLSudoku2x2(t *testing.T) {
 	}
 }
 
+func TestCDCLPhp5p6hSat(t *testing.T) {
+	// Pigeonhole principle: 5 pigeons, 6 holes - SAT
+	// Each pigeon must go to at least one hole (5 clauses of size 6)
+	// No two pigeons can share a hole (90 binary clauses)
+	// SAT: 5 pigeons can fit in 6 holes
+	// This is a real GBD instance (php_5p_6h_sat.cnf)
+	c := cnf.CNF{
+		NumVars: 30,
+		Clauses: []cnf.Clause{
+			// Each pigeon goes to at least one hole (pigeon i uses vars i*6+1 to i*6+6)
+			newClause(1, 2, 3, 4, 5, 6),   // Pigeon 1
+			newClause(7, 8, 9, 10, 11, 12), // Pigeon 2
+			newClause(13, 14, 15, 16, 17, 18), // Pigeon 3
+			newClause(19, 20, 21, 22, 23, 24), // Pigeon 4
+			newClause(25, 26, 27, 28, 29, 30), // Pigeon 5
+
+			// Hole 1: pigeons 1,2,3,4,5 cannot share (vars 1,7,13,19,25)
+			newClause(-1, -7), newClause(-1, -13), newClause(-1, -19), newClause(-1, -25),
+			newClause(-7, -13), newClause(-7, -19), newClause(-7, -25),
+			newClause(-13, -19), newClause(-13, -25),
+			newClause(-19, -25),
+
+			// Hole 2: pigeons 1,2,3,4,5 cannot share (vars 2,8,14,20,26)
+			newClause(-2, -8), newClause(-2, -14), newClause(-2, -20), newClause(-2, -26),
+			newClause(-8, -14), newClause(-8, -20), newClause(-8, -26),
+			newClause(-14, -20), newClause(-14, -26),
+			newClause(-20, -26),
+
+			// Hole 3: pigeons 1,2,3,4,5 cannot share (vars 3,9,15,21,27)
+			newClause(-3, -9), newClause(-3, -15), newClause(-3, -21), newClause(-3, -27),
+			newClause(-9, -15), newClause(-9, -21), newClause(-9, -27),
+			newClause(-15, -21), newClause(-15, -27),
+			newClause(-21, -27),
+
+			// Hole 4: pigeons 1,2,3,4,5 cannot share (vars 4,10,16,22,28)
+			newClause(-4, -10), newClause(-4, -16), newClause(-4, -22), newClause(-4, -28),
+			newClause(-10, -16), newClause(-10, -22), newClause(-10, -28),
+			newClause(-16, -22), newClause(-16, -28),
+			newClause(-22, -28),
+
+			// Hole 5: pigeons 1,2,3,4,5 cannot share (vars 5,11,17,23,29)
+			newClause(-5, -11), newClause(-5, -17), newClause(-5, -23), newClause(-5, -29),
+			newClause(-11, -17), newClause(-11, -23), newClause(-11, -29),
+			newClause(-17, -23), newClause(-17, -29),
+			newClause(-23, -29),
+
+			// Hole 6: pigeons 1,2,3,4,5 cannot share (vars 6,12,18,24,30)
+			newClause(-6, -12), newClause(-6, -18), newClause(-6, -24), newClause(-6, -30),
+			newClause(-12, -18), newClause(-12, -24), newClause(-12, -30),
+			newClause(-18, -24), newClause(-18, -30),
+			newClause(-24, -30),
+		},
+		NumClauses: 65,
+	}
+
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT (pigeonhole 5 pigeons 6 holes), got %v", result)
+	}
+}
+
 func TestCDCLTseitinCycleUnsat(t *testing.T) {
 	// Simple UNSAT instance based on odd cycle
 	// x1 ∨ x2, ¬x2 ∨ x3, ¬x3 ∨ x4, ¬x4 ∨ x5, ¬x5 ∨ ¬x1
