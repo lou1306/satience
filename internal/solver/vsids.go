@@ -1,7 +1,6 @@
 package solver
 
 import (
-	"container/heap"
 	"satience/internal/cnf"
 )
 
@@ -16,35 +15,73 @@ const DecayInterval = 10
 type vsidsHeapItem struct {
 	varIdx   uint32
 	activity float64
-	index    int // index in the heap
 }
 
-// vsidsHeap implements heap.Interface for activity-based variable selection
+// vsidsHeap is a custom max-heap for activity-based variable selection
+// Implemented without container/heap to avoid interface{} type assertions
 type vsidsHeap []vsidsHeapItem
 
-func (h vsidsHeap) Len() int           { return len(h) }
-func (h vsidsHeap) Less(i, j int) bool { return h[i].activity > h[j].activity } // Max-heap
-func (h vsidsHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
+// up restores the heap property by moving an element up the tree
+// Used after inserting a new element at the end
+func (h *vsidsHeap) up(pos int) {
+	for pos > 0 {
+		parent := (pos - 1) / 2
+		if (*h)[pos].activity <= (*h)[parent].activity {
+			break
+		}
+		(*h)[pos], (*h)[parent] = (*h)[parent], (*h)[pos]
+		pos = parent
+	}
 }
 
-func (h *vsidsHeap) Push(x interface{}) {
+// down restores the heap property by moving an element down the tree
+// Used after removing the root element
+func (h *vsidsHeap) down(pos int) {
 	n := len(*h)
-	item := x.(vsidsHeapItem)
-	item.index = n
-	*h = append(*h, item)
+	for {
+		left := 2*pos + 1
+		if left >= n {
+			break
+		}
+		right := left + 1
+		largest := left
+		if right < n && (*h)[right].activity > (*h)[left].activity {
+			largest = right
+		}
+		if (*h)[pos].activity >= (*h)[largest].activity {
+			break
+		}
+		(*h)[pos], (*h)[largest] = (*h)[largest], (*h)[pos]
+		pos = largest
+	}
 }
 
-func (h *vsidsHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = vsidsHeapItem{} // avoid memory leak
-	item.index = -1
-	*h = old[0 : n-1]
+// push adds an element to the heap
+func (h *vsidsHeap) push(item vsidsHeapItem) {
+	*h = append(*h, item)
+	h.up(len(*h) - 1)
+}
+
+// pop removes and returns the maximum element (root of the heap)
+func (h *vsidsHeap) pop() vsidsHeapItem {
+	n := len(*h)
+	// Swap root with last element
+	(*h)[0], (*h)[n-1] = (*h)[n-1], (*h)[0]
+	item := (*h)[n-1]
+	*h = (*h)[:n-1]
+	if len(*h) > 0 {
+		h.down(0)
+	}
 	return item
+}
+
+// init builds a heap from an unsorted slice in O(n) time
+func (h *vsidsHeap) init() {
+	n := len(*h)
+	// Start from the last non-leaf node and heapify down
+	for i := n/2 - 1; i >= 0; i-- {
+		h.down(i)
+	}
 }
 
 // VSIDS implements the VSIDS (Variable State Independent Decaying Sum) heuristic
@@ -123,12 +160,12 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 			v.heap = append(v.heap, vsidsHeapItem{
 				varIdx:   uint32(i),
 				activity: effectiveActivity,
-				index:    -1,
 			})
 		}
 	}
 
-	heap.Init(&v.heap)
+	// Build heap in O(n) time
+	v.heap.init()
 	v.heapValid = true
 }
 
@@ -264,13 +301,13 @@ func (v *VSIDS) decay() {
 // This provides O(log n) selection instead of O(n) linear scan
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	// Rebuild heap if invalid or empty
-	if !v.heapValid || v.heap.Len() == 0 {
+	if !v.heapValid || len(v.heap) == 0 {
 		v.buildHeap(assignments)
 	}
 
 	// Pop variables until we find an unassigned one
-	for v.heap.Len() > 0 {
-		item := heap.Pop(&v.heap).(vsidsHeapItem)
+	for len(v.heap) > 0 {
+		item := v.heap.pop()
 		varIdx := int(item.varIdx)
 
 		// Skip if variable is now assigned (stale heap entry)
@@ -280,7 +317,7 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 
 		// Push it back with updated activity (including LBD bonus)
 		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx]
-		heap.Push(&v.heap, item)
+		v.heap.push(item)
 
 		return uint32(varIdx)
 	}
