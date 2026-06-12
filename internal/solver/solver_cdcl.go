@@ -2096,11 +2096,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	propagationCount := 0
 
-	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
-		lit := s.trail[trailIndex]
+	// Cache frequently accessed slices to help compiler optimize
+	trail := s.trail
+	assignments := s.assignments
+	watchLists := s.watchLists
+
+	for trailIndex := s.qhead; trailIndex < len(trail); trailIndex++ {
+		lit := trail[trailIndex]
 
 		varIdx := uint32(lit)
-		value := s.assignments[varIdx].Value
+		value := assignments[varIdx].Value
 		var falseLit cnf.Literal
 		if value {
 			falseLit = cnf.NewLiteral(varIdx, true)
@@ -2111,11 +2116,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		watchIdx := cnf.LitToIndex(falseLit)
 
 		// Process watches for this literal using swap-with-last deletion
-		watchList := s.watchLists[watchIdx]
+		watchList := watchLists[watchIdx]
 
-		for readIdx := 0; readIdx < len(watchList); readIdx++ {
+		// Backward iteration - naturally safe for swap-with-last deletion
+		// Go's range loop eliminates bounds checks
+		for readIdx := len(watchList) - 1; readIdx >= 0; readIdx-- {
 			watch := watchList[readIdx]
-
 			// Skip deleted clauses
 			if watch.Clause == nil {
 				continue
@@ -2125,8 +2131,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitIdx := watch.Blit
 			blit := cnf.IndexToLit(int(blitIdx))
 
-			// Check if blit is true
-			blitAssign := s.assignments[blit.Var()]
+			// Check if blit is true - cache assignment to avoid repeated bounds checks
+			blitVar := blit.Var()
+			blitAssign := assignments[blitVar]
 			blitIsTrue := blitAssign.Level != 0 && ((blit.IsNegated() && !blitAssign.Value) || (!blit.IsNegated() && blitAssign.Value))
 
 			if blitIsTrue {
@@ -2135,27 +2142,29 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// Look for replacement watch
+			// Use range loop for clause literals - compiler eliminates bounds check
 			foundReplacement := false
-			for j := 0; j < len(clause.Literals); j++ {
-				clauseLit := clause.Literals[j]
+			for _, clauseLit := range clause.Literals {
 				if clauseLit == falseLit || clauseLit == blit {
 					continue
 				}
 
-				litLevel := s.assignments[clauseLit.Var()].Level
-				litValue := s.assignments[clauseLit.Var()].Value
-				litTrue := (!clauseLit.IsNegated() && litValue) || (clauseLit.IsNegated() && !litValue)
+				// Cache assignment to avoid repeated bounds checks
+				clauseLitVar := clauseLit.Var()
+				litAssign := assignments[clauseLitVar]
+				litTrue := (!clauseLit.IsNegated() && litAssign.Value) || (clauseLit.IsNegated() && !litAssign.Value)
 
-				if litTrue || litLevel == 0 {
+				if litTrue || litAssign.Level == 0 {
 					// Found replacement - move watch from falseLit to clauseLit
 					newWatchIdx := cnf.LitToIndex(clauseLit)
 					blitIdxU := uint32(cnf.LitToIndex(blit))
 
 					// Get position of new watch before adding
-					newPos := len(s.watchLists[newWatchIdx])
+					newWatchList := watchLists[newWatchIdx]
+					newPos := len(newWatchList)
 
 					// Add new watch to clauseLit's watch list
-					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+					watchLists[newWatchIdx] = append(newWatchList, cnf.Watch{
 						Clause: clause,
 						Blit:   blitIdxU,
 						SymPos: watch.SymPos, // Points to symmetric watch position
@@ -2163,9 +2172,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 					// O(1) Update symmetric watch at blit's index
 					symPos := watch.SymPos
-					if symPos >= 0 && int(symPos) < len(s.watchLists[blitIdx]) {
-						s.watchLists[blitIdx][symPos].Blit = uint32(newWatchIdx)
-						s.watchLists[blitIdx][symPos].SymPos = int32(newPos)
+					if symPos >= 0 {
+						blitWatchList := watchLists[blitIdx]
+						if int(symPos) < len(blitWatchList) {
+							blitWatchList[symPos].Blit = uint32(newWatchIdx)
+							blitWatchList[symPos].SymPos = int32(newPos)
+						}
 					}
 
 					foundReplacement = true
@@ -2182,54 +2194,55 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					// Update symmetric position of the moved watch
 					movedWatch := watchList[readIdx]
 					movedSymPos := movedWatch.SymPos
-					if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
-						s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+					if movedSymPos >= 0 {
+						movedBlitList := watchLists[movedWatch.Blit]
+						if int(movedSymPos) < len(movedBlitList) {
+							movedBlitList[movedSymPos].SymPos = int32(readIdx)
+						}
 					}
-					// Don't increment readIdx - need to process the moved watch
-					readIdx--
+					// With backward iteration, we've already processed the last element
+					// So no need to re-process the moved watch
 				}
 				// Truncate (remove last element which is now duplicated)
 				watchList = watchList[:lastIdx]
-				continue
+			} else {
+				// No replacement found - check if we can propagate or have conflict
+				// Cache assignment to avoid repeated bounds checks
+				blitLevel := assignments[blitVar].Level
+
+				if blitLevel == 0 {
+					// Propagate blit
+					s.assignLiteralByClause(blit, s.level, clause)
+					propagationCount++
+					s.propagations++
+					// Keep the watch in place - blit is now true
+				} else {
+					// blit is already assigned - check if it's false (conflict) or true (satisfied)
+					blitValue := assignments[blitVar].Value
+					blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
+
+					if !blitTrue {
+						// Both watched literals are false - conflict!
+						// CRITICAL: Write back watch list modifications before returning
+						// Otherwise, watch list modifications from earlier in this loop are lost
+						watchLists[watchIdx] = watchList
+						return true, clause
+					}
+					// blit is true, keep watch in place
+				}
 			}
-
-			// No replacement found - check if we can propagate or have conflict
-			blitLevel := s.assignments[blit.Var()].Level
-
-			if blitLevel == 0 {
-				// Propagate blit
-				s.assignLiteralByClause(blit, s.level, clause)
-				propagationCount++
-				s.propagations++
-				// Keep the watch in place - blit is now true
-				continue
-			}
-
-			// blit is already assigned - check if it's false (conflict) or true (satisfied)
-			blitValue := s.assignments[blit.Var()].Value
-			blitTrue := (!blit.IsNegated() && blitValue) || (blit.IsNegated() && !blitValue)
-
-			if !blitTrue {
-				// Both watched literals are false - conflict!
-				// CRITICAL: Write back watch list modifications before returning
-				// Otherwise, watch list modifications from earlier in this loop are lost
-				s.watchLists[watchIdx] = watchList
-				return true, clause
-			}
-
-			// blit is true, keep watch in place
 		}
 
 		// Store the modified watch list back
-		s.watchLists[watchIdx] = watchList
+		watchLists[watchIdx] = watchList
 	}
 
 	// Update qhead to end of trail
-	s.qhead = len(s.trail)
+	s.qhead = len(trail)
 
 	// Debug: report propagations
 	if s.verbose && propagationCount > 0 {
-		s.DebugPropagateLog(s.qhead-propagationCount, len(s.trail), propagationCount)
+		s.DebugPropagateLog(s.qhead-propagationCount, len(trail), propagationCount)
 	}
 
 	return false, nil
@@ -3563,4 +3576,24 @@ func (s *CDCLSolver) SolveDPLL() SolveResult {
 		return SAT
 	}
 	return UNSAT
+}
+
+// PropagateBenchmark exposes propagate for benchmarking
+func (s *CDCLSolver) PropagateBenchmark() {
+	s.propagate()
+}
+
+// Trail returns the trail for benchmarking
+func (s *CDCLSolver) Trail() []int {
+	return s.trail
+}
+
+// ResetTrail resets the trail for benchmarking
+func (s *CDCLSolver) ResetTrail() {
+	s.trail = s.trail[:0]
+	s.trailLevel = s.trailLevel[:0]
+	s.level = 0
+	for i := range s.assignments {
+		s.assignments[i].Level = 0
+	}
 }
