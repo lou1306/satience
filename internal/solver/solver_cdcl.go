@@ -48,7 +48,7 @@ const (
 const (
 	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
-	DefaultRestartBase      = 25    // Base for Luby restart sequence (optimized from 50)
+	DefaultRestartBase      = 50    // Base for Luby restart sequence (balanced)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
 	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
@@ -1091,17 +1091,15 @@ func (s *CDCLSolver) shouldRestart() bool {
 		return true
 	}
 
-	// Secondary: Glucose-style adaptive restarts for extreme LBD spikes only
-	// Only trigger if LBD is MUCH higher than average (not just 1.5x)
-	if s.lbdCount >= 100 {
+	// Secondary: Glucose-style adaptive restarts (moderate aggressiveness)
+	// Trigger when current LBD > 2× average - between conservative (3×) and aggressive (1.5×)
+	// This balances escaping unproductive regions vs avoiding restart storms
+	if s.lbdCount >= 100 && s.conflicts-s.restartCount >= 200 {
 		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
 
-		// Only restart if LBD is extremely high (> 3x average AND > 20)
-		// This catches truly pathological cases without over-restarting
-		if s.lastConflictLBD > int(3.0*avgLBD) && s.lastConflictLBD > 20 {
-			if len(s.learnedClauses) >= 100 {
-				return true
-			}
+		// Glucose criterion: restart when LBD > 2× average AND LBD > 6
+		if s.lastConflictLBD > int(2.0*avgLBD) && s.lastConflictLBD > 6 {
+			return true
 		}
 	}
 
@@ -1135,13 +1133,12 @@ func (s *CDCLSolver) restart() {
 		}
 		s.tmpLevelSet = s.tmpLevelSet[:0]
 
-		// Keep glue clauses (LBD <= 10) - INCREASED to prevent re-learning same clauses
-		// Our 1-UIP produces clauses with LBD 5-8 typically on PHP instances
-		// Deleting these causes the solver to re-encounter the same conflicts
-		// LBD <= 3: core glue (most valuable, never delete)
-		// LBD 3-10: useful glue (keep across restarts)
-		// LBD > 10: trash (delete on restart)
-		if lbd <= 10 {
+		// Keep only true glue clauses (LBD <= 3)
+		// LBD <= 2: core glue (most valuable, never delete)
+		// LBD = 3: near-glue (very valuable, keep across restarts)
+		// LBD > 3: delete on restart (will be re-learned if needed)
+		// This is standard in MiniSat/Glucose - keeps learned database lean
+		if lbd <= 3 {
 			glueCount++
 			isGlue[i] = true
 		}
