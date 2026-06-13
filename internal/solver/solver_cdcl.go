@@ -614,12 +614,18 @@ func (s *CDCLSolver) initWatches() {
 		s.addLearnedClauseToWatches(learnedIdx, clause, clause.Literals)
 	}
 
+	// CRITICAL: Set watchInitialized AFTER all clauses are watched
+	// This flag controls whether propagateWatched() is used instead of linear propagation
+	s.watchInitialized = true
+
 	if s.verbose {
 		totalWatches := 0
 		for _, wl := range s.watchLists {
 			totalWatches += len(wl)
 		}
-		fmt.Printf("c [verbose] Watched literals enabled: %d watch lists, %d total watches\n", len(s.watchLists), totalWatches)
+		avgWatches := float64(totalWatches) / float64(numLits)
+		fmt.Printf("c [verbose] Watched literals enabled: %d watch lists, %d total watches, %.1f avg per lit\n", 
+			len(s.watchLists), totalWatches, avgWatches)
 	}
 }
 
@@ -654,8 +660,6 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 		Blit:      uint32(idx0),
 		SymPos:    int32(pos0),
 	})
-
-	s.watchInitialized = true
 }
 
 // addLearnedClauseToWatches adds a learned clause to the watch lists
