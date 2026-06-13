@@ -98,6 +98,8 @@ type CDCLSolver struct {
 	clauseAge          []int
 	clauseSize         []int // Track clause size for deletion
 	clauseLBD          []int // Track LBD at time of learning
+	clauseUseCount     []int // Track how often clause used in conflict analysis
+	clausePropCount    []int // Track how many propagations clause caused
 	normalClauseCount  int   // Track number of non-glue clauses (LBD > 3)
 	currentAge         int
 	verbose            bool
@@ -181,6 +183,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		clauseActivity:      make([]float64, 0),
 		clauseAge:           make([]int, 0),
 		clauseLBD:           make([]int, 0),
+		clauseUseCount:      make([]int, 0),
+		clausePropCount:     make([]int, 0),
 		currentAge:          0,
 		verbose:             false,
 		decisions:           0,
@@ -214,10 +218,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLearnedLits:        make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
-		// Initialize minimization thresholds to selective defaults (balanced performance)
-		minimizationMaxSize:       15,  // Minimize clauses ≤15 literals
-		minimizationMaxLBD:        5,   // Minimize clauses with LBD ≤5
-		minimizationMaxReasonSize: 10,  // Skip reason clauses >10 literals
+		// Initialize minimization thresholds to aggressive defaults
+		// More aggressive minimization produces shorter, higher-quality learned clauses
+		minimizationMaxSize:       30,  // Minimize clauses ≤30 literals (increased from 15)
+		minimizationMaxLBD:        8,   // Minimize clauses with LBD ≤8 (increased from 5)
+		minimizationMaxReasonSize: 15,  // Skip reason clauses >15 literals (increased from 10)
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -2354,6 +2359,10 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				}
 				s.assignLiteralByClause(unassignedLit, assignLevel, clause)
 				unitPropagated = true
+				// Track propagation count for this learned clause
+				if learnedIdx < len(s.clausePropCount) {
+					s.clausePropCount[learnedIdx]++
+				}
 				break
 			}
 		}
@@ -2600,6 +2609,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 			if &s.learnedClauses[i] == conflictClause {
 				if i < len(s.clauseActivity) {
 					s.clauseActivity[i] += 1.0
+					s.clauseUseCount[i]++
 				}
 				break
 			}
@@ -2990,6 +3000,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			newAge := make([]int, 0)
 			newSize := make([]int, 0)
 			newLBD := make([]int, 0)
+			newUseCount := make([]int, 0)
+			newPropCount := make([]int, 0)
 
 			for i := range s.learnedClauses {
 				if keepClause[i] {
@@ -2998,6 +3010,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					newAge = append(newAge, s.clauseAge[i])
 					newSize = append(newSize, s.clauseSize[i])
 					newLBD = append(newLBD, s.clauseLBD[i])
+					newUseCount = append(newUseCount, s.clauseUseCount[i])
+					newPropCount = append(newPropCount, s.clausePropCount[i])
 				}
 			}
 
@@ -3006,6 +3020,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.clauseAge = newAge
 			s.clauseSize = newSize
 			s.clauseLBD = newLBD
+			s.clauseUseCount = newUseCount
+			s.clausePropCount = newPropCount
 			// Recalculate normal clause count after deletion
 			s.normalClauseCount = 0
 			for _, lbdVal := range s.clauseLBD {
@@ -3019,6 +3035,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.clauseSize = append(s.clauseSize, len(s.tmpLearnedLits))
 		s.clauseLBD = append(s.clauseLBD, lbd)
+		s.clauseUseCount = append(s.clauseUseCount, 0)
+		s.clausePropCount = append(s.clausePropCount, 0)
 		if lbd > 3 {
 			s.normalClauseCount++
 		}
@@ -3201,12 +3219,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Rationale: High-LBD clauses are weak constraints that don't prune search effectively
 
 	type clauseInfo struct {
-		idx      int
-		lbd      int
-		size     int
-		age      int
-		activity float64
-		score    float64 // Higher = more likely to delete
+		idx       int
+		lbd       int
+		size      int
+		age       int
+		activity  float64
+		useCount  int
+		propCount int
+		score     float64 // Higher = more likely to delete
 	}
 
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
@@ -3216,14 +3236,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		size := len(clause.Literals)
 		age := s.currentAge - s.clauseAge[i]
 		activity := s.clauseActivity[i]
+		useCount := s.clauseUseCount[i]
+		propCount := s.clausePropCount[i]
 
 		// Calculate deletion score (higher = delete first)
 		// PRIMARY FACTOR: LBD (higher LBD = much more likely to delete)
-		// This is the key change: LBD weight increased from 50 to 200
 		score := float64(lbd) * 200.0
 
 		// SECONDARY FACTOR: Age (old clauses less relevant)
-		// Reduced weight since LBD is now primary
 		score += float64(age) * 5.0
 
 		// TERTIARY FACTOR: Size (larger clauses less useful)
@@ -3231,6 +3251,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 		// BONUS: Activity (active clauses more useful)
 		score -= activity * 100.0
+
+		// Quality metrics tracked but not used in deletion scoring
+		// LBD remains the primary quality indicator
+		// Future work: correlate useCount/propCount with actual solving effectiveness
 
 		// PROTECTION: Core glue clauses (LBD ≤ 2) are NEVER deleted
 		if lbd <= 2 {
@@ -3248,23 +3272,24 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 
 		// FORCE DELETION: High-LBD clauses (LBD > 8) regardless of age
-		// These are the clauses causing poor performance on random instances
 		if lbd > 8 {
 			score += 2000.0 // Strong push toward deletion
 		}
 
-		// FORCE DELETION: Very high-LBD clauses (LBD > 12) - almost certain deletion
+		// FORCE DELETION: Very high-LBD clauses (LBD > 12)
 		if lbd > 12 {
 			score += 3000.0 // Very strong push toward deletion
 		}
 
 		clauses = append(clauses, clauseInfo{
-			idx:      i,
-			lbd:      lbd,
-			size:     size,
-			age:      age,
-			activity: activity,
-			score:    score,
+			idx:       i,
+			lbd:       lbd,
+			size:      size,
+			age:       age,
+			activity:  activity,
+			useCount:  useCount,
+			propCount: propCount,
+			score:     score,
 		})
 	}
 
@@ -3303,6 +3328,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	newAge := make([]int, 0, len(keepIndices))
 	newSize := make([]int, 0, len(keepIndices))
 	newLBD := make([]int, 0, len(keepIndices))
+	newUseCount := make([]int, 0, len(keepIndices))
+	newPropCount := make([]int, 0, len(keepIndices))
 
 	// Rebuild pool with only kept clauses (direct copy, no intermediate allocation)
 	s.learnedClausePool.Clear()
@@ -3322,6 +3349,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		newAge = append(newAge, s.clauseAge[idx])
 		newSize = append(newSize, s.clauseSize[idx])
 		newLBD = append(newLBD, s.clauseLBD[idx])
+		newUseCount = append(newUseCount, s.clauseUseCount[idx])
+		newPropCount = append(newPropCount, s.clausePropCount[idx])
 	}
 
 	s.learnedClauses = newClauses
@@ -3329,6 +3358,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseAge = newAge
 	s.clauseSize = newSize
 	s.clauseLBD = newLBD
+	s.clauseUseCount = newUseCount
+	s.clausePropCount = newPropCount
 
 	// Mark LBD order as dirty - must rebuild after clause deletion
 	s.lbdOrderDirty = true
