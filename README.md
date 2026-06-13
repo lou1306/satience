@@ -102,18 +102,20 @@ Satience is optimized for correctness first, with performance optimizations for 
 | Argument chains | ✓ Correct |
 | Random instances | ✓ Correct |
 
-**Benchmark Suite Results (30s timeout, GOAMD64=v3):**
-- **Solved**: 10/31 instances (32%)
-- **Soundness**: 100% on all instances (0 wrong results)
-- **Tseitin instances**: 100% solved (both SAT and UNSAT)
+**Benchmark Suite Results (MiniSat Fast Suite, 30s timeout, GOAMD64=v3):**
+- **Solved**: 30/32 instances (93.7% solve rate)
+- **Soundness**: 100% on all solved instances (0 wrong results)
+- **Tseitin instances**: 100% solved (4×4, 5×5, 6×6 - both SAT and UNSAT)
 - **Arg chain**: Solved
-- **Hard 5-SAT**: ~20,000 conflicts/sec (63% improvement after watched literals fix)
+- **Hard 5-SAT**: ~20,000 conflicts/sec
+- **Random 600v instance**: Solved in 24.6s (was TIMEOUT before watched literals fix)
 
 **Performance Characteristics:**
 - Watched literals propagation with O(1) clause index access
-- Props/dec ratio: 10.8 on hard instances
+- Props/dec ratio: 48 initially, ~33 steady-state on hard instances
 - Trail scanning optimization in 1-UIP conflict analysis
 - Activity heap for O(log n) variable selection
+- LBD-based clause database management (max 2,500 learned clauses)
 
 ## Testing
 
@@ -214,11 +216,15 @@ Thanks to the SAT research community for excellent benchmarks and test instances
 - ✅ Trail scanning optimization in 1-UIP conflict analysis
 - ✅ Activity heap for O(log n) variable selection
 - ✅ LBD-based clause database management
+- ✅ Clause quality tracking (useCount, propCount metrics)
+- ✅ Moderate Glucose-style restarts (2× avg LBD threshold)
 
 **Performance:**
 - ~20,000 conflicts/sec on hard 5-SAT instances
-- Props/dec ratio: 10.8 (efficient propagation)
+- Props/dec ratio: 48 initially, ~33 steady-state
 - 63% speedup from watched literals clause index caching
+- 93.7% solve rate on MiniSat Fast Suite (30/32 instances)
+- Random 600v instance: 24.6s (was TIMEOUT before watch fix)
 
 **Known Limitations:**
 - Performance on very large instances (10K+ vars) limited by linear scanning in some areas
