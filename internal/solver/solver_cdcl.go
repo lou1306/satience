@@ -149,10 +149,9 @@ type CDCLSolver struct {
 	qhead int // Watched literals: next trail index to process
 }
 
-// resolveCandidate is used in learnClause for sorting resolution order
+// resolveCandidate is used in learnClause for tracking resolution candidates
 type resolveCandidate struct {
 	varIdx uint32
-	size   int
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
@@ -2764,7 +2763,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 	s.tmpCandidates = s.tmpCandidates[:0]
 
-	// Build list of trail positions at current level
+	// Build list of trail positions at current level (in reverse trail order)
 	// This avoids scanning lower-level trail elements on every resolution step
 	// Only done once per conflict, saves O(trail_size) work per resolution
 	for i := len(s.trail) - 1; i >= 0; i-- {
@@ -2773,13 +2772,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			if s.tmpLiteralInClause[varIdx] {
 				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
 					varIdx: varIdx,
-					size:   0, // Will be set if needed
 				})
 			}
 		}
 	}
 
-	// Start from end of trail and scan backwards through current-level literals only
+	// Process candidates in trail order (most recently assigned first)
+	// This is the standard MiniSat approach and guarantees finding the 1-UIP correctly
+	// Candidates were built in reverse trail order, so process from index 0
 	candidateIdx := 0
 	pathC := s.tmpLevelCount[s.level]
 
@@ -2832,7 +2832,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 						// Add to candidate list for resolution (at end, will be processed)
 						s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
 							varIdx: v,
-							size:   0,
 						})
 					}
 				}
