@@ -3255,9 +3255,21 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// BONUS: Activity (active clauses more useful)
 		score -= activity * 100.0
 
-		// Quality metrics tracked but not used in deletion scoring
-		// LBD remains the primary quality indicator
-		// Future work: correlate useCount/propCount with actual solving effectiveness
+		// QUALITY METRIC: Usage in conflict analysis (modest protection)
+		// Clauses involved in conflicts are useful, but LBD is still primary
+		if useCount > 5 {
+			score -= float64(useCount) * 15.0 // Modest protection
+		} else if useCount > 0 {
+			score -= float64(useCount) * 3.0 // Light protection
+		}
+
+		// QUALITY METRIC: Propagation count (modest protection)
+		// Clauses that propagate often are useful, but don't over-protect
+		if propCount > 15 {
+			score -= float64(propCount) * 8.0 // Modest protection
+		} else if propCount > 0 {
+			score -= float64(propCount) * 2.0 // Light protection
+		}
 
 		// PROTECTION: Core glue clauses (LBD ≤ 2) are NEVER deleted
 		if lbd <= 2 {
