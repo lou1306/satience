@@ -2498,13 +2498,14 @@ func (s *CDCLSolver) decide() bool {
 		if s.conflicts > 0 && varIdx == s.lastDecisionVar {
 			s.consecutiveFlips++
 
-			// If flipping for 10+ conflicts, trigger diversification
-			if s.consecutiveFlips >= 10 {
-				s.vsids.diversify()
+			// If flipping for 20+ conflicts, trigger aggressive diversification
+			// Increased threshold from 10 to 20 to allow more focused search
+			if s.consecutiveFlips >= 20 {
+				s.vsids.diversifyAggressive()
 				s.consecutiveFlips = 0
 				if s.verbose {
 					fmt.Printf("c [DIVERSIFY] Conflict %d: triggered after %d flips on var %d\n",
-						s.conflicts, 10, varIdx+1)
+						s.conflicts, 20, varIdx+1)
 				}
 			}
 		} else {
