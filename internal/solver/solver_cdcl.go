@@ -2135,40 +2135,36 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			clause := watch.Clause
 			blitIdx := watch.Blit
 			
-			// OPTIMIZATION: Inline IndexToLit - avoids function call overhead
-			// varIdx = idx / 2, isNegated = (idx % 2) == 1
+			// Inline IndexToLit
 			blitVarIdx := blitIdx >> 1
 			blitNegated := (blitIdx & 1) != 0
 			
-			// OPTIMIZATION: Cache assignment data to avoid repeated array access
-			// Use varLevel cache instead of random assignments[].Level access
-			blitLevel := s.varLevel[blitVarIdx]
+			// Use assignments[].Level (not varLevel cache)
+			blitLevel := s.assignments[blitVarIdx].Level
 			
 			if blitLevel != 0 {
-				// blit is assigned, check if it satisfies the clause
 				blitValue := s.assignments[blitVarIdx].Value
 				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
 				if blitLitTrue {
-					// Clause is satisfied, keep watch in place
 					continue
 				}
-				// blit is assigned but false, fall through to look for replacement
 			}
-			// blit is unassigned or false, look for replacement watch
 
 			// Look for replacement watch
 			foundReplacement := false
 			for j := 0; j < len(clause.Literals); j++ {
 				clauseLit := clause.Literals[j]
 				
-				// OPTIMIZATION: Inline literal comparison
-				if clauseLit == cnf.Literal(watchIdx) || cnf.Literal(blitIdx) == clauseLit {
+				// Convert watchIdx back to Literal for comparison
+				// Watch index: bit 0 = negation, Literal: bit 31 = negation
+				watchLit := cnf.IndexToLit(watchIdx)
+				blitLit := cnf.IndexToLit(int(blitIdx))
+				if clauseLit == watchLit || blitLit == clauseLit {
 					continue
 				}
 
 				clauseLitVar := clauseLit.Var()
-				// OPTIMIZATION: Use varLevel cache for level check
-				litLevel := s.varLevel[clauseLitVar]
+				litLevel := s.assignments[clauseLitVar].Level
 				litValue := s.assignments[clauseLitVar].Value
 				litNegated := clauseLit.IsNegated()
 				litTrue := (!litNegated && litValue) || (litNegated && !litValue)
@@ -2191,10 +2187,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						SymPos: watch.SymPos, // Points to symmetric watch position
 					})
 
-					// O(1) Update symmetric watch at blit's index
-					// OPTIMIZATION: Remove bounds check - SymPos is maintained by invariant
+					// Update symmetric watch at blit's index
 					symPos := watch.SymPos
-					if symPos >= 0 {
+					if symPos >= 0 && int(symPos) < len(s.watchLists[blitIdx]) {
 						s.watchLists[blitIdx][symPos].Blit = uint32(newWatchIdx)
 						s.watchLists[blitIdx][symPos].SymPos = int32(newPos)
 					}
@@ -2213,8 +2208,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					// Update symmetric position of the moved watch
 					movedWatch := watchList[readIdx]
 					movedSymPos := movedWatch.SymPos
-					// OPTIMIZATION: Remove bounds check - SymPos is maintained by invariant
-					if movedSymPos >= 0 {
+					if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
 						s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
 					}
 					// Don't increment readIdx - need to process the moved watch
@@ -2226,22 +2220,25 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// No replacement found - check if we can propagate or have conflict
+			// Re-read blitLevel - may have changed during replacement search
+			blitLevel = s.assignments[blitVarIdx].Level
+			
 			if blitLevel == 0 {
-				// Propagate blit
-				blitLit := cnf.Literal(blitIdx)
+				blitLit := cnf.IndexToLit(int(blitIdx))
 				s.assignLiteralByClause(blitLit, s.level, clause)
 				propagationCount++
 				s.propagations++
-				// Keep the watch in place - blit is now true
 				continue
 			}
 
-			// blit is already assigned and false - conflict!
-			// Both watched literals are false - conflict!
-			// CRITICAL: Write back watch list modifications before returning
-			// Otherwise, watch list modifications from earlier in this loop are lost
-			s.watchLists[watchIdx] = watchList
-			return true, clause
+			// Re-check blit value - may have been assigned TRUE during replacement search
+			blitValue := s.assignments[blitVarIdx].Value
+			blitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
+
+			if !blitTrue {
+				s.watchLists[watchIdx] = watchList
+				return true, clause
+			}
 		}
 
 		// Store the modified watch list back
