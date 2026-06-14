@@ -3055,11 +3055,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		s.currentAge++
 
-		// Add clause to memory pool (avoids per-clause allocation)
-		_, clauseLits := s.learnedClausePool.AddClause(s.tmpLearnedLits)
+		// FIX: Copy literals to avoid slice view invalidation when pool reallocates
+		// The pool's AddClause returns a slice view that becomes invalid on next AddClause
+		literalsCopy := make([]cnf.Literal, len(s.tmpLearnedLits))
+		copy(literalsCopy, s.tmpLearnedLits)
 
-		// Create clause metadata with pointer to pool storage
-		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: clauseLits, Learned: true})
+		// Add clause to memory pool (for potential future compaction)
+		s.learnedClausePool.AddClause(s.tmpLearnedLits)
+
+		// Store the COPY, not the pool's slice view
+		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
 
 		// Get index and stable pointer after append (slice might have reallocated)
 		learnedIdx := len(s.learnedClauses) - 1
@@ -3318,7 +3323,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		})
 	}
 
-	// Sort by score (descending - highest score = delete first)
+	// Sort by score (descending - highest score = delete first, lowest = keep)
 	sort.Slice(clauses, func(i, j int) bool {
 		return clauses[i].score > clauses[j].score
 	})
@@ -3334,15 +3339,19 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// Build list of clause indices to keep
+	// Sorted descending: clauses[0] = worst (highest score), clauses[end] = best (lowest score)
 	keepIndices := make([]int, 0, toKeep)
+	
+	// First, always keep protected clauses (negative score)
 	for i := range clauses {
-		// Always keep protected clauses (negative score)
 		if clauses[i].score < 0 {
 			keepIndices = append(keepIndices, clauses[i].idx)
-			continue
 		}
-		// Keep highest quality clauses until we reach toKeep
-		if len(keepIndices) < toKeep {
+	}
+	
+	// Then, keep the best non-protected clauses from the end of the sorted array
+	for i := len(clauses) - 1; i >= 0 && len(keepIndices) < toKeep; i-- {
+		if clauses[i].score >= 0 {
 			keepIndices = append(keepIndices, clauses[i].idx)
 		}
 	}
@@ -3356,7 +3365,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	newUseCount := make([]int, 0, len(keepIndices))
 	newPropCount := make([]int, 0, len(keepIndices))
 
-	// Rebuild pool with only kept clauses (direct copy, no intermediate allocation)
+	// Rebuild pool with only kept clauses
 	s.learnedClausePool.Clear()
 	for _, idx := range keepIndices {
 		s.learnedClausePool.AddClause(s.learnedClauses[idx].Literals)
