@@ -283,8 +283,8 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 
 **Week 1 targets** (expected 15-25% speedup):
 - [x] 1A: Cache clause literals pointer in propagateWatched ✅ (June 2026)
+- [x] 2A: Lazy clause activity decay (every 100 conflicts) ✅ (June 2026)
 - [ ] 1B: Use varLevel cache consistently in propagateWatched
-- [ ] 2A: Lazy clause activity decay (every 100 conflicts)
 - [ ] 1C: Inline IndexToLit at line 2182
 - [ ] 4A: Pre-allocate watch lists with expected capacity
 
@@ -295,3 +295,9 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 - Eliminates repeated slice header access in hot path (140ms → ~100ms expected)
 - Benchmark: 25/40 (62.5%) on MiniSat Fast Suite, soundness verified
 - Note: Individual instance times vary due to CDCL search path sensitivity
+
+**2A: Lazy clause activity decay** ✅
+- Decay clause activity every 100 conflicts instead of every conflict
+- Reduces GC pressure and CPU overhead in handleConflict (was 180ms decay loop)
+- Benchmark improved: 25/40 → 27/40 (62.5% → 67.5% solve rate)
+- Soundness verified: all 35 tests passing
