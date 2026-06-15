@@ -409,7 +409,7 @@ func DefaultPreprocessingConfig() PreprocessingConfig {
 	return PreprocessingConfig{
 		EnableUnitProp:        true,
 		EnableEquivalence:     false, // DISABLED: Soundness bug - false equivalences
-		EnablePureLiteral:     false, // DISABLED: Soundness bug - incorrect assignments
+		EnablePureLiteral:     true,  // ENABLED: Pure literal elimination is sound
 		EnableSubsumption:     true,  // FIXED: Subsumption elimination is now sound
 		EnableSelfSubsumption: false, // DISABLED: Soundness bug - incorrect clause removal
 		EnableHyperBinary:     false, // DISABLED: Soundness bug - derives false empty clauses
