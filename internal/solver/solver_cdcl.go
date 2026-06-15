@@ -2160,8 +2160,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitVarIdx := blitIdx >> 1
 			blitNegated := (blitIdx & 1) != 0
 			
-			// Use assignments[].Level (not varLevel cache)
-			blitLevel := s.assignments[blitVarIdx].Level
+			// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
+			blitLevel := s.varLevel[blitVarIdx]
 			
 			if blitLevel != 0 {
 				blitValue := s.assignments[blitVarIdx].Value
@@ -2187,7 +2187,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				}
 
 				clauseLitVar := clauseLit.Var()
-				litLevel := s.assignments[clauseLitVar].Level
+				// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
+				litLevel := s.varLevel[clauseLitVar]
 				litValue := s.assignments[clauseLitVar].Value
 				litNegated := clauseLit.IsNegated()
 				litTrue := (!litNegated && litValue) || (litNegated && !litValue)
