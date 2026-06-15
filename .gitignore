@@ -32,3 +32,7 @@ benchmark/*.txt
 *.log
 *.db
 satience_v3
+
+# Additional build artifacts
+satience_opt
+satience_preproc
