@@ -92,8 +92,7 @@ type CDCLSolver struct {
 	iterations         int
 	propagations       int // Total propagations (assignments by unit propagation)
 	maxIter            int
-	learnedClauses     []cnf.Clause    // Learned clauses (metadata only, literals in learnedClausePool)
-	learnedClausePool  *LearnedClausePool // Memory pool for learned clause literals
+	learnedClauses     []cnf.Clause // Learned clauses (literals stored directly in Clause struct)
 	clauseActivity     []float64
 	clauseAge          []int
 	clauseSize         []int // Track clause size for deletion
@@ -178,7 +177,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		iterations:          0,
 		maxIter:             0,
 		learnedClauses:      make([]cnf.Clause, 0),
-		learnedClausePool:   NewLearnedClausePool(maxLearned, 6), // Pre-allocate for expected clauses
 		clauseActivity:      make([]float64, 0),
 		clauseAge:           make([]int, 0),
 		clauseLBD:           make([]int, 0),
@@ -328,14 +326,10 @@ func (s *CDCLSolver) GetLearnedCount() int {
 	return len(s.learnedClauses)
 }
 
-// GetMemoryPoolStats returns memory pool statistics
+// GetMemoryPoolStats returns memory pool statistics (deprecated - pool removed)
 func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemoryKB int) {
-	if s.learnedClausePool == nil {
-		return 0, 0, 0
-	}
-	return s.learnedClausePool.NumActiveClauses(), 
-		   len(s.learnedClausePool.literals), 
-		   s.learnedClausePool.MemoryUsage() / 1024
+	// Memory pool removed - learned clauses stored directly in Clause structs
+	return len(s.learnedClauses), 0, 0
 }
 
 func (s *CDCLSolver) getDetailedStats() SolverStats {
@@ -3082,24 +3076,19 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		s.currentAge++
 
-		// FIX: Copy literals to avoid slice view invalidation when pool reallocates
-		// The pool's AddClause returns a slice view that becomes invalid on next AddClause
+		// Store learned clause directly (no pool - pool caused slice invalidation issues)
+		// Literals are stored in the Clause struct's Literals field
 		literalsCopy := make([]cnf.Literal, len(s.tmpLearnedLits))
 		copy(literalsCopy, s.tmpLearnedLits)
-
-		// Add clause to memory pool (for potential future compaction)
-		s.learnedClausePool.AddClause(s.tmpLearnedLits)
-
-		// Store the COPY, not the pool's slice view
 		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
 
-		// Get index and stable pointer after append (slice might have reallocated)
+		// Get clause pointer after append (slice might have reallocated)
 		learnedIdx := len(s.learnedClauses) - 1
 		clause := &s.learnedClauses[learnedIdx]
 
 		// Add learned clause to watches
 		if s.watchInitialized {
-			s.addLearnedClauseToWatches(learnedIdx, clause, s.tmpLearnedLits)
+			s.addLearnedClauseToWatches(learnedIdx, clause, literalsCopy)
 		}
 
 		// Mark LBD order as dirty - will be rebuilt on next propagation
@@ -3392,20 +3381,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	newUseCount := make([]int, 0, len(keepIndices))
 	newPropCount := make([]int, 0, len(keepIndices))
 
-	// Rebuild pool with only kept clauses
-	s.learnedClausePool.Clear()
+	// Build new arrays from kept clauses (literals already in Clause structs)
 	for _, idx := range keepIndices {
-		s.learnedClausePool.AddClause(s.learnedClauses[idx].Literals)
-	}
-
-	// Build new arrays from kept clauses
-	for i, idx := range keepIndices {
-		// Refresh literal pointer from pool
-		if clauseLits := s.learnedClausePool.GetClause(i); clauseLits != nil {
-			newClauses = append(newClauses, cnf.Clause{Literals: clauseLits, Learned: true})
-		} else {
-			newClauses = append(newClauses, s.learnedClauses[idx])
-		}
+		newClauses = append(newClauses, s.learnedClauses[idx])
 		newActivity = append(newActivity, s.clauseActivity[idx])
 		newAge = append(newAge, s.clauseAge[idx])
 		newSize = append(newSize, s.clauseSize[idx])
