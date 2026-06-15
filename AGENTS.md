@@ -237,3 +237,61 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 - Verified trail order (most recent first) is optimal
 - Experimented with reason-clause-size sorting (caused regression)
 - Current implementation is already optimal for standard CDCL
+
+## Profiling Analysis (June 2026)
+
+**Profiled instance**: `0f4576a6e7399336e11f0828d32263dd.cnf` (1.25s solve time)
+
+### CPU Time Breakdown
+
+| Component | CPU Time | % Total | Status |
+|-----------|----------|---------|--------|
+| **propagateWatched** | 0.53s | **33.5%** | 🔴 Critical |
+| **handleConflict** | 0.56s | **35.4%** | 🔴 Critical |
+| **learnClause** | 0.28s | **17.7%** | 🟡 High |
+| **deleteLearnedClauses** | 0.18s | **11.4%** | 🟡 Medium |
+| **GC overhead** | ~0.30s | **~20%** | 🟡 High |
+
+### Hot Spots in propagateWatched (530ms total)
+
+| Line | Code | Time | % |
+|------|------|------|---|
+| 2176 | `for j := 0; j < len(clause.Literals); j++` | 140ms | 26.4% |
+| 2150 | `watch := watchList[readIdx]` | 80ms | 15.1% |
+| 2182 | `blitLit := cnf.IndexToLit(int(blitIdx))` | 50ms | 9.4% |
+| 2205 | `s.watchLists[newWatchIdx] = append(...)` | 40ms | 7.5% |
+| 2188-2189 | `assignments[clauseLitVar].Level/Value` | 60ms | 11.3% |
+
+### Optimization Opportunities
+
+#### P0 (Immediate - Week 1)
+1. **Lazy clause activity decay** (5-10% overall) - Decay every N conflicts instead of every conflict
+2. **Cache clause literals pointer** (5-8% overall) - Cache `clause.Literals` before inner loop
+3. **Use varLevel cache consistently** (3-5% overall) - Replace `assignments[].Level` with `varLevel[]`
+
+#### P1 (Short-term - Week 2)
+4. **Pre-allocate watch lists** (3-5% overall) - Avoid append() allocations in hot path
+5. **Inline remaining IndexToLit calls** (2-3% overall) - Manual inlining at line 2182
+6. **Optimize duplicate detection** (2-4% overall) - Hash table instead of linear scan
+
+#### P2 (Medium-term - Weeks 3-4)
+7. **Array-of-Structs for variable state** (10-15% overall) - Combine assignments/varLevel into single struct
+8. **Contiguous learned clause storage** (5-10% overall) - Eliminate slice allocations
+9. **Incremental clause deletion** (2-3% overall) - Delete few clauses per conflict
+
+### Implementation Priority
+
+**Week 1 targets** (expected 15-25% speedup):
+- [x] 1A: Cache clause literals pointer in propagateWatched ✅ (June 2026)
+- [ ] 1B: Use varLevel cache consistently in propagateWatched
+- [ ] 2A: Lazy clause activity decay (every 100 conflicts)
+- [ ] 1C: Inline IndexToLit at line 2182
+- [ ] 4A: Pre-allocate watch lists with expected capacity
+
+### Completed Optimizations
+
+**1A: Cache clause literals pointer** ✅
+- Cached `clause.Literals` before inner loop in propagateWatched
+- Eliminates repeated slice header access in hot path (140ms → ~100ms expected)
+- Benchmark: 25/40 (62.5%) on MiniSat Fast Suite, soundness verified
+- Note: Individual instance times vary due to CDCL search path sensitivity
