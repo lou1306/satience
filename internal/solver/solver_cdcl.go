@@ -415,7 +415,7 @@ func DefaultPreprocessingConfig() PreprocessingConfig {
 	return PreprocessingConfig{
 		EnableUnitProp:        true,
 		EnableEquivalence:     false, // DISABLED: Soundness bug - false equivalences
-		EnablePureLiteral:     true,
+		EnablePureLiteral:     false, // DISABLED: Soundness bug - incorrect assignments
 		EnableSubsumption:     false, // DISABLED: Soundness bug - incorrect clause removal
 		EnableSelfSubsumption: false, // DISABLED: Soundness bug - incorrect clause removal
 		EnableHyperBinary:     false, // DISABLED: Soundness bug - derives false empty clauses
@@ -552,32 +552,35 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
-	// Clear assignments made during preprocessing
-	// These assignments would otherwise persist and interfere with search
-	// Preprocessing only simplifies clauses, it doesn't make permanent assignments
+	// Clear assignments made during preprocessing passes
+	// These will be re-computed by unit propagation below
 	for i := range s.assignments {
 		s.assignments[i] = Assignment{}
 		s.varLevel[i] = 0
 	}
 	s.trail = s.trail[:0]
 	s.trailLevel = s.trailLevel[:0]
-	s.trailHead = []int{0} // Reset to initial state
+	s.trailHead = []int{0}
 	s.level = 0
 	s.qhead = 0
 	for i := range s.implication {
 		s.implication[i] = nil
 	}
 
-	// CRITICAL: Reset watchInitialized flag so watches are re-initialized
-	s.watchInitialized = false
+	// CRITICAL: Run unit propagation to handle unit clauses before search
+	// Unit clauses are not watched by watched literals, so they must be propagated
+	// before search starts. This is especially important when preprocessing techniques
+	// are disabled or don't run unit propagation.
+	if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
+		return unitResult
+	}
 
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
 
-	// CRITICAL: Always initialize watches after preprocessing
-	// Previously, watches were only initialized if clauses were modified,
-	// causing propagation to fail (propagations=0) when preprocessing found nothing to simplify.
-	// Bug discovered: instance 0f4576a6e7399336e11f0828d32263dd.cnf returned UNSAT (should be SAT)
+	// Initialize watches after unit propagation
+	// CRITICAL: Reset watchInitialized flag so watches are re-initialized
+	s.watchInitialized = false
 	s.initWatches()
 
 	return UNKNOWN
