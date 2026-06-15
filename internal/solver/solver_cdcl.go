@@ -416,7 +416,7 @@ func DefaultPreprocessingConfig() PreprocessingConfig {
 		EnableUnitProp:        true,
 		EnableEquivalence:     false, // DISABLED: Soundness bug - false equivalences
 		EnablePureLiteral:     false, // DISABLED: Soundness bug - incorrect assignments
-		EnableSubsumption:     false, // DISABLED: Soundness bug - incorrect clause removal
+		EnableSubsumption:     true,  // FIXED: Subsumption elimination is now sound
 		EnableSelfSubsumption: false, // DISABLED: Soundness bug - incorrect clause removal
 		EnableHyperBinary:     false, // DISABLED: Soundness bug - derives false empty clauses
 	}
@@ -810,23 +810,40 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 }
 
 func (s *CDCLSolver) subsumptionElimination() {
+	if len(s.cnf.Clauses) == 0 {
+		return
+	}
+
+	// Mark clauses for removal to avoid iteration issues with swap-delete
+	toRemove := make([]bool, len(s.cnf.Clauses))
 	removed := 0
 
 	for i := 0; i < len(s.cnf.Clauses); i++ {
+		if toRemove[i] {
+			continue
+		}
 		for j := 0; j < len(s.cnf.Clauses); j++ {
-			if i == j {
+			if i == j || toRemove[j] {
 				continue
 			}
 
 			if s.subsumes(&s.cnf.Clauses[i], &s.cnf.Clauses[j]) {
-				s.cnf.Clauses[j] = s.cnf.Clauses[len(s.cnf.Clauses)-1]
-				s.cnf.Clauses = s.cnf.Clauses[:len(s.cnf.Clauses)-1]
+				toRemove[j] = true
 				removed++
-				if j < len(s.cnf.Clauses) {
-					j--
-				}
 			}
 		}
+	}
+
+	// Build new clause list without removed clauses
+	if removed > 0 {
+		newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses)-removed)
+		for i := 0; i < len(s.cnf.Clauses); i++ {
+			if !toRemove[i] {
+				newClauses = append(newClauses, s.cnf.Clauses[i])
+			}
+		}
+		s.cnf.Clauses = newClauses
+		s.cnf.NumClauses = len(newClauses)
 	}
 
 	if s.verbose {
@@ -1009,19 +1026,22 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 }
 
 func (s *CDCLSolver) subsumes(c1, c2 *cnf.Clause) bool {
-	if len(c1.Literals) >= len(c2.Literals) {
+	// c1 subsumes c2 if c1 is a subset of c2 (all literals in c1 are also in c2)
+	// Example: (x1) subsumes (x1 ∨ x2) because satisfying x1 automatically satisfies (x1 ∨ x2)
+	// c1 must be shorter or equal length to c2
+	if len(c1.Literals) > len(c2.Literals) {
 		return false
 	}
 
+	// Build set of literals in c2 (the potentially subsumed clause)
 	set := make(map[uint32]bool)
-	for _, lit := range c1.Literals {
-		key := uint32(lit)<<1 | boolToUint(lit.IsNegated())
-		set[key] = true
+	for _, lit := range c2.Literals {
+		set[uint32(lit)] = true
 	}
 
-	for _, lit := range c2.Literals {
-		key := uint32(lit)<<1 | boolToUint(lit.IsNegated())
-		if !set[key] {
+	// Check if all literals in c1 are in c2
+	for _, lit := range c1.Literals {
+		if !set[uint32(lit)] {
 			return false
 		}
 	}
