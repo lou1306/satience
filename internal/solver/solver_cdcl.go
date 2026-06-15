@@ -414,11 +414,11 @@ type PreprocessingConfig struct {
 func DefaultPreprocessingConfig() PreprocessingConfig {
 	return PreprocessingConfig{
 		EnableUnitProp:        true,
-		EnableEquivalence:     true,
+		EnableEquivalence:     false, // DISABLED: Soundness bug - false equivalences
 		EnablePureLiteral:     true,
-		EnableSubsumption:     true,
-		EnableSelfSubsumption: true,
-		EnableHyperBinary:     true,
+		EnableSubsumption:     false, // DISABLED: Soundness bug - incorrect clause removal
+		EnableSelfSubsumption: false, // DISABLED: Soundness bug - incorrect clause removal
+		EnableHyperBinary:     false, // DISABLED: Soundness bug - derives false empty clauses
 	}
 }
 
@@ -567,6 +567,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	for i := range s.implication {
 		s.implication[i] = nil
 	}
+
+	// CRITICAL: Reset watchInitialized flag so watches are re-initialized
+	s.watchInitialized = false
 
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
@@ -1370,9 +1373,10 @@ func (s *CDCLSolver) inprocessing() {
 	}
 
 	// 4. Hyper-binary resolution (cheap, adds binary clauses)
-	if s.conflicts%500 == 0 {
-		s.hyperBinaryResolution()
-	}
+	// DISABLED: Soundness bug - derives false empty clauses
+	// if s.conflicts%500 == 0 {
+	// 	s.hyperBinaryResolution()
+	// }
 
 	removed := initialClauses - s.cnf.NumClauses
 	if s.verbose && removed != 0 {
