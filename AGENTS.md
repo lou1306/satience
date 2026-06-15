@@ -284,7 +284,7 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 **Week 1 targets** (expected 15-25% speedup):
 - [x] 1A: Cache clause literals pointer in propagateWatched ✅ (June 2026)
 - [x] 2A: Lazy clause activity decay (every 100 conflicts) ✅ (June 2026)
-- [ ] 1B: Use varLevel cache consistently in propagateWatched
+- [x] 1B: Use varLevel cache consistently in propagateWatched ✅ (June 2026)
 - [ ] 1C: Inline IndexToLit at line 2182
 - [ ] 4A: Pre-allocate watch lists with expected capacity
 
@@ -301,3 +301,9 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 - Reduces GC pressure and CPU overhead in handleConflict (was 180ms decay loop)
 - Benchmark improved: 25/40 → 27/40 (62.5% → 67.5% solve rate)
 - Soundness verified: all 35 tests passing
+
+**1B: Use varLevel cache** ✅
+- Replace assignments[].Level with varLevel[] cache in propagateWatched
+- Avoids random memory access to assignments[] struct fields
+- Hard UNSAT instance: 0.62s → 0.32s (48% faster on 7fa52f87c4556ea449f68b3369e82c24.cnf)
+- Expected 3-5% overall speedup on propagation-heavy instances
