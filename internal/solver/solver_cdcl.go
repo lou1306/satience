@@ -256,6 +256,7 @@ func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
 // Default seed is 0
 func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
+	s.vsids.SetRandomSeed(seed)
 }
 
 // SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)

@@ -1,12 +1,8 @@
 package solver
 
 import (
-	"math/rand"
 	"satience/internal/cnf"
-	"time"
 )
-
-var vsidsRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // DefaultDecayInterval is the default number of conflicts between VSIDS activity decays
 // Value of 10 provides good balance: 10× fewer heap rebuilds with minimal quality loss
@@ -108,6 +104,7 @@ type VSIDS struct {
 	heap                  vsidsHeap // Activity heap for O(log n) selection
 	heapValid             bool      // True if heap is up-to-date
 	decayInterval         int       // Number of conflicts between activity decays
+	randomSeed            uint64    // Seed for deterministic random noise (default 0)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -131,6 +128,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapValid:             false,
 		decayInterval:         DefaultDecayInterval,
+		randomSeed:            0, // Default seed for deterministic randomness
 	}
 }
 
@@ -182,6 +180,11 @@ func (v *VSIDS) EnableLRB() {
 // EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
 func (v *VSIDS) EnableLBD() {
 	v.useLBD = true
+}
+
+// SetRandomSeed sets the seed for deterministic random noise in tie-breaking
+func (v *VSIDS) SetRandomSeed(seed uint64) {
+	v.randomSeed = seed
 }
 
 // SetDecayInterval sets the number of conflicts between activity decays
@@ -330,8 +333,13 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 			continue
 		}
 
-		// Push it back with updated activity (including LBD bonus and small random noise)
-		noise := (vsidsRand.Float64() - 0.5) * 0.01 * (v.activity[varIdx] + v.lbdBonus[varIdx])
+		// Push it back with updated activity (including LBD bonus and small deterministic noise)
+		// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
+		v.randomSeed ^= v.randomSeed << 13
+		v.randomSeed ^= v.randomSeed >> 7
+		v.randomSeed ^= v.randomSeed << 17
+		// Convert to float64 in range [0, 1) and scale to ±0.5% noise
+		noise := (float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) - 0.5) * 0.01 * (v.activity[varIdx] + v.lbdBonus[varIdx])
 		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx] + noise
 		v.heap.push(item)
 
@@ -351,8 +359,13 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 
 	for i, act := range v.activity {
 		if assignments[i].Level == 0 {
-			// Add small random noise (±0.5%) to break ties
-			noise := (vsidsRand.Float64() - 0.5) * 0.01 * (act + v.lbdBonus[i])
+			// Add small deterministic noise (±0.5%) to break ties
+			// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
+			v.randomSeed ^= v.randomSeed << 13
+			v.randomSeed ^= v.randomSeed >> 7
+			v.randomSeed ^= v.randomSeed << 17
+			// Convert to float64 in range [0, 1) and scale to ±0.5% noise
+			noise := (float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) - 0.5) * 0.01 * (act + v.lbdBonus[i])
 			effectiveActivity := act + v.lbdBonus[i] + noise
 			if effectiveActivity > bestEffectiveActivity {
 				bestEffectiveActivity = effectiveActivity
@@ -461,11 +474,16 @@ func (v *VSIDS) diversify() {
 }
 
 // diversifyAggressive performs very aggressive diversification when completely stuck
-// Resets all scores and adds random noise to break symmetry
+// Resets all scores and adds deterministic noise to break symmetry
 func (v *VSIDS) diversifyAggressive() {
-	// Reset activity with random values to break symmetry
+	// Reset activity with deterministic values to break symmetry
+	// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
 	for i := range v.activity {
-		v.activity[i] = 0.5 + vsidsRand.Float64()*0.5 // Random between 0.5 and 1.0
+		v.randomSeed ^= v.randomSeed << 13
+		v.randomSeed ^= v.randomSeed >> 7
+		v.randomSeed ^= v.randomSeed << 17
+		// Convert to float64 in range [0, 1)
+		v.activity[i] = 0.5 + float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF)*0.5
 	}
 
 	// Reset LBD bonus completely
