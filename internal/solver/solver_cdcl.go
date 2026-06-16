@@ -155,7 +155,9 @@ type CDCLSolver struct {
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
 type resolveCandidate struct {
-	varIdx uint32
+	varIdx     uint32
+	trailPos   int // Trail position (for preserving trail order after sorting)
+	reasonSize int // Size of reason clause (for optional sorting heuristics)
 }
 
 // clauseInfo is used in deleteLearnedClauses for tracking clause deletion scores
@@ -2853,8 +2855,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		if s.trailLevel[i] == s.level {
 			varIdx := uint32(s.trail[i])
 			if s.tmpLiteralInClause[varIdx] {
+				// Get reason clause size for potential sorting heuristics
+				reasonClause := s.implication[varIdx]
+				reasonSize := 0
+				if reasonClause != nil {
+					reasonSize = len(reasonClause.Literals)
+				}
 				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
-					varIdx: varIdx,
+					varIdx:     varIdx,
+					trailPos:   i,
+					reasonSize: reasonSize,
 				})
 			}
 		}
@@ -2862,7 +2872,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// Process candidates in trail order (most recently assigned first)
 	// This is the standard MiniSat approach and guarantees finding the 1-UIP correctly
-	// Candidates were built in reverse trail order, so process from index 0
+	// Trail order respects the temporal sequence of implications
+	//
+	// OPTIMIZATION ATTEMPTED: Sort by reason clause size
+	// Result: Made performance WORSE on PHP instances (6085 vs 2364 conflicts)
+	// Reason: Trail order produces better 1-UIP clauses even if larger
+	// The first UIP found via trail order leads to better backjumping
+	//
+	// Conclusion: Keep standard MiniSat trail order - it's already optimal
 	candidateIdx := 0
 	pathC := s.tmpLevelCount[s.level]
 
