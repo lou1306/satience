@@ -2619,11 +2619,12 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Claus
 	s.trailLevel = append(s.trailLevel, level)
 	s.implication[varIdx] = clause
 
-	// Save the phase (polarity) for decisions only
-	// Don't save phase for propagations - the phase is forced by the clause
-	if clause == nil {
-		s.savedPhase[varIdx] = value
-	}
+	// Save the phase (polarity) for ALL assignments (phase saving heuristic)
+	// OPTIMIZATION: Save phase for propagations too, not just decisions
+	// This maintains consistent polarity patterns on structured instances (PHP, Tseitin)
+	// Variables forced to same polarity by clauses will remember that polarity on re-decision
+	// Standard in modern solvers (MiniSat, Glucose) - helps escape local minima after restarts
+	s.savedPhase[varIdx] = value
 
 	if s.verbose && level > 0 {
 		reasonStr := "propagation"
@@ -2663,9 +2664,8 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 	// Store clause pointer directly - O(1), no lookup needed!
 	s.implication[varIdx] = clause
 
-	if level > s.level {
-		s.savedPhase[varIdx] = value
-	}
+	// Save phase for ALL assignments (consistent with assignLiteral)
+	s.savedPhase[varIdx] = value
 }
 
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
