@@ -134,6 +134,11 @@ type CDCLSolver struct {
 	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
 	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
 	tmpLearnedLits []cnf.Literal // Reusable buffer for learned clause literals
+	tmpSortedLits []cnf.Literal // Temporary buffer for canonical clause sorting
+
+	// Clause database hash table for O(1) duplicate detection
+	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
+	learnedClauseHashes map[uint64]bool
 
 	// Watched literals infrastructure
 	watchLists        [][]cnf.Watch // watchLists[lit] = clauses watching lit
@@ -171,6 +176,32 @@ type clauseInfoSlice []clauseInfo
 func (s clauseInfoSlice) Len() int           { return len(s) }
 func (s clauseInfoSlice) Less(i, j int) bool { return s[i].score > s[j].score } // Descending: higher score = delete first
 func (s clauseInfoSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+// computeCanonicalHash computes a hash for a clause with literals sorted
+// This ensures A∨B and B∨A produce the same hash (duplicate detection)
+func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint64 {
+	// Copy literals to temporary buffer for sorting
+	tmpSorted = append(tmpSorted[:0], literals...)
+	
+	// Sort literals for canonical representation
+	// Simple insertion sort (efficient for small clauses)
+	for i := 1; i < len(tmpSorted); i++ {
+		key := tmpSorted[i]
+		j := i - 1
+		for j >= 0 && tmpSorted[j] > key {
+			tmpSorted[j+1] = tmpSorted[j]
+			j--
+		}
+		tmpSorted[j+1] = key
+	}
+	
+	// Compute hash from sorted literals
+	hash := uint64(len(tmpSorted))
+	for _, lit := range tmpSorted {
+		hash = hash*31 + uint64(lit)
+	}
+	return hash
+}
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
@@ -232,6 +263,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpFlippedVars:      make([]bool, formula.NumVars),
 		tmpTouchedVars:        make([]uint32, 0, formula.NumVars),
 		tmpLearnedLits:        make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
+		tmpSortedLits:         make([]cnf.Literal, 0, 64), // Pre-allocate for canonical sorting
+		learnedClauseHashes:   make(map[uint64]bool, 2500), // Hash table for O(1) duplicate detection
 		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
 		learnedClauseBase: int(formula.NumClauses),
 		// Initialize minimization thresholds to aggressive defaults
@@ -2994,31 +3027,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 
 		// DUPLICATE DETECTION: Skip if this clause already exists
-		// Use simple hash-based check for O(n) comparison only when hash matches
-		s.tmpClauseHash = 0
-		for _, lit := range s.tmpLearnedLits {
-			s.tmpClauseHash = s.tmpClauseHash*31 + uint64(lit)
-		}
+		// OPTIMIZATION: Use hash table with canonical ordering for O(1) lookup
+		// Canonical hash ensures A∨B and B∨A are detected as duplicates
+		canonicalHash := computeCanonicalHash(s.tmpLearnedLits, s.tmpSortedLits)
 
-		isDuplicate := false
-		for _, existing := range s.learnedClauses {
-			if len(existing.Literals) != len(s.tmpLearnedLits) {
-				continue
-			}
-			match := true
-			for j, lit := range s.tmpLearnedLits {
-				if existing.Literals[j] != lit {
-					match = false
-					break
-				}
-			}
-			if match {
-				isDuplicate = true
-				break
-			}
-		}
-
-		if isDuplicate {
+		if s.learnedClauseHashes[canonicalHash] {
 			// Don't learn this clause, but still return backjump level
 			return s.level - 1
 		}
@@ -3119,6 +3132,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		if s.watchInitialized {
 			s.addLearnedClauseToWatches(learnedIdx, clause, literalsCopy)
 		}
+
+		// OPTIMIZATION: Add canonical hash to hash table for O(1) duplicate detection
+		s.learnedClauseHashes[canonicalHash] = true
 
 		// Mark LBD order as dirty - will be rebuilt on next propagation
 		s.lbdOrderDirty = true
@@ -3416,6 +3432,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseLBD = newLBD
 	s.clauseUseCount = newUseCount
 	s.clausePropCount = newPropCount
+
+	// OPTIMIZATION: Rebuild hash table from remaining clauses
+	// This keeps duplicate detection in sync after deletion
+	s.learnedClauseHashes = make(map[uint64]bool, len(s.learnedClauses))
+	for i := range s.learnedClauses {
+		hash := computeCanonicalHash(s.learnedClauses[i].Literals, s.tmpSortedLits)
+		s.learnedClauseHashes[hash] = true
+	}
 
 	// Mark LBD order as dirty - must rebuild after clause deletion
 	s.lbdOrderDirty = true
