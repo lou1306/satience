@@ -153,6 +153,25 @@ type resolveCandidate struct {
 	varIdx uint32
 }
 
+// clauseInfo is used in deleteLearnedClauses for tracking clause deletion scores
+type clauseInfo struct {
+	idx       int
+	lbd       int
+	size      int
+	age       int
+	activity  float64
+	useCount  int
+	propCount int
+	score     float64 // Higher = more likely to delete
+}
+
+// clauseInfoSlice implements sort.Interface for clauseInfo slice
+type clauseInfoSlice []clauseInfo
+
+func (s clauseInfoSlice) Len() int           { return len(s) }
+func (s clauseInfoSlice) Less(i, j int) bool { return s[i].score > s[j].score } // Descending: higher score = delete first
+func (s clauseInfoSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := DefaultMaxLearned
@@ -3262,17 +3281,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Strategy: PRIMARY factor is LBD quality, SECONDARY is age
 	// Rationale: High-LBD clauses are weak constraints that don't prune search effectively
 
-	type clauseInfo struct {
-		idx       int
-		lbd       int
-		size      int
-		age       int
-		activity  float64
-		useCount  int
-		propCount int
-		score     float64 // Higher = more likely to delete
-	}
-
 	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
 
 	for i, clause := range s.learnedClauses {
@@ -3350,9 +3358,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// Sort by score (descending - highest score = delete first, lowest = keep)
-	sort.Slice(clauses, func(i, j int) bool {
-		return clauses[i].score > clauses[j].score
-	})
+	// OPTIMIZATION: Use custom sort.Interface to avoid closure overhead
+	sort.Sort(clauseInfoSlice(clauses))
 
 	// Target: Keep only the best 50% of clauses (aggressive deletion)
 	// This ensures database stays high-quality
