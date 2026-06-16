@@ -2173,15 +2173,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			// Look for replacement watch
 			foundReplacement := false
+			// OPTIMIZATION 1C: Move loop-invariant computation outside inner loop
+			// watchLit and blitLit are constant for all literals in the clause
+			watchLit := cnf.IndexToLit(watchIdx)
+			blitLit := cnf.IndexToLit(int(blitIdx))
 			// OPTIMIZATION 1A: Cache clause literals pointer to avoid repeated field access
 			literals := clause.Literals
 			for j := 0; j < len(literals); j++ {
 				clauseLit := literals[j]
 				
-				// Convert watchIdx back to Literal for comparison
-				// Watch index: bit 0 = negation, Literal: bit 31 = negation
-				watchLit := cnf.IndexToLit(watchIdx)
-				blitLit := cnf.IndexToLit(int(blitIdx))
+				// Skip the watched literals themselves
 				if clauseLit == watchLit || blitLit == clauseLit {
 					continue
 				}
