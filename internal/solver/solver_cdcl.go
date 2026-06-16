@@ -2228,20 +2228,21 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Look for replacement watch
 			foundReplacement := false
 			// OPTIMIZATION 1C: Move loop-invariant computation outside inner loop
-			// watchLit and blitLit are constant for all literals in the clause
-			watchLit := cnf.IndexToLit(watchIdx)
-			blitLit := cnf.IndexToLit(int(blitIdx))
+			// OPTIMIZATION 4: Pre-compute watchLitVar and blitLitVar as uint32 for fast comparison
+			watchLitVar := uint32(watchIdx >> 1)
+			blitLitVar := blitVarIdx
 			// OPTIMIZATION 1A: Cache clause literals pointer to avoid repeated field access
 			literals := clause.Literals
 			for j := 0; j < len(literals); j++ {
 				clauseLit := literals[j]
+				clauseLitVar := clauseLit.Var()
 				
 				// Skip the watched literals themselves
-				if clauseLit == watchLit || clauseLit == blitLit {
+				// OPTIMIZATION 4: Compare uint32 variables instead of full Literal type
+				if clauseLitVar == watchLitVar || clauseLitVar == blitLitVar {
 					continue
 				}
 
-				clauseLitVar := clauseLit.Var()
 				// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
 				litLevel := s.varLevel[clauseLitVar]
 				litValue := s.assignments[clauseLitVar].Value
