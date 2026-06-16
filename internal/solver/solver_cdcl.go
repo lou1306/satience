@@ -48,7 +48,7 @@ const (
 const (
 	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
-	DefaultRestartBase      = 50    // Base for Luby restart sequence (balanced)
+	DefaultRestartBase      = 20    // Base for Luby restart sequence (aggressive for structured instances)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
 	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
@@ -1194,27 +1194,14 @@ func (s *CDCLSolver) restart() {
 		fmt.Printf("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 	}
 
-	// IMPORTANT: Calculate LBD and identify glue clauses BEFORE clearing assignments!
-	// Glue clauses (LBD <= 3) are preserved across restarts
+	// Use stored LBD values (calculated at learning time) instead of recalculating
+	// Recalculating during restart gives wrong values since assignments change
 	glueCount := 0
 	isGlue := make([]bool, len(s.learnedClauses))
 
-	for i, clause := range s.learnedClauses {
-		// Calculate LBD while assignments are still valid using tmpLevelSet (avoid map allocation)
-		lbd := 0
-		for _, lit := range clause.Literals {
-			lvl := s.assignments[lit.Var()].Level
-			if lvl > 0 && !s.tmpLevelSetUsed[lvl] {
-				s.tmpLevelSetUsed[lvl] = true
-				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
-				lbd++
-			}
-		}
-		// Clear tmpLevelSetUsed for next clause
-		for _, lvl := range s.tmpLevelSet {
-			s.tmpLevelSetUsed[lvl] = false
-		}
-		s.tmpLevelSet = s.tmpLevelSet[:0]
+	for i := range s.learnedClauses {
+		// Use stored LBD from when clause was learned
+		lbd := s.clauseLBD[i]
 
 		// Keep only true glue clauses (LBD <= 3)
 		// LBD <= 2: core glue (most valuable, never delete)
@@ -2579,16 +2566,17 @@ func (s *CDCLSolver) decide() bool {
 		if s.conflicts > 0 && varIdx == s.lastDecisionVar {
 			s.consecutiveFlips++
 
-			// If flipping for 20+ conflicts, trigger aggressive diversification
-			// Increased threshold from 10 to 20 to allow more focused search
-			if s.consecutiveFlips >= 20 {
-				s.vsids.diversifyAggressive()
-				s.consecutiveFlips = 0
-				if s.verbose {
-					fmt.Printf("c [DIVERSIFY] Conflict %d: triggered after %d flips on var %d\n",
-						s.conflicts, 20, varIdx+1)
-				}
-			}
+			// DISABLED: Aggressive diversification was counterproductive on structured instances
+			// It resets VSIDS activity, preventing convergence on the right variables
+			// Instead, let VSIDS naturally escape local minima through decay and restarts
+			// if s.consecutiveFlips >= 20 {
+			// 	s.vsids.diversifyAggressive()
+			// 	s.consecutiveFlips = 0
+			// 	if s.verbose {
+			// 		fmt.Printf("c [DIVERSIFY] Conflict %d: triggered after %d flips on var %d\n",
+			// 			s.conflicts, 20, varIdx+1)
+			// 	}
+			// }
 		} else {
 			s.consecutiveFlips = 0
 		}

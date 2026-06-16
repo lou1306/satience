@@ -5,9 +5,9 @@ import (
 )
 
 // DefaultDecayInterval is the default number of conflicts between VSIDS activity decays
-// Value of 50 provides good balance: 50× fewer heap rebuilds with minimal quality loss
-// Increased from 10 to reduce heap rebuild overhead (buildHeap was 5-8% of CPU time)
-const DefaultDecayInterval = 50
+// Value of 10 provides good balance: frequent decay keeps focus on recent conflicts
+// Lower values = more focus on recent conflicts, better for structured instances
+const DefaultDecayInterval = 10
 
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
