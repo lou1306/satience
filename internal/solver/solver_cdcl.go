@@ -1924,6 +1924,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
+	// Binary clauses get 100x base weight to strongly bias initial variable selection
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
 	for {
@@ -2032,6 +2033,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
+	// Binary clauses get 100x base weight to strongly bias initial variable selection
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
 	for {

@@ -151,6 +151,22 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	v.heapValid = false // Invalidate heap after modifying activities
 }
 
+// InitializeFromConflicts is DEPRECATED - investigated but did not improve performance
+// Tested on PHP instances with various conflict counts (10, 20, 50)
+// Result: Always worse than clause-structure initialization
+// PHP 6p5h: 4167 conflicts (conflict-based) vs 2364 conflicts (clause-based)
+//
+// Reason: Learning clauses during initialization pollutes the clause database
+// and biases search in suboptimal direction. Clause-structure initialization
+// (short clauses = higher activity) is already well-tuned for diverse instances.
+//
+// Keeping this function for future reference and potential re-investigation.
+func (v *VSIDS) InitializeFromConflicts(solver *CDCLSolver, numConflicts int) {
+	// Implementation removed - see deprecation note above
+	_ = solver
+	_ = numConflicts
+}
+
 // buildHeap rebuilds the activity heap from current activity scores
 // Only includes unassigned variables
 // Includes LBD bonus in activity score for selection
