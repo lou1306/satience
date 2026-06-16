@@ -2979,11 +2979,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > LowQualityLBDThreshold)
 		// These clauses are too weak to be useful for propagation
 		// They span too many decision levels and don't prune search effectively
-		// Glucose typically uses LBD threshold of 5-8, we use 15 as initial tuning
-		LowQualityLBDThreshold := 15
+		// Glucose standard: LBD ≤ 8, we match this for better clause database quality
+		LowQualityLBDThreshold := 8
 		if lbd > LowQualityLBDThreshold {
 			if s.verbose && s.conflicts <= DebugConflictLimit {
-				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=15)\n", lbd, len(s.tmpLearnedLits))
+				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=8)\n", lbd, len(s.tmpLearnedLits))
 			}
 			// Use precomputed maxLevel from single pass above
 			backjumpLevel := maxLevel
