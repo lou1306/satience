@@ -592,11 +592,12 @@ func (s *CDCLSolver) initWatches() {
 	s.watchLists = make([][]cnf.Watch, numLits)
 
 	// Pre-allocate watch lists with estimated capacity to avoid reallocations
-	// Formula: 2 watches per clause (one per watched literal) / num literals
-	// Minimum 8 to handle uneven distribution (some literals appear in many clauses)
-	avgWatchesPerLit := (s.cnf.NumClauses * 2) / numLits
-	if avgWatchesPerLit < 8 {
-		avgWatchesPerLit = 8
+	// OPTIMIZATION P0: Increased from 2* to 4* to reduce append() overhead in hot path
+	// Formula: 4 watches per clause (one per watched literal) / num literals
+	// Minimum 16 to handle uneven distribution (some literals appear in many clauses)
+	avgWatchesPerLit := (s.cnf.NumClauses * 4) / numLits
+	if avgWatchesPerLit < 16 {
+		avgWatchesPerLit = 16
 	}
 	for i := range s.watchLists {
 		s.watchLists[i] = make([]cnf.Watch, 0, avgWatchesPerLit)
@@ -2184,7 +2185,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLit := literals[j]
 				
 				// Skip the watched literals themselves
-				if clauseLit == watchLit || blitLit == clauseLit {
+				if clauseLit == watchLit || clauseLit == blitLit {
 					continue
 				}
 
