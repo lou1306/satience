@@ -350,14 +350,9 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 			continue
 		}
 
-		// Push it back with updated activity (including LBD bonus and small deterministic noise)
-		// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
-		v.randomSeed ^= v.randomSeed << 13
-		v.randomSeed ^= v.randomSeed >> 7
-		v.randomSeed ^= v.randomSeed << 17
-		// Convert to float64 in range [0, 1) and scale to ±0.5% noise
-		noise := (float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) - 0.5) * 0.01 * (v.activity[varIdx] + v.lbdBonus[varIdx])
-		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx] + noise
+		// Push it back with current activity (no noise)
+		// Variables with higher activity naturally stay near top of heap
+		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx]
 		v.heap.push(item)
 
 		return uint32(varIdx)

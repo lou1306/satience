@@ -147,6 +147,11 @@ type CDCLSolver struct {
 
 	// LBD-based learned clause ordering for propagation prioritization
 	learnedClauseOrder  []int // Indices into learnedClauses/clauseLBD sorted by LBD
+
+	// Variable elimination tracking for model reconstruction
+	eliminatedVars      []uint32                // List of eliminated variable indices
+	varElimDefinition   map[uint32][]cnf.Literal // Definition of eliminated var (resolvent that eliminated it)
+	varElimPolarity     map[uint32]bool         // Polarity of eliminated var in its definition
 	lbdOrderDirty       bool  // True if order needs rebuilding
 	lbdOrderLastRebuild int   // Conflict count when order was last rebuilt
 
@@ -274,6 +279,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		minimizationMaxSize:       30,  // Minimize clauses ≤30 literals (increased from 15)
 		minimizationMaxLBD:        8,   // Minimize clauses with LBD ≤8 (increased from 5)
 		minimizationMaxReasonSize: 15,  // Skip reason clauses >15 literals (increased from 10)
+		// Initialize variable elimination tracking
+		eliminatedVars:    make([]uint32, 0),
+		varElimDefinition: make(map[uint32][]cnf.Literal),
+		varElimPolarity:   make(map[uint32]bool),
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -551,8 +560,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Variable elimination: disabled (causes model reconstruction bugs)
-		// TODO: Fix variable elimination with proper model reconstruction
+		// Variable elimination: DISABLED - implementation has soundness bugs
+		// The current implementation doesn't properly handle sequential elimination
+		// where eliminating one variable affects the eliminatability of others
+		// TODO: Implement proper variable elimination with:
+		// 1. Dynamic re-computation of elimination candidates after each variable
+		// 2. Proper resolvent generation that preserves UNSAT
+		// 3. Model reconstruction that's applied before any SAT return
 
 		// Run unit propagation to catch new units from equivalence substitution
 		if preprocessConfig.EnableUnitProp {
@@ -1165,27 +1179,12 @@ func luby(i int) int {
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
 func (s *CDCLSolver) shouldRestart() bool {
-	// Luby sequence (PRIMARY) - standard restart policy
-	// Glucose-style adaptive restarts (SECONDARY) - only for extreme cases
-
-	// Primary: Luby sequence restarts
+	// Luby sequence restarts (aggressive base 20 for structured instances)
 	lubyValue := luby(s.lubyIndex + 1)
 	threshold := lubyValue * s.restartBase
 
 	if s.conflicts-s.restartCount >= threshold {
 		return true
-	}
-
-	// Secondary: Glucose-style adaptive restarts (moderate aggressiveness)
-	// Trigger when current LBD > 2× average - between conservative (3×) and aggressive (1.5×)
-	// This balances escaping unproductive regions vs avoiding restart storms
-	if s.lbdCount >= 100 && s.conflicts-s.restartCount >= 200 {
-		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
-
-		// Glucose criterion: restart when LBD > 2× average AND LBD > 6
-		if s.lastConflictLBD > int(2.0*avgLBD) && s.lastConflictLBD > 6 {
-			return true
-		}
 	}
 
 	return false
@@ -1397,10 +1396,10 @@ func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Litera
 }
 
 func (s *CDCLSolver) inprocessing() {
-	// Skip inprocessing on small/medium instances - overhead outweighs benefits
-	// Small instances (< 500 clauses) solve quickly without simplification
-	// Inprocessing O(n*m) subsumption check is too expensive on small formulas
-	if s.cnf.NumClauses < 500 {
+	// OPTIMIZATION: Lowered threshold from 500 to 50 clauses to enable inprocessing on PHP instances
+	// PHP 6p5h: 81 clauses, PHP 7p6h: 133 clauses, PHP 8p7h: 204 clauses - all now get inprocessing
+	// Inprocessing (subsumption, self-subsumption) helps reduce clause database and find conflicts faster
+	if s.cnf.NumClauses < 50 {
 		return
 	}
 
@@ -1853,6 +1852,16 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
 		}
+		// CRITICAL: Don't return SAT if there are eliminated variables
+		// The eliminated variables need to be reconstructed from their definitions
+		// Let CDCL solve the (now empty) formula, then reconstruct
+		if len(s.eliminatedVars) > 0 {
+			if s.verbose {
+				fmt.Printf("c [verbose] Pure literal elimination: deferring SAT to allow model reconstruction (%d eliminated vars)\n",
+					len(s.eliminatedVars))
+			}
+			return UNKNOWN
+		}
 		// Assign all remaining unassigned variables arbitrarily
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			if s.assignments[varIdx].Level == 0 {
@@ -1871,6 +1880,279 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 	}
 
 	return UNKNOWN
+}
+
+// variableElimination eliminates variables via resolution and tracks definitions for model reconstruction
+// Returns SAT if empty clause found, UNKNOWN otherwise
+func (s *CDCLSolver) variableElimination() SolveResult {
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: starting with %d variables, %d clauses\n",
+			s.cnf.NumVars, s.cnf.NumClauses)
+	}
+
+	// Count occurrences of each variable (positive and negative)
+	posCount := make([]int, s.cnf.NumVars)
+	negCount := make([]int, s.cnf.NumVars)
+	posClauses := make(map[uint32][]int) // varIdx -> clause indices
+	negClauses := make(map[uint32][]int)
+
+	for clauseIdx, clause := range s.cnf.Clauses {
+		for _, lit := range clause.Literals {
+			varIdx := lit.Var()
+			if lit.IsNegated() {
+				negCount[varIdx]++
+				negClauses[varIdx] = append(negClauses[varIdx], clauseIdx)
+			} else {
+				posCount[varIdx]++
+				posClauses[varIdx] = append(posClauses[varIdx], clauseIdx)
+			}
+		}
+	}
+
+	// Find eliminatable variables
+	// Heuristic: eliminate if resolvent size is manageable
+	eliminationOrder := make([]uint32, 0)
+	for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+		if posCount[varIdx] > 0 && negCount[varIdx] > 0 {
+			resolventSize := posCount[varIdx] * negCount[varIdx]
+			// Only eliminate if resolvent won't explode (increased from 500 to 2000)
+			if resolventSize <= 2000 {
+				eliminationOrder = append(eliminationOrder, varIdx)
+			}
+		}
+	}
+
+	if len(eliminationOrder) == 0 {
+		if s.verbose {
+			fmt.Printf("c [verbose] Variable elimination: no variables to eliminate (resolvent too large for all vars)\n")
+			// Debug: show which vars could be eliminated
+			for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+				if posCount[varIdx] > 0 && negCount[varIdx] > 0 {
+					resolventSize := posCount[varIdx] * negCount[varIdx]
+					fmt.Printf("c [debug] Var %d: pos=%d, neg=%d, resolvent=%d\n",
+						varIdx, posCount[varIdx], negCount[varIdx], resolventSize)
+				}
+			}
+		}
+		return UNKNOWN
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: eliminating %d variables\n", len(eliminationOrder))
+	}
+
+	// Track which clauses are deleted
+	clauseDeleted := make([]bool, len(s.cnf.Clauses))
+
+	// Collect all resolvents to add after processing (don't modify clause list during iteration)
+	allResolvents := make([]cnf.Clause, 0)
+
+	// Eliminate each variable
+	for _, varIdx := range eliminationOrder {
+		posCls := posClauses[varIdx]
+		negCls := negClauses[varIdx]
+
+		// Skip if all clauses already deleted
+		activePos := make([]int, 0)
+		activeNeg := make([]int, 0)
+		for _, idx := range posCls {
+			if idx < len(clauseDeleted) && !clauseDeleted[idx] {
+				activePos = append(activePos, idx)
+			}
+		}
+		for _, idx := range negCls {
+			if idx < len(clauseDeleted) && !clauseDeleted[idx] {
+				activeNeg = append(activeNeg, idx)
+			}
+		}
+
+		if len(activePos) == 0 || len(activeNeg) == 0 {
+			continue
+		}
+
+		// Mark old clauses for deletion
+		for _, idx := range activePos {
+			clauseDeleted[idx] = true
+		}
+		for _, idx := range activeNeg {
+			clauseDeleted[idx] = true
+		}
+
+		// Generate resolvents
+		for _, pIdx := range activePos {
+			for _, nIdx := range activeNeg {
+				posClause := s.cnf.Clauses[pIdx]
+				negClause := s.cnf.Clauses[nIdx]
+
+				// Resolve on varIdx
+				resolvent := s.resolveOnVarElim(posClause, negClause, varIdx)
+				if resolvent != nil {
+					// Check for empty clause (UNSAT)
+					if len(resolvent.Literals) == 0 {
+						if s.verbose {
+							fmt.Printf("c [verbose] Variable elimination: empty clause found (UNSAT)\n")
+						}
+						return UNSAT
+					}
+					if !s.isTautology(resolvent) {
+						allResolvents = append(allResolvents, *resolvent)
+					}
+				}
+			}
+		}
+
+		// Store definition for model reconstruction
+		// The eliminated variable is defined by: var = (any positive clause literal) when positive clause satisfied
+		// We store the first positive clause as the definition
+		if len(activePos) > 0 {
+			defClause := s.cnf.Clauses[activePos[0]]
+			// Remove the eliminated variable from the definition
+			defLits := make([]cnf.Literal, 0, len(defClause.Literals)-1)
+			for _, lit := range defClause.Literals {
+				if lit.Var() != varIdx {
+					defLits = append(defLits, lit)
+				}
+			}
+			s.varElimDefinition[varIdx] = defLits
+			// Polarity: var is true if any literal in positive clause is true
+			s.varElimPolarity[varIdx] = true
+		}
+
+		s.eliminatedVars = append(s.eliminatedVars, varIdx)
+	}
+
+	// Remove deleted clauses and add resolvents
+	newClauses := make([]cnf.Clause, 0)
+	for i, clause := range s.cnf.Clauses {
+		if i < len(clauseDeleted) && !clauseDeleted[i] {
+			newClauses = append(newClauses, clause)
+		}
+	}
+	// Add resolvents
+	newClauses = append(newClauses, allResolvents...)
+	s.cnf.Clauses = newClauses
+	s.cnf.NumClauses = len(newClauses)
+
+	// Zero out VSIDS activity for eliminated variables
+	for _, varIdx := range s.eliminatedVars {
+		s.vsids.activity[varIdx] = 0.0
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Variable elimination: eliminated %d variables, %d clauses remaining\n",
+			len(s.eliminatedVars), s.cnf.NumClauses)
+	}
+
+	return UNKNOWN
+}
+
+// resolveOnVarElim resolves two clauses on a variable (for variable elimination)
+// Returns nil if resolvent is empty or tautological
+func (s *CDCLSolver) resolveOnVarElim(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
+	// Find the literals for varIdx
+	var lit1, lit2 cnf.Literal
+	found1, found2 := false, false
+
+	for _, lit := range clause1.Literals {
+		if lit.Var() == varIdx {
+			lit1 = lit
+			found1 = true
+			break
+		}
+	}
+	for _, lit := range clause2.Literals {
+		if lit.Var() == varIdx {
+			lit2 = lit
+			found2 = true
+			break
+		}
+	}
+
+	if !found1 || !found2 {
+		return nil
+	}
+
+	// Check if they have opposite polarity (required for resolution)
+	if lit1.IsNegated() == lit2.IsNegated() {
+		return nil
+	}
+
+	// Build resolvent (all literals except the resolved variable)
+	resolventLits := make([]cnf.Literal, 0, len(clause1.Literals)+len(clause2.Literals)-2)
+	for _, lit := range clause1.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+	for _, lit := range clause2.Literals {
+		if lit.Var() != varIdx {
+			resolventLits = append(resolventLits, lit)
+		}
+	}
+
+	if len(resolventLits) == 0 {
+		// Empty clause = UNSAT
+		return &cnf.Clause{Literals: make([]cnf.Literal, 0)}
+	}
+
+	return &cnf.Clause{Literals: resolventLits, Learned: false}
+}
+
+// reconstructEliminatedVars reconstructs assignments for eliminated variables
+// Must be called after solving returns SAT
+func (s *CDCLSolver) reconstructEliminatedVars() {
+	if len(s.eliminatedVars) == 0 {
+		return
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Reconstructing %d eliminated variables\n", len(s.eliminatedVars))
+	}
+
+	// Reconstruct in reverse elimination order (last eliminated first)
+	for i := len(s.eliminatedVars) - 1; i >= 0; i-- {
+		varIdx := s.eliminatedVars[i]
+		defLits, exists := s.varElimDefinition[varIdx]
+		if !exists {
+			continue
+		}
+
+		// Evaluate the definition: var is true if any literal in definition is true
+		defValue := false
+		for _, lit := range defLits {
+			litVar := lit.Var()
+			if int(litVar) >= len(s.assignments) {
+				continue
+			}
+			assign := s.assignments[litVar]
+			if assign.Level == 0 {
+				// Unassigned variable in definition - use default (false)
+				continue
+			}
+			litValue := assign.Value
+			if lit.IsNegated() {
+				litValue = !litValue
+			}
+			if litValue {
+				defValue = true
+				break
+			}
+		}
+
+		// If definition is empty (unit clause was eliminated), use polarity
+		if len(defLits) == 0 {
+			defValue = s.varElimPolarity[varIdx]
+		}
+
+		s.assignments[varIdx] = Assignment{
+			Value: defValue,
+			Level: 1, // Mark as assigned (not a decision)
+		}
+
+		if s.verbose {
+			fmt.Printf("c [debug] Reconstructed var %d = %v from definition\n", varIdx, defValue)
+		}
+	}
 }
 
 // Solve determines if the CNF formula is satisfiable.
@@ -1962,12 +2244,22 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
-			// Inprocessing: apply simplification techniques during search
+			// OPTIMIZATION: Enable inprocessing on PHP-sized instances (50+ clauses)
+			// Run every 500 conflicts on small instances (50-500 clauses)
 			// Run every 2000 conflicts on large instances (>500 clauses)
-			// Skip on small/medium instances where overhead outweighs benefits
-			if s.conflicts > 0 && s.conflicts%2000 == 0 && s.cnf.NumClauses >= 500 {
+			inprocessInterval := 2000
+			if s.cnf.NumClauses >= 50 && s.cnf.NumClauses < 500 {
+				inprocessInterval = 500  // More frequent on medium instances
+			}
+			// DEBUG: Always print at conflict 500 to verify logic
+			if s.conflicts == 500 && s.verbose {
+				fmt.Printf("c [debug] Inprocessing check: conflicts=%d, interval=%d, mod=%d, NumClauses=%d, condition=%v\n",
+					s.conflicts, inprocessInterval, s.conflicts%inprocessInterval, s.cnf.NumClauses,
+					s.conflicts > 0 && s.conflicts%inprocessInterval == 0 && s.cnf.NumClauses >= 50)
+			}
+			if s.conflicts > 0 && s.conflicts%inprocessInterval == 0 && s.cnf.NumClauses >= 50 {
 				if s.verbose {
-					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d\n", s.conflicts)
+					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, %d clauses)\n", s.conflicts, inprocessInterval, s.cnf.NumClauses)
 				}
 				s.inprocessing()
 			}
@@ -2071,6 +2363,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			}
 			s.backjumpLevel = 0
 
+			// Inprocessing disabled for now - overhead outweighs benefits on PHP instances
+			// TODO: Re-enable with better heuristics for when to run inprocessing
+
 			if s.shouldRestart() {
 				s.restart()
 			}
@@ -2078,6 +2373,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 
 		if s.allAssigned() {
+			// Reconstruct eliminated variables before returning model
+			s.reconstructEliminatedVars()
+
 			// Verify model satisfies all clauses
 			if !s.verifyModel() {
 				if s.verbose {
@@ -2573,14 +2871,6 @@ func (s *CDCLSolver) decide() bool {
 			// DISABLED: Aggressive diversification was counterproductive on structured instances
 			// It resets VSIDS activity, preventing convergence on the right variables
 			// Instead, let VSIDS naturally escape local minima through decay and restarts
-			// if s.consecutiveFlips >= 20 {
-			// 	s.vsids.diversifyAggressive()
-			// 	s.consecutiveFlips = 0
-			// 	if s.verbose {
-			// 		fmt.Printf("c [DIVERSIFY] Conflict %d: triggered after %d flips on var %d\n",
-			// 			s.conflicts, 20, varIdx+1)
-			// 	}
-			// }
 		} else {
 			s.consecutiveFlips = 0
 		}
