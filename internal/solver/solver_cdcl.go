@@ -324,9 +324,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpCandidateBufferSize:   100,
 		tmpLearnedLitBufferSize:  64,
 		learnedClauseHashInitial: 2500,
-		// Restart policy defaults
-		restartGlucoseRatio:      1.5,
-		restartGlucoseMinConflicts: 50,
+		// Restart policy defaults (aggressive for better performance on random instances)
+		restartGlucoseRatio:      1.2,
+		restartGlucoseMinConflicts: 25,
 		restartKeepGlueLBD:       3,
 	}
 

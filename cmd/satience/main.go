@@ -29,9 +29,9 @@ func run() int {
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
 	// Restart policy parameters
-	restartBase := flag.Int("restart-base", 20, "Luby restart sequence base multiplier (default=20)")
-	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5)")
-	restartGlucoseMin := flag.Int("restart-glucose-min", 50, "Min conflicts before Glucose restarts (default=50)")
+	restartBase := flag.Int("restart-base", 10, "Luby restart sequence base multiplier (default=10)")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.2, "Glucose restart when LBD > ratio × avg (default=1.2)")
+	restartGlucoseMin := flag.Int("restart-glucose-min", 25, "Min conflicts before Glucose restarts (default=25)")
 	restartKeepGlue := flag.Int("restart-keep-glue", 3, "Keep clauses with LBD ≤ this during restart (default=3)")
 	flag.Parse()
 
