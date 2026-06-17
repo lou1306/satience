@@ -2868,6 +2868,8 @@ func (s *CDCLSolver) decide() bool {
 	s.trailHead = append(s.trailHead, len(s.trail))
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, nil)
 	s.decisions++
+	// SYMMETRY BREAKING: Track this decision to apply recency penalty
+	s.vsids.TrackDecision(varIdx, s.conflicts)
 	if s.verbose {
 		fmt.Printf("c [DECIDE] Level %d (was %d): var %d = %v (decision), trailHead len=%d\n",
 			s.level, s.level-1, varIdx+1, phase, len(s.trailHead))

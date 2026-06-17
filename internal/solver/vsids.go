@@ -106,6 +106,10 @@ type VSIDS struct {
 	heapValid             bool      // True if heap is up-to-date
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
+	// Symmetry breaking: track activity momentum and decision recency
+	activityMomentum      []float64 // Rate of activity change (positive = increasing importance)
+	lastDecisionConflict  []int     // Last conflict where variable was decided (-1 if never)
+	decisionRecencyPenalty []float64 // Penalty for recently decided variables
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -114,23 +118,31 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	// Bump amounts reduced to prevent activity explosion
 	maxDecay := 0.999
 	initialDecay := 0.95
-	return &VSIDS{
-		activity:              make([]float64, numVars),
-		conflictParticipation: make([]int, numVars),
-		decayFactor:           initialDecay,
-		inverseDecay:          1.0 / initialDecay,
-		useLRB:                false,
-		lrbDecayInterval:      1024,
-		conflictCount:         0,
-		useLBD:                true,
-		lbdBonus:              make([]float64, numVars),
-		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
-		heap:                  make(vsidsHeap, 0, numVars),
-		heapValid:             false,
-		decayInterval:         DefaultDecayInterval,
-		randomSeed:            0, // Default seed for deterministic randomness
+	v := &VSIDS{
+		activity:               make([]float64, numVars),
+		conflictParticipation:  make([]int, numVars),
+		decayFactor:            initialDecay,
+		inverseDecay:           1.0 / initialDecay,
+		useLRB:                 false,
+		lrbDecayInterval:       1024,
+		conflictCount:          0,
+		useLBD:                 true,
+		lbdBonus:               make([]float64, numVars),
+		maxDecayFactor:         maxDecay,
+		decayIncrement:         (maxDecay - initialDecay) / 10000.0,
+		heap:                   make(vsidsHeap, 0, numVars),
+		heapValid:              false,
+		decayInterval:          DefaultDecayInterval,
+		randomSeed:             0, // Default seed for deterministic randomness
+		// Symmetry breaking initialization
+		activityMomentum:       make([]float64, numVars),
+		lastDecisionConflict:   make([]int, numVars),
+		decisionRecencyPenalty: make([]float64, numVars),
 	}
+	for i := range v.lastDecisionConflict {
+		v.lastDecisionConflict[i] = -1
+	}
+	return v
 }
 
 // InitializeFromClauses initializes VSIDS activity based on clause participation
@@ -202,6 +214,27 @@ func (v *VSIDS) EnableLBD() {
 // SetRandomSeed sets the seed for deterministic random noise in tie-breaking
 func (v *VSIDS) SetRandomSeed(seed uint64) {
 	v.randomSeed = seed
+}
+
+// TrackDecision records that a variable was decided on at the current conflict
+// This is used for symmetry breaking to avoid repeatedly deciding on the same variable
+func (v *VSIDS) TrackDecision(varIdx uint32, conflictCount int) {
+	if int(varIdx) < len(v.lastDecisionConflict) {
+		// Calculate recency: how many conflicts ago was this variable decided?
+		lastConflict := v.lastDecisionConflict[varIdx]
+		if lastConflict >= 0 {
+			recency := conflictCount - lastConflict
+			// Only apply recency penalty if variable was decided very recently (within 5 conflicts)
+			// This prevents flipping without penalizing normal search behavior
+			if recency < 5 {
+				v.decisionRecencyPenalty[varIdx] = 50.0 / float64(recency+1)
+			} else {
+				// Decay penalty if variable hasn't been decided recently
+				v.decisionRecencyPenalty[varIdx] *= 0.5
+			}
+		}
+		v.lastDecisionConflict[varIdx] = conflictCount
+	}
 }
 
 // SetDecayInterval sets the number of conflicts between activity decays
@@ -322,18 +355,25 @@ func (v *VSIDS) decay() {
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
 
-	// Apply decay to all activity scores
+	// SYMMETRY BREAKING: Update activity momentum before decaying
+	// Momentum = bump amount (how much activity increased before decay)
+	// This tracks which variables are being bumped in recent conflicts
 	for i := range v.activity {
+		oldActivity := v.activity[i]
 		v.activity[i] *= v.decayFactor
+		// Momentum = activity lost to decay (represents recent bumping)
+		v.activityMomentum[i] = oldActivity - v.activity[i]
+		// Decay recency penalty over time
+		v.decisionRecencyPenalty[i] *= 0.9
 	}
 
 	// Invalidate heap since all activities changed
-	// Heap will be rebuilt on next selectVariableWithHeap call
 	v.heapValid = false
 }
 
 // selectVariableWithHeap returns the unassigned variable with highest activity using a heap
 // This provides O(log n) selection instead of O(n) linear scan
+// SYMMETRY BREAKING: Uses activity momentum and recency penalty to break ties
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	// Rebuild heap if invalid or empty
 	if !v.heapValid || len(v.heap) == 0 {
@@ -350,9 +390,12 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 			continue
 		}
 
-		// Push it back with current activity (no noise)
-		// Variables with higher activity naturally stay near top of heap
-		item.activity = v.activity[varIdx] + v.lbdBonus[varIdx]
+		// SYMMETRY BREAKING: Recency penalty to avoid flipping on same variable
+		// Momentum disabled - it helped UNSAT but hurt SAT instances
+		recencyPenalty := v.decisionRecencyPenalty[varIdx]
+		effectiveActivity := v.activity[varIdx] + v.lbdBonus[varIdx] - recencyPenalty
+		
+		item.activity = effectiveActivity
 		v.heap.push(item)
 
 		return uint32(varIdx)
