@@ -33,6 +33,12 @@ func run() int {
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.2, "Glucose restart when LBD > ratio × avg (default=1.2)")
 	restartGlucoseMin := flag.Int("restart-glucose-min", 25, "Min conflicts before Glucose restarts (default=25)")
 	restartKeepGlue := flag.Int("restart-keep-glue", 3, "Keep clauses with LBD ≤ this during restart (default=3)")
+	// Clause deletion parameters
+	clauseDelLBD := flag.Float64("clause-del-lbd", 200.0, "LBD score weight for clause deletion (default=200.0)")
+	clauseDelAge := flag.Float64("clause-del-age", 5.0, "Age score weight for clause deletion (default=5.0)")
+	clauseDelSize := flag.Float64("clause-del-size", 10.0, "Size score weight for clause deletion (default=10.0)")
+	clauseDelActivity := flag.Float64("clause-del-activity", 100.0, "Activity protection weight (default=100.0)")
+	clauseDelKeepRatio := flag.Float64("clause-del-keep-ratio", 0.5, "Ratio of clauses to keep during deletion (default=0.5)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -88,6 +94,9 @@ func run() int {
 	
 	// Configure restart policy
 	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin, *restartKeepGlue)
+	
+	// Configure clause deletion policy
+	s.SetClauseDeletionParameters(*clauseDelLBD, *clauseDelAge, *clauseDelSize, *clauseDelActivity, *clauseDelKeepRatio)
 
 	// Configure clause minimization
 	switch *minimize {

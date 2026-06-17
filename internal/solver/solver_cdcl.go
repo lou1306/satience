@@ -180,6 +180,20 @@ type CDCLSolver struct {
 	restartGlucoseRatio      float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int   // Min conflicts before Glucose restarts kick in (default 50)
 	restartKeepGlueLBD       int     // Keep clauses with LBD ≤ this during restart (default 3)
+	// Clause deletion scoring parameters
+	clauseDeletionLBDWeight      float64 // LBD score weight (default 200.0)
+	clauseDeletionAgeWeight      float64 // Age score weight (default 5.0)
+	clauseDeletionSizeWeight     float64 // Size score weight (default 10.0)
+	clauseDeletionActivityWeight float64 // Activity protection weight (default 100.0)
+	clauseDeletionUseCountHigh   int     // UseCount threshold for strong protection (default 5)
+	clauseDeletionUseCountLow    int     // UseCount threshold for light protection (default 0)
+	clauseDeletionPropCountHigh  int     // PropCount threshold for strong protection (default 15)
+	clauseDeletionPropCountLow   int     // PropCount threshold for light protection (default 0)
+	clauseDeletionHighLBD1       int     // LBD threshold for force deletion bonus 1 (default 8)
+	clauseDeletionHighLBD2       int     // LBD threshold for force deletion bonus 2 (default 12)
+	clauseDeletionHighLBDBonus1  float64 // Force deletion bonus for LBD > highLBD1 (default 2000.0)
+	clauseDeletionHighLBDBonus2  float64 // Force deletion bonus for LBD > highLBD2 (default 3000.0)
+	clauseDeletionKeepRatio      float64 // Ratio of clauses to keep during deletion (default 0.50)
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -328,6 +342,18 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartGlucoseRatio:      1.2,
 		restartGlucoseMinConflicts: 25,
 		restartKeepGlueLBD:       3,
+		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
+		clauseDeletionLBDWeight:      200.0,
+		clauseDeletionAgeWeight:      5.0,
+		clauseDeletionSizeWeight:     10.0,
+		clauseDeletionActivityWeight: 100.0,
+		clauseDeletionUseCountHigh:   5,
+		clauseDeletionPropCountHigh:  15,
+		clauseDeletionHighLBD1:       8,
+		clauseDeletionHighLBD2:       12,
+		clauseDeletionHighLBDBonus1:  2000.0,
+		clauseDeletionHighLBDBonus2:  3000.0,
+		clauseDeletionKeepRatio:      0.50,
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -547,6 +573,38 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 		keepGlueLBD = 2
 	}
 	s.restartKeepGlueLBD = keepGlueLBD
+}
+
+// SetClauseDeletionParameters configures clause deletion scoring parameters
+// lbdWeight: LBD score weight (default 200.0)
+// ageWeight: Age score weight (default 5.0)
+// sizeWeight: Size score weight (default 10.0)
+// activityWeight: Activity protection weight (default 100.0)
+// keepRatio: Ratio of clauses to keep during deletion (default 0.50)
+func (s *CDCLSolver) SetClauseDeletionParameters(
+	lbdWeight, ageWeight, sizeWeight, activityWeight, keepRatio float64,
+) {
+	if lbdWeight < 0 {
+		lbdWeight = 0
+	}
+	if ageWeight < 0 {
+		ageWeight = 0
+	}
+	if sizeWeight < 0 {
+		sizeWeight = 0
+	}
+	if activityWeight < 0 {
+		activityWeight = 0
+	}
+	if keepRatio < 0.1 || keepRatio > 0.9 {
+		keepRatio = 0.5
+	}
+	
+	s.clauseDeletionLBDWeight = lbdWeight
+	s.clauseDeletionAgeWeight = ageWeight
+	s.clauseDeletionSizeWeight = sizeWeight
+	s.clauseDeletionActivityWeight = activityWeight
+	s.clauseDeletionKeepRatio = keepRatio
 }
 
 // SetMinimizationThresholds configures clause minimization behavior
@@ -3809,33 +3867,31 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		useCount := s.clauseUseCount[i]
 		propCount := s.clausePropCount[i]
 
-		// Calculate deletion score (higher = delete first)
+		// Calculate deletion score using configurable weights (higher = delete first)
 		// PRIMARY FACTOR: LBD (higher LBD = much more likely to delete)
-		score := float64(lbd) * 200.0
+		score := float64(lbd) * s.clauseDeletionLBDWeight
 
 		// SECONDARY FACTOR: Age (old clauses less relevant)
-		score += float64(age) * 5.0
+		score += float64(age) * s.clauseDeletionAgeWeight
 
 		// TERTIARY FACTOR: Size (larger clauses less useful)
-		score += float64(size) * 10.0
+		score += float64(size) * s.clauseDeletionSizeWeight
 
 		// BONUS: Activity (active clauses more useful)
-		score -= activity * 100.0
+		score -= activity * s.clauseDeletionActivityWeight
 
-		// QUALITY METRIC: Usage in conflict analysis (modest protection)
-		// Clauses involved in conflicts are useful, but LBD is still primary
-		if useCount > 5 {
-			score -= float64(useCount) * 15.0 // Modest protection
+		// QUALITY METRIC: Usage in conflict analysis
+		if useCount > s.clauseDeletionUseCountHigh {
+			score -= float64(useCount) * 15.0
 		} else if useCount > 0 {
-			score -= float64(useCount) * 3.0 // Light protection
+			score -= float64(useCount) * 3.0
 		}
 
-		// QUALITY METRIC: Propagation count (modest protection)
-		// Clauses that propagate often are useful, but don't over-protect
-		if propCount > 15 {
-			score -= float64(propCount) * 8.0 // Modest protection
+		// QUALITY METRIC: Propagation count
+		if propCount > s.clauseDeletionPropCountHigh {
+			score -= float64(propCount) * 8.0
 		} else if propCount > 0 {
-			score -= float64(propCount) * 2.0 // Light protection
+			score -= float64(propCount) * 2.0
 		}
 
 		// PROTECTION: Core glue clauses (LBD ≤ coreGlueLBDThreshold) are NEVER deleted
@@ -3853,14 +3909,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			score = -1000.0
 		}
 
-		// FORCE DELETION: High-LBD clauses (LBD > 8) regardless of age
-		if lbd > 8 {
-			score += 2000.0
+		// FORCE DELETION: High-LBD clauses
+		if lbd > s.clauseDeletionHighLBD1 {
+			score += s.clauseDeletionHighLBDBonus1
 		}
-
-		// FORCE DELETION: Very high-LBD clauses (LBD > 12)
-		if lbd > 12 {
-			score += 3000.0
+		if lbd > s.clauseDeletionHighLBD2 {
+			score += s.clauseDeletionHighLBDBonus2
 		}
 
 		clauses = append(clauses, clauseInfo{
@@ -3879,9 +3933,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// OPTIMIZATION: Use custom sort.Interface to avoid closure overhead
 	sort.Sort(clauseInfoSlice(clauses))
 
-	// Target: Keep only the best 50% of clauses (aggressive deletion)
+	// Target: Keep configurable ratio of clauses (default 50%, aggressive deletion)
 	// This ensures database stays high-quality
-	toKeep := int(float64(len(s.learnedClauses)) * 0.50)
+	toKeep := int(float64(len(s.learnedClauses)) * s.clauseDeletionKeepRatio)
 	if toKeep < s.minLearned {
 		toKeep = s.minLearned
 	}
