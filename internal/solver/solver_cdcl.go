@@ -156,6 +156,26 @@ type CDCLSolver struct {
 	lbdOrderLastRebuild int   // Conflict count when order was last rebuilt
 
 	qhead int // Watched literals: next trail index to process
+
+	// Configurable parameters (exposed for tuning)
+	inprocessingInterval     int     // Run inprocessing every N conflicts (default 500)
+	inprocessingMaxClauses   int     // Skip inprocessing if > N clauses (default 5000)
+	inprocessingTimeLimitMs  int     // Time limit for inprocessing in ms (default 200)
+	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
+	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
+	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
+	varElimMaxVars           int     // Skip variable elimination if > N vars (default 20000)
+	varElimMaxClauses        int     // Skip variable elimination if > N clauses (default 100000)
+	varElimMaxResolventSize  int     // Max resolvent size for variable elimination (default 100)
+	clauseDeletionMinLBD     int     // Minimum LBD to consider for deletion (default 3)
+	glueClauseLBDThreshold   int     // LBD ≤ this are glue clauses (default 2)
+	coreGlueLBDThreshold     int     // LBD ≤ this are core glue (never delete, default 2)
+	largeClauseSizeThreshold int     // Size threshold for large clause detection (default 15)
+	maxClauseAgeThreshold    int     // Age threshold for forced deletion (default 500)
+	clauseActivityDecay      float64 // Clause activity decay factor (default 0.95)
+	tmpCandidateBufferSize   int     // Buffer size for resolve candidates (default 100)
+	tmpLearnedLitBufferSize  int     // Buffer size for learned literals (default 64)
+	learnedClauseHashInitial int     // Initial capacity for learned clause hash table (default 2500)
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -222,8 +242,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	solver := &CDCLSolver{
 		cnf:                 formula,
 		assignments:         make([]Assignment, formula.NumVars),
-		trail:               make([]int, 0, formula.NumVars),      // Pre-allocate to avoid growth allocations
-		trailLevel:          make([]int, 0, formula.NumVars),      // Pre-allocate to avoid growth allocations
+		trail:               make([]int, 0, formula.NumVars),
+		trailLevel:          make([]int, 0, formula.NumVars),
 		varLevel:            make([]int, formula.NumVars),
 		trailHead:           make([]int, 1),
 		qhead:               0,
@@ -251,8 +271,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lubyIndex:           0,
 		lbdSum:              0,
 		lbdCount:            0,
-		randomDecisionRate:  0.0, // Default: no random decisions
-		randomSeed:          0,   // Default seed for deterministic randomness
+		randomDecisionRate:  0.0,
+		randomSeed:          0,
 		learnedClauseOrder:  make([]int, 0),
 		lbdOrderDirty:       true,
 		lbdOrderLastRebuild: 0,
@@ -268,21 +288,38 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLevelSetUsed:     make([]bool, formula.NumVars+1),
 		tmpResolved:         make([]bool, formula.NumVars),
 		tmpFlippedVars:      make([]bool, formula.NumVars),
-		tmpTouchedVars:        make([]uint32, 0, formula.NumVars),
-		tmpLearnedLits:        make([]cnf.Literal, 0, 64), // Pre-allocate for average clause size
-		tmpSortedLits:         make([]cnf.Literal, 0, 64), // Pre-allocate for canonical sorting
-		learnedClauseHashes:   make(map[uint64]bool, 2500), // Hash table for O(1) duplicate detection
-		// Set learned clause base ID to original NumClauses (before preprocessing modifies it)
-		learnedClauseBase: int(formula.NumClauses),
-		// Initialize minimization thresholds to aggressive defaults
-		// More aggressive minimization produces shorter, higher-quality learned clauses
-		minimizationMaxSize:       30,  // Minimize clauses ≤30 literals (increased from 15)
-		minimizationMaxLBD:        8,   // Minimize clauses with LBD ≤8 (increased from 5)
-		minimizationMaxReasonSize: 15,  // Skip reason clauses >15 literals (increased from 10)
-		// Initialize variable elimination tracking
+		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
+		tmpLearnedLits:      make([]cnf.Literal, 0, 64),
+		tmpSortedLits:       make([]cnf.Literal, 0, 64),
+		learnedClauseHashes: make(map[uint64]bool, 2500),
+		learnedClauseBase:   int(formula.NumClauses),
+		// Minimization thresholds
+		minimizationMaxSize:       30,
+		minimizationMaxLBD:        8,
+		minimizationMaxReasonSize: 15,
+		// Variable elimination tracking
 		eliminatedVars:    make([]uint32, 0),
 		varElimDefinition: make(map[uint32][]cnf.Literal),
 		varElimPolarity:   make(map[uint32]bool),
+		// Configurable parameters with defaults
+		inprocessingInterval:     500,
+		inprocessingMaxClauses:   5000,
+		inprocessingTimeLimitMs:  200,
+		preprocessingMinClauses:  50,
+		preprocessingMaxVars:     50000,
+		preprocessingMaxClauses:  500000,
+		varElimMaxVars:           20000,
+		varElimMaxClauses:        100000,
+		varElimMaxResolventSize:  100,
+		clauseDeletionMinLBD:     3,
+		glueClauseLBDThreshold:   2,
+		coreGlueLBDThreshold:     2,
+		largeClauseSizeThreshold: 15,
+		maxClauseAgeThreshold:    500,
+		clauseActivityDecay:      0.95,
+		tmpCandidateBufferSize:   100,
+		tmpLearnedLitBufferSize:  64,
+		learnedClauseHashInitial: 2500,
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -320,6 +357,128 @@ func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
 func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
 	s.vsids.SetRandomSeed(seed)
+}
+
+// SetInprocessingInterval sets how often to run inprocessing (default 500 conflicts)
+func (s *CDCLSolver) SetInprocessingInterval(interval int) {
+	if interval < 100 {
+		interval = 100
+	}
+	s.inprocessingInterval = interval
+}
+
+// SetInprocessingMaxClauses sets the maximum clauses for inprocessing (default 5000)
+func (s *CDCLSolver) SetInprocessingMaxClauses(max int) {
+	if max < 100 {
+		max = 100
+	}
+	s.inprocessingMaxClauses = max
+}
+
+// SetInprocessingTimeLimitMs sets the time limit for inprocessing in milliseconds (default 200)
+func (s *CDCLSolver) SetInprocessingTimeLimitMs(ms int) {
+	if ms < 50 {
+		ms = 50
+	}
+	s.inprocessingTimeLimitMs = ms
+}
+
+// SetPreprocessingThresholds sets the preprocessing size thresholds
+// minClauses: skip if < N clauses (default 50)
+// maxVars: skip if > N vars (default 50000)
+// maxClauses: skip if > N clauses (default 500000)
+func (s *CDCLSolver) SetPreprocessingThresholds(minClauses, maxVars, maxClauses int) {
+	if minClauses < 0 {
+		minClauses = 0
+	}
+	if maxVars < 0 {
+		maxVars = 0
+	}
+	if maxClauses < 0 {
+		maxClauses = 0
+	}
+	s.preprocessingMinClauses = minClauses
+	s.preprocessingMaxVars = maxVars
+	s.preprocessingMaxClauses = maxClauses
+}
+
+// SetVariableEliminationThresholds sets the variable elimination thresholds
+// maxVars: skip if > N vars (default 20000)
+// maxClauses: skip if > N clauses (default 100000)
+// maxResolventSize: max resolvent size (default 100)
+func (s *CDCLSolver) SetVariableEliminationThresholds(maxVars, maxClauses, maxResolventSize int) {
+	if maxVars < 0 {
+		maxVars = 0
+	}
+	if maxClauses < 0 {
+		maxClauses = 0
+	}
+	if maxResolventSize < 0 {
+		maxResolventSize = 0
+	}
+	s.varElimMaxVars = maxVars
+	s.varElimMaxClauses = maxClauses
+	s.varElimMaxResolventSize = maxResolventSize
+}
+
+// SetClauseDeletionLBDThresholds sets the LBD thresholds for clause deletion
+// minLBD: minimum LBD to consider for deletion (default 3)
+// glueLBD: LBD ≤ this are glue clauses (default 2)
+// coreGlueLBD: LBD ≤ this are core glue, never delete (default 2)
+func (s *CDCLSolver) SetClauseDeletionLBDThresholds(minLBD, glueLBD, coreGlueLBD int) {
+	if minLBD < 0 {
+		minLBD = 0
+	}
+	if glueLBD < 0 {
+		glueLBD = 0
+	}
+	if coreGlueLBD < 0 {
+		coreGlueLBD = 0
+	}
+	s.clauseDeletionMinLBD = minLBD
+	s.glueClauseLBDThreshold = glueLBD
+	s.coreGlueLBDThreshold = coreGlueLBD
+}
+
+// SetClauseDeletionThresholds sets the size and age thresholds for clause deletion
+// largeSize: size threshold for large clause detection (default 15)
+// maxAge: age threshold for forced deletion (default 500)
+func (s *CDCLSolver) SetClauseDeletionThresholds(largeSize, maxAge int) {
+	if largeSize < 0 {
+		largeSize = 0
+	}
+	if maxAge < 0 {
+		maxAge = 0
+	}
+	s.largeClauseSizeThreshold = largeSize
+	s.maxClauseAgeThreshold = maxAge
+}
+
+// SetClauseActivityDecay sets the clause activity decay factor (default 0.95)
+func (s *CDCLSolver) SetClauseActivityDecay(decay float64) {
+	if decay < 0.5 || decay > 1.0 {
+		decay = 0.95
+	}
+	s.clauseActivityDecay = decay
+}
+
+// SetTemporaryBufferSizes sets the buffer sizes for temporary allocations
+// candidateBuf: buffer size for resolve candidates (default 100)
+// learnedLitBuf: buffer size for learned literals (default 64)
+// hashInitial: initial capacity for learned clause hash table (default 2500)
+func (s *CDCLSolver) SetTemporaryBufferSizes(candidateBuf, learnedLitBuf, hashInitial int) {
+	if candidateBuf < 1 {
+		candidateBuf = 1
+	}
+	if learnedLitBuf < 1 {
+		learnedLitBuf = 1
+	}
+	if hashInitial < 1 {
+		hashInitial = 1
+	}
+	s.tmpCandidateBufferSize = candidateBuf
+	s.tmpLearnedLitBufferSize = learnedLitBuf
+	s.learnedClauseHashInitial = hashInitial
 }
 
 // SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
@@ -499,9 +658,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
-	// Skip on very small instances (< 50 clauses) - overhead outweighs benefits
-	// Small instances solve faster with direct CDCL search
-	if s.cnf.NumClauses < 50 {
+	// Skip on very small instances - overhead outweighs benefits
+	if s.cnf.NumClauses < s.preprocessingMinClauses {
 		if s.verbose {
 			fmt.Printf("c [verbose] Skipping preprocessing: instance too small (%d clauses)\n", s.cnf.NumClauses)
 		}
@@ -510,9 +668,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNKNOWN
 	}
 
-	if s.cnf.NumVars > 50000 || s.cnf.NumClauses > 500000 {
-		// Skip on VERY large instances (>50K vars or >500K clauses) - preprocessing too slow
-		// But DO run basic preprocessing on medium-large instances (10K-50K vars)
+	// Skip on VERY large instances - preprocessing too slow
+	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
 		if s.verbose {
 			fmt.Printf("c [verbose] Skipping preprocessing: instance too large (%d vars, %d clauses)\n",
 				s.cnf.NumVars, s.cnf.NumClauses)
@@ -522,7 +679,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNKNOWN
 	}
 	
-	// For large instances (10K-50K vars or 50K-500K clauses), use lightweight preprocessing
+	// For large instances, use lightweight preprocessing
 	isLargeInstance := s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000
 	if isLargeInstance && s.verbose {
 		fmt.Printf("c [verbose] Running lightweight preprocessing on large instance (%d vars, %d clauses)\n",
@@ -965,16 +1122,16 @@ func (s *CDCLSolver) isSubsumedByAny(clause cnf.Clause, clauses []cnf.Clause) bo
 // - Removes redundant constraints that slow down search
 
 // Safeguards:
-// - Only run every 500 conflicts (expensive O(n²) operation)
-// - Skip on large formulas (>5000 clauses)
-// - Time limit of 200ms to avoid slowing down search
+// - Only run every inprocessingInterval conflicts (expensive O(n²) operation)
+// - Skip on large formulas (>inprocessingMaxClauses clauses)
+// - Time limit of inprocessingTimeLimitMs to avoid slowing down search
 func (s *CDCLSolver) inprocessSubsumption() {
-	if s.cnf.NumClauses > 5000 {
+	if s.cnf.NumClauses > s.inprocessingMaxClauses {
 		return
 	}
 
 	startTime := time.Now()
-	timeLimit := 200 * time.Millisecond
+	timeLimit := time.Duration(s.inprocessingTimeLimitMs) * time.Millisecond
 
 	removedOriginal := 0
 	removedLearned := 0
@@ -1917,14 +2074,14 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 
 		// Find best eliminatable variable (smallest resolvent)
 		bestVar := uint32(0)
-		bestResolventSize := 2001 // Max allowed
+		maxResolventSize := s.varElimMaxResolventSize + 1
+		bestResolventSize := maxResolventSize
 		hasEliminatable := false
 
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			if posCount[varIdx] > 0 && negCount[varIdx] > 0 {
 				resolventSize := posCount[varIdx] * negCount[varIdx]
-				// Only eliminate if resolvent won't explode
-				if resolventSize <= 2000 && resolventSize < bestResolventSize {
+				if resolventSize <= s.varElimMaxResolventSize && resolventSize < bestResolventSize {
 					bestVar = varIdx
 					bestResolventSize = resolventSize
 					hasEliminatable = true
@@ -2231,22 +2388,10 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
-			// OPTIMIZATION: Enable inprocessing on PHP-sized instances (50+ clauses)
-			// Run every 500 conflicts on small instances (50-500 clauses)
-			// Run every 2000 conflicts on large instances (>500 clauses)
-			inprocessInterval := 2000
-			if s.cnf.NumClauses >= 50 && s.cnf.NumClauses < 500 {
-				inprocessInterval = 500  // More frequent on medium instances
-			}
-			// DEBUG: Always print at conflict 500 to verify logic
-			if s.conflicts == 500 && s.verbose {
-				fmt.Printf("c [debug] Inprocessing check: conflicts=%d, interval=%d, mod=%d, NumClauses=%d, condition=%v\n",
-					s.conflicts, inprocessInterval, s.conflicts%inprocessInterval, s.cnf.NumClauses,
-					s.conflicts > 0 && s.conflicts%inprocessInterval == 0 && s.cnf.NumClauses >= 50)
-			}
-			if s.conflicts > 0 && s.conflicts%inprocessInterval == 0 && s.cnf.NumClauses >= 50 {
+			// Trigger inprocessing at configured interval
+			if s.conflicts > 0 && s.conflicts%s.inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
 				if s.verbose {
-					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, %d clauses)\n", s.conflicts, inprocessInterval, s.cnf.NumClauses)
+					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, %d clauses)\n", s.conflicts, s.inprocessingInterval, s.cnf.NumClauses)
 				}
 				s.inprocessing()
 			}
@@ -3624,29 +3769,29 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			score -= float64(propCount) * 2.0 // Light protection
 		}
 
-		// PROTECTION: Core glue clauses (LBD ≤ 2) are NEVER deleted
-		if lbd <= 2 {
-			score = -10000.0 // Absolutely never delete
+		// PROTECTION: Core glue clauses (LBD ≤ coreGlueLBDThreshold) are NEVER deleted
+		if lbd <= s.coreGlueLBDThreshold {
+			score = -10000.0
 		}
 
-		// NEAR-GLUE PROTECTION: LBD = 3 - strong protection
-		if lbd == 3 {
-			score = -5000.0 // Very strong protection
+		// NEAR-GLUE PROTECTION: LBD = coreGlueLBDThreshold+1 - strong protection
+		if lbd == s.coreGlueLBDThreshold+1 {
+			score = -5000.0
 		}
 
-		// MODERATE PROTECTION: LBD = 4 with small size
-		if lbd == 4 && size <= 5 {
-			score = -1000.0 // Moderate protection
+		// MODERATE PROTECTION: LBD = coreGlueLBDThreshold+2 with small size
+		if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
+			score = -1000.0
 		}
 
 		// FORCE DELETION: High-LBD clauses (LBD > 8) regardless of age
 		if lbd > 8 {
-			score += 2000.0 // Strong push toward deletion
+			score += 2000.0
 		}
 
 		// FORCE DELETION: Very high-LBD clauses (LBD > 12)
 		if lbd > 12 {
-			score += 3000.0 // Very strong push toward deletion
+			score += 3000.0
 		}
 
 		clauses = append(clauses, clauseInfo{

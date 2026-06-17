@@ -93,14 +93,14 @@ func (h *vsidsHeap) init() {
 type VSIDS struct {
 	activity              []float64 // Activity score for each variable
 	conflictParticipation []int     // Number of conflicts each variable participates in
-	decayFactor           float64   // Decay factor (0.95 -> 0.999)
+	decayFactor           float64   // Current decay factor (initialDecay -> maxDecayFactor)
 	inverseDecay          float64   // 1/decay for efficiency
 	useLRB                bool      // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval      int       // Decay every N conflicts
+	lrbDecayInterval      int       // Decay every N conflicts for LRB
 	conflictCount         int       // Total conflicts for LRB decay timing
 	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
 	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
-	maxDecayFactor        float64   // Maximum decay factor (0.999)
+	maxDecayFactor        float64   // Maximum decay factor
 	decayIncrement        float64   // Increment per conflict
 	heap                  vsidsHeap // Activity heap for O(log n) selection
 	heapValid             bool      // True if heap is up-to-date
@@ -110,14 +110,25 @@ type VSIDS struct {
 	activityMomentum      []float64 // Rate of activity change (positive = increasing importance)
 	lastDecisionConflict  []int     // Last conflict where variable was decided (-1 if never)
 	decisionRecencyPenalty []float64 // Penalty for recently decided variables
+	// Configurable parameters (exposed for tuning)
+	initialDecayFactor    float64   // Initial decay factor (default 0.95)
+	decayRampUpConflicts  int       // Conflicts to reach max decay (default 10000)
+	lbdBonusScale         float64   // Scale factor for LBD bonus (default 2000.0)
+	lbdBonusDecay         float64   // Decay factor for LBD bonus (default 0.999)
+	baseBumpAmount        float64   // Base bump amount for clauses (default 50.0)
+	recencyPenaltyScale   float64   // Scale for recency penalty (default 50.0)
+	recencyPenaltyDecay   float64   // Decay for recency penalty (default 0.9)
+	recencyWindow         int       // Window for recency penalty (default 5 conflicts)
+	clauseInitBaseWeight  float64   // Base weight for clause initialization (default 10.0)
+	binaryClauseWeight    float64   // Weight for binary clauses (default 100.0)
+	activityResetScale    float64   // Scale for activity reset (default 0.5)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
 	// Standard decay settings (MiniSat-style)
-	// Bump amounts reduced to prevent activity explosion
-	maxDecay := 0.999
 	initialDecay := 0.95
+	maxDecay := 0.999
 	v := &VSIDS{
 		activity:               make([]float64, numVars),
 		conflictParticipation:  make([]int, numVars),
@@ -133,11 +144,23 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		heap:                   make(vsidsHeap, 0, numVars),
 		heapValid:              false,
 		decayInterval:          DefaultDecayInterval,
-		randomSeed:             0, // Default seed for deterministic randomness
+		randomSeed:             0,
 		// Symmetry breaking initialization
 		activityMomentum:       make([]float64, numVars),
 		lastDecisionConflict:   make([]int, numVars),
 		decisionRecencyPenalty: make([]float64, numVars),
+		// Default parameter values
+		initialDecayFactor:     initialDecay,
+		decayRampUpConflicts:   10000,
+		lbdBonusScale:          2000.0,
+		lbdBonusDecay:          0.999,
+		baseBumpAmount:         50.0,
+		recencyPenaltyScale:    50.0,
+		recencyPenaltyDecay:    0.9,
+		recencyWindow:          5,
+		clauseInitBaseWeight:   10.0,
+		binaryClauseWeight:     100.0,
+		activityResetScale:     0.5,
 	}
 	for i := range v.lastDecisionConflict {
 		v.lastDecisionConflict[i] = -1
@@ -147,12 +170,12 @@ func NewVSIDS(numVars uint32) *VSIDS {
 
 // InitializeFromClauses initializes VSIDS activity based on clause participation
 // Variables in shorter clauses get MUCH higher activity (more constrained = more important)
-// Binary clauses get 100x base weight to strongly bias initial variable selection
+// Binary clauses get binaryClauseWeight multiplier to strongly bias initial variable selection
 func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	for _, clause := range clauses {
-		baseWeight := 10.0
+		baseWeight := v.clauseInitBaseWeight
 		if len(clause.Literals) == 2 {
-			baseWeight = 100.0
+			baseWeight = v.binaryClauseWeight
 		}
 		weight := baseWeight / float64(len(clause.Literals))
 
@@ -220,17 +243,15 @@ func (v *VSIDS) SetRandomSeed(seed uint64) {
 // This is used for symmetry breaking to avoid repeatedly deciding on the same variable
 func (v *VSIDS) TrackDecision(varIdx uint32, conflictCount int) {
 	if int(varIdx) < len(v.lastDecisionConflict) {
-		// Calculate recency: how many conflicts ago was this variable decided?
 		lastConflict := v.lastDecisionConflict[varIdx]
 		if lastConflict >= 0 {
 			recency := conflictCount - lastConflict
-			// Only apply recency penalty if variable was decided very recently (within 5 conflicts)
-			// This prevents flipping without penalizing normal search behavior
-			if recency < 5 {
-				v.decisionRecencyPenalty[varIdx] = 50.0 / float64(recency+1)
+			// Apply recency penalty if within recency window
+			if recency < v.recencyWindow {
+				v.decisionRecencyPenalty[varIdx] = v.recencyPenaltyScale / float64(recency+1)
 			} else {
-				// Decay penalty if variable hasn't been decided recently
-				v.decisionRecencyPenalty[varIdx] *= 0.5
+				// Decay penalty if outside recency window
+				v.decisionRecencyPenalty[varIdx] *= v.recencyPenaltyDecay
 			}
 		}
 		v.lastDecisionConflict[varIdx] = conflictCount
@@ -248,6 +269,114 @@ func (v *VSIDS) SetDecayInterval(interval int) {
 	v.decayInterval = interval
 }
 
+// SetInitialDecayFactor sets the initial decay factor (default 0.95)
+// Lower values = more aggressive decay = more exploration
+func (v *VSIDS) SetInitialDecayFactor(factor float64) {
+	if factor < 0.5 || factor > 0.99 {
+		factor = 0.95
+	}
+	v.initialDecayFactor = factor
+	v.decayFactor = factor
+	v.inverseDecay = 1.0 / factor
+}
+
+// SetMaxDecayFactor sets the maximum decay factor (default 0.999)
+// Higher values = slower decay = more focused search on important variables
+func (v *VSIDS) SetMaxDecayFactor(factor float64) {
+	if factor < 0.9 || factor > 1.0 {
+		factor = 0.999
+	}
+	v.maxDecayFactor = factor
+	// Recalculate decay increment based on new max
+	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / float64(v.decayRampUpConflicts)
+}
+
+// SetDecayRampUpConflicts sets the number of conflicts to reach max decay (default 10000)
+func (v *VSIDS) SetDecayRampUpConflicts(conflicts int) {
+	if conflicts < 100 {
+		conflicts = 100
+	}
+	v.decayRampUpConflicts = conflicts
+	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / float64(conflicts)
+}
+
+// SetLBDBonusScale sets the scale factor for LBD bonus (default 2000.0)
+// Higher values = stronger preference for low-LBD (glue) clauses
+func (v *VSIDS) SetLBDBonusScale(scale float64) {
+	if scale < 0 {
+		scale = 0
+	}
+	v.lbdBonusScale = scale
+}
+
+// SetLBDBonusDecay sets the decay factor for LBD bonus (default 0.999)
+// Higher values = slower decay = glue clauses influence search longer
+func (v *VSIDS) SetLBDBonusDecay(decay float64) {
+	if decay < 0.9 || decay > 1.0 {
+		decay = 0.999
+	}
+	v.lbdBonusDecay = decay
+}
+
+// SetBaseBumpAmount sets the base bump amount for clauses (default 50.0)
+// Higher values = more aggressive activity increase for conflict variables
+func (v *VSIDS) SetBaseBumpAmount(amount float64) {
+	if amount < 1.0 {
+		amount = 1.0
+	}
+	v.baseBumpAmount = amount
+}
+
+// SetRecencyPenaltyScale sets the scale for recency penalty (default 50.0)
+// Higher values = stronger penalty against recently-decided variables
+func (v *VSIDS) SetRecencyPenaltyScale(scale float64) {
+	if scale < 0 {
+		scale = 0
+	}
+	v.recencyPenaltyScale = scale
+}
+
+// SetRecencyPenaltyDecay sets the decay for recency penalty (default 0.9)
+// Higher values = penalty persists longer
+func (v *VSIDS) SetRecencyPenaltyDecay(decay float64) {
+	if decay < 0.5 || decay > 1.0 {
+		decay = 0.9
+	}
+	v.recencyPenaltyDecay = decay
+}
+
+// SetRecencyWindow sets the window for recency penalty (default 5 conflicts)
+// Variables decided within this window get penalty applied
+func (v *VSIDS) SetRecencyWindow(window int) {
+	if window < 1 {
+		window = 1
+	}
+	v.recencyWindow = window
+}
+
+// SetClauseInitWeights sets the initialization weights for clauses
+// baseWeight: base weight for all clauses (default 10.0)
+// binaryWeight: weight multiplier for binary clauses (default 100.0)
+func (v *VSIDS) SetClauseInitWeights(baseWeight, binaryWeight float64) {
+	if baseWeight < 0 {
+		baseWeight = 0
+	}
+	if binaryWeight < 0 {
+		binaryWeight = 0
+	}
+	v.clauseInitBaseWeight = baseWeight
+	v.binaryClauseWeight = binaryWeight
+}
+
+// SetActivityResetScale sets the scale for activity reset on restart (default 0.5)
+// 0.5 = keep 50% of activity, 0.0 = reset completely, 1.0 = keep all
+func (v *VSIDS) SetActivityResetScale(scale float64) {
+	if scale < 0.0 || scale > 1.0 {
+		scale = 0.5
+	}
+	v.activityResetScale = scale
+}
+
 // bumpLBD adds LBD bonus to variables in a learned clause
 // Lower LBD = higher bonus (glue clauses are most important)
 func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
@@ -255,14 +384,10 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 		return
 	}
 
-	// Bonus formula: MODERATE bonus for lower LBD
-	// Reduced from 20000 to 2000 to prevent activity explosion on random instances
-	// LBD=2: bonus = 500 (was 10000)
-	// LBD=3: bonus = 222 (was 3333)
-	// LBD=4: bonus = 125 (was 1250)
-	// LBD=10: bonus = 20 (was 100)
-	// Still prioritizes glue clauses but doesn't dominate VSIDS on random instances
-	bonus := 2000.0 / float64(lbd*lbd)
+	// Bonus formula: bonus = lbdBonusScale / (lbd^2)
+	// LBD=2: bonus = lbdBonusScale/4
+	// LBD=3: bonus = lbdBonusScale/9
+	bonus := v.lbdBonusScale / float64(lbd*lbd)
 
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
@@ -276,10 +401,9 @@ func (v *VSIDS) decayLBD() {
 		return
 	}
 
-	// Decay extremely slowly (only 0.1% per conflict) to preserve glue clause importance
-	// Glue clauses should influence search for tens of thousands of conflicts
+	// Decay LBD bonus scores
 	for i := range v.lbdBonus {
-		v.lbdBonus[i] *= 0.999
+		v.lbdBonus[i] *= v.lbdBonusDecay
 	}
 }
 
@@ -298,16 +422,11 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 // Also tracks conflict participation for LRB heuristic
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 func (v *VSIDS) bumpClause(literals []cnf.Literal) {
-	// Scale bump by clause size: BALANCED bumps for mixed instance types
-	// Reduced from 400 to 50 to prevent activity explosion while maintaining effectiveness
-	// Binary clauses: bump = 25.0
-	// Ternary clauses: bump = 16.7
-	// 5-literal clauses: bump = 10.0
-	// 10-literal clauses: bump = 5.0
-	baseBump := 50.0
+	baseBump := v.baseBumpAmount
 	bumpAmount := baseBump / float64(len(literals))
-	if bumpAmount < 2.0 {
-		bumpAmount = 2.0 // Minimum bump for very large clauses
+	minBump := v.baseBumpAmount * 0.04 // 2.0 when baseBump=50.0
+	if bumpAmount < minBump {
+		bumpAmount = minBump
 	}
 
 	for _, lit := range literals {
@@ -364,7 +483,7 @@ func (v *VSIDS) decay() {
 		// Momentum = activity lost to decay (represents recent bumping)
 		v.activityMomentum[i] = oldActivity - v.activity[i]
 		// Decay recency penalty over time
-		v.decisionRecencyPenalty[i] *= 0.9
+		v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
 	}
 
 	// Invalidate heap since all activities changed
@@ -486,10 +605,9 @@ func (v *VSIDS) ConflictParticipationForDebug(varIdx uint32) int {
 // Called on restart. We scale down activity rather than zeroing it completely,
 // which preserves some learned information while allowing exploration of new variables.
 func (v *VSIDS) resetActivity() {
-	// Scale down activity by 50% instead of zeroing - preserves important variables
-	// but allows other variables to compete
+	// Scale down activity - preserves important variables but allows others to compete
 	for i := range v.activity {
-		v.activity[i] *= 0.5
+		v.activity[i] *= v.activityResetScale
 	}
 
 	// Reset LBD bonus completely - glue clause importance changes after restart
