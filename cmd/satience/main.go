@@ -23,6 +23,7 @@ func run() int {
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
+	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
 	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence)")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
@@ -71,6 +72,9 @@ func run() int {
 	}
 	if *useLRB {
 		s.EnableLRB()
+	}
+	if *useCHB {
+		s.EnableCHB()
 	}
 	if *randomRate > 0.0 {
 		s.SetRandomDecisionRate(*randomRate)

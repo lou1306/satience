@@ -494,6 +494,20 @@ func (s *CDCLSolver) EnableLRB() {
 	s.vsids.EnableLRB()
 }
 
+// EnableCHB enables CHB (Conflict History Based) heuristic
+// CHB tracks recent conflict frequency with aggressive decay instead of cumulative VSIDS activity
+func (s *CDCLSolver) EnableCHB() {
+	s.vsids.EnableCHB()
+}
+
+// SetCHBParameters configures CHB heuristic parameters
+// decayFactor: decay factor for conflict frequency (default 0.75, range 0.5-0.95)
+// decayInterval: decay every N conflicts (default 50)
+func (s *CDCLSolver) SetCHBParameters(decayFactor float64, decayInterval int) {
+	s.vsids.SetCHBDecayFactor(decayFactor)
+	s.vsids.SetCHBDecayInterval(decayInterval)
+}
+
 // SetMinimizationThresholds configures clause minimization behavior
 // size: skip minimization for clauses larger than this (0=all clauses)
 // lbd: skip minimization for clauses with LBD larger than this (0=all clauses)
