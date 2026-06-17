@@ -28,6 +28,11 @@ func run() int {
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
+	// Restart policy parameters
+	restartBase := flag.Int("restart-base", 20, "Luby restart sequence base multiplier (default=20)")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5)")
+	restartGlucoseMin := flag.Int("restart-glucose-min", 50, "Min conflicts before Glucose restarts (default=50)")
+	restartKeepGlue := flag.Int("restart-keep-glue", 3, "Keep clauses with LBD ≤ this during restart (default=3)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -80,6 +85,9 @@ func run() int {
 		s.SetRandomDecisionRate(*randomRate)
 	}
 	s.SetRandomSeed(*randomSeed)
+	
+	// Configure restart policy
+	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin, *restartKeepGlue)
 
 	// Configure clause minimization
 	switch *minimize {

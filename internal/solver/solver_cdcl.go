@@ -176,6 +176,10 @@ type CDCLSolver struct {
 	tmpCandidateBufferSize   int     // Buffer size for resolve candidates (default 100)
 	tmpLearnedLitBufferSize  int     // Buffer size for learned literals (default 64)
 	learnedClauseHashInitial int     // Initial capacity for learned clause hash table (default 2500)
+	// Restart policy parameters
+	restartGlucoseRatio      float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
+	restartGlucoseMinConflicts int   // Min conflicts before Glucose restarts kick in (default 50)
+	restartKeepGlueLBD       int     // Keep clauses with LBD ≤ this during restart (default 3)
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -320,6 +324,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpCandidateBufferSize:   100,
 		tmpLearnedLitBufferSize:  64,
 		learnedClauseHashInitial: 2500,
+		// Restart policy defaults
+		restartGlucoseRatio:      1.5,
+		restartGlucoseMinConflicts: 50,
+		restartKeepGlueLBD:       3,
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -506,6 +514,39 @@ func (s *CDCLSolver) EnableCHB() {
 func (s *CDCLSolver) SetCHBParameters(decayFactor float64, decayInterval int) {
 	s.vsids.SetCHBDecayFactor(decayFactor)
 	s.vsids.SetCHBDecayInterval(decayInterval)
+}
+
+// SetRestartParameters configures restart policy parameters
+// base: Luby sequence base multiplier (default 20, range 1-1000)
+// glucoseRatio: Glucose restart when LBD > ratio × avg (default 1.5, range 1.0-5.0)
+// minConflicts: min conflicts before Glucose restarts activate (default 50)
+// keepGlueLBD: keep clauses with LBD ≤ this during restart (default 3)
+func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minConflicts, keepGlueLBD int) {
+	if base < 1 {
+		base = 1
+	}
+	if base > 1000 {
+		base = 1000
+	}
+	s.restartBase = base
+	
+	if glucoseRatio < 1.0 {
+		glucoseRatio = 1.0
+	}
+	if glucoseRatio > 5.0 {
+		glucoseRatio = 5.0
+	}
+	s.restartGlucoseRatio = glucoseRatio
+	
+	if minConflicts < 0 {
+		minConflicts = 0
+	}
+	s.restartGlucoseMinConflicts = minConflicts
+	
+	if keepGlueLBD < 2 {
+		keepGlueLBD = 2
+	}
+	s.restartKeepGlueLBD = keepGlueLBD
 }
 
 // SetMinimizationThresholds configures clause minimization behavior
@@ -1333,14 +1374,14 @@ func luby(i int) int {
 //    - Guaranteed to restart periodically even if LBD criterion not met
 //    - This is proactive: restarts based on conflict count
 
-// Hybrid Approach:
-// - First 50 conflicts: Use Luby (need LBD statistics)
-// - After 50 conflicts: Use Glucose criterion (more aggressive)
-// - If Glucose criterion not met: Fall back to Luby
+// Hybrid Approach (NOW WITH CONFIGURABLE PARAMETERS):
+// - First restartGlucoseMinConflicts conflicts: Use Luby only
+// - After restartGlucoseMinConflicts: Use Glucose criterion (configurable ratio)
+// - If Glucose criterion not met: Fall back to Luby (configurable base)
 
 // What Happens on Restart:
 // 1. Clear the trail (all assignments)
-// 2. Keep only "glue clauses" (LBD ≤ 3) - most valuable learned clauses
+// 2. Keep only "glue clauses" (LBD ≤ restartKeepGlueLBD) - most valuable learned clauses
 // 3. Delete all other learned clauses (50-90% reduction)
 // 4. Reset LBD statistics for fresh measurement
 // 5. Continue search with same VSIDS scores (learnings preserved)
@@ -1351,7 +1392,23 @@ func luby(i int) int {
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
 func (s *CDCLSolver) shouldRestart() bool {
-	// Luby sequence restarts (aggressive base 20 for structured instances)
+	// Check Glucose-style adaptive restart first (if past min conflicts)
+	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 {
+		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
+		
+		// Glucose criterion: restart when recent LBD is much worse than average
+		// Configurable via restartGlucoseRatio (default 1.5×)
+		recentLBD := float64(s.lastConflictLBD)
+		if recentLBD > avgLBD*s.restartGlucoseRatio {
+			if s.verbose {
+				fmt.Printf("c [restart] Glucose: LBD %.1f > avg %.1f × %.2f\n", 
+					recentLBD, avgLBD, s.restartGlucoseRatio)
+			}
+			return true
+		}
+	}
+	
+	// Fall back to Luby sequence (configurable base)
 	lubyValue := luby(s.lubyIndex + 1)
 	threshold := lubyValue * s.restartBase
 
@@ -1373,15 +1430,13 @@ func (s *CDCLSolver) restart() {
 	isGlue := make([]bool, len(s.learnedClauses))
 
 	for i := range s.learnedClauses {
-		// Use stored LBD from when clause was learned
 		lbd := s.clauseLBD[i]
 
-		// Keep only true glue clauses (LBD <= 3)
-		// LBD <= 2: core glue (most valuable, never delete)
-		// LBD = 3: near-glue (very valuable, keep across restarts)
-		// LBD > 3: delete on restart (will be re-learned if needed)
-		// This is standard in MiniSat/Glucose - keeps learned database lean
-		if lbd <= 3 {
+		// Keep glue clauses (configurable via restartKeepGlueLBD, default 3)
+		// LBD ≤ 2: core glue (most valuable)
+		// LBD = 3: near-glue (very valuable)
+		// LBD > restartKeepGlueLBD: delete (will be re-learned if needed)
+		if lbd <= s.restartKeepGlueLBD {
 			glueCount++
 			isGlue[i] = true
 		}
