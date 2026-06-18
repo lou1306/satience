@@ -12,6 +12,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - 60 second timeout per benchmark
 - Real GBD instances from benchmark-database.de
 - SAT Competition 2026 output format compliant
+- Compile with GOAMD64=v3 for AVX2/BMI2 optimizations
 
 ## Status: Production Ready
 
@@ -20,6 +21,8 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - ✅ All unit tests passing (15/15)
 - ✅ 100% soundness verified (0 wrong results on 60+ tests)
 - ✅ Models verified to satisfy all clauses
+- ✅ Swap-remove clause deletion (23× GC reduction)
+- ✅ Contiguous literal storage with free slot reuse
 - ✅ Modern CDCL features: 1-UIP learning, backjumping, adaptive restarts, LBD management, phase saving
 - ✅ Watched literals propagation with O(1) clause index access
 - ✅ Preprocessing: unit propagation
@@ -28,28 +31,34 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 
 ## Performance
 
-**Watched literals**: Implemented and working with O(1) clause index access ✅
+**Swap-Remove Clause Deletion** (June 2026) ✅
 
-**Benchmark results vs MiniSat** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, June 2026):
-- **Solved**: 30/32 instances (93.7% solve rate)
+Replaces array rebuilding with in-place swap-remove during learned clause deletion:
+- **GC cycles**: 606 → 26 on 26Kv FCC instance (23× reduction)
+- **GC time**: ~8-10s → ~0.4s (20× faster)
+- **Mechanism**: Move active clauses into deleted slots, scan watches to update ClauseIdx, track freed literal regions for reuse
+
+**Benchmark results** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, June 2026):
+- **Solved**: 26/32 instances (81.2% solve rate)
+- **40 smallest CNFs**: 28/40 (70.0%) with 5s timeout
 - **Tseitin**: All solved (4×4, 5×5, 6×6 - both SAT and UNSAT) ✅
 - **Arg chain**: Solved ✅
-- **Hard 5-SAT**: ~20,000 conflicts/sec
-- **Random 600v**: Solved in 24.6s (was TIMEOUT before watched literals fix)
 - **PHP UNSAT**: Timeout (cardinality constraint reasoning needed)
-- **Algebraic/Combinatorial**: Many timeout (need better heuristics)
+- **Algebraic/Combinatorial**: Mixed results (need better heuristics)
 
 **Performance characteristics**:
+- Swap-remove deletion: No array rebuilding, O(watches) scan per swap
+- Contiguous literal storage: Free slot tracking and reuse
 - Watched literals with ClauseIdx caching: 63% speedup
 - Trail scanning optimization in 1-UIP: O(current_level) instead of O(trail_size)
 - Activity heap: O(log n) variable selection
 - LBD-based clause database management (max 2,500 learned clauses)
-- Props/dec ratio: 48 initially, ~33 steady-state on hard instances
+- Props/dec ratio: ~33 steady-state on hard instances
 
 **Primary bottleneck**: 
 - PHP instances: Lack of cardinality constraint detection
-- Large instances: Memory allocation overhead (no memory pool)
-- VSIDS tuning: Not optimal for random instances (lacks community structure)
+- Random instances: VSIDS lacks community structure exploitation
+- Large instances: Memory pressure from watch list allocations
 
 ## Implemented Features
 
@@ -63,12 +72,15 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - Clause minimization via self-subsumption
 - Watched literals propagation with O(1) clause index access
 - Clause quality tracking (useCount, propCount metrics)
+- **Swap-remove clause deletion** (no array rebuilding)
+- **Free literal slot tracking and reuse**
 
 ### Variable Selection
 - VSIDS with activity decay (0.95 → 0.999 over 10k conflicts)
 - Activity heap for O(log n) variable selection
 - LBD-based activity bonus (20000/LBD²)
 - LRB (Learning Rate Based) heuristic available via `-lrb` flag
+- CHB (Conflict History Based) heuristic available via `-chb` flag
 - Conflict participation tracking
 
 ### Preprocessing
@@ -80,7 +92,11 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - `-max-iter`: Iteration limit
 - `-cpuprofile`: Profile output
 - `-lrb`: Use LRB heuristic
+- `-chb`: Use CHB heuristic
 - `-minimize`: Clause minimization mode (aggressive/selective/none, default=selective)
+- `-restart-base`: Luby restart base (default=20)
+- `-restart-glucose-ratio`: Glucose restart LBD ratio (default=1.2)
+- `-clause-del-*`: Clause deletion scoring parameters
 
 ### SAT Competition 2026 Format
 - Solution: `s SATISFIABLE` / `s UNSATISFIABLE` / `s UNKNOWN`
@@ -94,19 +110,24 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - **Literal**: `uint32` (bit 31=sign, bits 0-30=variable index)
 - **Variables**: 0-based internally, 1-based in DIMACS
 - **Constants**: `litVarMask=0x7FFFFFFF`, `litNegatedMask=0x80000000`
+- **Learned Clauses**: Contiguous literal storage with offset/size arrays
+- **Free Slots**: `literalFreeSlot` struct tracks freed regions for reuse
 
 ### Key Files
 - `internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF, Watch)
 - `internal/parser/parser.go`: DIMACS CNF parser
-- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts, watched literals
-- `internal/solver/vsids.go`: VSIDS/LRB variable selection with activity heap
+- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts, swap-remove deletion
+- `internal/solver/vsids.go`: VSIDS/LRB/CHB variable selection with activity heap
 - `internal/solver/solver.go`: Base solver with propagation
 - `internal/solver/solver_test.go`: Unit tests
+- `internal/solver/verify.go`: Model verification
 - `cmd/satience/main.go`: CLI
 - `cmd/fuzz/main.go`: Fuzzer
 - `internal/fuzzer/fuzzer.go`: Fuzzing infrastructure
 
 ### Implemented Optimizations
+- **Swap-remove clause deletion**: Move active clauses into deleted slots, update watches via scan
+- **Free literal slot reuse**: Track and reuse freed literal regions
 - **Watched literals**: O(1) propagation with ClauseIdx field in Watch struct (63% speedup)
 - **Trail scanning optimization**: Pre-filter trail elements at current level in 1-UIP
 - **Activity heap**: O(log n) variable selection instead of O(n) linear scan
@@ -149,11 +170,13 @@ benchmark/eval_small_random.sh [n_instances]
 - **1-UIP validation**: Skip clauses with ≠1 literal at current level
 - **Activity reset on restart**: Prevents VSIDS loops
 - **Phase saving for decisions only**: Don't save forced propagations
-- **Restart policy**: Moderate Glucose-style (2× avg LBD, was 3×)
-- **maxLearned=2500**: Learned clause limit (reduced from 10000 for better performance)
+- **Restart policy**: Aggressive Glucose-style (1.2× avg LBD, min 25 conflicts)
+- **maxLearned=2500**: Learned clause limit
 - **ClauseIdx in Watch struct**: O(1) clause index access (63% speedup)
 - **Default minimization = selective**: Aggressive mode adds 1-2% overhead
 - **watchInitialized flag**: Set AFTER all clauses watched (critical bug fix)
+- **Swap-remove over array rebuild**: 23× GC reduction, preserves memory pool benefits
+- **Watch scan during swap-remove**: O(watches) per swap, acceptable since deletion is infrequent
 
 ## Next Steps
 
@@ -161,14 +184,13 @@ benchmark/eval_small_random.sh [n_instances]
 1. **Cardinality constraint detection** (3-5 days): Detect PHP-like cardinality constraints and add specialized propagator. Expected 100-1000× speedup on PHP UNSAT instances.
 
 ### High Priority
-2. **Memory pool** (2-4 days): Contiguous clause storage for learned clauses, reduce GC pressure and allocation overhead. Expected 2-5× speedup on large instances.
-3. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
-4. **CHB heuristic** (1-2 days): Conflict History Based variable selection as alternative to VSIDS
+2. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
+3. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
+4. **Watch list pre-allocation** (1-2 days): Reduce watch list allocation overhead
 
 ### Medium Priority
-5. **Better clause deletion** (1-2 days): Use useCount/propCount metrics in deletion scoring
-6. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
-7. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
+5. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
+6. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
 
 ### Not Planned (per constraints)
 - Parallel solving
@@ -186,23 +208,16 @@ PHP UNSAT instances timeout while MiniSat solves instantly. This is due to:
 **This is fixable**: Specialized propagators would provide 100-1000× speedup on PHP instances.
 
 ### Random Instances
-Some random 600v instances take 20-30s vs MiniSat's 0.1s. This is due to:
+Some random instances timeout. This is due to:
 - VSIDS exploits community structure (absent in random instances)
-- Lack of advanced heuristics (CHB, LRB tuning)
-
-**Watched literals fixed**: Random 600v instance now solves in 24.6s (was TIMEOUT).
+- Lack of advanced heuristics (CHB, LRB tuning needed)
 
 ## Recent Commits
 
 ```
-bb2be41 - Fix watched literals initialization bug
-7d0e8e0 - Clean up 1-UIP resolution code
-63ee961 - Add clause quality tracking infrastructure
-b923d4e - Improve restart policy: moderate Glucose-style restarts
-f2044be - Make DecayInterval a configurable solver variable
-01d811c - Implement custom heap without container/heap interface
-b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
-9f970d4 - Improve clause database management: LBD-based deletion
+ebb9fa8 - Implement swap-remove clause deletion to reduce GC pressure
+f53361a - Feature: Expose clause deletion scoring parameters as CLI options
+8c694c2 - Optimize: Update default restart policy to aggressive configuration
 ```
 
 ## Critical Context
@@ -215,101 +230,53 @@ b62e9f7 - Implement lazy VSIDS decay: decay every 10 conflicts
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
 - Compile with GOAMD64=v3 for AVX2/BMI2 optimizations
 
-## Recent Work Summary
+## Swap-Remove Implementation Details
 
-**Watched Literals Propagation** ✅
-- Fixed critical initialization bug (watchInitialized flag set in wrong location)
-- Now properly tracks all original and learned clauses
-- Hard 600v random instance: TIMEOUT → 24.6s solve time
-- Props/dec ratio improved from ~33 to 48 initially
+### Why Swap-Remove?
 
-**Clause Quality Tracking** ✅
-- Added useCount (conflict participation) and propCount (propagation count) metrics
-- Infrastructure in place for future quality-based deletion
-- LBD remains primary deletion factor
+**Before** (array rebuild):
+```go
+// Allocate NEW arrays every deletion
+newLiterals := make([]cnf.Literal, ...)
+for _, idx := range keepIndices {
+    newLiterals = append(newLiterals, ...)  // Allocation!
+}
+s.learnedLiterals = newLiterals  // GC triggers
+```
 
-**Restart Policy** ✅
-- Changed from conservative (3× avg LBD) to moderate (2× avg LBD)
-- Glue clause threshold: LBD ≤ 10 → LBD ≤ 3 (standard MiniSat/Glucose)
-- Maintains 93.7% solve rate, more aggressive on unproductive search
+**After** (swap-remove):
+```go
+// Move clauses in-place, NO allocation
+for readIdx := 0; readIdx < capacity; readIdx++ {
+    if !deleted[readIdx] {
+        if writeIdx != readIdx {
+            moveClause(writeIdx, readIdx)  // Just copy metadata
+            updateWatchClauseIndices(...)   // Update watches
+        }
+        writeIdx++
+    }
+}
+// Truncate arrays (no allocation)
+s.learnedOffsets = s.learnedOffsets[:writeIdx]
+```
 
-**1-UIP Resolution** ✅
-- Verified trail order (most recent first) is optimal
-- Experimented with reason-clause-size sorting (caused regression)
-- Current implementation is already optimal for standard CDCL
+### Key Components
 
-## Profiling Analysis (June 2026)
+1. **learnedActiveCount**: Track active clauses (excludes tombstones)
+2. **learnedCapacity**: Total capacity including deleted slots
+3. **literalFreeSlots**: Track freed literal regions for reuse
+4. **updateWatchClauseIndices()**: Scan watch lists to update ClauseIdx after swap
+5. **Free slot reuse**: Check `literalFreeSlots` before appending new literals
 
-**Profiled instance**: `0f4576a6e7399336e11f0828d32263dd.cnf` (1.25s solve time)
+### Trade-offs
 
-### CPU Time Breakdown
+**Pros**:
+- 23× fewer GCs on large instances
+- No array allocations during deletion
+- Preserves memory pool benefits
+- Watch references stay valid
 
-| Component | CPU Time | % Total | Status |
-|-----------|----------|---------|--------|
-| **propagateWatched** | 0.53s | **33.5%** | 🔴 Critical |
-| **handleConflict** | 0.56s | **35.4%** | 🔴 Critical |
-| **learnClause** | 0.28s | **17.7%** | 🟡 High |
-| **deleteLearnedClauses** | 0.18s | **11.4%** | 🟡 Medium |
-| **GC overhead** | ~0.30s | **~20%** | 🟡 High |
-
-### Hot Spots in propagateWatched (530ms total)
-
-| Line | Code | Time | % |
-|------|------|------|---|
-| 2176 | `for j := 0; j < len(clause.Literals); j++` | 140ms | 26.4% |
-| 2150 | `watch := watchList[readIdx]` | 80ms | 15.1% |
-| 2182 | `blitLit := cnf.IndexToLit(int(blitIdx))` | 50ms | 9.4% |
-| 2205 | `s.watchLists[newWatchIdx] = append(...)` | 40ms | 7.5% |
-| 2188-2189 | `assignments[clauseLitVar].Level/Value` | 60ms | 11.3% |
-
-### Optimization Opportunities
-
-#### P0 (Immediate - Week 1)
-1. **Lazy clause activity decay** (5-10% overall) - Decay every N conflicts instead of every conflict
-2. **Cache clause literals pointer** (5-8% overall) - Cache `clause.Literals` before inner loop
-3. **Use varLevel cache consistently** (3-5% overall) - Replace `assignments[].Level` with `varLevel[]`
-
-#### P1 (Short-term - Week 2)
-4. **Pre-allocate watch lists** (3-5% overall) - Avoid append() allocations in hot path
-5. **Inline remaining IndexToLit calls** (2-3% overall) - Manual inlining at line 2182
-6. **Optimize duplicate detection** (2-4% overall) - Hash table instead of linear scan
-
-#### P2 (Medium-term - Weeks 3-4)
-7. **Array-of-Structs for variable state** (10-15% overall) - Combine assignments/varLevel into single struct
-8. **Contiguous learned clause storage** (5-10% overall) - Eliminate slice allocations
-9. **Incremental clause deletion** (2-3% overall) - Delete few clauses per conflict
-
-### Implementation Priority
-
-**Week 1 targets** (expected 15-25% speedup):
-- [x] 1A: Cache clause literals pointer in propagateWatched ✅ (June 2026)
-- [x] 2A: Lazy clause activity decay (every 100 conflicts) ✅ (June 2026)
-- [x] 1B: Use varLevel cache consistently in propagateWatched ✅ (June 2026)
-- [x] 4A: Pre-allocate watch lists with expected capacity ✅ (Already implemented)
-- [ ] 1C: Inline IndexToLit at line 2182
-
-### Completed Optimizations
-
-**1A: Cache clause literals pointer** ✅
-- Cached `clause.Literals` before inner loop in propagateWatched
-- Eliminates repeated slice header access in hot path (140ms → ~100ms expected)
-- Benchmark: 25/40 (62.5%) on MiniSat Fast Suite, soundness verified
-- Note: Individual instance times vary due to CDCL search path sensitivity
-
-**2A: Lazy clause activity decay** ✅
-- Decay clause activity every 100 conflicts instead of every conflict
-- Reduces GC pressure and CPU overhead in handleConflict (was 180ms decay loop)
-- Benchmark improved: 25/40 → 27/40 (62.5% → 67.5% solve rate)
-- Soundness verified: all 35 tests passing
-
-**1B: Use varLevel cache** ✅
-- Replace assignments[].Level with varLevel[] cache in propagateWatched
-- Avoids random memory access to assignments[] struct fields
-- Hard UNSAT instance: 0.62s → 0.32s (48% faster on 7fa52f87c4556ea449f68b3369e82c24.cnf)
-- Expected 3-5% overall speedup on propagation-heavy instances
-
-**4A: Pre-allocate watch lists** ✅ (Already implemented)
-- Pre-allocates watch lists with capacity = max(8, 2*NumClauses/NumLits) in initWatches()
-- Eliminates append() allocations in propagateWatched hot path
-- Profile shows append overhead is now negligible (<1% of propagateWatched time)
-- propagateWatched total: 530ms → 260ms (51% reduction after all optimizations)
+**Cons**:
+- O(watches) scan during each swap-remove (acceptable - deletion is infrequent)
+- Slightly more complex code
+- Literal pool can fragment over time (mitigated by free slot reuse)

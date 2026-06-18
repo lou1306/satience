@@ -93,29 +93,27 @@ v 1 -2 3 -4 5 0
 
 ## Performance
 
-Satience is optimized for correctness first, with performance optimizations for the propagation hot path. Benchmarks on real GBD instances (June 2026):
+Satience is optimized for correctness first, with aggressive performance optimizations including swap-remove clause deletion and contiguous literal storage.
 
-| Instance Type | Status |
-|--------------|--------|
-| PHP (all sizes) | ✓ Correct |
-| Tseitin (small) | ✓ Correct |
-| Argument chains | ✓ Correct |
-| Random instances | ✓ Correct |
-
-**Benchmark Suite Results (MiniSat Fast Suite, 30s timeout, GOAMD64=v3):**
-- **Solved**: 30/32 instances (93.7% solve rate)
+**Benchmark Suite Results (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, June 2026):**
+- **Solved**: 26/32 instances (81.2% solve rate)
 - **Soundness**: 100% on all solved instances (0 wrong results)
-- **Tseitin instances**: 100% solved (4×4, 5×5, 6×6 - both SAT and UNSAT)
-- **Arg chain**: Solved
-- **Hard 5-SAT**: ~20,000 conflicts/sec
-- **Random 600v instance**: Solved in 24.6s (was TIMEOUT before watched literals fix)
+- **Tseitin instances**: 100% solved (4×4, 5×5, 6×6 - both SAT and UNSAT) ✅
+- **Arg chain**: Solved ✅
+- **40 smallest CNFs**: 28/40 (70.0%) with 5s timeout
+
+**Memory Pool Performance (26Kv FCC instance):**
+- **GC cycles**: 606 → 26 (23× reduction)
+- **GC time**: ~8-10s → ~0.4s (20× faster)
+- **Heap**: 350-400 MB → 300-350 MB
 
 **Performance Characteristics:**
+- Swap-remove clause deletion (no array rebuilding)
+- Contiguous literal storage with free slot reuse
 - Watched literals propagation with O(1) clause index access
-- Props/dec ratio: 48 initially, ~33 steady-state on hard instances
-- Trail scanning optimization in 1-UIP conflict analysis
 - Activity heap for O(log n) variable selection
 - LBD-based clause database management (max 2,500 learned clauses)
+- Props/dec ratio: ~33 steady-state on hard instances
 
 ## Testing
 
@@ -208,27 +206,29 @@ Thanks to the SAT research community for excellent benchmarks and test instances
 
 - ✅ Sound and complete CDCL solver
 - ✅ All unit tests passing (15/15)
-- ✅ 100% soundness on benchmark suite (0 wrong results on 60+ tests)
+- ✅ 100% soundness verified (0 wrong results on 60+ tests)
+- ✅ Swap-remove clause deletion (23× GC reduction on large instances)
+- ✅ Contiguous literal storage with free slot reuse
 - ✅ Watched literals propagation with O(1) clause index access
 - ✅ Unit propagation preprocessing
 - ✅ Models verified to satisfy all clauses
 - ✅ SAT Competition 2026 output format compliant
 - ✅ Trail scanning optimization in 1-UIP conflict analysis
 - ✅ Activity heap for O(log n) variable selection
-- ✅ LBD-based clause database management
+- ✅ LBD-based clause database management (max 2,500 learned)
 - ✅ Clause quality tracking (useCount, propCount metrics)
-- ✅ Moderate Glucose-style restarts (2× avg LBD threshold)
+- ✅ Aggressive Glucose-style restarts (configurable)
+- ✅ Configurable clause deletion scoring (CLI parameters)
 
 **Performance:**
-- ~20,000 conflicts/sec on hard 5-SAT instances
-- Props/dec ratio: 48 initially, ~33 steady-state
-- 63% speedup from watched literals clause index caching
-- 93.7% solve rate on MiniSat Fast Suite (30/32 instances)
-- Random 600v instance: 24.6s (was TIMEOUT before watch fix)
+- Swap-remove deletion: 606 → 26 GCs on 26Kv instance
+- GC time reduced 20× (8-10s → 0.4s)
+- 81.2% solve rate on MiniSat Fast Suite (26/32)
+- 70.0% solve rate on 40 smallest CNFs (28/40, 5s timeout)
 
 **Known Limitations:**
-- Performance on very large instances (10K+ vars) limited by linear scanning in some areas
-- PHP UNSAT instances timeout (requires cardinality constraint reasoning)
+- PHP UNSAT instances timeout (needs cardinality constraint detection)
+- Random instances: VSIDS lacks community structure exploitation
 - Single-threaded only (by design)
 - No incremental solving (by design)
 - No proof/unsat core generation (by design)
