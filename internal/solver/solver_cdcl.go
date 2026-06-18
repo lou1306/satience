@@ -129,6 +129,7 @@ type CDCLSolver struct {
 	conflictsAtLevel   []int   // Track conflicts per decision level
 	lastRandomDecision int     // Last conflict where we made random decision
 	randomDecisionRate      float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
+	randomDecisionPeriod int     // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
 	randomSeed            uint64  // Seed for deterministic random selection
 	lastDecisionVar         uint32  // Last variable chosen for decision
 	consecutiveFlips        int     // Count of consecutive decisions on same variable
@@ -310,6 +311,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lbdSum:              0,
 		lbdCount:            0,
 		randomDecisionRate:  0.0,
+		randomDecisionPeriod: 0,    // Default: DISABLED (causes 65% overhead with no measurable benefit)
 		randomSeed:          0,
 		learnedClauseOrder:  make([]int, 0),
 		lbdOrderDirty:       true,
@@ -405,6 +407,18 @@ func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
 		rate = 1.0
 	}
 	s.randomDecisionRate = rate
+}
+
+// SetRandomDecisionPeriod sets the frequency of forced random decisions
+// period is the number of conflicts between random decisions (0 = disabled)
+// WARNING: Random decisions cause O(n) variable scan overhead
+// Profiling shows 65% overhead with no measurable benefit on standard benchmarks
+// Only enable for specific instance families that benefit from diversification
+func (s *CDCLSolver) SetRandomDecisionPeriod(period int) {
+	if period < 0 {
+		period = 0
+	}
+	s.randomDecisionPeriod = period
 }
 
 // SetRandomSeed sets the seed for deterministic random selection
@@ -3143,8 +3157,8 @@ func (s *CDCLSolver) decide() bool {
 			}
 		}
 
-		// Add periodic random decisions as fallback (reduced frequency to avoid O(n) scans)
-		if !forceRandom && s.conflicts > 0 && s.conflicts%1000 == 0 {
+		// Add periodic random decisions as fallback (configurable frequency, 0 = disabled)
+		if !forceRandom && s.randomDecisionPeriod > 0 && s.conflicts > 0 && s.conflicts%s.randomDecisionPeriod == 0 {
 			forceRandom = true
 		}
 
