@@ -146,6 +146,7 @@ type CDCLSolver struct {
 	tmpClauseHash uint64 // Hash for duplicate detection
 	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
 	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
+	tmpUnassignedVars []uint32 // Reusable buffer for random variable selection (avoids allocation)
 	tmpLearnedLits []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits []cnf.Literal // Temporary buffer for canonical clause sorting
 
@@ -326,6 +327,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpResolved:         make([]bool, formula.NumVars),
 		tmpFlippedVars:      make([]bool, formula.NumVars),
 		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
+		tmpUnassignedVars:   make([]uint32, 0, formula.NumVars),
 		tmpLearnedLits:      make([]cnf.Literal, 0, 64),
 		tmpSortedLits:       make([]cnf.Literal, 0, 64),
 		learnedClauseHashes: make(map[uint64]bool, 2500),
@@ -3079,15 +3081,17 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 }
 
 // selectRandomUnassigned selects a random unassigned variable
+// OPTIMIZATION: Uses persistent tmpUnassignedVars buffer to avoid allocation
 func (s *CDCLSolver) selectRandomUnassigned() uint32 {
-	unassigned := make([]uint32, 0)
+	// Reuse persistent buffer - no allocation!
+	s.tmpUnassignedVars = s.tmpUnassignedVars[:0]
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
 		if s.assignments[i].Level == 0 {
-			unassigned = append(unassigned, i)
+			s.tmpUnassignedVars = append(s.tmpUnassignedVars, i)
 		}
 	}
 
-	if len(unassigned) == 0 {
+	if len(s.tmpUnassignedVars) == 0 {
 		return 0
 	}
 
@@ -3100,8 +3104,8 @@ func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 	s.randomSeed = seed
 
 	// Use lower bits to select index
-	idx := int(seed % uint64(len(unassigned)))
-	return unassigned[idx]
+	idx := int(seed % uint64(len(s.tmpUnassignedVars)))
+	return s.tmpUnassignedVars[idx]
 }
 
 func (s *CDCLSolver) decide() bool {
@@ -3139,8 +3143,8 @@ func (s *CDCLSolver) decide() bool {
 			}
 		}
 
-		// Add periodic random decisions as fallback
-		if !forceRandom && s.conflicts > 0 && s.conflicts%200 == 0 {
+		// Add periodic random decisions as fallback (reduced frequency to avoid O(n) scans)
+		if !forceRandom && s.conflicts > 0 && s.conflicts%1000 == 0 {
 			forceRandom = true
 		}
 
