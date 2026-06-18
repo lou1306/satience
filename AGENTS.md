@@ -72,6 +72,7 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 - Clause minimization via self-subsumption
 - Watched literals propagation with O(1) clause index access
 - Clause quality tracking (useCount, propCount metrics)
+- **Watch list pre-allocation**: Accounts for original + learned clauses, caps at 256 capacity
 - **Swap-remove clause deletion** (no array rebuilding)
 - **Free literal slot tracking and reuse**
 
@@ -126,6 +127,7 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 - `internal/fuzzer/fuzzer.go`: Fuzzing infrastructure
 
 ### Implemented Optimizations
+- **Watch list pre-allocation**: Accounts for original + learned clauses, caps at 256 capacity
 - **Swap-remove clause deletion**: Move active clauses into deleted slots, update watches via scan
 - **Free literal slot reuse**: Track and reuse freed literal regions
 - **Watched literals**: O(1) propagation with ClauseIdx field in Watch struct (63% speedup)
@@ -186,7 +188,7 @@ benchmark/eval_small_random.sh [n_instances]
 ### High Priority
 2. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
 3. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
-4. **Watch list pre-allocation** (1-2 days): Reduce watch list allocation overhead
+4. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
 
 ### Medium Priority
 5. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
