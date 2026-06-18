@@ -925,8 +925,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Subsumption elimination - skip on large instances (O(n^2))
-		if preprocessConfig.EnableSubsumption && !isLargeInstance {
+		// Subsumption elimination - skip on medium/large instances (O(n^2))
+		// Threshold lowered from 50K to 1K clauses - subsumption overhead dominates on typical benchmarks
+		if preprocessConfig.EnableSubsumption && !isLargeInstance && s.cnf.NumClauses < 1000 {
 			s.subsumptionElimination()
 		}
 
@@ -1328,6 +1329,14 @@ func (s *CDCLSolver) inprocessSubsumption() {
 	if s.cnf.NumClauses > s.inprocessingMaxClauses {
 		return
 	}
+
+	// OPTIMIZATION: Disable inprocess subsumption entirely - O(n×m) cost dominates on typical benchmarks
+	// Even with threshold checks, subsumption eventually runs and takes too long
+	// Subsumption during preprocessing is more effective anyway
+	if s.verbose {
+		fmt.Printf("c [inprocess] Skipping subsumption: disabled (too expensive)\n")
+	}
+	return
 
 	startTime := time.Now()
 	timeLimit := time.Duration(s.inprocessingTimeLimitMs) * time.Millisecond
@@ -1799,7 +1808,8 @@ func (s *CDCLSolver) inprocessing() {
 	}
 
 	// 2. Self-subsumption (every 1000 conflicts, more expensive)
-	if s.conflicts%1000 == 0 {
+	// OPTIMIZATION: Skip on large clause databases - O(n²) complexity
+	if s.conflicts%1000 == 0 && s.cnf.NumClauses < 500 {
 		s.selfSubsumption()
 	}
 	if time.Since(startTime) > timeLimit {
