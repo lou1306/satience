@@ -185,7 +185,11 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 		}
 	}
 
-	for _, clause := range s.learnedClauses {
+	for i := range s.learnedOffsets {
+		if s.learnedSizes[i] == 0 {
+			continue
+		}
+		clause := cnf.Clause{Literals: s.getLearnedClauseLiterals(i), Learned: true}
 		allFalse := true
 		for _, lit := range clause.Literals {
 			varIdx := lit.Var()
@@ -230,7 +234,11 @@ func (s *CDCLSolver) VerifyModel(reason string) error {
 		}
 	}
 
-	for _, clause := range s.learnedClauses {
+	for i := range s.learnedOffsets {
+		if s.learnedSizes[i] == 0 {
+			continue
+		}
+		clause := cnf.Clause{Literals: s.getLearnedClauseLiterals(i), Learned: true}
 		satisfied := false
 		for _, lit := range clause.Literals {
 			varIdx := lit.Var()

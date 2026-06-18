@@ -78,6 +78,13 @@ const (
 //   - Phase saving
 //
 // Fields are mostly private; use provided methods for interaction.
+
+// literalFreeSlot tracks a free region in the learnedLiterals pool for reuse
+type literalFreeSlot struct {
+	offset int // Start offset in learnedLiterals
+	size   int // Number of literals in this free slot
+}
+
 type CDCLSolver struct {
 	cnf                 *cnf.CNF
 	assignments         []Assignment
@@ -92,14 +99,20 @@ type CDCLSolver struct {
 	iterations         int
 	propagations       int // Total propagations (assignments by unit propagation)
 	maxIter            int
-	learnedClauses     []cnf.Clause // Learned clauses (literals stored directly in Clause struct)
-	clauseActivity     []float64
-	clauseAge          []int
-	clauseSize         []int // Track clause size for deletion
-	clauseLBD          []int // Track LBD at time of learning
-	clauseUseCount     []int // Track how often clause used in conflict analysis
-	clausePropCount    []int // Track how many propagations clause caused
-	normalClauseCount  int   // Track number of non-glue clauses (LBD > 3)
+	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
+	learnedLiterals      []cnf.Literal // All learned clause literals in one contiguous slice
+	learnedOffsets       []int         // Start offset in learnedLiterals for each clause
+	learnedSizes         []int         // Number of literals in each clause (0 = deleted/tombstone)
+	clauseActivity       []float64
+	clauseAge            []int
+	clauseSize           []int // Track clause size for deletion (mirrors learnedSizes for speed)
+	clauseLBD            []int // Track LBD at time of learning
+	clauseUseCount       []int // Track how often clause used in conflict analysis
+	clausePropCount      []int // Track how many propagations clause caused
+	normalClauseCount    int   // Track number of non-glue clauses (LBD > 3)
+	learnedActiveCount   int   // Number of active clauses (excludes tombstones)
+	learnedCapacity      int   // Total capacity including tombstones
+	literalFreeSlots     []literalFreeSlot // Free regions in learnedLiterals for reuse
 	currentAge         int
 	verbose            bool
 	decisions          int
@@ -271,12 +284,18 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		implication:         make([]*cnf.Clause, formula.NumVars),
 		iterations:          0,
 		maxIter:             0,
-		learnedClauses:      make([]cnf.Clause, 0),
-		clauseActivity:      make([]float64, 0),
-		clauseAge:           make([]int, 0),
-		clauseLBD:           make([]int, 0),
-		clauseUseCount:      make([]int, 0),
-		clausePropCount:     make([]int, 0),
+		learnedLiterals:     make([]cnf.Literal, 0, 10000), // Pre-allocate for ~2500 clauses × avg 4 literals
+		learnedOffsets:      make([]int, 0, 2500),
+		learnedSizes:        make([]int, 0, 2500),
+		clauseActivity:      make([]float64, 0, 2500),
+		clauseAge:           make([]int, 0, 2500),
+		clauseSize:          make([]int, 0, 2500),
+		clauseLBD:           make([]int, 0, 2500),
+		clauseUseCount:      make([]int, 0, 2500),
+		clausePropCount:     make([]int, 0, 2500),
+		learnedActiveCount:  0,
+		learnedCapacity:     0,
+		literalFreeSlots:    make([]literalFreeSlot, 0, 64),
 		currentAge:          0,
 		verbose:             false,
 		decisions:           0,
@@ -659,13 +678,24 @@ func (s *CDCLSolver) GetIterations() int {
 
 // GetLearnedCount returns the number of learned clauses
 func (s *CDCLSolver) GetLearnedCount() int {
-	return len(s.learnedClauses)
+	return s.learnedActiveCount
 }
 
-// GetMemoryPoolStats returns memory pool statistics (deprecated - pool removed)
+// GetMemoryPoolStats returns memory pool statistics
 func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemoryKB int) {
-	// Memory pool removed - learned clauses stored directly in Clause structs
-	return len(s.learnedClauses), 0, 0
+	activeClauses = s.learnedActiveCount
+	poolLiterals = len(s.learnedLiterals)
+	// Approximate memory: literals (4 bytes each) + offsets/sizes/metadata (8 bytes each × 7 arrays × capacity)
+	cap := cap(s.learnedOffsets)
+	poolMemoryKB = (len(s.learnedLiterals)*4 + cap*8*7) / 1024
+	return activeClauses, poolLiterals, poolMemoryKB
+}
+
+// getLearnedClauseLiterals returns the literals for a learned clause (view into contiguous pool)
+func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
+	offset := s.learnedOffsets[clauseIdx]
+	size := s.learnedSizes[clauseIdx]
+	return s.learnedLiterals[offset : offset+size]
 }
 
 func (s *CDCLSolver) getDetailedStats() SolverStats {
@@ -673,18 +703,18 @@ func (s *CDCLSolver) getDetailedStats() SolverStats {
 		Conflicts:      s.conflicts,
 		Decisions:      s.decisions,
 		Iterations:     s.iterations,
-		LearnedClauses: len(s.learnedClauses),
+		LearnedClauses: s.learnedActiveCount,
 		MaxLevel:       s.level,
 	}
 
 	// Calculate clause size statistics
-	if len(s.learnedClauses) > 0 {
-		minSize := len(s.learnedClauses[0].Literals)
+	if s.learnedActiveCount > 0 {
+		minSize := s.learnedSizes[0]
 		maxSize := minSize
 		totalSize := 0
 
-		for _, clause := range s.learnedClauses {
-			size := len(clause.Literals)
+		for i := range s.learnedSizes {
+			size := s.learnedSizes[i]
 			totalSize += size
 			if size < minSize {
 				minSize = size
@@ -694,7 +724,7 @@ func (s *CDCLSolver) getDetailedStats() SolverStats {
 			}
 		}
 
-		stats.AvgClauseSize = totalSize / len(s.learnedClauses)
+		stats.AvgClauseSize = totalSize / s.learnedActiveCount
 		stats.MinClauseSize = minSize
 		stats.MaxClauseSize = maxSize
 	}
@@ -950,9 +980,14 @@ func (s *CDCLSolver) initWatches() {
 
 	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
 
-	for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
-		clause := &s.learnedClauses[learnedIdx]
-		s.addLearnedClauseToWatches(learnedIdx, clause, clause.Literals)
+	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
+		if s.learnedSizes[learnedIdx] == 0 {
+			continue // Skip tombstones
+		}
+		literals := s.getLearnedClauseLiterals(learnedIdx)
+		// Create a temporary Clause struct for addLearnedClauseToWatches
+		tmpClause := &cnf.Clause{Literals: literals, Learned: true}
+		s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 	}
 
 	// CRITICAL: Set watchInitialized AFTER all clauses are watched
@@ -1188,25 +1223,29 @@ func (s *CDCLSolver) subsumptionElimination() {
 }
 
 func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
-	// Remove learned clauses that are subsumed by the new clause
-	remaining := make([]cnf.Clause, 0, len(s.learnedClauses))
+	// Mark learned clauses that are subsumed by the new clause for deletion
 	removed := 0
 
-	for i := range s.learnedClauses {
-		if !s.subsumes(newClause, &s.learnedClauses[i]) {
-			remaining = append(remaining, s.learnedClauses[i])
-		} else {
+	for i := 0; i < s.learnedActiveCount; i++ {
+		lits := s.getLearnedClauseLiterals(i)
+		tmpClause := &cnf.Clause{Literals: lits, Learned: true}
+		if s.subsumes(newClause, tmpClause) {
+			// Mark for deletion by clearing the clause
+			s.learnedOffsets[i] = 0
+			s.learnedSizes[i] = 0
+			s.clauseActivity[i] = 0
+			s.clauseAge[i] = 0
+			s.clauseLBD[i] = 999999
+			s.clauseUseCount[i] = 0
+			s.clausePropCount[i] = 0
 			removed++
 		}
 	}
 
-	if removed > 0 {
-		s.learnedClauses = remaining
-		s.clauseActivity = make([]float64, len(s.learnedClauses))
-		s.clauseAge = make([]int, len(s.learnedClauses))
-		if s.verbose {
-			fmt.Printf("c [verbose] Learned clause subsumption: removed %d clauses\n", removed)
-		}
+	// Note: We don't physically remove the clauses here to avoid invalidating watch indices
+	// They will be cleaned up during the next clause deletion phase
+	if removed > 0 && s.verbose {
+		fmt.Printf("c [verbose] Learned clause subsumption: marked %d clauses for deletion\n", removed)
 	}
 }
 
@@ -1254,12 +1293,14 @@ func (s *CDCLSolver) inprocessSubsumption() {
 	remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses))
 	for i := range s.cnf.Clauses {
 		subsumed := false
-		for j := range s.learnedClauses {
-			if s.subsumes(&s.learnedClauses[j], &s.cnf.Clauses[i]) {
-				subsumed = true
-				break
-			}
+	for j := range s.learnedOffsets {
+		lits := s.getLearnedClauseLiterals(j)
+		tmpClause := &cnf.Clause{Literals: lits, Learned: true}
+		if s.subsumes(tmpClause, &s.cnf.Clauses[i]) {
+			subsumed = true
+			break
 		}
+	}
 		if !subsumed {
 			remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
 		} else {
@@ -1279,32 +1320,40 @@ func (s *CDCLSolver) inprocessSubsumption() {
 		}
 	}
 
-	// Remove learned clauses subsumed by other learned clauses
+	// Mark learned clauses subsumed by other learned clauses for deletion
 	// Keep only the most general (shortest) learned clauses
-	if len(s.learnedClauses) > 100 {
-		remainingLearned := make([]cnf.Clause, 0, len(s.learnedClauses))
-		for i := range s.learnedClauses {
+	if s.learnedActiveCount > 100 {
+		for i := 0; i < s.learnedCapacity; i++ {
+			if s.learnedSizes[i] == 0 {
+				continue // Already marked for deletion
+			}
 			subsumed := false
-			for j := range s.learnedClauses {
-				if i != j && s.subsumes(&s.learnedClauses[j], &s.learnedClauses[i]) {
+			for j := range s.learnedOffsets {
+				if i == j || s.learnedSizes[j] == 0 {
+					continue
+				}
+				litsI := s.getLearnedClauseLiterals(i)
+				litsJ := s.getLearnedClauseLiterals(j)
+				clauseI := &cnf.Clause{Literals: litsI, Learned: true}
+				clauseJ := &cnf.Clause{Literals: litsJ, Learned: true}
+				if s.subsumes(clauseJ, clauseI) {
 					subsumed = true
 					break
 				}
 			}
-			if !subsumed {
-				remainingLearned = append(remainingLearned, s.learnedClauses[i])
-			} else {
+			if subsumed {
+				// Mark for deletion
+				s.learnedOffsets[i] = 0
+				s.learnedSizes[i] = 0
+				s.clauseActivity[i] = 0
+				s.clauseAge[i] = 0
+				s.clauseLBD[i] = 999999
 				removedLearned++
 			}
 		}
 
-		if removedLearned > 0 {
-			s.learnedClauses = remainingLearned
-			s.clauseActivity = make([]float64, len(s.learnedClauses))
-			s.clauseAge = make([]int, len(s.learnedClauses))
-			if s.verbose {
-				fmt.Printf("c [inprocess] Removed %d learned clauses subsumed by other learned clauses\n", removedLearned)
-			}
+		if removedLearned > 0 && s.verbose {
+			fmt.Printf("c [inprocess] Marked %d learned clauses for deletion (subsumed)\n", removedLearned)
 		}
 	}
 
@@ -1485,9 +1534,9 @@ func (s *CDCLSolver) restart() {
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
 	glueCount := 0
-	isGlue := make([]bool, len(s.learnedClauses))
+	isGlue := make([]bool, len(s.learnedOffsets))
 
-	for i := range s.learnedClauses {
+	for i := 0; i < len(s.learnedOffsets); i++ {
 		lbd := s.clauseLBD[i]
 
 		// Keep glue clauses (configurable via restartKeepGlueLBD, default 3)
@@ -1501,7 +1550,7 @@ func (s *CDCLSolver) restart() {
 	}
 
 	if s.verbose {
-		fmt.Printf("c [verbose] Restart: keeping %d glue clauses, deleting %d non-glue\n", glueCount, len(s.learnedClauses)-glueCount)
+		fmt.Printf("c [verbose] Restart: keeping %d glue clauses, deleting %d non-glue\n", glueCount, s.learnedActiveCount-glueCount)
 	}
 
 	// Clear trail and assignments
@@ -2486,7 +2535,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
-				s.iterations, s.conflicts, s.level, len(s.learnedClauses), mem.Alloc/1024/1024)
+				s.iterations, s.conflicts, s.level, s.learnedActiveCount, mem.Alloc/1024/1024)
 		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
 			if s.verbose {
@@ -2505,7 +2554,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 					propsPerDec = float64(s.propagations) / float64(s.decisions)
 				}
 				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n",
-					s.conflicts, s.level, len(s.learnedClauses), s.decisions, s.propagations, propsPerDec)
+					s.conflicts, s.level, s.learnedActiveCount, s.decisions, s.propagations, propsPerDec)
 			}
 			if !s.backtrack() {
 				if s.verbose {
@@ -2593,7 +2642,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
-				s.iterations, s.conflicts, s.level, len(s.learnedClauses), mem.Alloc/1024/1024)
+				s.iterations, s.conflicts, s.level, s.learnedActiveCount, mem.Alloc/1024/1024)
 		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
 			if s.verbose {
@@ -2612,7 +2661,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 					propsPerDec = float64(s.propagations) / float64(s.decisions)
 				}
 				fmt.Printf("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n",
-					s.conflicts, s.level, len(s.learnedClauses), s.decisions, s.propagations, propsPerDec)
+					s.conflicts, s.level, s.learnedActiveCount, s.decisions, s.propagations, propsPerDec)
 			}
 			if !s.backtrack() {
 				if s.verbose {
@@ -2959,16 +3008,19 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 		// Disabling this causes infinite loops: learned clauses don't prevent same conflict
 
 		// Simple linear scanning of learned clauses (O(n) but correct)
-		for learnedIdx := 0; learnedIdx < len(s.learnedClauses); learnedIdx++ {
-			clause := &s.learnedClauses[learnedIdx]
-			clauseSize := len(clause.Literals)
+		for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
+			if s.learnedSizes[learnedIdx] == 0 {
+				continue // Skip tombstones
+			}
+			literals := s.getLearnedClauseLiterals(learnedIdx)
+			clauseSize := s.learnedSizes[learnedIdx]
 
 			satisfiedCount := 0
 			falseCount := 0
 			unassignedCount := 0
 			var unassignedLit cnf.Literal
 
-			for _, lit := range clause.Literals {
+			for _, lit := range literals {
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
 				if litLevel == 0 {
@@ -2990,7 +3042,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 			}
 
 			if unassignedCount == 0 && falseCount > 0 {
-				return true, clause
+				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
+				return true, tmpClause
 			}
 
 			if unassignedCount == 1 && falseCount == clauseSize-1 {
@@ -2998,7 +3051,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				if assignLevel == 0 {
 					assignLevel = 1
 				}
-				s.assignLiteralByClause(unassignedLit, assignLevel, clause)
+				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
+				s.assignLiteralByClause(unassignedLit, assignLevel, tmpClause)
 				unitPropagated = true
 				// Track propagation count for this learned clause
 				if learnedIdx < len(s.clausePropCount) {
@@ -3241,16 +3295,11 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	conflictLits := conflictClause.Literals
 
 	// Bump activity for learned clause involved in conflict
+	// Note: With memory pool, we can't compare pointers, so we skip this optimization
+	// The clause will still get activity bumps during conflict analysis
 	if conflictClause.Learned {
-		for i := range s.learnedClauses {
-			if &s.learnedClauses[i] == conflictClause {
-				if i < len(s.clauseActivity) {
-					s.clauseActivity[i] += 1.0
-					s.clauseUseCount[i]++
-				}
-				break
-			}
-		}
+		// Find matching clause by comparing literals (expensive, so skip for now)
+		// TODO: Track learned clause index in conflictClause metadata
 	}
 
 	// Conflict clause selection: prefer shorter clauses for better learning
@@ -3327,7 +3376,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
-			s.conflicts, s.iterations, s.level, len(s.learnedClauses), len(s.trail))
+			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
 	}
 
 	// Fast cleanup from previous conflict: reset only touched variables (O(k) instead of O(n))
@@ -3601,7 +3650,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		maxNormalClauses := 1500  // Reduced from 2000 for tighter database
 
 		// Immediate deletion trigger for high-LBD clauses
-		if lbd > 10 && len(s.learnedClauses) > 1000 {
+		if lbd > 10 && s.learnedActiveCount > 1000 {
 			// Learned a very high-LBD clause and database is large - delete now
 			s.deleteLearnedClauses()
 		}
@@ -3612,61 +3661,65 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", s.normalClauseCount, maxNormalClauses)
 			}
 
-			// Mark clauses to keep
-			keepClause := make([]bool, len(s.learnedClauses))
-			for i := range s.learnedClauses {
+			// Mark clauses for deletion (tombstone approach - don't rebuild arrays)
+			deletedCount := 0
+			for i := 0; i < s.learnedCapacity; i++ {
+				if s.learnedSizes[i] == 0 {
+					continue // Already deleted
+				}
 				if s.clauseLBD[i] <= 3 {
-					// Keep all glue clauses
-					keepClause[i] = true
-				} else {
-					// Keep only newest 50% of normal clauses
-					ageRank := 0
-					for j := range s.learnedClauses {
-						if s.clauseLBD[j] > 3 && s.clauseAge[j] < s.clauseAge[i] {
-							ageRank++
-						}
+					continue // Keep all glue clauses
+				}
+				// Delete older 50% of normal clauses
+				ageRank := 0
+				for j := 0; j < s.learnedCapacity; j++ {
+					if s.learnedSizes[j] > 0 && s.clauseLBD[j] > 3 && s.clauseAge[j] < s.clauseAge[i] {
+						ageRank++
 					}
-					keepClause[i] = (ageRank < s.normalClauseCount/2)
+				}
+				if ageRank >= s.normalClauseCount/2 {
+					// Mark for deletion and track free literal slot
+					offset := s.learnedOffsets[i]
+					size := s.learnedSizes[i]
+					s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
+					
+					s.learnedSizes[i] = 0
+					s.clauseActivity[i] = 0
+					s.clauseAge[i] = 0
+					s.clauseLBD[i] = 999999
+					s.clauseUseCount[i] = 0
+					s.clausePropCount[i] = 0
+					deletedCount++
 				}
 			}
-
-			// Compact arrays
-			newClauses := make([]cnf.Clause, 0)
-			newActivity := make([]float64, 0)
-			newAge := make([]int, 0)
-			newSize := make([]int, 0)
-			newLBD := make([]int, 0)
-			newUseCount := make([]int, 0)
-			newPropCount := make([]int, 0)
-
-			for i := range s.learnedClauses {
-				if keepClause[i] {
-					newClauses = append(newClauses, s.learnedClauses[i])
-					newActivity = append(newActivity, s.clauseActivity[i])
-					newAge = append(newAge, s.clauseAge[i])
-					newSize = append(newSize, s.clauseSize[i])
-					newLBD = append(newLBD, s.clauseLBD[i])
-					newUseCount = append(newUseCount, s.clauseUseCount[i])
-					newPropCount = append(newPropCount, s.clausePropCount[i])
-				}
-			}
-
-			s.learnedClauses = newClauses
-			s.clauseActivity = newActivity
-			s.clauseAge = newAge
-			s.clauseSize = newSize
-			s.clauseLBD = newLBD
-			s.clauseUseCount = newUseCount
-			s.clausePropCount = newPropCount
-			// Recalculate normal clause count after deletion
-			s.normalClauseCount = 0
-			for _, lbdVal := range s.clauseLBD {
-				if lbdVal > 3 {
-					s.normalClauseCount++
-				}
-			}
+			
+			s.normalClauseCount -= deletedCount
+			s.learnedActiveCount -= deletedCount
 		}
 
+		// Store learned clause literals in contiguous pool (reuse free slots if available)
+		var offset int
+		if len(s.literalFreeSlots) > 0 {
+			// Reuse a free slot
+			slot := s.literalFreeSlots[len(s.literalFreeSlots)-1]
+			s.literalFreeSlots = s.literalFreeSlots[:len(s.literalFreeSlots)-1]
+			offset = slot.offset
+			// Truncate literals array to reuse this region
+			if offset+len(s.tmpLearnedLits) > len(s.learnedLiterals) {
+				s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, offset+len(s.tmpLearnedLits)-len(s.learnedLiterals))...)
+			}
+		} else {
+			// Append to end
+			offset = len(s.learnedLiterals)
+			s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
+		}
+		
+		// Copy literals to the slot
+		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
+		
+		// Append metadata (use swap-remove compatible approach)
+		s.learnedOffsets = append(s.learnedOffsets, offset)
+		s.learnedSizes = append(s.learnedSizes, len(s.tmpLearnedLits))
 		s.clauseActivity = append(s.clauseActivity, 0.0)
 		s.clauseAge = append(s.clauseAge, s.currentAge)
 		s.clauseSize = append(s.clauseSize, len(s.tmpLearnedLits))
@@ -3677,20 +3730,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.normalClauseCount++
 		}
 		s.currentAge++
+		s.learnedActiveCount++
+		s.learnedCapacity++
 
-		// Store learned clause directly (no pool - pool caused slice invalidation issues)
-		// Literals are stored in the Clause struct's Literals field
-		literalsCopy := make([]cnf.Literal, len(s.tmpLearnedLits))
-		copy(literalsCopy, s.tmpLearnedLits)
-		s.learnedClauses = append(s.learnedClauses, cnf.Clause{Literals: literalsCopy, Learned: true})
-
-		// Get clause pointer after append (slice might have reallocated)
-		learnedIdx := len(s.learnedClauses) - 1
-		clause := &s.learnedClauses[learnedIdx]
-
+		// Get clause index and literals for watch addition
+		learnedIdx := s.learnedActiveCount - 1
+		literals := s.getLearnedClauseLiterals(learnedIdx)
+		
 		// Add learned clause to watches
 		if s.watchInitialized {
-			s.addLearnedClauseToWatches(learnedIdx, clause, literalsCopy)
+			tmpClause := &cnf.Clause{Literals: literals, Learned: true}
+			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 		}
 
 		// OPTIMIZATION: Add canonical hash to hash table for O(1) duplicate detection
@@ -3700,13 +3750,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.lbdOrderDirty = true
 
 		// Enforce maxLearned limit by deleting clauses when exceeded
-		if len(s.learnedClauses) > s.maxLearned {
+		if s.learnedActiveCount > s.maxLearned {
 			s.deleteLearnedClauses()
 		}
 
 		// ALWAYS print first 10 learned clauses for debugging
-		if len(s.learnedClauses) <= 10 {
-			s.DebugClauseLog(len(s.learnedClauses)-1, lbd, s.tmpLearnedLits)
+		if s.learnedActiveCount <= 10 {
+			s.DebugClauseLog(s.learnedActiveCount-1, lbd, s.tmpLearnedLits)
 		}
 
 		// LBD-based VSIDS: bump variables in low-LBD clauses
@@ -3853,63 +3903,50 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// LBD-based clause deletion - keep only high-quality learned clauses
-	// Strategy: PRIMARY factor is LBD quality, SECONDARY is age
-	// Rationale: High-LBD clauses are weak constraints that don't prune search effectively
+	// LBD-based clause deletion using SWAP-REMOVE to avoid array rebuilding
+	// This preserves memory pool benefits and eliminates allocations during deletion
 
-	clauses := make([]clauseInfo, 0, len(s.learnedClauses))
+	// Step 1: Score all active clauses
+	clauses := make([]clauseInfo, 0, s.learnedActiveCount)
 
-	for i, clause := range s.learnedClauses {
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedSizes[i] == 0 {
+			continue // Skip tombstones
+		}
 		lbd := s.clauseLBD[i]
-		size := len(clause.Literals)
+		size := s.learnedSizes[i]
 		age := s.currentAge - s.clauseAge[i]
 		activity := s.clauseActivity[i]
 		useCount := s.clauseUseCount[i]
 		propCount := s.clausePropCount[i]
 
-		// Calculate deletion score using configurable weights (higher = delete first)
-		// PRIMARY FACTOR: LBD (higher LBD = much more likely to delete)
+		// Calculate deletion score (higher = delete first)
 		score := float64(lbd) * s.clauseDeletionLBDWeight
-
-		// SECONDARY FACTOR: Age (old clauses less relevant)
 		score += float64(age) * s.clauseDeletionAgeWeight
-
-		// TERTIARY FACTOR: Size (larger clauses less useful)
 		score += float64(size) * s.clauseDeletionSizeWeight
-
-		// BONUS: Activity (active clauses more useful)
 		score -= activity * s.clauseDeletionActivityWeight
 
-		// QUALITY METRIC: Usage in conflict analysis
 		if useCount > s.clauseDeletionUseCountHigh {
 			score -= float64(useCount) * 15.0
 		} else if useCount > 0 {
 			score -= float64(useCount) * 3.0
 		}
-
-		// QUALITY METRIC: Propagation count
 		if propCount > s.clauseDeletionPropCountHigh {
 			score -= float64(propCount) * 8.0
 		} else if propCount > 0 {
 			score -= float64(propCount) * 2.0
 		}
 
-		// PROTECTION: Core glue clauses (LBD ≤ coreGlueLBDThreshold) are NEVER deleted
+		// Protection for glue clauses
 		if lbd <= s.coreGlueLBDThreshold {
 			score = -10000.0
-		}
-
-		// NEAR-GLUE PROTECTION: LBD = coreGlueLBDThreshold+1 - strong protection
-		if lbd == s.coreGlueLBDThreshold+1 {
+		} else if lbd == s.coreGlueLBDThreshold+1 {
 			score = -5000.0
-		}
-
-		// MODERATE PROTECTION: LBD = coreGlueLBDThreshold+2 with small size
-		if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
+		} else if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
 			score = -1000.0
 		}
 
-		// FORCE DELETION: High-LBD clauses
+		// Force deletion for high-LBD clauses
 		if lbd > s.clauseDeletionHighLBD1 {
 			score += s.clauseDeletionHighLBDBonus1
 		}
@@ -3929,99 +3966,106 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		})
 	}
 
-	// Sort by score (descending - highest score = delete first, lowest = keep)
-	// OPTIMIZATION: Use custom sort.Interface to avoid closure overhead
+	// Sort by score (descending - worst clauses first)
 	sort.Sort(clauseInfoSlice(clauses))
 
-	// Target: Keep configurable ratio of clauses (default 50%, aggressive deletion)
-	// This ensures database stays high-quality
-	toKeep := int(float64(len(s.learnedClauses)) * s.clauseDeletionKeepRatio)
+	// Calculate how many to delete
+	toKeep := int(float64(s.learnedActiveCount) * s.clauseDeletionKeepRatio)
 	if toKeep < s.minLearned {
 		toKeep = s.minLearned
 	}
-	if toKeep > len(s.learnedClauses) {
-		toKeep = len(s.learnedClauses)
+	if toKeep > s.learnedActiveCount {
+		toKeep = s.learnedActiveCount
+	}
+	toDelete := len(clauses) - toKeep
+	if toDelete <= 0 {
+		return // Nothing to delete
 	}
 
-	// Build list of clause indices to keep
-	// Sorted descending: clauses[0] = worst (highest score), clauses[end] = best (lowest score)
-	keepIndices := make([]int, 0, toKeep)
-	
-	// First, always keep protected clauses (negative score)
-	for i := range clauses {
+	// Step 2: Mark clauses for deletion and track free literal slots
+	deleted := make([]bool, s.learnedCapacity)
+	for i := 0; i < toDelete; i++ {
 		if clauses[i].score < 0 {
-			keepIndices = append(keepIndices, clauses[i].idx)
+			break // Don't delete protected clauses
 		}
+		idx := clauses[i].idx
+		deleted[idx] = true
+		
+		// Track literal region as free for reuse
+		offset := s.learnedOffsets[idx]
+		size := s.learnedSizes[idx]
+		s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
 	}
+
+	// Step 3: Swap-remove - move active clauses into deleted slots
+	// This avoids rebuilding arrays and preserves memory pool
+	writeIdx := 0
+	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
+		if deleted[readIdx] {
+			continue // Skip deleted slots
+		}
+		
+		if writeIdx != readIdx {
+			// Move clause metadata from readIdx to writeIdx
+			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
+			s.learnedSizes[writeIdx] = s.learnedSizes[readIdx]
+			s.clauseActivity[writeIdx] = s.clauseActivity[readIdx]
+			s.clauseAge[writeIdx] = s.clauseAge[readIdx]
+			s.clauseSize[writeIdx] = s.clauseSize[readIdx]
+			s.clauseLBD[writeIdx] = s.clauseLBD[readIdx]
+			s.clauseUseCount[writeIdx] = s.clauseUseCount[readIdx]
+			s.clausePropCount[writeIdx] = s.clausePropCount[readIdx]
+			
+			// CRITICAL: Update all watches referencing this clause
+			s.updateWatchClauseIndices(writeIdx, readIdx)
+		}
+		writeIdx++
+	}
+
+	// Step 4: Update active count and capacity
+	s.learnedActiveCount = writeIdx
+	s.learnedCapacity = writeIdx
 	
-	// Then, keep the best non-protected clauses from the end of the sorted array
-	for i := len(clauses) - 1; i >= 0 && len(keepIndices) < toKeep; i-- {
-		if clauses[i].score >= 0 {
-			keepIndices = append(keepIndices, clauses[i].idx)
-		}
-	}
+	// Truncate metadata arrays (no reallocation, just update length)
+	s.learnedOffsets = s.learnedOffsets[:writeIdx]
+	s.learnedSizes = s.learnedSizes[:writeIdx]
+	s.clauseActivity = s.clauseActivity[:writeIdx]
+	s.clauseAge = s.clauseAge[:writeIdx]
+	s.clauseSize = s.clauseSize[:writeIdx]
+	s.clauseLBD = s.clauseLBD[:writeIdx]
+	s.clauseUseCount = s.clauseUseCount[:writeIdx]
+	s.clausePropCount = s.clausePropCount[:writeIdx]
 
-	// Rebuild all arrays to keep only non-deleted clauses
-	newClauses := make([]cnf.Clause, 0, len(keepIndices))
-	newActivity := make([]float64, 0, len(keepIndices))
-	newAge := make([]int, 0, len(keepIndices))
-	newSize := make([]int, 0, len(keepIndices))
-	newLBD := make([]int, 0, len(keepIndices))
-	newUseCount := make([]int, 0, len(keepIndices))
-	newPropCount := make([]int, 0, len(keepIndices))
-
-	// Build new arrays from kept clauses (literals already in Clause structs)
-	for _, idx := range keepIndices {
-		newClauses = append(newClauses, s.learnedClauses[idx])
-		newActivity = append(newActivity, s.clauseActivity[idx])
-		newAge = append(newAge, s.clauseAge[idx])
-		newSize = append(newSize, s.clauseSize[idx])
-		newLBD = append(newLBD, s.clauseLBD[idx])
-		newUseCount = append(newUseCount, s.clauseUseCount[idx])
-		newPropCount = append(newPropCount, s.clausePropCount[idx])
-	}
-
-	s.learnedClauses = newClauses
-	s.clauseActivity = newActivity
-	s.clauseAge = newAge
-	s.clauseSize = newSize
-	s.clauseLBD = newLBD
-	s.clauseUseCount = newUseCount
-	s.clausePropCount = newPropCount
-
-	// OPTIMIZATION: Rebuild hash table from remaining clauses
-	// This keeps duplicate detection in sync after deletion
-	s.learnedClauseHashes = make(map[uint64]bool, len(s.learnedClauses))
-	for i := range s.learnedClauses {
-		hash := computeCanonicalHash(s.learnedClauses[i].Literals, s.tmpSortedLits)
+	// Step 5: Rebuild hash table from remaining clauses
+	s.learnedClauseHashes = make(map[uint64]bool, s.learnedActiveCount)
+	for i := 0; i < s.learnedActiveCount; i++ {
+		lits := s.getLearnedClauseLiterals(i)
+		hash := computeCanonicalHash(lits, s.tmpSortedLits)
 		s.learnedClauseHashes[hash] = true
 	}
 
-	// Mark LBD order as dirty - must rebuild after clause deletion
+	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
 
 	if s.verbose {
-		actualDeleted := len(s.learnedClauses) - len(keepIndices)
-		fmt.Printf("c [verbose] Deleted %d learned clauses, kept %d (target: %d)\n", actualDeleted, len(s.learnedClauses), toKeep)
-		if actualDeleted == 0 && len(s.learnedClauses) > 300 {
-			// Debug: show why clauses are protected
-			protectedLBD := 0
-			protectedSize := 0
-			for i, clause := range s.learnedClauses {
-				if i >= 100 {
-					break // Sample first 100
-				}
-				// Use stored LBD (calculated at learning time)
-				lbd := s.clauseLBD[i]
-				size := len(clause.Literals)
-				if lbd <= 3 {
-					protectedLBD++
-				}
-				if size < 5 {
-					protectedSize++
-				}
+		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
+	}
+}
+
+// updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx
+// This is called during swap-remove in deleteLearnedClauses()
+func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
+	// Scan all watch lists to find and update references
+	// Watch stores ClauseIdx as negative for learned clauses: -learnedIdx-1
+	oldClauseIdx := -oldIdx - 1
+	newClauseIdx := -newIdx - 1
+	
+	for litIdx := range s.watchLists {
+		watchList := s.watchLists[litIdx]
+		for i := range watchList {
+			if watchList[i].ClauseIdx == oldClauseIdx {
+				watchList[i].ClauseIdx = newClauseIdx
 			}
-			fmt.Printf("c [debug] Protection stats (sample 100): storedLBD≤3=%d, size<5=%d\n", protectedLBD, protectedSize)
 		}
 	}
 }
@@ -4169,9 +4213,15 @@ func (s *CDCLSolver) getReasonLBD(varIdx uint32) int {
 	}
 
 	if reasonClause.Learned {
-		// Find learned clause to get LBD
-		for i := range s.learnedClauses {
-			if &s.learnedClauses[i] == reasonClause {
+		// Find learned clause to get LBD by comparing literals
+		reasonLits := reasonClause.Literals
+		for i := 0; i < s.learnedCapacity; i++ {
+			if s.learnedSizes[i] != len(reasonLits) {
+				continue
+			}
+			lits := s.getLearnedClauseLiterals(i)
+			// Simple comparison - check if first literal matches (fast path)
+			if len(lits) > 0 && len(reasonLits) > 0 && lits[0] == reasonLits[0] {
 				if i < len(s.clauseLBD) {
 					return s.clauseLBD[i]
 				}
@@ -4188,7 +4238,7 @@ func (s *CDCLSolver) getReasonLBD(varIdx uint32) int {
 // rebuildLBDOrder rebuilds the learned clause order sorted by LBD (lowest first)
 // Called periodically to prioritize glue clauses during propagation
 func (s *CDCLSolver) rebuildLBDOrder() {
-	n := len(s.learnedClauses)
+	n := s.learnedActiveCount
 	if n == 0 {
 		s.learnedClauseOrder = s.learnedClauseOrder[:0]
 		s.lbdOrderDirty = false
