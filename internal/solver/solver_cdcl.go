@@ -3121,41 +3121,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if !blitTrue {
 				s.watchLists[watchIdx] = watchList
-				// VERIFICATION: Check if conflict is real (all literals false) - ALWAYS check, not just at high conflicts
-				if s.verbose {
-					if len(clauseLits) == 0 {
-						fmt.Printf("c [VERIFY] CONFLICT ERROR: Empty clause at conflict %d! ClauseIdx=%d, watch.Blit=%d\n", s.conflicts+1, watch.ClauseIdx, watch.Blit)
-					} else {
-						allFalse := true
-						trueLit := -1
-						for _, lit := range clauseLits {
-							varIdx := lit.Var()
-							val := s.assignments[varIdx].Value
-							litTrue := (!lit.IsNegated() && val) || (lit.IsNegated() && !val)
-							if litTrue {
-								allFalse = false
-								trueLit = int(varIdx)
-								break
-							}
-						}
-						if allFalse {
-							if s.conflicts >= 792800 {
-								fmt.Printf("c [VERIFY] Conflict %d OK: all %d literals false, ClauseIdx=%d\n", s.conflicts+1, len(clauseLits), watch.ClauseIdx)
-							}
-						} else {
-							fmt.Printf("c [VERIFY] CONFLICT ERROR at %d: lit %d is TRUE in clause! ClauseIdx=%d, learnedIdx=%d, clauseLits=%d\n", 
-								s.conflicts+1, trueLit+1, watch.ClauseIdx, -watch.ClauseIdx-1, len(clauseLits))
-							// Print all literals for debugging
-							for i, lit := range clauseLits {
-								varIdx := lit.Var()
-								val := s.assignments[varIdx].Value
-								litTrue := (!lit.IsNegated() && val) || (lit.IsNegated() && !val)
-								lvl := s.assignments[varIdx].Level
-								fmt.Printf("c   [%d]lit%d=%v@L%d\n", i, varIdx+1, litTrue, lvl)
-							}
-						}
-					}
-				}
 				return true, clause
 			}
 		}
@@ -3617,14 +3582,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Note: s.conflicts already incremented in handleConflict()
 
-	// Log first N conflicts and last 10 conflicts before termination
-	logConflict := s.verbose && (s.conflicts <= DebugConflictLimit || s.conflicts >= 792800)
-	if logConflict {
-		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d, conflictLits=%d\n",
-			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail), len(conflictLits))
-		if len(conflictLits) == 0 {
-			fmt.Printf("c [ERROR] EMPTY CONFLICT CLAUSE at conflict %d!\n", s.conflicts)
-		}
+	if s.verbose && s.conflicts <= DebugConflictLimit {
+		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
+			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
 	}
 
 	// Fast cleanup from previous conflict: reset only touched variables (O(k) instead of O(n))
