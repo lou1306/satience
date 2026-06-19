@@ -3540,12 +3540,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpLiteralIsNegated[varIdx] = false
 		s.tmpResolved[varIdx] = false
 	}
-	for _, lvl := range s.tmpLevelSet {
+	// CRITICAL FIX: Clear ALL levels, not just those in tmpLevelSet
+	// tmpLevelSet is populated during 1-UIP, so doesn't include initialization levels
+	for lvl := 0; lvl < len(s.tmpLevelCount); lvl++ {
 		s.tmpLevelCount[lvl] = 0
 		s.tmpLevelSetUsed[lvl] = false
 	}
-
-	// Reset for new conflict
 	s.tmpTouchedVars = s.tmpTouchedVars[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
 	s.tmpLevelSet = s.tmpLevelSet[:0]
