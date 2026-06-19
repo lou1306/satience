@@ -3753,10 +3753,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		currentSize = currentSize - 1 + newLiterals
 	}
 
+	// Calculate LBD BEFORE building learned clause (tmpLiteralInClause is cleared during build)
+	lbd := 0
+	maxLevel := 0
+	for _, varIdx := range s.tmpTouchedVars {
+		if s.tmpLiteralInClause[varIdx] {
+			lvl := s.assignments[varIdx].Level
+			if lvl >= 0 && !s.tmpLevelSetUsed[lvl] {
+				s.tmpLevelSetUsed[lvl] = true
+				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+				lbd++
+			}
+			if lvl > maxLevel && lvl < s.level {
+				maxLevel = lvl
+			}
+		}
+	}
+
 	// Build the learned clause from remaining literals (using reusable buffer)
 	s.tmpLearnedLits = s.tmpLearnedLits[:0] // Clear but keep capacity
 	litsAtCurrentLevel := 0
-	maxLevel := 0 // For backjump level calculation
 
 	// CRITICAL: Clear tmpLiteralInClause as we add literals to prevent duplicates
 	// tmpTouchedVars may have duplicate entries from multiple resolution steps
@@ -3768,9 +3784,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			lvl := s.assignments[varIdx].Level
 			if lvl == s.level {
 				litsAtCurrentLevel++
-			}
-			if lvl > maxLevel && lvl < s.level {
-				maxLevel = lvl
 			}
 		}
 	}
@@ -3793,19 +3806,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			backjumpLevel = 1
 		}
 		return backjumpLevel
-	}
-
-	// Calculate LBD using touched vars (single pass, already computed maxLevel)
-	lbd := 0
-	for _, varIdx := range s.tmpTouchedVars {
-		if s.tmpLiteralInClause[varIdx] {
-			lvl := s.assignments[varIdx].Level
-			if lvl > 0 && !s.tmpLevelSetUsed[lvl] {
-				s.tmpLevelSetUsed[lvl] = true
-				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
-				lbd++
-			}
-		}
 	}
 
 	// CLAUSE MINIMIZATION via self-subsumption
