@@ -46,7 +46,7 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	DefaultMaxLearned       = 2500  // Maximum learned clauses before deletion
+	DefaultMaxLearned       = 10000  // Increased for better performance  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
 	DefaultRestartBase      = 20    // Base for Luby restart sequence (aggressive for structured instances)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
@@ -2958,7 +2958,17 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				continue
 			}
 
-			clause := watch.Clause
+			// Get current clause data - for learned clauses, use ClauseIdx to avoid stale pointer after swap-remove
+			var clause *cnf.Clause
+			var clauseLits []cnf.Literal
+			if watch.ClauseIdx >= 0 {
+				clause = watch.Clause
+				clauseLits = clause.Literals
+			} else {
+				learnedIdx := -watch.ClauseIdx - 1
+				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
+				clause = &cnf.Clause{Literals: clauseLits, Learned: true}
+			}
 			blitIdx := watch.Blit
 			
 			// Inline IndexToLit
@@ -2983,9 +2993,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			watchLitVar := uint32(watchIdx >> 1)
 			blitLitVar := blitVarIdx
 			// OPTIMIZATION 1A: Cache clause literals pointer to avoid repeated field access
-			literals := clause.Literals
-			for j := 0; j < len(literals); j++ {
-				clauseLit := literals[j]
+			// clauseLits already set above
+			for j := 0; j < len(clauseLits); j++ {
+				clauseLit := clauseLits[j]
 				clauseLitVar := clauseLit.Var()
 				
 				// Skip the watched literals themselves
