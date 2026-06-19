@@ -1632,6 +1632,14 @@ func (s *CDCLSolver) restart() {
 	s.restartCount = s.conflicts
 	s.lbdSum = 0
 	s.lbdCount = 0
+	
+	// CRITICAL: Clear tmpFlippedVars on restart
+	// tmpFlippedVars tracks variables flipped at level 1 to detect exhaustion
+	// But it must be cleared on restart since all assignments are cleared
+	// Failure to clear causes false UNSAT (variable flipped in old context blocks new search)
+	for k := range s.tmpFlippedVars {
+		s.tmpFlippedVars[k] = false
+	}
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
 
@@ -2966,6 +2974,40 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLits = clause.Literals
 			} else {
 				learnedIdx := -watch.ClauseIdx - 1
+				// CRITICAL FIX: Check if learnedIdx is valid (within current learnedCapacity)
+				// After swap-remove deletion, learnedCapacity is reduced, and watches may point to deleted clauses
+				if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
+					// Watch points to deleted clause - remove it by swapping with last
+					lastIdx := len(watchList) - 1
+					if readIdx != lastIdx {
+						watchList[readIdx] = watchList[lastIdx]
+						// Update symmetric position of moved watch
+						movedWatch := watchList[readIdx]
+						movedSymPos := movedWatch.SymPos
+						if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
+							s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+						}
+						readIdx--
+					}
+					watchList = watchList[:lastIdx]
+					continue
+				}
+				// Check if clause was deleted (size=0)
+				if s.learnedSizes[learnedIdx] == 0 {
+					// Clause was deleted - remove watch
+					lastIdx := len(watchList) - 1
+					if readIdx != lastIdx {
+						watchList[readIdx] = watchList[lastIdx]
+						movedWatch := watchList[readIdx]
+						movedSymPos := movedWatch.SymPos
+						if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
+							s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+						}
+						readIdx--
+					}
+					watchList = watchList[:lastIdx]
+					continue
+				}
 				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
 				clause = &cnf.Clause{Literals: clauseLits, Learned: true}
 			}
@@ -3023,9 +3065,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 					// Add new watch to clauseLit's watch list
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
-						Clause: clause,
-						Blit:   blitIdx,
-						SymPos: watch.SymPos, // Points to symmetric watch position
+						Clause:    clause,
+						ClauseIdx: watch.ClauseIdx, // CRITICAL: Preserve ClauseIdx for learned clause tracking
+						Blit:      blitIdx,
+						SymPos:    watch.SymPos, // Points to symmetric watch position
 					})
 
 					// Update symmetric watch at blit's index
@@ -3078,6 +3121,41 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if !blitTrue {
 				s.watchLists[watchIdx] = watchList
+				// VERIFICATION: Check if conflict is real (all literals false) - ALWAYS check, not just at high conflicts
+				if s.verbose {
+					if len(clauseLits) == 0 {
+						fmt.Printf("c [VERIFY] CONFLICT ERROR: Empty clause at conflict %d! ClauseIdx=%d, watch.Blit=%d\n", s.conflicts+1, watch.ClauseIdx, watch.Blit)
+					} else {
+						allFalse := true
+						trueLit := -1
+						for _, lit := range clauseLits {
+							varIdx := lit.Var()
+							val := s.assignments[varIdx].Value
+							litTrue := (!lit.IsNegated() && val) || (lit.IsNegated() && !val)
+							if litTrue {
+								allFalse = false
+								trueLit = int(varIdx)
+								break
+							}
+						}
+						if allFalse {
+							if s.conflicts >= 792800 {
+								fmt.Printf("c [VERIFY] Conflict %d OK: all %d literals false, ClauseIdx=%d\n", s.conflicts+1, len(clauseLits), watch.ClauseIdx)
+							}
+						} else {
+							fmt.Printf("c [VERIFY] CONFLICT ERROR at %d: lit %d is TRUE in clause! ClauseIdx=%d, learnedIdx=%d, clauseLits=%d\n", 
+								s.conflicts+1, trueLit+1, watch.ClauseIdx, -watch.ClauseIdx-1, len(clauseLits))
+							// Print all literals for debugging
+							for i, lit := range clauseLits {
+								varIdx := lit.Var()
+								val := s.assignments[varIdx].Value
+								litTrue := (!lit.IsNegated() && val) || (lit.IsNegated() && !val)
+								lvl := s.assignments[varIdx].Level
+								fmt.Printf("c   [%d]lit%d=%v@L%d\n", i, varIdx+1, litTrue, lvl)
+							}
+						}
+					}
+				}
 				return true, clause
 			}
 		}
@@ -3539,9 +3617,14 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Note: s.conflicts already incremented in handleConflict()
 
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
-			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
+	// Log first N conflicts and last 10 conflicts before termination
+	logConflict := s.verbose && (s.conflicts <= DebugConflictLimit || s.conflicts >= 792800)
+	if logConflict {
+		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d, conflictLits=%d\n",
+			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail), len(conflictLits))
+		if len(conflictLits) == 0 {
+			fmt.Printf("c [ERROR] EMPTY CONFLICT CLAUSE at conflict %d!\n", s.conflicts)
+		}
 	}
 
 	// Fast cleanup from previous conflict: reset only touched variables (O(k) instead of O(n))
@@ -3715,8 +3798,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	litsAtCurrentLevel := 0
 	maxLevel := 0 // For backjump level calculation
 
+	// CRITICAL: Clear tmpLiteralInClause as we add literals to prevent duplicates
+	// tmpTouchedVars may have duplicate entries from multiple resolution steps
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
+			s.tmpLiteralInClause[varIdx] = false // Clear to prevent duplicate
 			lit := cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx])
 			s.tmpLearnedLits = append(s.tmpLearnedLits, lit)
 			lvl := s.assignments[varIdx].Level
@@ -4269,6 +4355,9 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 // which would all lead to the same conflict.
 func (s *CDCLSolver) backtrack() bool {
 	if len(s.trailHead) <= 1 {
+		if s.verbose {
+			fmt.Printf("c [BACKTRACK] Returning false: trailHead len=%d\n", len(s.trailHead))
+		}
 		return false
 	}
 
@@ -4284,12 +4373,29 @@ func (s *CDCLSolver) backtrack() bool {
 			decisionPoint := s.trailHead[1]
 			if decisionPoint < len(s.trail) {
 				decisionVar := uint32(s.trail[decisionPoint])
-				// Check if we already flipped this variable
-				if s.tmpFlippedVars[decisionVar] {
-					return false
-				}
-				s.tmpFlippedVars[decisionVar] = true
 				decisionValue := s.assignments[decisionVar].Value
+				
+				// Track which polarity failed at level 1
+				// Use tmpFlippedVars to track: true = positive failed, false = negative failed
+				// When both polarities fail, return UNSAT
+				polarityFailed := decisionValue // true if positive polarity failed, false if negative failed
+				
+				if s.tmpFlippedVars[decisionVar] {
+					// Variable was flipped before - check if opposite polarity also failed
+					prevPolarityFailed := s.tmpFlippedVars[decisionVar]
+					if prevPolarityFailed != polarityFailed {
+						// Both polarities have failed - instance is UNSAT
+						if s.verbose {
+							fmt.Printf("c [BACKTRACK] Both polarities of var %d failed at conflict %d - returning UNSAT\n", decisionVar+1, s.conflicts)
+						}
+						return false
+					}
+					// Same polarity failed again - continue searching (different context)
+				}
+				
+				// Record which polarity failed
+				s.tmpFlippedVars[decisionVar] = polarityFailed
+				
 				for i := decisionPoint + 1; i < len(s.trail); i++ {
 					varIdx := uint32(s.trail[i])
 					s.assignments[varIdx] = Assignment{}
@@ -4317,8 +4423,8 @@ func (s *CDCLSolver) backtrack() bool {
 	// Find the decision point at the backjump level
 	decisionPoint := s.trailHead[bjLevel]
 	if decisionPoint >= len(s.trail) {
-		if s.verbose && s.conflicts <= DebugConflictLimit {
-			fmt.Printf("c [BACKTRACK] FAIL: decision point %d >= trail len %d\n", decisionPoint, len(s.trail))
+		if s.verbose {
+			fmt.Printf("c [BACKTRACK] FAIL: decision point %d >= trail len %d at conflict %d\n", decisionPoint, len(s.trail), s.conflicts)
 		}
 		return false
 	}
