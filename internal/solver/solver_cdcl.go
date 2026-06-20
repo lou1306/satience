@@ -132,6 +132,10 @@ type CDCLSolver struct {
 	randomSeed            uint64  // Seed for deterministic random selection
 	lastDecisionVar         uint32  // Last variable chosen for decision
 	consecutiveFlips        int     // Count of consecutive decisions on same variable
+	// Exploration diversity tracking (IMPROVEMENT #3)
+	decidedVars           []uint32 // Variables decided during current search phase
+	decidedVarSet         []bool   // Fast lookup for decided variables
+	restartDecisionCount  int      // Decisions since last restart (for diversity reset)
 	minimizationMaxSize     int     // Skip minimization for clauses > this size (0=all)
 	minimizationMaxLBD      int     // Skip minimization for clauses with LBD > this (0=all)
 	minimizationMaxReasonSize int   // Skip resolution with reason clauses > this size
@@ -323,6 +327,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lbdOrderLastRebuild: 0,
 		lastConflictLBD:     0,
 		conflictsAtLevel:    make([]int, formula.NumVars+1),
+		decidedVars:         make([]uint32, 0, formula.NumVars),
+		decidedVarSet:       make([]bool, formula.NumVars),
+		restartDecisionCount: 0,
 		lastRandomDecision:  -1000,
 		// Pre-allocate reusable buffers
 		tmpLiteralInClause:  make([]bool, formula.NumVars),
@@ -1645,6 +1652,13 @@ func (s *CDCLSolver) restart() {
 		s.conflictsAtLevel[i] = 0
 	}
 
+	// IMPROVEMENT #3: Reset exploration diversity tracking
+	s.decidedVars = s.decidedVars[:0]
+	for i := range s.decidedVarSet {
+		s.decidedVarSet[i] = false
+	}
+	s.restartDecisionCount = 0
+
 	// Reset restart counters
 	s.lubyIndex++
 	s.restartCount = s.conflicts
@@ -1845,7 +1859,7 @@ func (s *CDCLSolver) inprocessing() {
 
 	// 3. Subsumption AFTER VE to clean up clause explosion
 	// This is critical: VE creates many resolvents, subsumption removes redundant ones
-	s.inprocessSubsumption()
+	// s.inprocessSubsumption() // DISABLED: unsound - removes original clauses needed for UNSAT proofs
 	if time.Since(startTime) > timeLimit {
 		return
 	}
@@ -3000,12 +3014,23 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	}
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
-	// IMPROVEMENT #1: Reset VSIDS activities after preprocessing
-	// After VE, clause structure does not reflect variable importance
-	// Reset all remaining variables to equal activity, let conflicts determine importance
+	// IMPROVEMENT #1: Improved VSIDS initialization after preprocessing
+	// After VE, clause structure reflects remaining variable importance
+	// Variables in more/shorter clauses are more constrained = higher activity
 	for i := range s.assignments {
 		if s.assignments[i].Level == 0 {
-			s.vsids.activity[i] = 1.0
+			// Count occurrences in remaining clauses
+			occurrences := 0
+			for _, clause := range s.cnf.Clauses {
+				for _, lit := range clause.Literals {
+					if lit.Var() == uint32(i) {
+						occurrences++
+						break
+					}
+				}
+			}
+			// Base activity + bonus for constrained variables
+			s.vsids.activity[i] = 1.0 + float64(occurrences) * 0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
@@ -3122,12 +3147,23 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Binary clauses get 100x base weight to strongly bias initial variable selection
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
-	// IMPROVEMENT #1: Reset VSIDS activities after preprocessing
-	// After VE, clause structure does not reflect variable importance
-	// Reset all remaining variables to equal activity, let conflicts determine importance
+	// IMPROVEMENT #1: Improved VSIDS initialization after preprocessing
+	// After VE, clause structure reflects remaining variable importance
+	// Variables in more/shorter clauses are more constrained = higher activity
 	for i := range s.assignments {
 		if s.assignments[i].Level == 0 {
-			s.vsids.activity[i] = 1.0
+			// Count occurrences in remaining clauses
+			occurrences := 0
+			for _, clause := range s.cnf.Clauses {
+				for _, lit := range clause.Literals {
+					if lit.Var() == uint32(i) {
+						occurrences++
+						break
+					}
+				}
+			}
+			// Base activity + bonus for constrained variables
+			s.vsids.activity[i] = 1.0 + float64(occurrences) * 0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
@@ -3742,6 +3778,33 @@ func (s *CDCLSolver) decide() bool {
 	} else {
 		// Select variable using VSIDS heuristic
 		varIdx, _ = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+		
+		// IMPROVEMENT #3: Force exploration diversity when stuck
+		// Only override VSIDS if same variable selected too many times
+		if int(varIdx) < len(s.decidedVarSet) && s.decidedVarSet[varIdx] {
+			s.restartDecisionCount++
+			// Force alternative if same var selected > 10 times this restart
+			if s.restartDecisionCount > 10 {
+				for i := range s.assignments {
+					if i >= int(s.cnf.NumVars) {
+						break
+					}
+					if s.assignments[i].Level == 0 && !s.isEliminatedVar(uint32(i)) && !s.decidedVarSet[i] {
+						varIdx = uint32(i)
+						s.restartDecisionCount = 0
+						break
+					}
+				}
+			}
+		} else {
+			s.restartDecisionCount = 0
+		}
+		
+		// Track this decision for diversity
+		if int(varIdx) < len(s.decidedVarSet) && !s.decidedVarSet[varIdx] {
+			s.decidedVarSet[varIdx] = true
+			s.decidedVars = append(s.decidedVars, varIdx)
+		}
 		
 		// Use saved phase from previous decisions (phase saving heuristic)
 		// This remembers the polarity that worked well in previous search attempts
