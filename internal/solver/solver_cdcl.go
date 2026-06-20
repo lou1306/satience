@@ -1964,7 +1964,7 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 
 		if !hasEliminatable {
 			if s.verbose && iter == 0 {
-				fmt.Printf("c [inprocess] VE: no eliminatable variables found (require positive deficiency)\n")
+				fmt.Printf("c [inprocess] VE: no eliminatable variables found\n")
 			}
 			break
 		}
