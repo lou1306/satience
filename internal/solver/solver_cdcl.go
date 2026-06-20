@@ -48,7 +48,7 @@ const (
 const (
 	DefaultMaxLearned       = 10000  // Increased for better performance  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
-	DefaultRestartBase      = 20    // Base for Luby restart sequence (aggressive for structured instances)
+	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
 	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
@@ -353,7 +353,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		inprocessingInterval:     500,
 		inprocessingMaxClauses:   5000,
 		inprocessingTimeLimitMs:  200,
-		preprocessingMinClauses:  50,
+		preprocessingMinClauses:  10,  // Lowered to enable inprocessing after aggressive VE
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
 		varElimMaxVars:           20000,
@@ -373,8 +373,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLearnedLitBufferSize:  64,
 		learnedClauseHashInitial: 2500,
 		// Restart policy defaults (aggressive for better performance on random instances)
-		restartGlucoseRatio:      1.2,
-		restartGlucoseMinConflicts: 25,
+		restartGlucoseRatio:      3.0,     // Less aggressive (MiniSat-style)
+		restartGlucoseMinConflicts: 100,   // Wait for more conflicts
 		restartKeepGlueLBD:       3,
 		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
 		clauseDeletionLBDWeight:      200.0,
@@ -985,10 +985,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 
 	// Clear assignments made during preprocessing passes
-	// These will be re-computed by unit propagation below
+	// EXCEPT for eliminated variables - keep them assigned so VSIDS doesn't select them
 	for i := range s.assignments {
-		s.assignments[i] = Assignment{}
-		s.varLevel[i] = 0
+		// Keep eliminated variables assigned
+		isEliminated := false
+		for _, elimVar := range s.eliminatedVars {
+			if elimVar == uint32(i) {
+				isEliminated = true
+				break
+			}
+		}
+		if !isEliminated {
+			s.assignments[i] = Assignment{}
+			s.varLevel[i] = 0
+		}
 	}
 	s.trail = s.trail[:0]
 	s.trailHead = []int{0}
@@ -1809,7 +1819,7 @@ func (s *CDCLSolver) inprocessing() {
 	// OPTIMIZATION: Lowered threshold from 500 to 50 clauses to enable inprocessing on PHP instances
 	// PHP 6p5h: 81 clauses, PHP 7p6h: 133 clauses, PHP 8p7h: 204 clauses - all now get inprocessing
 	// Inprocessing (subsumption, self-subsumption) helps reduce clause database and find conflicts faster
-	if s.cnf.NumClauses < 50 {
+	if s.cnf.NumClauses < 10 {  // Lowered to enable inprocessing after aggressive VE
 		return
 	}
 
@@ -1827,13 +1837,8 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 2. Variable elimination (creates resolvents, may increase clause count)
-	// Run VE every 100 conflicts on small instances to eliminate variables progressively
-	if s.cnf.NumVars < 100 && s.conflicts%10 == 0 && s.conflicts > 0 {
-		s.inprocessVariableElimination()
-	} else if s.conflicts%100 == 0 && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 {
-		s.inprocessVariableElimination()
-	}
+	// 2. Variable elimination DISABLED - soundness bug with variable tracking
+	// Preprocessing VE eliminates most vars, search handles the rest
 	if time.Since(startTime) > timeLimit {
 		return
 	}
@@ -1911,10 +1916,9 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 
 		// Find best eliminatable variable
 		bestVar := uint32(0)
-		// For inprocessing on small instances, allow negative deficiency (MiniSat-style)
-		// MiniSat eliminates vars even with clause blowup on PHP instances
-		bestResolventSize := 1000001 // Allow massive resolvents for inprocessing VE
-		bestDeficiency := -1000.0 // Allow negative deficiency for aggressive elimination
+		// For inprocessing, use conservative thresholds to avoid clause explosion
+		bestResolventSize := 1000 // Only eliminate if resolvent is small
+		bestDeficiency := -100.0  // Allow some clause blowup but not extreme
 		hasEliminatable := false
 
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
@@ -1926,26 +1930,17 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 			}
 
 			totalOcc := posOcc + negOcc
-			// For inprocessing on small instances, be EXTREMELY aggressive on occurrence threshold
-			// After VE creates resolvents, variables can appear in thousands of clauses
-			maxOcc := 10000 // Allow eliminating very high-occurrence variables
+			// For inprocessing, use conservative thresholds
+			maxOcc := 500 // Skip high-occurrence variables
 			if totalOcc > maxOcc {
-				if s.verbose && iter == 0 && varIdx < 5 {
-					fmt.Printf("c [inprocess] VE: var %d skipped (totalOcc=%d > maxOcc=%d)\n", varIdx, totalOcc, maxOcc)
-				}
 				continue
 			}
 
 			resolventSize := posOcc * negOcc
 
-			// For inprocessing on small instances, be EXTREMELY aggressive
-			// PHP instances: MiniSat eliminates vars even with massive clause blowup
-			// Use fixed high threshold since s.cnf.NumVars is original count (doesn't decrease)
-			maxResolvent := 1000000 // Allow massive resolvents for inprocessing VE
+			// For inprocessing, only eliminate if resolvent is manageable
+			maxResolvent := 2000 // Skip if resolvent would be too large
 			if resolventSize > maxResolvent {
-				if s.verbose && iter == 0 && varIdx < 5 {
-					fmt.Printf("c [inprocess] VE: var %d skipped (resolventSize=%d > maxResolvent=%d)\n", varIdx, resolventSize, maxResolvent)
-				}
 				continue
 			}
 
@@ -2789,6 +2784,11 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		s.varElimPolarity[varIdx] = true
 
 		s.eliminatedVars = append(s.eliminatedVars, varIdx)
+		// Assign eliminated variable so VSIDS does not select it
+		s.assignments[varIdx] = Assignment{
+			Value: s.varElimPolarity[varIdx],
+			Level: 1,
+		}
 		eliminatedCount++
 		iterCount++
 		clausesRemoved += originalClauses
@@ -2990,6 +2990,14 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
 	// Binary clauses get 100x base weight to strongly bias initial variable selection
+
+	// Re-assign eliminated variables so VSIDS does not select them
+	for _, varIdx := range s.eliminatedVars {
+		s.assignments[varIdx] = Assignment{
+			Value: s.varElimPolarity[varIdx],
+			Level: 1,
+		}
+	}
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
 	for {
@@ -3103,6 +3111,14 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Variables in shorter clauses get higher activity (more constrained = more important)
 	// Binary clauses get 100x base weight to strongly bias initial variable selection
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
+
+	// Re-assign eliminated variables so VSIDS does not select them
+	for _, varIdx := range s.eliminatedVars {
+		s.assignments[varIdx] = Assignment{
+			Value: s.varElimPolarity[varIdx],
+			Level: 1,
+		}
+	}
 
 	for {
 		s.iterations++
