@@ -1066,23 +1066,17 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Get positions before appending
-	pos0 := len(s.watchLists[idx0])
-	pos1 := len(s.watchLists[idx1])
-
-	// Add watches with symmetric position tracking
+	// Add watches (symmetric watch tracking via ClauseIdx scanning)
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		Clause:    clause,
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx1),
-		SymPos:    int32(pos1),
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		Clause:    clause,
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx0),
-		SymPos:    int32(pos0),
 	})
 }
 
@@ -1099,26 +1093,20 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Get positions before appending
-	pos0 := len(s.watchLists[idx0])
-	pos1 := len(s.watchLists[idx1])
-
 	// Learned clause index is stored as negative: -learnedIdx-1
 	clauseIdx := -learnedIdx - 1
 
-	// Add watches with symmetric position tracking
+	// Add watches (symmetric watch tracking via ClauseIdx scanning)
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		Clause:    clause,
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx1),
-		SymPos:    int32(pos1),
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		Clause:    clause,
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx0),
-		SymPos:    int32(pos0),
 	})
 }
 
@@ -2981,15 +2969,18 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					lastIdx := len(watchList) - 1
 					if readIdx != lastIdx {
 						watchList[readIdx] = watchList[lastIdx]
-						// Update symmetric position of moved watch
+						// Update symmetric watch Blit by scanning for ClauseIdx
 						movedWatch := watchList[readIdx]
-						movedSymPos := movedWatch.SymPos
-						if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
-							s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+						for symI := range s.watchLists[movedWatch.Blit] {
+							if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
+								s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
+								break
+							}
 						}
 						readIdx--
 					}
 					watchList = watchList[:lastIdx]
+					s.watchLists[watchIdx] = watchList
 					continue
 				}
 				// Check if clause was deleted (size=0)
@@ -2998,14 +2989,18 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					lastIdx := len(watchList) - 1
 					if readIdx != lastIdx {
 						watchList[readIdx] = watchList[lastIdx]
+						// Update symmetric watch Blit by scanning for ClauseIdx
 						movedWatch := watchList[readIdx]
-						movedSymPos := movedWatch.SymPos
-						if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
-							s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+						for symI := range s.watchLists[movedWatch.Blit] {
+							if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
+								s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
+								break
+							}
 						}
 						readIdx--
 					}
 					watchList = watchList[:lastIdx]
+					s.watchLists[watchIdx] = watchList
 					continue
 				}
 				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
@@ -3060,22 +3055,19 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						newWatchIdx |= 1
 					}
 
-					// Get position of new watch before adding
-					newPos := len(s.watchLists[newWatchIdx])
-
 					// Add new watch to clauseLit's watch list
 					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 						Clause:    clause,
-						ClauseIdx: watch.ClauseIdx, // CRITICAL: Preserve ClauseIdx for learned clause tracking
+						ClauseIdx: watch.ClauseIdx,
 						Blit:      blitIdx,
-						SymPos:    watch.SymPos, // Points to symmetric watch position
 					})
 
-					// Update symmetric watch at blit's index
-					symPos := watch.SymPos
-					if symPos >= 0 && int(symPos) < len(s.watchLists[blitIdx]) {
-						s.watchLists[blitIdx][symPos].Blit = uint32(newWatchIdx)
-						s.watchLists[blitIdx][symPos].SymPos = int32(newPos)
+					// Update symmetric watch Blit by scanning for ClauseIdx
+					for symI := range s.watchLists[blitIdx] {
+						if s.watchLists[blitIdx][symI].ClauseIdx == watch.ClauseIdx {
+							s.watchLists[blitIdx][symI].Blit = uint32(newWatchIdx)
+							break
+						}
 					}
 
 					foundReplacement = true
@@ -3089,17 +3081,20 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if readIdx != lastIdx {
 					// Move last watch to current position
 					watchList[readIdx] = watchList[lastIdx]
-					// Update symmetric position of the moved watch
+					// Update symmetric watch Blit by scanning for ClauseIdx
 					movedWatch := watchList[readIdx]
-					movedSymPos := movedWatch.SymPos
-					if movedSymPos >= 0 && int(movedSymPos) < len(s.watchLists[movedWatch.Blit]) {
-						s.watchLists[movedWatch.Blit][movedSymPos].SymPos = int32(readIdx)
+					for symI := range s.watchLists[movedWatch.Blit] {
+						if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
+							s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
+							break
+						}
 					}
 					// Don't increment readIdx - need to process the moved watch
 					readIdx--
 				}
 				// Truncate (remove last element which is now duplicated)
 				watchList = watchList[:lastIdx]
+				s.watchLists[watchIdx] = watchList
 				continue
 			}
 

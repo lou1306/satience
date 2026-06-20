@@ -30,8 +30,8 @@ func run() int {
 	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 10, "Luby restart sequence base multiplier (default=10)")
-	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.2, "Glucose restart when LBD > ratio × avg (default=1.2)")
-	restartGlucoseMin := flag.Int("restart-glucose-min", 25, "Min conflicts before Glucose restarts (default=25)")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
+	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10 for PHP)")
 	restartKeepGlue := flag.Int("restart-keep-glue", 3, "Keep clauses with LBD ≤ this during restart (default=3)")
 	// Clause deletion parameters
 	clauseDelLBD := flag.Float64("clause-del-lbd", 200.0, "LBD score weight for clause deletion (default=200.0)")
