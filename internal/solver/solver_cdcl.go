@@ -139,10 +139,12 @@ type CDCLSolver struct {
 	tmpLiteralInClause  []bool
 	tmpLiteralIsNegated []bool
 	tmpLevelCount       []int
+	tmpLevelCountUsed   []bool   // Track which levels have non-zero tmpLevelCount
 	tmpCandidates       []resolveCandidate
 	tmpLevelSet         []int    // For LBD calculation (replaces map)
 	tmpLevelSetUsed     []bool   // Track which levels are in tmpLevelSet
 	tmpResolved         []bool   // Track resolved variables in 1-UIP to prevent cycles
+	tmpResolvedVars     []uint32 // Track which variables were resolved (for fast reset)
 	tmpClauseHash uint64 // Hash for duplicate detection
 	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
 	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
@@ -325,10 +327,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLiteralInClause:  make([]bool, formula.NumVars),
 		tmpLiteralIsNegated: make([]bool, formula.NumVars),
 		tmpLevelCount:       make([]int, formula.NumVars+1),
+		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
 		tmpCandidates:       make([]resolveCandidate, 0, 100),
 		tmpLevelSet:         make([]int, 0, formula.NumVars),
 		tmpLevelSetUsed:     make([]bool, formula.NumVars+1),
 		tmpResolved:         make([]bool, formula.NumVars),
+		tmpResolvedVars:     make([]uint32, 0, formula.NumVars),
 		tmpFlippedVars:      make([]bool, formula.NumVars),
 		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
 		tmpUnassignedVars:   make([]uint32, 0, formula.NumVars),
@@ -1638,14 +1642,19 @@ func (s *CDCLSolver) restart() {
 		s.tmpLiteralInClause[i] = false
 		s.tmpLiteralIsNegated[i] = false
 	}
+	for i := range s.tmpResolved {
+		s.tmpResolved[i] = false
+	}
 	for i := range s.tmpLevelCount {
 		s.tmpLevelCount[i] = 0
 	}
 	for i := range s.tmpLevelSetUsed {
 		s.tmpLevelSetUsed[i] = false
+		s.tmpLevelCountUsed[i] = false
 	}
 	s.tmpLevelSet = s.tmpLevelSet[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
+	s.tmpResolvedVars = s.tmpResolvedVars[:0]
 
 	// CRITICAL FIX: Re-propagate unit clauses after restart
 	// Unit clauses (length 1) are NOT watched, so they won't be re-propagated
@@ -3577,13 +3586,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	for _, varIdx := range s.tmpTouchedVars {
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpLiteralIsNegated[varIdx] = false
+	}
+	// Clear only resolved variables (O(k) instead of O(n))
+	for _, varIdx := range s.tmpResolvedVars {
 		s.tmpResolved[varIdx] = false
 	}
-	// CRITICAL FIX: Clear ALL levels, not just those in tmpLevelSet
-	// tmpLevelSet is populated during 1-UIP, so doesn't include initialization levels
-	for lvl := 0; lvl < len(s.tmpLevelCount); lvl++ {
+	s.tmpResolvedVars = s.tmpResolvedVars[:0]
+	// Clear only used levels (O(k) instead of O(max_level))
+	for _, lvl := range s.tmpLevelSet {
 		s.tmpLevelCount[lvl] = 0
 		s.tmpLevelSetUsed[lvl] = false
+		s.tmpLevelCountUsed[lvl] = false
 	}
 	s.tmpTouchedVars = s.tmpTouchedVars[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
@@ -3607,6 +3620,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.tmpTouchedVars = append(s.tmpTouchedVars, varIdx)
 			lvl := s.assignments[varIdx].Level
 			if lvl <= s.level {
+				if !s.tmpLevelCountUsed[lvl] {
+					s.tmpLevelCountUsed[lvl] = true
+					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+				}
 				s.tmpLevelCount[lvl]++
 			}
 		}
@@ -3706,6 +3723,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Resolve: remove varIdx, add reason literals
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpResolved[varIdx] = true
+		s.tmpResolvedVars = append(s.tmpResolvedVars, varIdx)
 		s.tmpLevelCount[s.level]--
 		pathC--
 
@@ -3722,6 +3740,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
 				lvl := s.varLevel[v]  // Use cached level instead of assignments[v].Level
 				if lvl <= s.level {
+					if !s.tmpLevelCountUsed[lvl] {
+						s.tmpLevelCountUsed[lvl] = true
+						s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+					}
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
 						pathC++
