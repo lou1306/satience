@@ -3129,11 +3129,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
 
-	// Debug: report propagations
-	if s.verbose && propagationCount > 0 {
-		s.DebugPropagateLog(s.qhead-propagationCount, len(s.trail), propagationCount)
-	}
-
 	return false, nil
 }
 
@@ -3796,16 +3791,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// INVARIANT CHECK: Verify exactly 1 literal at current level
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		s.Debug1UIPLog(s.conflicts, len(s.tmpLearnedLits), litsAtCurrentLevel, s.level)
-	}
-
-	// If 1-UIP didn't reduce to exactly 1 literal at current level, log error and handle
+	// If 1-UIP didn't reduce to exactly 1 literal at current level, handle it
 	if litsAtCurrentLevel != 1 {
-		if s.verbose {
-			s.Debug1UIPErrorLog(s.conflicts, len(s.tmpLearnedLits), s.level, s.tmpLearnedLits)
-		}
 		if s.level == 1 {
 			return 1
 		}
@@ -3971,11 +3958,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Enforce maxLearned limit by deleting clauses when exceeded
 		if s.learnedActiveCount > s.maxLearned {
 			s.deleteLearnedClauses()
-		}
-
-		// ALWAYS print first 10 learned clauses for debugging
-		if s.learnedActiveCount <= 10 {
-			s.DebugClauseLog(s.learnedActiveCount-1, lbd, s.tmpLearnedLits)
 		}
 
 		// LBD-based VSIDS: bump variables in low-LBD clauses
