@@ -1859,10 +1859,8 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 5. Pure literal elimination (safe, assigns variables appearing in one polarity)
-	if s.cnf.NumVars < 500 {
-		s.inprocessPureLiteralElimination()
-	}
+	// 5. Pure literal elimination DISABLED - unsound with eliminated variables from preprocessing
+	// s.inprocessPureLiteralElimination()
 	if time.Since(startTime) > timeLimit {
 		return
 	}
@@ -3000,6 +2998,16 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	}
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
+	// IMPROVEMENT #1: Reset VSIDS activities after preprocessing
+	// After VE, clause structure does not reflect variable importance
+	// Reset all remaining variables to equal activity, let conflicts determine importance
+	for i := range s.assignments {
+		if s.assignments[i].Level == 0 {
+			s.vsids.activity[i] = 1.0
+		}
+	}
+	s.vsids.heapValid = false // Force heap rebuild
+
 	for {
 		s.iterations++
 		if s.iterations%IterationReportInterval == 0 && s.verbose {
@@ -3111,6 +3119,16 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Variables in shorter clauses get higher activity (more constrained = more important)
 	// Binary clauses get 100x base weight to strongly bias initial variable selection
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
+
+	// IMPROVEMENT #1: Reset VSIDS activities after preprocessing
+	// After VE, clause structure does not reflect variable importance
+	// Reset all remaining variables to equal activity, let conflicts determine importance
+	for i := range s.assignments {
+		if s.assignments[i].Level == 0 {
+			s.vsids.activity[i] = 1.0
+		}
+	}
+	s.vsids.heapValid = false // Force heap rebuild
 
 	// Re-assign eliminated variables so VSIDS does not select them
 	for _, varIdx := range s.eliminatedVars {

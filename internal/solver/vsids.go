@@ -480,6 +480,12 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 		conflictBoost := 1.0 + float64(v.conflictParticipation[lit.Var()])*0.05
 		v.bumpLarge(lit.Var(), bumpAmount*conflictBoost)
 		v.conflictParticipation[lit.Var()]++
+		// IMPROVEMENT #3: Reset activity after too many conflicts (prevent lock-in)
+		if v.conflictParticipation[lit.Var()] > 500 {
+			v.activity[lit.Var()] = 1.0  // Reset to prevent lock-in
+			v.conflictParticipation[lit.Var()] = 0
+			v.heapValid = false  // Force heap rebuild
+		}
 		
 		// CHB: Track conflict frequency with aggressive bump
 		if v.useCHB {
