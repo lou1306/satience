@@ -359,9 +359,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		varElimMaxClauses:        100000,
 		varElimMaxResolventSize:  50,     // Reduced from 100 (more conservative)
 		varElimMaxOccurrences:    200,    // Reduced from 500 (only eliminate low-occurrence vars)
-		varElimMinDeficiency:     2.0,    // Require removing ≥2 more clauses than added
-		varElimMaxIterations:     50,     // Reduced from 100 (faster exit)
-		varElimMaxTimeMs:         200,    // Reduced from 500ms (stricter time limit)
+		varElimMinDeficiency:     0.0,    // Allow elimination even without clause reduction (MiniSat-style)
+		varElimMaxIterations:     100,    // Increased from 50 for better PHP performance
+		varElimMaxTimeMs:         500,    // Increased from 200ms for more thorough elimination
 		clauseDeletionMinLBD:     3,
 		glueClauseLBDThreshold:   2,
 		coreGlueLBDThreshold:     2,
@@ -897,20 +897,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 
 		// Variable elimination: eliminate variables via resolution
-		// Only run on instances with VERY high clause density (clauses/vars > 5)
-		// This heuristic targets highly constrained structured instances
-		// Skip on most instances - VE overhead dominates on typical benchmarks
+		// Run on small/medium instances with moderate clause density (clauses/vars > 2.0)
+		// PHP instances have density ~2.7, MiniSat eliminates vars regardless of density
+		// Skip on large instances where VE overhead dominates
 		clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
-		if !isLargeInstance && s.cnf.NumVars < 10000 && s.cnf.NumClauses < 100000 && clauseDensity > 5.0 {
+		if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
 			if s.verbose {
-				fmt.Printf("c [verbose] Running VE: clause density %.1f > 5.0 threshold\n", clauseDensity)
+				fmt.Printf("c [verbose] Running VE: clause density %.1f > 2.0 threshold\n", clauseDensity)
 			}
 			veResult := s.variableElimination()
 			if veResult == UNSAT {
 				return UNSAT
 			}
-		} else if s.verbose && clauseDensity <= 5.0 {
-			fmt.Printf("c [verbose] Skipping VE: clause density %.1f <= 5.0\n", clauseDensity)
+		} else if s.verbose && clauseDensity <= 2.0 {
+			fmt.Printf("c [verbose] Skipping VE: clause density %.1f <= 2.0\n", clauseDensity)
 		}
 
 		// Run unit propagation to catch new units from equivalence substitution
