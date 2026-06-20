@@ -912,11 +912,12 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			oldMaxResolvent := s.varElimMaxResolventSize
 			oldMaxOcc := s.varElimMaxOccurrences
 			oldMinDef := s.varElimMinDeficiency
-			// Set aggressive thresholds but require positive deficiency
+			// Conservative preprocessing VE - only eliminate with positive deficiency
+			// Let inprocessing VE during search handle aggressive elimination (MiniSat-style)
 			if s.cnf.NumVars < 50 {
 				s.varElimMaxResolventSize = 20000
 				s.varElimMaxOccurrences = 10000
-				s.varElimMinDeficiency = 1.0 // Require net clause reduction
+				s.varElimMinDeficiency = 1.0 // Require net clause reduction in preprocessing
 			}
 			veResult := s.variableElimination()
 			// Restore old thresholds
@@ -1825,9 +1826,9 @@ func (s *CDCLSolver) inprocessing() {
 
 	// 2. Variable elimination (creates resolvents, may increase clause count)
 	// Run VE every 100 conflicts on small instances to eliminate variables progressively
-	if s.cnf.NumVars < 100 && s.conflicts%100 == 0 && s.conflicts > 0 {
+	if s.cnf.NumVars < 100 && s.conflicts%10 == 0 && s.conflicts > 0 {
 		s.inprocessVariableElimination()
-	} else if s.conflicts%2000 == 0 && s.cnf.NumVars < 500 && s.cnf.NumClauses < 2000 {
+	} else if s.conflicts%100 == 0 && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 {
 		s.inprocessVariableElimination()
 	}
 	if time.Since(startTime) > timeLimit {
@@ -1878,7 +1879,7 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 	startTime := time.Now()
 	// Aggressive time limit for inprocessing VE - PHP instances need more time
 	timeLimit := 500 * time.Millisecond
-	maxIters := 50 // More iterations to eliminate chain of variables
+	maxIters := 2 // Eliminate only 1-2 vars per call to prevent clause explosion (MiniSat-style gradual elimination)
 	eliminatedCount := 0
 
 	for iter := 0; iter < maxIters; iter++ {
@@ -1907,9 +1908,10 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 
 		// Find best eliminatable variable
 		bestVar := uint32(0)
-		// For inprocessing, require positive deficiency to avoid clause explosion
-		bestResolventSize := 20001 // Allow very large resolvents for inprocessing VE
-		bestDeficiency := 0.0 // Require positive deficiency (net clause reduction)
+		// For inprocessing on small instances, allow negative deficiency (MiniSat-style)
+		// MiniSat eliminates vars even with clause blowup on PHP instances
+		bestResolventSize := 1000001 // Allow massive resolvents for inprocessing VE
+		bestDeficiency := -1000.0 // Allow negative deficiency for aggressive elimination
 		hasEliminatable := false
 
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
@@ -1934,9 +1936,9 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 			resolventSize := posOcc * negOcc
 
 			// For inprocessing on small instances, be EXTREMELY aggressive
-			// PHP instances: variables can have very high occurrence after elimination
+			// PHP instances: MiniSat eliminates vars even with massive clause blowup
 			// Use fixed high threshold since s.cnf.NumVars is original count (doesn't decrease)
-			maxResolvent := 20000 // Allow very large resolvents for inprocessing VE
+			maxResolvent := 1000000 // Allow massive resolvents for inprocessing VE
 			if resolventSize > maxResolvent {
 				if s.verbose && iter == 0 && varIdx < 5 {
 					fmt.Printf("c [inprocess] VE: var %d skipped (resolventSize=%d > maxResolvent=%d)\n", varIdx, resolventSize, maxResolvent)
@@ -1945,12 +1947,6 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 			}
 
 			deficiency := float64(posOcc + negOcc) - float64(resolventSize)
-
-			// Skip variables with negative deficiency (clause blowup)
-			// This prevents clause explosion during inprocessing
-			if deficiency < bestDeficiency {
-				continue
-			}
 
 			if s.verbose && iter == 0 && varIdx < 5 {
 				fmt.Printf("c [inprocess] VE: var %d pos=%d neg=%d total=%d resolvent=%d deficiency=%.1f\n",
