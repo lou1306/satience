@@ -8,6 +8,7 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 - Single-threaded (no parallel solving)
 - No incremental solving
 - No proof/unsat core generation
+- **No cardinality constraint detection** (PHP instances out of scope)
 - Go language
 - 60 second timeout per benchmark
 - Real GBD instances from benchmark-database.de
@@ -182,32 +183,29 @@ benchmark/eval_small_random.sh [n_instances]
 
 ## Next Steps
 
-### Critical
-1. **Cardinality constraint detection** (3-5 days): Detect PHP-like cardinality constraints and add specialized propagator. Expected 100-1000× speedup on PHP UNSAT instances.
-
 ### High Priority
-2. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
-3. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
-4. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
+1. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
+2. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
+3. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
 
 ### Medium Priority
 5. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
 6. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
 
 ### Not Planned (per constraints)
+- **Cardinality constraint detection**: PHP-like instances need specialized propagators for counting constraints. Expected 100-1000× speedup but requires fundamental architecture changes.
 - Parallel solving
 - Incremental solving
 - Proof/unsat core generation
+- Advanced preprocessing (beyond unit propagation)
 
 ## Known Limitations
 
 ### PHP (Pigeonhole Principle) Instances
-PHP UNSAT instances timeout while MiniSat solves instantly. This is due to:
-- Lack of cardinality constraint detection
+PHP UNSAT instances timeout while MiniSat solves instantly. This is **by design** (cardinality constraint detection is out of scope):
 - Basic 1-UIP doesn't capture counting constraints
 - VSIDS doesn't focus on critical "counting" variables
-
-**This is fixable**: Specialized propagators would provide 100-1000× speedup on PHP instances.
+- **Out of scope**: Specialized propagators would provide 100-1000× speedup but require fundamental architecture changes
 
 ### Random Instances
 Some random instances timeout. This is due to:

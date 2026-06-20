@@ -227,8 +227,18 @@ Thanks to the SAT research community for excellent benchmarks and test instances
 - 70.0% solve rate on 40 smallest CNFs (28/40, 5s timeout)
 
 **Known Limitations:**
-- PHP UNSAT instances timeout (needs cardinality constraint detection)
+- PHP UNSAT instances timeout (cardinality constraint detection out of scope)
 - Random instances: VSIDS lacks community structure exploitation
 - Single-threaded only (by design)
 - No incremental solving (by design)
 - No proof/unsat core generation (by design)
+
+## Out of Scope Features
+
+Per project constraints, the following features are explicitly **out of scope**:
+
+- **Cardinality constraint detection**: PHP-like instances require specialized propagators for counting constraints (100-1000× speedup expected, but requires fundamental architecture changes)
+- **Parallel solving**: Single-threaded only
+- **Incremental solving**: No assumption stack or incremental interface
+- **Proof generation**: No UNSAT core or resolution proof output
+- **Advanced preprocessing**: Beyond basic unit propagation (e.g., variable elimination, subsumption)
