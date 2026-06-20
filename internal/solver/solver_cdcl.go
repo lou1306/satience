@@ -168,6 +168,7 @@ type CDCLSolver struct {
 	eliminatedVars      []uint32                // List of eliminated variable indices
 	varElimDefinition   map[uint32][]cnf.Literal // Definition of eliminated var (resolvent that eliminated it)
 	varElimPolarity     map[uint32]bool         // Polarity of eliminated var in its definition
+	emptyClauseFound    bool   // Set when empty learned clause derived (UNSAT)
 	lbdOrderDirty       bool  // True if order needs rebuilding
 	lbdOrderLastRebuild int   // Conflict count when order was last rebuilt
 
@@ -1319,11 +1320,10 @@ func (s *CDCLSolver) inprocessSubsumption() {
 		return
 	}
 
-	// OPTIMIZATION: Disable inprocess subsumption entirely - O(n×m) cost dominates on typical benchmarks
-	// Even with threshold checks, subsumption eventually runs and takes too long
-	// Subsumption during preprocessing is more effective anyway
+	// DISABLED: Soundness bug - subsumption removing too many clauses
+	// Debug needed to fix before re-enabling
 	if s.verbose {
-		fmt.Printf("c [inprocess] Skipping subsumption: disabled (too expensive)\n")
+		fmt.Printf("c [inprocess] Skipping subsumption: soundness bug under investigation\n")
 	}
 	return
 
@@ -1823,17 +1823,312 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 4. Hyper-binary resolution (cheap, adds binary clauses)
-	// DISABLED: Soundness bug - derives false empty clauses
-	// if s.conflicts%500 == 0 {
-	// 	s.hyperBinaryResolution()
-	// }
+	// 4. Variable elimination during search (expensive, run sparingly)
+	// Only on small instances where VE is effective and fast
+	// PHP instances benefit greatly from continuous variable elimination
+	// Trigger early on small instances (< 100 vars) to eliminate variables quickly
+	if s.cnf.NumVars < 100 && s.conflicts == 5 {
+		s.inprocessVariableElimination()
+	} else if s.conflicts%2000 == 0 && s.cnf.NumVars < 500 && s.cnf.NumClauses < 2000 {
+		s.inprocessVariableElimination()
+	}
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	// 5. Pure literal elimination during search (safe, assigns variables appearing in one polarity)
+	// Can create cascade: assigning pure literals may make other variables pure
+	if s.cnf.NumVars < 500 {
+		s.inprocessPureLiteralElimination()
+	}
+	if time.Since(startTime) > timeLimit {
+		return
+	}
 
 	removed := initialClauses - s.cnf.NumClauses
 	if s.verbose && removed != 0 {
 		elapsed := time.Since(startTime)
 		fmt.Printf("c [inprocess] Inprocessing complete: removed %d clauses in %.1fms\n", removed, float64(elapsed.Nanoseconds())/1e6)
 	}
+}
+
+// inprocessVariableElimination performs lightweight variable elimination during search
+// Lighter version of variableElimination() with shorter time limit and fewer iterations
+// Only eliminates variables with positive deficiency (net clause reduction)
+// Does NOT track eliminated variables for model reconstruction (too complex during search)
+func (s *CDCLSolver) inprocessVariableElimination() {
+	if s.verbose {
+		fmt.Printf("c [inprocess] Variable elimination during search: %d vars, %d clauses, maxOcc=%d, maxRes=%d\n",
+			s.cnf.NumVars, s.cnf.NumClauses, s.varElimMaxOccurrences, s.varElimMaxResolventSize)
+	}
+
+	startTime := time.Now()
+	timeLimit := 100 * time.Millisecond // Shorter time limit for inprocessing
+	maxIters := 10 // Fewer iterations than preprocessing
+	eliminatedCount := 0
+
+	for iter := 0; iter < maxIters; iter++ {
+		if time.Since(startTime) > timeLimit {
+			break
+		}
+
+		// Count occurrences
+		posCount := make([]int, s.cnf.NumVars)
+		negCount := make([]int, s.cnf.NumVars)
+		posClauses := make(map[uint32][]int)
+		negClauses := make(map[uint32][]int)
+
+		for clauseIdx, clause := range s.cnf.Clauses {
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if lit.IsNegated() {
+					negCount[varIdx]++
+					negClauses[varIdx] = append(negClauses[varIdx], clauseIdx)
+				} else {
+					posCount[varIdx]++
+					posClauses[varIdx] = append(posClauses[varIdx], clauseIdx)
+				}
+			}
+		}
+
+		// Find best eliminatable variable
+		bestVar := uint32(0)
+		bestResolventSize := s.varElimMaxResolventSize + 1
+		bestDeficiency := -1000.0 // Allow elimination with large clause blowup (MiniSat-style)
+		hasEliminatable := false
+
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			posOcc := posCount[varIdx]
+			negOcc := negCount[varIdx]
+
+			if posOcc == 0 || negOcc == 0 {
+				continue
+			}
+
+			totalOcc := posOcc + negOcc
+			// For small instances (< 50 vars), allow eliminating variables with many occurrences
+			maxOcc := s.varElimMaxOccurrences
+			if s.cnf.NumVars < 50 {
+				maxOcc = 1000 // Allow eliminating high-occurrence variables on small instances
+			}
+			if totalOcc > maxOcc {
+				if s.verbose && iter == 0 && varIdx < 5 {
+					fmt.Printf("c [inprocess] VE: var %d skipped (totalOcc=%d > maxOcc=%d)\n", varIdx, totalOcc, maxOcc)
+				}
+				continue
+			}
+
+			resolventSize := posOcc * negOcc
+
+			// For small instances (< 50 vars), be very aggressive - allow much larger resolvents
+			maxResolvent := s.varElimMaxResolventSize
+			if s.cnf.NumVars < 50 {
+				maxResolvent = 1000 // Allow much larger resolvents on small instances (MiniSat-style)
+			}
+			if resolventSize > maxResolvent {
+				if s.verbose && iter == 0 && varIdx < 5 {
+					fmt.Printf("c [inprocess] VE: var %d skipped (resolventSize=%d > maxResolvent=%d)\n", varIdx, resolventSize, maxResolvent)
+				}
+				continue
+			}
+
+			deficiency := float64(posOcc + negOcc) - float64(resolventSize)
+
+			if s.verbose && iter == 0 && varIdx < 5 {
+				fmt.Printf("c [inprocess] VE: var %d pos=%d neg=%d total=%d resolvent=%d deficiency=%.1f\n",
+					varIdx, posOcc, negOcc, totalOcc, resolventSize, deficiency)
+			}
+
+			if resolventSize < bestResolventSize ||
+				(resolventSize == bestResolventSize && deficiency > bestDeficiency) {
+				bestVar = varIdx
+				bestResolventSize = resolventSize
+				bestDeficiency = deficiency
+				hasEliminatable = true
+			}
+		}
+
+		if !hasEliminatable {
+			if s.verbose && iter == 0 {
+				fmt.Printf("c [inprocess] VE: no eliminatable variables found\n")
+			}
+			break
+		}
+
+		if s.verbose && iter == 0 {
+			fmt.Printf("c [inprocess] VE: checking %d vars, bestVar=%d, bestResolvent=%d, bestDeficiency=%.1f\n",
+				s.cnf.NumVars, bestVar, bestResolventSize, bestDeficiency)
+		}
+
+		// Eliminate the variable
+		varIdx := bestVar
+		posCls := posClauses[varIdx]
+		negCls := negClauses[varIdx]
+
+		// Generate resolvents
+		newResolvents := make([]*cnf.Clause, 0)
+		resolventHashes := make(map[uint64]bool)
+
+		for _, pIdx := range posCls {
+			for _, nIdx := range negCls {
+				posClause := s.cnf.Clauses[pIdx]
+				negClause := s.cnf.Clauses[nIdx]
+
+				resolvent := s.resolveOnVarElim(posClause, negClause, varIdx)
+				if resolvent != nil {
+					if len(resolvent.Literals) == 0 {
+						// Empty clause found - should not happen during search on satisfiable instances
+						return
+					}
+
+					if s.isTautology(resolvent) {
+						continue
+					}
+
+					hash := s.clauseHash(resolvent)
+					if !resolventHashes[hash] {
+						resolventHashes[hash] = true
+						newResolvents = append(newResolvents, resolvent)
+					}
+				}
+			}
+		}
+
+		// Remove old clauses and add resolvents
+		// Mark clauses for removal (those containing varIdx)
+		toRemove := make(map[int]bool)
+		for _, idx := range posCls {
+			toRemove[idx] = true
+		}
+		for _, idx := range negCls {
+			toRemove[idx] = true
+		}
+
+		// Build new clause list
+		newClauses := make([]cnf.Clause, 0, s.cnf.NumClauses-len(posCls)-len(negCls)+len(newResolvents))
+		for i, clause := range s.cnf.Clauses {
+			if !toRemove[i] {
+				newClauses = append(newClauses, clause)
+			}
+		}
+		for _, resolvent := range newResolvents {
+			newClauses = append(newClauses, *resolvent)
+		}
+
+		s.cnf.Clauses = newClauses
+		s.cnf.NumClauses = len(newClauses)
+		s.cnf.RebuildLiteralPool()
+
+		eliminatedCount++
+	}
+
+	if s.verbose && eliminatedCount > 0 {
+		elapsed := time.Since(startTime)
+		fmt.Printf("c [inprocess] VE eliminated %d variables in %.1fms, now %d clauses\n",
+			eliminatedCount, float64(elapsed.Nanoseconds())/1e6, s.cnf.NumClauses)
+	}
+}
+
+// inprocessPureLiteralElimination performs pure literal elimination during search
+// Assigns variables appearing in only one polarity, removes satisfied clauses
+// Can create cascade: assigning pure literals may make other variables pure
+// Does NOT track eliminated variables for model reconstruction (too complex during search)
+func (s *CDCLSolver) inprocessPureLiteralElimination() {
+	if s.verbose {
+		fmt.Printf("c [inprocess] Pure literal elimination during search: %d vars, %d clauses\n",
+			s.cnf.NumVars, s.cnf.NumClauses)
+	}
+
+	startTime := time.Now()
+	timeLimit := 50 * time.Millisecond // Short time limit for inprocessing
+	assignedCount := 0
+
+	changed := true
+	for changed {
+		if time.Since(startTime) > timeLimit {
+			break
+		}
+
+		changed = false
+
+		// Scan for pure literals
+		hasPositive := make([]bool, s.cnf.NumVars)
+		hasNegative := make([]bool, s.cnf.NumVars)
+
+		for _, clause := range s.cnf.Clauses {
+			for _, lit := range clause.Literals {
+				varIdx := lit.Var()
+				if lit.IsNegated() {
+					hasNegative[varIdx] = true
+				} else {
+					hasPositive[varIdx] = true
+				}
+			}
+		}
+
+		// Assign pure literals
+		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
+			isPure := false
+			pureValue := false
+
+			if hasPositive[varIdx] && !hasNegative[varIdx] {
+				isPure = true
+				pureValue = true
+			} else if hasNegative[varIdx] && !hasPositive[varIdx] {
+				isPure = true
+				pureValue = false
+			}
+
+			if isPure {
+				// Assign the pure literal
+				s.assignments[varIdx] = Assignment{
+					Value: pureValue,
+					Level: 1,
+				}
+				changed = true
+				assignedCount++
+
+				// Remove satisfied clauses
+				newClauses := make([]cnf.Clause, 0, s.cnf.NumClauses)
+				for _, clause := range s.cnf.Clauses {
+					satisfied := false
+					for _, lit := range clause.Literals {
+						if lit.Var() == varIdx {
+							if (lit.IsNegated() && !pureValue) || (!lit.IsNegated() && pureValue) {
+								satisfied = true
+								break
+							}
+						}
+					}
+					if !satisfied {
+						newClauses = append(newClauses, clause)
+					}
+				}
+				s.cnf.Clauses = newClauses
+				s.cnf.NumClauses = len(newClauses)
+
+				if s.verbose {
+					fmt.Printf("c [inprocess] Pure literal: assigned var %d = %v, now %d clauses\n",
+						varIdx, pureValue, s.cnf.NumClauses)
+				}
+			}
+		}
+	}
+
+	if s.verbose && assignedCount > 0 {
+		elapsed := time.Since(startTime)
+		fmt.Printf("c [inprocess] Pure literal eliminated %d variables in %.1fms, now %d clauses\n",
+			assignedCount, float64(elapsed.Nanoseconds())/1e6, s.cnf.NumClauses)
+	}
+}
+
+// clauseHash computes a simple hash for a clause (for duplicate detection)
+func (s *CDCLSolver) clauseHash(clause *cnf.Clause) uint64 {
+	hash := uint64(len(clause.Literals))
+	for _, lit := range clause.Literals {
+		hash = hash*31 + uint64(lit)
+	}
+	return hash
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
@@ -2716,9 +3011,14 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			s.backjumpLevel = 0
 
 			// Trigger inprocessing at configured interval
-			if s.conflicts > 0 && s.conflicts%s.inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
+			// For small instances (< 100 vars), trigger earlier but not too frequently
+			inprocessingInterval := s.inprocessingInterval
+			if s.cnf.NumVars < 100 {
+				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
+			}
+			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
 				if s.verbose {
-					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, %d clauses)\n", s.conflicts, s.inprocessingInterval, s.cnf.NumClauses)
+					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
 				s.inprocessing()
 			}
@@ -2822,8 +3122,18 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			}
 			s.backjumpLevel = 0
 
-			// Inprocessing disabled for now - overhead outweighs benefits on PHP instances
-			// TODO: Re-enable with better heuristics for when to run inprocessing
+			// Trigger inprocessing at configured interval
+			// For small instances (< 100 vars), trigger earlier but not too frequently
+			inprocessingInterval := s.inprocessingInterval
+			if s.cnf.NumVars < 100 {
+				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
+			}
+			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
+				if s.verbose {
+					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
+				}
+				s.inprocessing()
+			}
 
 			if s.shouldRestart() {
 				s.restart()
@@ -3791,6 +4101,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
+	// CRITICAL: Check for empty learned clause (UNSAT)
+	// This happens when 1-UIP analysis resolves away all literals
+	if len(s.tmpLearnedLits) == 0 {
+		if s.verbose {
+			fmt.Printf("c [learnClause] Empty learned clause at conflict %d - UNSAT\n", s.conflicts)
+		}
+		// Mark for immediate UNSAT detection
+		s.emptyClauseFound = true
+		return 0 // Will trigger UNSAT in backtrack
+	}
+
 	// If 1-UIP didn't reduce to exactly 1 literal at current level, handle it
 	if litsAtCurrentLevel != 1 {
 		if s.level == 1 {
@@ -4304,6 +4625,14 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 // This skips exploring the entire subtree under (x=1, y=1) at level 2,
 // which would all lead to the same conflict.
 func (s *CDCLSolver) backtrack() bool {
+	// Check for empty learned clause (UNSAT detected during 1-UIP analysis)
+	if s.emptyClauseFound {
+		if s.verbose {
+			fmt.Printf("c [BACKTRACK] Empty clause found - returning UNSAT\n")
+		}
+		return false
+	}
+
 	if len(s.trailHead) <= 1 {
 		if s.verbose {
 			fmt.Printf("c [BACKTRACK] Returning false: trailHead len=%d\n", len(s.trailHead))
