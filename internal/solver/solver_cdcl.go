@@ -89,7 +89,6 @@ type CDCLSolver struct {
 	cnf                 *cnf.CNF
 	assignments         []Assignment
 	trail               []int
-	trailLevel          []int  // Cache of assignment levels for trail elements
 	varLevel            []int  // Cache of variable levels (avoids random assignments[].Level access)
 	trailHead           []int
 	level               int
@@ -280,7 +279,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		cnf:                 formula,
 		assignments:         make([]Assignment, formula.NumVars),
 		trail:               make([]int, 0, formula.NumVars),
-		trailLevel:          make([]int, 0, formula.NumVars),
 		varLevel:            make([]int, formula.NumVars),
 		trailHead:           make([]int, 1),
 		qhead:               0,
@@ -966,7 +964,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		s.varLevel[i] = 0
 	}
 	s.trail = s.trail[:0]
-	s.trailLevel = s.trailLevel[:0]
 	s.trailHead = []int{0}
 	s.level = 0
 	s.qhead = 0
@@ -1599,7 +1596,6 @@ func (s *CDCLSolver) restart() {
 
 	// Clear trail and assignments
 	s.trail = s.trail[:0]
-	s.trailLevel = s.trailLevel[:0]
 	s.trailHead = s.trailHead[:1]
 	s.qhead = 0 // Reset qhead since trail is empty
 	s.level = 0
@@ -1669,7 +1665,6 @@ func (s *CDCLSolver) restart() {
 				}
 				s.varLevel[varIdx] = 1
 				s.trail = append(s.trail, int(varIdx))
-				s.trailLevel = append(s.trailLevel, 1)
 				s.implication[varIdx] = clause
 			}
 		}
@@ -1893,7 +1888,6 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				}
 				s.varLevel[varIdx] = 1
 				s.trail = append(s.trail, int(varIdx))
-				s.trailLevel = append(s.trailLevel, 1)
 				changed = true
 				// Don't modify clauses - just track assignments in trail
 			}
@@ -1941,7 +1935,6 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 		}
 		s.varLevel[varIdx] = s.level
 		s.trail = append(s.trail, int(varIdx))
-		s.trailLevel = append(s.trailLevel, s.level)
 		s.implication[varIdx] = clause
 
 		if s.verbose {
@@ -3428,7 +3421,6 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Claus
 	}
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
-	s.trailLevel = append(s.trailLevel, level)
 	s.implication[varIdx] = clause
 
 	// Save the phase (polarity) for ALL assignments (phase saving heuristic)
@@ -3471,7 +3463,6 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 	}
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
-	s.trailLevel = append(s.trailLevel, level)
 
 	// Store clause pointer directly - O(1), no lookup needed!
 	s.implication[varIdx] = clause
@@ -3642,7 +3633,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// This avoids reallocations during resolution when new literals are added
 	currentLevelCount := 0
 	for i := len(s.trail) - 1; i >= 0; i-- {
-		if s.trailLevel[i] == s.level {
+		if s.varLevel[uint32(s.trail[i])] == s.level {
 			currentLevelCount++
 		}
 	}
@@ -3657,7 +3648,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// This avoids scanning lower-level trail elements on every resolution step
 	// Only done once per conflict, saves O(trail_size) work per resolution
 	for i := len(s.trail) - 1; i >= 0; i-- {
-		if s.trailLevel[i] == s.level {
+		if s.varLevel[uint32(s.trail[i])] == s.level {
 			varIdx := uint32(s.trail[i])
 			if s.tmpLiteralInClause[varIdx] {
 				// Get reason clause size for potential sorting heuristics
@@ -4358,7 +4349,6 @@ func (s *CDCLSolver) backtrack() bool {
 					s.implication[varIdx] = nil
 				}
 				s.trail = s.trail[:decisionPoint+1]
-				s.trailLevel = s.trailLevel[:decisionPoint+1]
 				s.qhead = decisionPoint + 1
 				s.assignments[decisionVar] = Assignment{
 					Value: !decisionValue,
@@ -4400,7 +4390,6 @@ func (s *CDCLSolver) backtrack() bool {
 		s.implication[varIdx] = nil
 	}
 	s.trail = s.trail[:decisionPoint]
-	s.trailLevel = s.trailLevel[:decisionPoint]
 	// Reset qhead to decisionPoint - the flipped decision needs to be propagated
 	// and all subsequent trail elements have been cleared
 	s.qhead = decisionPoint
@@ -4419,7 +4408,6 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 	s.varLevel[decisionVar] = bjLevel
 	s.trail = append(s.trail, int(decisionVar))
-	s.trailLevel = append(s.trailLevel, bjLevel)
 
 	// CRITICAL FIX: Update trailHead[bjLevel] to point to the flipped decision
 	// Without this, 1-UIP analysis uses wrong trail range and learns duplicate clauses
@@ -4536,7 +4524,6 @@ func (s *CDCLSolver) Trail() []int {
 // ResetTrail resets the trail for benchmarking
 func (s *CDCLSolver) ResetTrail() {
 	s.trail = s.trail[:0]
-	s.trailLevel = s.trailLevel[:0]
 	s.level = 0
 	for i := range s.assignments {
 		s.assignments[i].Level = 0
