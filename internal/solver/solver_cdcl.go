@@ -1859,7 +1859,9 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 5. Pure literal elimination DISABLED - unsound with eliminated variables from preprocessing
+	// 5. Pure literal elimination DISABLED - unsound for UNSAT instances
+	// Pure literals during search are artifacts of partial clause database
+	// Assigning them can remove paths to UNSAT proofs
 	// s.inprocessPureLiteralElimination()
 	if time.Since(startTime) > timeLimit {
 		return
@@ -3634,6 +3636,17 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 
 // selectRandomUnassigned selects a random unassigned variable
 // OPTIMIZATION: Uses persistent tmpUnassignedVars buffer to avoid allocation
+
+// isEliminatedVar checks if a variable was eliminated during preprocessing
+func (s *CDCLSolver) isEliminatedVar(varIdx uint32) bool {
+	for _, elimVar := range s.eliminatedVars {
+		if elimVar == varIdx {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 	// Reuse persistent buffer - no allocation!
 	s.tmpUnassignedVars = s.tmpUnassignedVars[:0]
