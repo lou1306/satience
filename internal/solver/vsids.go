@@ -462,6 +462,7 @@ func (v *VSIDS) bump(varIdx uint32) {
 // Used for variables in conflict clauses to make them more likely to be chosen
 func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 	v.activity[varIdx] += amount
+	v.heapValid = false // Invalidate heap after modifying activity
 }
 
 // bumpClause increases activity for all variables in a clause
