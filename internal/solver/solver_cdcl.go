@@ -869,9 +869,12 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	initialClauses := s.cnf.NumClauses
 
 	// For large instances, use fewer passes and skip expensive techniques
-	maxPasses := 5
+	maxPasses := 3
 	if isLargeInstance {
-		maxPasses = 2 // Fewer passes on large instances
+		maxPasses = 2
+	}
+	if s.cnf.NumVars < 50 {
+		maxPasses = 10 // More passes for small instances to eliminate variable chains
 	}
 
 	// Increase to 5 passes for more thorough preprocessing
@@ -912,12 +915,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			oldMaxResolvent := s.varElimMaxResolventSize
 			oldMaxOcc := s.varElimMaxOccurrences
 			oldMinDef := s.varElimMinDeficiency
-			// Conservative preprocessing VE - only eliminate with positive deficiency
-			// Let inprocessing VE during search handle aggressive elimination (MiniSat-style)
+			// Aggressive preprocessing VE (MiniSat-style) - allow negative deficiency
 			if s.cnf.NumVars < 50 {
-				s.varElimMaxResolventSize = 20000
-				s.varElimMaxOccurrences = 10000
-				s.varElimMinDeficiency = 1.0 // Require net clause reduction in preprocessing
+				s.varElimMaxResolventSize = 100000
+				s.varElimMaxOccurrences = 100000
+				s.varElimMinDeficiency = -10000.0
 			}
 			veResult := s.variableElimination()
 			// Restore old thresholds
@@ -949,7 +951,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 		// Subsumption elimination - skip on medium/large instances (O(n^2))
 		// Threshold lowered from 50K to 1K clauses - subsumption overhead dominates on typical benchmarks
-		if preprocessConfig.EnableSubsumption && !isLargeInstance && s.cnf.NumClauses < 1000 {
+		// Always run subsumption for small instances after VE to clean up resolvents
+		if preprocessConfig.EnableSubsumption && !isLargeInstance && (s.cnf.NumVars < 50 || s.cnf.NumClauses < 1000) {
 			s.subsumptionElimination()
 		}
 
