@@ -4642,39 +4642,71 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", s.normalClauseCount, maxNormalClauses)
 			}
 
-			// Mark clauses for deletion (tombstone approach - don't rebuild arrays)
-			deletedCount := 0
+			// OPTIMIZATION: Use sort-based selection instead of O(n²) age ranking
+			// Collect all normal clause indices with their ages
+			type clauseAgeInfo struct {
+				idx  int
+				age  int
+			}
+			normalClauses := make([]clauseAgeInfo, 0, s.normalClauseCount)
 			for i := 0; i < s.learnedCapacity; i++ {
 				if s.learnedSizes[i] == 0 {
-					continue // Already deleted
+					continue // Skip deleted
 				}
 				if s.clauseLBD[i] <= 3 {
-					continue // Keep all glue clauses
+					continue // Skip glue clauses
 				}
-				// Delete older 50% of normal clauses
-				ageRank := 0
-				for j := 0; j < s.learnedCapacity; j++ {
-					if s.learnedSizes[j] > 0 && s.clauseLBD[j] > 3 && s.clauseAge[j] < s.clauseAge[i] {
-						ageRank++
+				normalClauses = append(normalClauses, clauseAgeInfo{
+					idx: i,
+					age: s.currentAge - s.clauseAge[i],
+				})
+			}
+			
+			// Sort by age (oldest first = highest age value)
+			// Using simple insertion sort for small arrays, falls back to sort.Slice for larger
+			if len(normalClauses) <= 32 {
+				// Insertion sort for small arrays (faster than sort.Slice for n < 32)
+				for i := 1; i < len(normalClauses); i++ {
+					key := normalClauses[i]
+					j := i - 1
+					for j >= 0 && normalClauses[j].age < key.age {
+						normalClauses[j+1] = normalClauses[j]
+						j--
 					}
+					normalClauses[j+1] = key
 				}
-				if ageRank >= s.normalClauseCount/2 {
-					// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
-					s.removeLearnedClauseWatches(i)
-					
-					// Mark for deletion and track free literal slot
-					offset := s.learnedOffsets[i]
-					size := s.learnedSizes[i]
-					s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
-					
-					s.learnedSizes[i] = 0
-					s.clauseActivity[i] = 0
-					s.clauseAge[i] = 0
-					s.clauseLBD[i] = 999999
-					s.clauseUseCount[i] = 0
-					s.clausePropCount[i] = 0
-					deletedCount++
-				}
+			} else {
+				// Use sort.Slice for larger arrays
+				sort.Slice(normalClauses, func(i, j int) bool {
+					return normalClauses[i].age > normalClauses[j].age // Oldest first
+				})
+			}
+			
+			// Delete oldest 50% of normal clauses
+			toDelete := len(normalClauses) / 2
+			if toDelete > len(normalClauses) {
+				toDelete = len(normalClauses)
+			}
+			
+			deletedCount := 0
+			for i := 0; i < toDelete; i++ {
+				idx := normalClauses[i].idx
+				
+				// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
+				s.removeLearnedClauseWatches(idx)
+				
+				// Mark for deletion and track free literal slot
+				offset := s.learnedOffsets[idx]
+				size := s.learnedSizes[idx]
+				s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
+				
+				s.learnedSizes[idx] = 0
+				s.clauseActivity[idx] = 0
+				s.clauseAge[idx] = 0
+				s.clauseLBD[idx] = 999999
+				s.clauseUseCount[idx] = 0
+				s.clausePropCount[idx] = 0
+				deletedCount++
 			}
 			
 			s.normalClauseCount -= deletedCount
