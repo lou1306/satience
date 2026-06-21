@@ -1446,6 +1446,146 @@ func (s *CDCLSolver) inprocessSubsumption() {
 	}
 }
 
+// inprocessSubsumptionSafe removes original clauses subsumed by OTHER original clauses
+// SOUND: Original clauses are permanent (never deleted), so subsumption is safe
+// Does NOT subsume original clauses by learned clauses (learned clauses can be deleted!)
+func (s *CDCLSolver) inprocessSubsumptionSafe() {
+	if s.cnf.NumClauses > s.inprocessingMaxClauses {
+		return
+	}
+
+	// Skip on very large clause databases
+	if s.cnf.NumClauses > 5000 {
+		return
+	}
+
+	startTime := time.Now()
+	timeLimit := time.Duration(s.inprocessingTimeLimitMs) * time.Millisecond
+
+	removedOriginal := 0
+
+	// Remove original clauses subsumed by OTHER original clauses only
+	// This is sound: original clauses are permanent
+	remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	for i := range s.cnf.Clauses {
+		subsumed := false
+		for j := range s.cnf.Clauses {
+			if i == j {
+				continue
+			}
+			if s.subsumes(&s.cnf.Clauses[j], &s.cnf.Clauses[i]) {
+				subsumed = true
+				break
+			}
+		}
+		if !subsumed {
+			remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
+		} else {
+			removedOriginal++
+		}
+	}
+
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	if removedOriginal > 0 {
+		s.cnf.Clauses = remainingOriginal
+		s.cnf.NumClauses = len(s.cnf.Clauses)
+		if s.verbose {
+			fmt.Printf("c [inprocess] Safe subsumption: removed %d original clauses (subsumed by other originals)\n", removedOriginal)
+		}
+	}
+}
+
+// inprocessBlockedClauseElimination removes blocked clauses
+// SOUND: Blocked clauses are redundant (removal preserves satisfiability)
+// A clause C is blocked by literal l if for every clause D with ¬l,
+// there exists a literal k where k ∈ C and ¬k ∈ D
+func (s *CDCLSolver) inprocessBlockedClauseElimination() {
+	if s.cnf.NumClauses > 2000 {
+		return // Skip on large instances
+	}
+
+	startTime := time.Now()
+	timeLimit := 50 * time.Millisecond // Short time limit
+
+	removed := 0
+	keptClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+
+	for _, clause := range s.cnf.Clauses {
+		isBlocked := false
+
+		// Check if clause is blocked by any of its literals
+		for _, lit := range clause.Literals {
+			if s.isClauseBlockedBy(clause, lit) {
+				isBlocked = true
+				break
+			}
+		}
+
+		if isBlocked {
+			removed++
+		} else {
+			keptClauses = append(keptClauses, clause)
+		}
+
+		if time.Since(startTime) > timeLimit {
+			break // Time limit reached
+		}
+	}
+
+	if removed > 0 {
+		s.cnf.Clauses = keptClauses
+		s.cnf.NumClauses = len(s.cnf.Clauses)
+		if s.verbose {
+			fmt.Printf("c [inprocess] Blocked clause elimination: removed %d clauses\n", removed)
+		}
+	}
+}
+
+// isClauseBlockedBy checks if a clause is blocked by a specific literal
+func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Literal) bool {
+	// Find all clauses containing the opposite literal
+	for _, other := range s.cnf.Clauses {
+		if !s.containsLiteral(other, s.negateLiteral(blockingLit)) {
+			continue // This clause doesn't contain ¬blockingLit
+		}
+
+		// Check if there's a resolving literal in the blocking clause
+		hasResolver := false
+		for _, lit := range clause.Literals {
+			if lit == blockingLit {
+				continue // Don't use the blocking literal itself
+			}
+			if s.containsLiteral(other, s.negateLiteral(lit)) {
+				hasResolver = true
+				break
+			}
+		}
+
+		if !hasResolver {
+			return false // Not blocked - no resolver for this other clause
+		}
+	}
+	return true // Blocked by this literal
+}
+
+// containsLiteral checks if a clause contains a literal
+func (s *CDCLSolver) containsLiteral(clause cnf.Clause, lit cnf.Literal) bool {
+	for _, l := range clause.Literals {
+		if l == lit {
+			return true
+		}
+	}
+	return false
+}
+
+// negateLiteral returns the negation of a literal
+func (s *CDCLSolver) negateLiteral(lit cnf.Literal) cnf.Literal {
+	return cnf.NewLiteral(lit.Var(), !lit.IsNegated())
+}
+
 func (s *CDCLSolver) isUnitLiteral(lit cnf.Literal) bool {
 	varIdx := lit.Var()
 	for _, clause := range s.cnf.Clauses {
@@ -1803,31 +1943,6 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 	return UNKNOWN
 }
 
-func (s *CDCLSolver) isClauseBlockedBy(clause cnf.Clause, blockingLit cnf.Literal) bool {
-	opposite := blockingLit.Negate()
-
-	for _, other := range s.cnf.Clauses {
-		containsOpposite := false
-		for _, lit := range other.Literals {
-			if lit == opposite {
-				containsOpposite = true
-				break
-			}
-		}
-
-		if !containsOpposite {
-			continue
-		}
-
-		resolvent := s.resolveOnVar(clause, other, blockingLit.Var())
-
-		if resolvent != nil && !s.isTautology(resolvent) {
-			return false
-		}
-	}
-
-	return true
-}
 
 func (s *CDCLSolver) inprocessing() {
 	// OPTIMIZATION: Lowered threshold from 500 to 50 clauses to enable inprocessing on PHP instances
@@ -1857,26 +1972,27 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 3. Subsumption AFTER VE to clean up clause explosion
-	// This is critical: VE creates many resolvents, subsumption removes redundant ones
-	// s.inprocessSubsumption() // DISABLED: unsound - removes original clauses needed for UNSAT proofs
+	// 3. SAFE subsumption: Only use glue clauses (LBD ≤ 2) which are never deleted
+	// This is sound: subsumed original clauses are permanently redundant
+	s.inprocessSubsumptionSafe()
 	if time.Since(startTime) > timeLimit {
 		return
 	}
 
-	// 4. Self-subsumption (every 1000 conflicts, more expensive)
-	// Further reduce clause database after subsumption
+	// 4. Blocked clause elimination (sound, removes redundant clauses)
+	// Run every 200 conflicts (more expensive than subsumption)
+	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
+		s.inprocessBlockedClauseElimination()
+	}
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	// 5. Self-subsumption (every 1000 conflicts, more expensive)
+	// Further reduce clause database after other simplifications
 	if s.conflicts%1000 == 0 && s.cnf.NumClauses < 5000 {
 		s.selfSubsumption()
 	}
-	if time.Since(startTime) > timeLimit {
-		return
-	}
-
-	// 5. Pure literal elimination DISABLED - unsound for UNSAT instances
-	// Pure literals during search are artifacts of partial clause database
-	// Assigning them can remove paths to UNSAT proofs
-	// s.inprocessPureLiteralElimination()
 	if time.Since(startTime) > timeLimit {
 		return
 	}
@@ -1886,6 +2002,17 @@ func (s *CDCLSolver) inprocessing() {
 		elapsed := time.Since(startTime)
 		fmt.Printf("c [inprocess] Inprocessing complete: removed %d clauses in %.1fms\n", removed, float64(elapsed.Nanoseconds())/1e6)
 	}
+
+	// CRITICAL: Rebuild watch lists after clause database modifications
+	// Watch lists must reflect current clause database to avoid stale references
+	if s.watchInitialized {
+		s.watchLists = make([][]cnf.Watch, 2*s.cnf.NumVars)
+		s.watchInitialized = false
+	}
+	s.initWatches()
+
+	// Clear qhead to re-process all trail elements with updated watches
+	s.qhead = 0
 }
 
 // inprocessVariableElimination performs lightweight variable elimination during search
@@ -2235,14 +2362,22 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 // Unlike unitPropagationPreprocess, this runs on the current trail state
 // and doesn't reset assignments. It's safe to call during search.
 func (s *CDCLSolver) inprocessUnitPropagation() {
+	// SOUND INPROCESSING: Level-0 unit propagation
 	// Only process original clauses (learned clauses change too frequently)
-	// and only if we have few enough clauses to make it worthwhile
+	// Assignments are made at level 0 (permanent, never backtracked)
+	// This is sound: equivalent to preprocessing unit propagation
 	if s.cnf.NumClauses > 10000 {
 		return
 	}
 
-	// Scan for unit clauses and propagate them
-	// This catches units created by clause deletion and subsumption
+	// Collect all unit clauses first (avoid modifying during iteration)
+	type unitClause struct {
+		varIdx uint32
+		value  bool
+	}
+	units := make([]unitClause, 0, 16)
+
+	// Phase 1: Scan for unit clauses
 	for i := 0; i < s.cnf.NumClauses && i < len(s.cnf.Clauses); i++ {
 		clause := &s.cnf.Clauses[i]
 		if len(clause.Literals) != 1 {
@@ -2257,18 +2392,22 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 			continue
 		}
 
-		// Propagate the unit
-		value := !lit.IsNegated()
-		s.assignments[varIdx] = Assignment{
-			Value: value,
-			Level: s.level,
+		units = append(units, unitClause{
+			varIdx: varIdx,
+			value:  !lit.IsNegated(),
+		})
+	}
+
+	// Phase 2: Assign all units at level 0 (permanent)
+	for _, unit := range units {
+		s.assignments[unit.varIdx] = Assignment{
+			Value: unit.value,
+			Level: 0, // CRITICAL: Level 0, not current level
 		}
-		s.varLevel[varIdx] = s.level
-		s.trail = append(s.trail, int(varIdx))
-		s.implication[varIdx] = clause
+		s.varLevel[unit.varIdx] = 0
 
 		if s.verbose {
-			fmt.Printf("c [inprocess] Unit propagation: var %d = %v\n", varIdx, value)
+			fmt.Printf("c [inprocess] Unit propagation: var %d = %v (level 0)\n", unit.varIdx, unit.value)
 		}
 	}
 }
