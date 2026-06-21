@@ -908,10 +908,16 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 
 		// Variable elimination DISABLED - SOUNDNESS BUG
-		// VE is eliminating variables incorrectly, causing UNSAT instances to return SAT
-		// Bug found: php_7p_6h_unsat.cnf returns SAT with preprocessing, UNSAT without
-		// TODO: Debug variableElimination() function - likely issue with resolvent construction
-		// or definition tracking for model reconstruction
+		// Bug: Multi-pass VE produces incorrect definitions for model reconstruction
+		// When variables are eliminated in multiple passes, later eliminations don't
+		// properly account for variables eliminated in earlier passes.
+		// This causes eliminated variables to be reconstructed incorrectly,
+		// leading to models that don't satisfy the original formula.
+		//
+		// Example: php_8p_7h_unsat.cnf returns SAT (wrong) with VE, UNSAT (correct) without
+		//
+		// Fix requires: Track definition dependencies across elimination passes,
+		// or use single-pass VE with proper transitive definition tracking.
 		// clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
 		// if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
 		// 	if s.verbose {
@@ -2724,9 +2730,13 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 // CRITICAL: Processes one variable at a time and re-computes elimination candidates after each elimination
 func (s *CDCLSolver) variableElimination() SolveResult {
 	if s.verbose {
-		fmt.Printf("c [verbose] Variable elimination: starting with %d variables, %d clauses\n",
+		fmt.Printf("c [verbose] VE DEBUG: starting with %d variables, %d clauses\n",
 			s.cnf.NumVars, s.cnf.NumClauses)
 	}
+	
+
+
+
 
 	eliminatedCount := 0
 	clausesRemoved := 0
@@ -2918,6 +2928,11 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		s.varElimPolarity[varIdx] = true
 
 		s.eliminatedVars = append(s.eliminatedVars, varIdx)
+		
+		if s.verbose {
+			fmt.Printf("c [debug] Eliminating var %d (resolvent size=%d, deficiency=%.1f, pos=%d, neg=%d)\n",
+				varIdx, bestResolventSize, bestDeficiency, len(posCls), len(negCls))
+		}
 		// Assign eliminated variable so VSIDS does not select it
 		s.assignments[varIdx] = Assignment{
 			Value: s.varElimPolarity[varIdx],
@@ -2955,9 +2970,12 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 	}
 
 	if s.verbose && eliminatedCount > 0 {
-		fmt.Printf("c [verbose] Variable elimination: eliminated %d variables, removed %d clauses, %d clauses remaining\n",
+		fmt.Printf("c [VE DEBUG] Eliminated %d variables, removed %d clauses, %d clauses remaining\n",
 			eliminatedCount, clausesRemoved, s.cnf.NumClauses)
+
 	}
+	
+
 
 	return UNKNOWN
 }
