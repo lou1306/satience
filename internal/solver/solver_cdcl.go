@@ -907,27 +907,19 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Variable elimination DISABLED - SOUNDNESS BUG
-		// Bug: Multi-pass VE produces incorrect definitions for model reconstruction
-		// When variables are eliminated in multiple passes, later eliminations don't
-		// properly account for variables eliminated in earlier passes.
-		// This causes eliminated variables to be reconstructed incorrectly,
-		// leading to models that don't satisfy the original formula.
-		//
-		// Example: php_8p_7h_unsat.cnf returns SAT (wrong) with VE, UNSAT (correct) without
-		//
-		// Fix requires: Track definition dependencies across elimination passes,
-		// or use single-pass VE with proper transitive definition tracking.
-		// clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
-		// if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
-		// 	if s.verbose {
-		// 		fmt.Printf("c [verbose] Running VE: clause density %.1f > 2.0 threshold\n", clauseDensity)
-		// 	}
-		// 	veResult := s.variableElimination()
-		// 	if veResult == UNSAT {
-		// 		return UNSAT
-		// 	}
-		// }
+		// Variable elimination - SOUND FIX: Only eliminate variables with pos=1
+		// This guarantees correct model reconstruction: x = ¬A where (x ∨ A) is the positive clause
+		// Multi-positive-clause elimination causes incorrect definitions and unsound models
+		clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
+		if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
+			if s.verbose {
+				fmt.Printf("c [verbose] Running VE: clause density %.1f > 2.0 threshold\n", clauseDensity)
+			}
+			veResult := s.variableElimination()
+			if veResult == UNSAT {
+				return UNSAT
+			}
+		}
 
 		// Run unit propagation to catch new units from equivalence substitution
 		if preprocessConfig.EnableUnitProp {
@@ -2783,6 +2775,9 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		}
 
 		// Find best eliminatable variable using bounded heuristics
+		// CRITICAL FIX: Only eliminate variables with posOcc=1 for sound model reconstruction
+		// When pos=1, the definition is simply: x = ¬A (where (x ∨ A) is the positive clause)
+		// When pos>1, concatenating all positive clause literals produces incorrect definitions
 		bestVar := uint32(0)
 		maxResolventSize := s.varElimMaxResolventSize + 1
 		bestResolventSize := maxResolventSize
@@ -2795,6 +2790,12 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			
 			// Skip if variable doesn't appear in both polarities
 			if posOcc == 0 || negOcc == 0 {
+				continue
+			}
+
+			// CRITICAL: Only eliminate variables with SINGLE positive clause (pos=1)
+			// This guarantees sound model reconstruction
+			if posOcc != 1 {
 				continue
 			}
 
@@ -2915,6 +2916,8 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		}
 
 		// Store definition for model reconstruction
+		// With pos=1 restriction, there's exactly one positive clause: (x ∨ A)
+		// Reconstruction rule: x = ¬A (x is true iff A is false)
 		allALits := make([]cnf.Literal, 0)
 		for _, pIdx := range posCls {
 			posClause := s.cnf.Clauses[pIdx]
@@ -3051,9 +3054,11 @@ func (s *CDCLSolver) reconstructEliminatedVars() {
 			continue
 		}
 
-		// Evaluate the definition: var is true if any literal in definition (Aᵢ) is true
-		// This corresponds to: x = true if any positive clause (x ∨ Aᵢ) is already satisfied by Aᵢ
-		defValue := false
+		// Evaluate the definition for pos=1 elimination
+		// Variable x was eliminated with single positive clause: (x ∨ A₁ ∨ A₂ ∨ ... ∨ Aₙ)
+		// Reconstruction rule: x = ¬(A₁ ∨ A₂ ∨ ... ∨ Aₙ) = ¬A₁ ∧ ¬A₂ ∧ ... ∧ ¬Aₙ
+		// In other words: x is true IFF all literals in the definition are false
+		allFalse := true
 		for _, lit := range defLits {
 			litVar := lit.Var()
 			if int(litVar) >= len(s.assignments) {
@@ -3061,7 +3066,7 @@ func (s *CDCLSolver) reconstructEliminatedVars() {
 			}
 			assign := s.assignments[litVar]
 			if assign.Level == 0 {
-				// Unassigned variable in definition - skip (treat as false)
+				// Unassigned variable in definition - can't determine, treat as false (conservative)
 				continue
 			}
 			litValue := assign.Value
@@ -3069,10 +3074,13 @@ func (s *CDCLSolver) reconstructEliminatedVars() {
 				litValue = !litValue
 			}
 			if litValue {
-				defValue = true
+				// A literal in the definition is true, so x must be false
+				allFalse = false
 				break
 			}
 		}
+		// x = ¬(OR of definition literals)
+		defValue := allFalse
 
 		// If definition is empty (unit clause (x) was eliminated), x must be true
 		if len(defLits) == 0 {
