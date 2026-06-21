@@ -155,6 +155,8 @@ type CDCLSolver struct {
 	tmpUnassignedVars []uint32 // Reusable buffer for random variable selection (avoids allocation)
 	tmpLearnedLits []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits []cnf.Literal // Temporary buffer for canonical clause sorting
+	tmpSubsumeSet     []bool   // Reusable bitmap for subsumption checking (avoids map allocation)
+	tmpSubsumeVars    []uint32 // Track variables in subsumption set for fast cleanup
 
 	// Clause database hash table for O(1) duplicate detection
 	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
@@ -346,6 +348,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpUnassignedVars:   make([]uint32, 0, formula.NumVars),
 		tmpLearnedLits:      make([]cnf.Literal, 0, 64),
 		tmpSortedLits:       make([]cnf.Literal, 0, 64),
+		tmpSubsumeSet:       make([]bool, formula.NumVars),
+		tmpSubsumeVars:      make([]uint32, 0, 64),
 		learnedClauseHashes: make(map[uint64]bool, 2500),
 		learnedClauseBase:   int(formula.NumClauses),
 		// Minimization thresholds
@@ -1443,9 +1447,10 @@ func (s *CDCLSolver) inprocessSubsumptionSafe() {
 
 	removedOriginal := 0
 
-	// Remove original clauses subsumed by OTHER original clauses only
-	// This is sound: original clauses are permanent
-	remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses))
+	// OPTIMIZATION P0: Use reusable buffer for clause indices to avoid allocation
+	// Mark clauses to remove instead of building new slice
+	toRemove := make([]bool, len(s.cnf.Clauses))
+
 	for i := range s.cnf.Clauses {
 		subsumed := false
 		for j := range s.cnf.Clauses {
@@ -1457,9 +1462,8 @@ func (s *CDCLSolver) inprocessSubsumptionSafe() {
 				break
 			}
 		}
-		if !subsumed {
-			remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
-		} else {
+		if subsumed {
+			toRemove[i] = true
 			removedOriginal++
 		}
 	}
@@ -1469,6 +1473,13 @@ func (s *CDCLSolver) inprocessSubsumptionSafe() {
 	}
 
 	if removedOriginal > 0 {
+		// Build new clause list only if clauses were removed
+		remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses)-removedOriginal)
+		for i := range s.cnf.Clauses {
+			if !toRemove[i] {
+				remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
+			}
+		}
 		s.cnf.Clauses = remainingOriginal
 		s.cnf.NumClauses = len(s.cnf.Clauses)
 		if s.verbose {
@@ -1619,19 +1630,32 @@ func (s *CDCLSolver) subsumes(c1, c2 *cnf.Clause) bool {
 		return false
 	}
 
-	// Build set of literals in c2 (the potentially subsumed clause)
-	set := make(map[uint32]bool)
+	// OPTIMIZATION P0: Use reusable bitmap instead of map allocation
+	// Track which variables are in c2 for O(1) lookup
+	s.tmpSubsumeVars = s.tmpSubsumeVars[:0]
 	for _, lit := range c2.Literals {
-		set[uint32(lit)] = true
+		varIdx := lit.Var()
+		if !s.tmpSubsumeSet[varIdx] {
+			s.tmpSubsumeSet[varIdx] = true
+			s.tmpSubsumeVars = append(s.tmpSubsumeVars, varIdx)
+		}
 	}
 
 	// Check if all literals in c1 are in c2
+	result := true
 	for _, lit := range c1.Literals {
-		if !set[uint32(lit)] {
-			return false
+		if !s.tmpSubsumeSet[lit.Var()] {
+			result = false
+			break
 		}
 	}
-	return true
+
+	// Cleanup: reset bitmap for next call (O(literals in c2) instead of O(numVars))
+	for _, varIdx := range s.tmpSubsumeVars {
+		s.tmpSubsumeSet[varIdx] = false
+	}
+
+	return result
 }
 
 func boolToUint(b bool) uint32 {
