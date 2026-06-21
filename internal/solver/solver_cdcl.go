@@ -907,40 +907,21 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Variable elimination: eliminate variables via resolution
-		// Run on small/medium instances with moderate clause density (clauses/vars > 2.0)
-		// PHP instances have density ~2.7, MiniSat eliminates vars regardless of density
-		// Skip on large instances where VE overhead dominates
-		clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
-		if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
-			if s.verbose {
-				fmt.Printf("c [verbose] Running VE: clause density %.1f > 2.0 threshold\n", clauseDensity)
-			}
-			// For very small instances (< 50 vars), use aggressive VE thresholds
-			// BUT only eliminate variables with positive deficiency (net clause reduction)
-			// This prevents clause explosion in preprocessing
-			oldMaxResolvent := s.varElimMaxResolventSize
-			oldMaxOcc := s.varElimMaxOccurrences
-			oldMinDef := s.varElimMinDeficiency
-			// Aggressive preprocessing VE (MiniSat-style) - allow negative deficiency
-			if s.cnf.NumVars < 50 {
-				s.varElimMaxResolventSize = 100000
-				s.varElimMaxOccurrences = 100000
-				s.varElimMinDeficiency = -10000.0
-			}
-			veResult := s.variableElimination()
-			// Restore old thresholds
-			if s.cnf.NumVars < 50 {
-				s.varElimMaxResolventSize = oldMaxResolvent
-				s.varElimMaxOccurrences = oldMaxOcc
-				s.varElimMinDeficiency = oldMinDef
-			}
-			if veResult == UNSAT {
-				return UNSAT
-			}
-		} else if s.verbose && clauseDensity <= 2.0 {
-			fmt.Printf("c [verbose] Skipping VE: clause density %.1f <= 2.0\n", clauseDensity)
-		}
+		// Variable elimination DISABLED - SOUNDNESS BUG
+		// VE is eliminating variables incorrectly, causing UNSAT instances to return SAT
+		// Bug found: php_7p_6h_unsat.cnf returns SAT with preprocessing, UNSAT without
+		// TODO: Debug variableElimination() function - likely issue with resolvent construction
+		// or definition tracking for model reconstruction
+		// clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
+		// if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
+		// 	if s.verbose {
+		// 		fmt.Printf("c [verbose] Running VE: clause density %.1f > 2.0 threshold\n", clauseDensity)
+		// 	}
+		// 	veResult := s.variableElimination()
+		// 	if veResult == UNSAT {
+		// 		return UNSAT
+		// 	}
+		// }
 
 		// Run unit propagation to catch new units from equivalence substitution
 		if preprocessConfig.EnableUnitProp {
