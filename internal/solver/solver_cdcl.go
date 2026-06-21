@@ -1134,6 +1134,76 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	})
 }
 
+// removeLearnedClauseWatches removes all watches for a deleted learned clause
+// P1 OPTIMIZATION: Remove watches immediately when clause is deleted (not during propagation)
+func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
+	if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
+		return
+	}
+	
+	// Get clause literals to find watched literals
+	if s.learnedSizes[learnedIdx] < 2 {
+		return // Clause too short to have watches
+	}
+	
+	literals := s.getLearnedClauseLiterals(learnedIdx)
+	if len(literals) < 2 {
+		return
+	}
+	
+	lit0 := literals[0]
+	lit1 := literals[1]
+	idx0 := cnf.LitToIndex(lit0)
+	idx1 := cnf.LitToIndex(lit1)
+	clauseIdx := -learnedIdx - 1
+	
+	// Remove watch from lit0's watch list
+	watchList0 := s.watchLists[idx0]
+	for i := range watchList0 {
+		if watchList0[i].ClauseIdx == clauseIdx {
+			// Remove this watch by swapping with last
+			lastIdx := len(watchList0) - 1
+			if i != lastIdx {
+				watchList0[i] = watchList0[lastIdx]
+				// Update symmetric watch Blit
+				movedWatch := watchList0[i]
+				for symI := range s.watchLists[movedWatch.Blit] {
+					if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
+						s.watchLists[movedWatch.Blit][symI].Blit = uint32(idx0)
+						break
+					}
+				}
+			}
+			watchList0 = watchList0[:lastIdx]
+			break
+		}
+	}
+	s.watchLists[idx0] = watchList0
+	
+	// Remove watch from lit1's watch list
+	watchList1 := s.watchLists[idx1]
+	for i := range watchList1 {
+		if watchList1[i].ClauseIdx == clauseIdx {
+			// Remove this watch by swapping with last
+			lastIdx := len(watchList1) - 1
+			if i != lastIdx {
+				watchList1[i] = watchList1[lastIdx]
+				// Update symmetric watch Blit
+				movedWatch := watchList1[i]
+				for symI := range s.watchLists[movedWatch.Blit] {
+					if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
+						s.watchLists[movedWatch.Blit][symI].Blit = uint32(idx1)
+						break
+					}
+				}
+			}
+			watchList1 = watchList1[:lastIdx]
+			break
+		}
+	}
+	s.watchLists[idx1] = watchList1
+}
+
 func (s *CDCLSolver) selfSubsumption() {
 	changed := true
 	for changed {
@@ -1290,6 +1360,9 @@ func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
 		lits := s.getLearnedClauseLiterals(i)
 		tmpClause := &cnf.Clause{Literals: lits, Learned: true}
 		if s.subsumes(newClause, tmpClause) {
+			// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
+			s.removeLearnedClauseWatches(i)
+			
 			// Mark for deletion by clearing the clause
 			s.learnedOffsets[i] = 0
 			s.learnedSizes[i] = 0
@@ -1302,8 +1375,7 @@ func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
 		}
 	}
 
-	// Note: We don't physically remove the clauses here to avoid invalidating watch indices
-	// They will be cleaned up during the next clause deletion phase
+	// Note: Watches removed immediately above, no cleanup needed during clause deletion
 	if removed > 0 && s.verbose {
 		fmt.Printf("c [verbose] Learned clause subsumption: marked %d clauses for deletion\n", removed)
 	}
@@ -1407,6 +1479,9 @@ func (s *CDCLSolver) inprocessSubsumption() {
 				}
 			}
 			if subsumed {
+				// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
+				s.removeLearnedClauseWatches(i)
+				
 				// Mark for deletion
 				s.learnedOffsets[i] = 0
 				s.learnedSizes[i] = 0
@@ -3520,12 +3595,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
-			// Skip deleted clauses
-			if watch.Clause == nil {
-				continue
-			}
 
 			// Get current clause data - for learned clauses, use ClauseIdx to avoid stale pointer after swap-remove
+			// P1 OPTIMIZATION: No deleted clause checks needed - watches removed immediately when clauses deleted
 			var clause *cnf.Clause
 			var clauseLits []cnf.Literal
 			if watch.ClauseIdx >= 0 {
@@ -3533,47 +3605,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLits = clause.Literals
 			} else {
 				learnedIdx := -watch.ClauseIdx - 1
-				// CRITICAL FIX: Check if learnedIdx is valid (within current learnedCapacity)
-				// After swap-remove deletion, learnedCapacity is reduced, and watches may point to deleted clauses
-				if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
-					// Watch points to deleted clause - remove it by swapping with last
-					lastIdx := len(watchList) - 1
-					if readIdx != lastIdx {
-						watchList[readIdx] = watchList[lastIdx]
-						// Update symmetric watch Blit by scanning for ClauseIdx
-						movedWatch := watchList[readIdx]
-						for symI := range s.watchLists[movedWatch.Blit] {
-							if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
-								s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
-								break
-							}
-						}
-						readIdx--
-					}
-					watchList = watchList[:lastIdx]
-					s.watchLists[watchIdx] = watchList
-					continue
-				}
-				// Check if clause was deleted (size=0)
-				if s.learnedSizes[learnedIdx] == 0 {
-					// Clause was deleted - remove watch
-					lastIdx := len(watchList) - 1
-					if readIdx != lastIdx {
-						watchList[readIdx] = watchList[lastIdx]
-						// Update symmetric watch Blit by scanning for ClauseIdx
-						movedWatch := watchList[readIdx]
-						for symI := range s.watchLists[movedWatch.Blit] {
-							if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
-								s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
-								break
-							}
-						}
-						readIdx--
-					}
-					watchList = watchList[:lastIdx]
-					s.watchLists[watchIdx] = watchList
-					continue
-				}
 				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
 				clause = &cnf.Clause{Literals: clauseLits, Learned: true}
 			}
@@ -4502,6 +4533,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					}
 				}
 				if ageRank >= s.normalClauseCount/2 {
+					// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
+					s.removeLearnedClauseWatches(i)
+					
 					// Mark for deletion and track free literal slot
 					offset := s.learnedOffsets[i]
 					size := s.learnedSizes[i]
