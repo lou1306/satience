@@ -1651,12 +1651,16 @@ func (s *CDCLSolver) restart() {
 	s.lbdCount = 0
 	
 	// CRITICAL: Clear tmpFlippedVars on restart
-	// tmpFlippedVars tracks variables flipped at level 1 to detect exhaustion
-	// But it must be cleared on restart since all assignments are cleared
-	// Failure to clear causes false UNSAT (variable flipped in old context blocks new search)
 	for k := range s.tmpFlippedVars {
 		s.tmpFlippedVars[k] = false
 	}
+	
+	// CRITICAL: Clear unit learned clauses on restart
+	// Unit clauses are context-specific and invalid after restart
+	for k := range s.unitLearnedClauses {
+		delete(s.unitLearnedClauses, k)
+	}
+	
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
 
@@ -4728,10 +4732,10 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 
 		// CRITICAL FIX: Track unit learned clauses for propagation and variable selection
 		// Unit clauses are NOT watched by watched literals scheme, so we track them separately
-		// NOTE: We do NOT check for conflicting units here - that causes false UNSAT on SAT instances
-		// where 1-UIP learns context-specific unit clauses that appear to conflict.
-		// True UNSAT is detected via empty clause from 1-UIP analysis.
-		if len(s.tmpLearnedLits) == 1 {
+		// CRITICAL: Only track unit clauses learned at level 1 (global constraints)
+		// Unit clauses learned at higher levels are context-specific and become invalid
+		// after backjump/restart, causing spurious conflicts.
+		if len(s.tmpLearnedLits) == 1 && s.level == 1 {
 			lit := s.tmpLearnedLits[0]
 			unitKey := lit.Var()
 			if lit.IsNegated() {
