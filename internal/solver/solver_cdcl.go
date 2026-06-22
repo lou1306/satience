@@ -947,14 +947,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Subsumption elimination - DISABLED due to soundness bug (incorrectly removes clauses)
-		// Subsumption elimination - skip on medium/large instances (O(n^2))
-		// Threshold lowered from 50K to 1K clauses - subsumption overhead dominates on typical benchmarks
-		// Always run subsumption for small instances after VE to clean up resolvents
-		if false && preprocessConfig.EnableSubsumption && !isLargeInstance && (s.cnf.NumVars < 50 || s.cnf.NumClauses < 1000) {
-			s.subsumptionElimination()
-		}
-
 		// Self-subsumption - skip on large instances (expensive)
 		if preprocessConfig.EnableSelfSubsumption && !isLargeInstance {
 			s.selfSubsumption()
@@ -1266,7 +1258,7 @@ func (s *CDCLSolver) selfSubsumption() {
 					for _, litB := range clauseB.Literals {
 						if litA.Var() == litB.Var() && litA.IsNegated() != litB.IsNegated() {
 							resolvent := s.resolveOnVar(clauseA, clauseB, litA.Var())
-							if resolvent != nil && s.subsumes(resolvent, &s.cnf.Clauses[j]) {
+							if resolvent != nil && clauseSubsumes(resolvent, &s.cnf.Clauses[j]) {
 								s.cnf.Clauses[j] = *resolvent
 								changed = true
 								if s.verbose {
@@ -1351,273 +1343,6 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 	s.cnf.NumClauses = len(newClauses)
 }
 
-func (s *CDCLSolver) subsumptionElimination() {
-	if len(s.cnf.Clauses) == 0 {
-		return
-	}
-
-	// Mark clauses for removal to avoid iteration issues with swap-delete
-	toRemove := make([]bool, len(s.cnf.Clauses))
-	removed := 0
-
-	for i := 0; i < len(s.cnf.Clauses); i++ {
-		if toRemove[i] {
-			continue
-		}
-		for j := 0; j < len(s.cnf.Clauses); j++ {
-			if i == j || toRemove[j] {
-				continue
-			}
-
-			if s.subsumes(&s.cnf.Clauses[i], &s.cnf.Clauses[j]) {
-				toRemove[j] = true
-				removed++
-			}
-		}
-	}
-
-	// Build new clause list without removed clauses
-	if removed > 0 {
-		newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses)-removed)
-		for i := 0; i < len(s.cnf.Clauses); i++ {
-			if !toRemove[i] {
-				newClauses = append(newClauses, s.cnf.Clauses[i])
-			}
-		}
-		s.cnf.Clauses = newClauses
-		s.cnf.NumClauses = len(newClauses)
-	}
-
-	if s.verbose {
-		fmt.Printf("c [verbose] Subsumption elimination: removed %d clauses\n", removed)
-	}
-}
-
-func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
-	// Mark learned clauses that are subsumed by the new clause for deletion
-	removed := 0
-
-	for i := 0; i < s.learnedActiveCount; i++ {
-		lits := s.getLearnedClauseLiterals(i)
-		litsCopy := make([]cnf.Literal, len(lits))
-		copy(litsCopy, lits)
-		tmpClause := &cnf.Clause{Literals: litsCopy, Learned: true}
-		if s.subsumes(newClause, tmpClause) {
-
-			// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
-			s.removeLearnedClauseWatches(i)
-			
-			// Mark for deletion by clearing the clause
-			s.learnedOffsets[i] = 0
-			s.learnedSizes[i] = 0
-			s.clauseActivity[i] = 0
-			s.clauseAge[i] = 0
-			s.clauseLBD[i] = 999999
-			s.clauseUseCount[i] = 0
-			s.clausePropCount[i] = 0
-			removed++
-		}
-	}
-
-	// Note: Watches removed immediately above, no cleanup needed during clause deletion
-	if removed > 0 && s.verbose {
-		fmt.Printf("c [verbose] Learned clause subsumption: marked %d clauses for deletion\n", removed)
-	}
-}
-
-func (s *CDCLSolver) isSubsumedByAny(clause cnf.Clause, clauses []cnf.Clause) bool {
-	for _, other := range clauses {
-		if s.subsumes(&other, &clause) {
-			return true
-		}
-	}
-	return false
-}
-
-// inprocessSubsumption applies subsumption elimination during search (inprocessing)
-
-// Inprocessing is the application of preprocessing techniques during the search phase.
-// This is crucial for maintaining a small, simplified formula throughout solving.
-
-// What it does:
-// 1. Remove original clauses subsumed by shorter original clauses
-// 2. Remove original clauses subsumed by learned clauses
-// 3. Remove learned clauses subsumed by other learned clauses
-
-// Why it helps:
-// - Learned clauses can subsume original clauses (especially short learned clauses)
-// - Reduces the formula size, making propagation faster
-// - Removes redundant constraints that slow down search
-
-// Safeguards:
-// - Only run every inprocessingInterval conflicts (expensive O(n²) operation)
-// - Skip on large formulas (>inprocessingMaxClauses clauses)
-// - Time limit of inprocessingTimeLimitMs to avoid slowing down search
-func (s *CDCLSolver) inprocessSubsumption() {
-	if s.cnf.NumClauses > s.inprocessingMaxClauses {
-		return
-	}
-
-	// Skip on very large clause databases
-	if s.cnf.NumClauses > 5000 {
-		return
-	}
-
-	startTime := time.Now()
-	timeLimit := time.Duration(s.inprocessingTimeLimitMs) * time.Millisecond
-
-	removedOriginal := 0
-	removedLearned := 0
-
-	// Remove original clauses subsumed by learned clauses
-	// This is the most impactful: learned clauses are often shorter and more general
-	remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses))
-	for i := range s.cnf.Clauses {
-		subsumed := false
-	for j := range s.learnedOffsets {
-		lits := s.getLearnedClauseLiterals(j)
-		litsCopy := make([]cnf.Literal, len(lits))
-		copy(litsCopy, lits)
-		tmpClause := &cnf.Clause{Literals: litsCopy, Learned: true}
-		if s.subsumes(tmpClause, &s.cnf.Clauses[i]) {
-			subsumed = true
-			break
-		}
-	}
-		if !subsumed {
-			remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
-		} else {
-			removedOriginal++
-		}
-	}
-
-	if time.Since(startTime) > timeLimit {
-		return
-	}
-
-	if removedOriginal > 0 {
-		s.cnf.Clauses = remainingOriginal
-		s.cnf.NumClauses = len(s.cnf.Clauses)
-		if s.verbose {
-			fmt.Printf("c [inprocess] Removed %d original clauses subsumed by learned clauses\n", removedOriginal)
-		}
-	}
-
-	// Mark learned clauses subsumed by other learned clauses for deletion
-	// Keep only the most general (shortest) learned clauses
-	if s.learnedActiveCount > 100 {
-		for i := 0; i < s.learnedCapacity; i++ {
-			if s.learnedSizes[i] == 0 {
-				continue // Already marked for deletion
-			}
-			subsumed := false
-			for j := range s.learnedOffsets {
-				if i == j || s.learnedSizes[j] == 0 {
-					continue
-				}
-				litsI := s.getLearnedClauseLiterals(i)
-				litsJ := s.getLearnedClauseLiterals(j)
-				litsICopy := make([]cnf.Literal, len(litsI))
-				copy(litsICopy, litsI)
-				litsJCopy := make([]cnf.Literal, len(litsJ))
-				copy(litsJCopy, litsJ)
-				clauseI := &cnf.Clause{Literals: litsICopy, Learned: true}
-				clauseJ := &cnf.Clause{Literals: litsJCopy, Learned: true}
-				if s.subsumes(clauseJ, clauseI) {
-					subsumed = true
-
-					break
-				}
-			}
-			if subsumed {
-				// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
-				s.removeLearnedClauseWatches(i)
-				
-				// Mark for deletion
-				s.learnedOffsets[i] = 0
-				s.learnedSizes[i] = 0
-				s.clauseActivity[i] = 0
-				s.clauseAge[i] = 0
-				s.clauseLBD[i] = 999999
-				removedLearned++
-			}
-		}
-
-		if removedLearned > 0 && s.verbose {
-			fmt.Printf("c [inprocess] Marked %d learned clauses for deletion (subsumed)\n", removedLearned)
-		}
-	}
-
-	totalRemoved := removedOriginal + removedLearned
-	if s.verbose && totalRemoved > 0 {
-		fmt.Printf("c [inprocess] Inprocessing subsumption: removed %d clauses (%d original, %d learned)\n",
-			totalRemoved, removedOriginal, removedLearned)
-	}
-}
-
-// inprocessSubsumptionSafe removes original clauses subsumed by OTHER original clauses
-// SOUND: Original clauses are permanent (never deleted), so subsumption is safe
-// Does NOT subsume original clauses by learned clauses (learned clauses can be deleted!)
-func (s *CDCLSolver) inprocessSubsumptionSafe() {
-	if s.cnf.NumClauses > s.inprocessingMaxClauses {
-		return
-	}
-
-	// Skip on very large clause databases
-	if s.cnf.NumClauses > 5000 {
-		return
-	}
-
-	startTime := time.Now()
-	timeLimit := time.Duration(s.inprocessingTimeLimitMs) * time.Millisecond
-
-	removedOriginal := 0
-
-	// OPTIMIZATION P0: Use reusable buffer for clause indices to avoid allocation
-	// Mark clauses to remove instead of building new slice
-	toRemove := make([]bool, len(s.cnf.Clauses))
-
-	for i := range s.cnf.Clauses {
-		subsumed := false
-		for j := range s.cnf.Clauses {
-			if i == j {
-				continue
-			}
-			if s.subsumes(&s.cnf.Clauses[j], &s.cnf.Clauses[i]) {
-				subsumed = true
-				break
-			}
-		}
-		if subsumed {
-			toRemove[i] = true
-			removedOriginal++
-		}
-	}
-
-	if time.Since(startTime) > timeLimit {
-		return
-	}
-
-	if removedOriginal > 0 {
-		// Build new clause list only if clauses were removed
-		remainingOriginal := make([]cnf.Clause, 0, len(s.cnf.Clauses)-removedOriginal)
-		for i := range s.cnf.Clauses {
-			if !toRemove[i] {
-				remainingOriginal = append(remainingOriginal, s.cnf.Clauses[i])
-			}
-		}
-		s.cnf.Clauses = remainingOriginal
-		s.cnf.NumClauses = len(s.cnf.Clauses)
-		if s.verbose {
-			fmt.Printf("c [inprocess] Safe subsumption: removed %d original clauses (subsumed by other originals)\n", removedOriginal)
-		}
-	}
-}
-
-// inprocessBlockedClauseElimination removes blocked clauses
-// SOUND: Blocked clauses are redundant (removal preserves satisfiability)
-// A clause C is blocked by literal l if for every clause D with ¬l,
-// there exists a literal k where k ∈ C and ¬k ∈ D
 func (s *CDCLSolver) inprocessBlockedClauseElimination() {
 	if s.cnf.NumClauses > 2000 {
 		return // Skip on large instances
@@ -1748,16 +1473,14 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 	return &cnf.Clause{Literals: literals, Learned: false}
 }
 
-func (s *CDCLSolver) subsumes(c1, c2 *cnf.Clause) bool {
-	// c1 subsumes c2 if c1 is a subset of c2 (all literals in c1 are also in c2)
-	// Example: (x1) subsumes (x1 ∨ x2) because satisfying x1 automatically satisfies (x1 ∨ x2)
-	// c1 must be shorter or equal length to c2
+
+// clauseSubsumes checks if c1 subsumes c2 (c1 is subset of c2)
+// Used by self-subsumption and variable elimination
+// c1 subsumes c2 if all literals in c1 are also in c2 (same var, same polarity)
+func clauseSubsumes(c1, c2 *cnf.Clause) bool {
 	if len(c1.Literals) > len(c2.Literals) {
 		return false
 	}
-
-	// Check if all literals in c1 are in c2 (same variable AND same polarity)
-	// Clauses are typically small (< 20 literals), so O(n*m) is acceptable
 	for _, lit1 := range c1.Literals {
 		found := false
 		for _, lit2 := range c2.Literals {
@@ -1770,7 +1493,6 @@ func (s *CDCLSolver) subsumes(c1, c2 *cnf.Clause) bool {
 			return false
 		}
 	}
-
 	return true
 }
 
@@ -2095,17 +1817,7 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 3. SAFE subsumption: DISABLED - unsound bug (incorrectly removes clauses)
-	// Only use glue clauses (LBD ≤ 2) which are never deleted
-	// This is sound: subsumed original clauses are permanently redundant
-	if false {
-		s.inprocessSubsumptionSafe()
-	}
-	if time.Since(startTime) > timeLimit {
-		return
-	}
-
-	// 4. Blocked clause elimination (sound, removes redundant clauses)
+	// 3. Blocked clause elimination (sound, removes redundant clauses)
 	// Run every 200 conflicts (more expensive than subsumption)
 	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
 		s.inprocessBlockedClauseElimination()
@@ -3040,7 +2752,7 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 					if len(resolvent.Literals) <= 5 {
 						subsumed := false
 						for _, existing := range s.cnf.Clauses {
-							if s.subsumes(&existing, resolvent) {
+							if clauseSubsumes(&existing, resolvent) {
 								subsumed = true
 								break
 							}
