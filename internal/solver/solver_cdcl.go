@@ -4465,9 +4465,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// Calculate LBD BEFORE building learned clause (tmpLiteralInClause is cleared during build)
+	// Calculate LBD and backjump level BEFORE building learned clause
+	// (tmpLiteralInClause is cleared during build)
 	lbd := 0
 	maxLevel := 0
+	backjumpLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := s.assignments[varIdx].Level
@@ -4476,8 +4478,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
 				lbd++
 			}
+			// Track highest and second-highest levels for backjumping
 			if lvl > maxLevel && lvl < s.level {
+				backjumpLevel = maxLevel  // Previous max becomes second-highest
 				maxLevel = lvl
+			} else if lvl > backjumpLevel && lvl < maxLevel {
+				backjumpLevel = lvl  // New second-highest
 			}
 		}
 	}
@@ -4773,39 +4779,24 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 
 		// LBD-based VSIDS: bump variables in low-LBD clauses
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
-	}
 
-	// Calculate backjump level
-	backjumpLevel := 0
-	maxLevelInClause := 0
-	for varIdx, inClause := range s.tmpLiteralInClause {
-		if inClause {
-			lvl := s.assignments[varIdx].Level
-			if lvl > maxLevelInClause {
-				maxLevelInClause = lvl
-			}
-			if lvl > backjumpLevel && lvl < s.level {
-				backjumpLevel = lvl
-			}
+		// Handle unit clauses: backjump to current level to flip the decision
+		if len(s.tmpLearnedLits) == 1 && backjumpLevel == 0 {
+			backjumpLevel = s.level
 		}
 	}
 
-	// CRITICAL FIX: Handle unit clauses at current level
-	// When the learned clause is unit (only one literal at current level),
-	// there's no second-highest level to backjump to. We must flip the
-	// decision at the current level, so backjump to current level.
+	// Fallback for non-learned clauses or when backjump level is still 0
 	if backjumpLevel == 0 {
-		if len(s.tmpLearnedLits) == 1 && s.assignments[s.tmpLearnedLits[0].Var()].Level == s.level {
-			// Unit clause at current level - backjump to current level to flip decision
-			backjumpLevel = s.level
-		} else {
+		backjumpLevel = maxLevel
+		if backjumpLevel == 0 {
 			backjumpLevel = 1
 		}
 	}
 
 	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] Backjump level calculated: %d (max in clause: %d, current level: %d)\n",
-			backjumpLevel, maxLevelInClause, s.level)
+			backjumpLevel, maxLevel, s.level)
 	}
 
 	s.lastConflictLBD = lbd
