@@ -3520,7 +3520,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			
 		} else if s.assignments[varIdx].Value != value {
 			// Assigned opposite value - CONFLICT!
-			
+			// This can happen when unit clauses learned in different contexts conflict.
+			// We treat it as a normal conflict and let 1-UIP analyze it.
 			lit := cnf.NewLiteral(varIdx, isNegated)
 			return true, &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 		}
@@ -4727,21 +4728,14 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 
 		// CRITICAL FIX: Track unit learned clauses for propagation and variable selection
 		// Unit clauses are NOT watched by watched literals scheme, so we track them separately
+		// NOTE: We do NOT check for conflicting units here - that causes false UNSAT on SAT instances
+		// where 1-UIP learns context-specific unit clauses that appear to conflict.
+		// True UNSAT is detected via empty clause from 1-UIP analysis.
 		if len(s.tmpLearnedLits) == 1 {
 			lit := s.tmpLearnedLits[0]
 			unitKey := lit.Var()
 			if lit.IsNegated() {
 				unitKey |= (1 << 31)
-			}
-			// CRITICAL: Check for conflicting unit clause (UNSAT detection)
-			// If we already have the opposite polarity unit clause, we have UNSAT
-			oppositeKey := unitKey ^ (1 << 31)  // Flip polarity bit
-			if s.unitLearnedClauses[oppositeKey] {
-				if s.verbose {
-					fmt.Printf("c [UNSAT] Conflicting unit clauses detected: var %d has both polarities as unit clauses\n", lit.Var())
-				}
-				s.emptyClauseFound = true
-				return 0
 			}
 			s.unitLearnedClauses[unitKey] = true
 		}
