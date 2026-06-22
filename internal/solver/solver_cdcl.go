@@ -359,7 +359,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpTautologyPolarity: make([]bool, formula.NumVars),
 		learnedClauseHashes: make(map[uint64]bool, 2500),
 		learnedClauseBase:   int(formula.NumClauses),
-		unitLearnedClauses:  make(map[uint32]bool),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
 		minimizationMaxLBD:        8,
@@ -3063,37 +3062,8 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			return UNKNOWN
 		}
 
-		// CRITICAL FIX: Propagate unit learned clauses BEFORE normal propagation
-		// This ensures unit clauses are propagated before any decisions are made
-		unitConflict := false
-		var unitConflictLit cnf.Literal
-		for unitKey := range s.unitLearnedClauses {
-			varIdx := unitKey & ^(uint32(1) << 31)
-			isNegated := (unitKey & (1 << 31)) != 0
-			value := !isNegated
-			if s.assignments[varIdx].Level == 0 {
-				s.assignments[varIdx] = Assignment{Value: value, Level: s.level}
-				s.varLevel[varIdx] = s.level
-				s.trail = append(s.trail, int(varIdx))
-				lit := cnf.NewLiteral(varIdx, isNegated)
-				s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
-				s.propagations++
-			} else if s.assignments[varIdx].Value != value {
-				// Conflict with existing assignment - this is a fundamental conflict
-				unitConflict = true
-				unitConflictLit = cnf.NewLiteral(varIdx, isNegated)
-				break
-			}
-		}
-		
-		var conflict bool
-		var conflictClause *cnf.Clause
-		if unitConflict {
-			conflict = true
-			conflictClause = &cnf.Clause{Literals: []cnf.Literal{unitConflictLit}, Learned: true}
-		} else {
-			conflict, conflictClause = s.propagate()
-		}
+		// Propagate all clauses (unit learned clauses handled in propagate())
+		conflict, conflictClause := s.propagate()
 		if conflict {
 			s.handleConflict(conflictClause)
 			if s.conflicts%50 == 0 && s.verbose {
@@ -3499,30 +3469,38 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	propagationCount := 0
 
-	// CRITICAL FIX: Propagate unit learned clauses from dedicated map (never deleted)
-	// Unit clauses are NOT watched and get lost from learned database, so we track them separately
-	for unitKey := range s.unitLearnedClauses {
-		varIdx := unitKey & ^(uint32(1) << 31)  // Clear polarity bit
-		isNegated := (unitKey & (1 << 31)) != 0
-		value := !isNegated
-		
-		
-		
+	// STANDARD UNIT PROPAGATION: Scan learned clauses for unit propagation FIRST
+	// This must run even if trail is empty (after backtrack to level 0)
+	// Learned clauses >= 2 literals are watched, but unit learned clauses
+	// (size=1) are not watched and must be scanned explicitly.
+	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
+		if s.learnedSizes[learnedIdx] != 1 {
+			continue
+		}
+		literals := s.getLearnedClauseLiterals(learnedIdx)
+		if len(literals) != 1 {
+			continue
+		}
+		lit := literals[0]
+		varIdx := lit.Var()
+		litValue := !lit.IsNegated()
 		if s.assignments[varIdx].Level == 0 {
-			// Not assigned - propagate
-			s.assignments[varIdx] = Assignment{Value: value, Level: s.level}
-			s.varLevel[varIdx] = s.level
+			// Use level 1 for root-level propagation (distinguishes from unassigned)
+			propLevel := s.level
+			if propLevel == 0 {
+				propLevel = 1
+			}
+			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
+			s.varLevel[varIdx] = propLevel
 			s.trail = append(s.trail, int(varIdx))
-			lit := cnf.NewLiteral(varIdx, isNegated)
-			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
-			propagationCount++
+			s.implication[varIdx] = &cnf.Clause{Literals: literals, Learned: true}
 			s.propagations++
-			
-		} else if s.assignments[varIdx].Value != value {
-			// Assigned opposite value - CONFLICT!
-			
-			lit := cnf.NewLiteral(varIdx, isNegated)
-			return true, &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
+		} else if s.assignments[varIdx].Value != litValue {
+			// Conflict: unit clause conflicts with existing assignment
+			if s.level == 0 {
+				s.emptyClauseFound = true
+			}
+			return true, &cnf.Clause{Literals: literals, Learned: true}
 		}
 	}
 
@@ -3715,36 +3693,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
-
-	// STANDARD UNIT PROPAGATION: Scan learned clauses for unit propagation
-	// Learned clauses >= 2 literals are watched above, but unit learned clauses
-	// (size=1) are not watched and must be scanned explicitly.
-	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
-		if s.learnedSizes[learnedIdx] != 1 {
-			continue
-		}
-		literals := s.getLearnedClauseLiterals(learnedIdx)
-		if len(literals) != 1 {
-			continue
-		}
-		lit := literals[0]
-		varIdx := lit.Var()
-		litValue := !lit.IsNegated()
-		if s.assignments[varIdx].Level == 0 {
-			s.assignments[varIdx] = Assignment{Value: litValue, Level: s.level}
-			s.varLevel[varIdx] = s.level
-			s.trail = append(s.trail, int(varIdx))
-			s.implication[varIdx] = &cnf.Clause{Literals: literals, Learned: true}
-			s.propagations++
-		} else if s.assignments[varIdx].Value != litValue {
-			// Conflict: unit clause conflicts with existing assignment
-			// If at level 0, this is UNSAT
-			if s.level == 0 {
-				s.emptyClauseFound = true
-			}
-			return true, &cnf.Clause{Literals: literals, Learned: true}
-		}
-	}
 
 	return false, nil
 }
@@ -3982,27 +3930,6 @@ func (s *CDCLSolver) decide() bool {
 		phase = s.conflicts%2 == 0
 		s.lastRandomDecision = s.conflicts
 
-		// CRITICAL FIX: Skip variables with unit learned clauses even for random decisions
-		posUnitKey := varIdx
-		negUnitKey := varIdx | (1 << 31)
-		if s.unitLearnedClauses[posUnitKey] || s.unitLearnedClauses[negUnitKey] {
-			// Variable has a unit clause - find an alternative
-			for i := range s.assignments {
-				if i >= int(s.cnf.NumVars) {
-					break
-				}
-				if s.assignments[i].Level == 0 && !s.isEliminatedVar(uint32(i)) {
-					posU := uint32(i)
-					negU := uint32(i) | (1 << 31)
-					if !s.unitLearnedClauses[posU] && !s.unitLearnedClauses[negU] {
-						varIdx = uint32(i)
-						phase = s.conflicts%2 == 0
-						break
-					}
-				}
-			}
-		}
-
 		if s.verbose && s.conflicts%1000 == 0 {
 			fmt.Printf("c [verbose] Random decision at conflict %d, level %d (rate=%.2f)\n", s.conflicts, s.level, s.randomDecisionRate)
 		}
@@ -4017,31 +3944,7 @@ func (s *CDCLSolver) decide() bool {
 	} else {
 		// Select variable using VSIDS heuristic
 		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
-		
-		// CRITICAL FIX: Skip variables with unit learned clauses
-		// Deciding on such variables causes immediate conflicts
-		posUnitKey := varIdx
-		negUnitKey := varIdx | (1 << 31)
-		if s.unitLearnedClauses[posUnitKey] || s.unitLearnedClauses[negUnitKey] {
-			// Variable has a unit clause - find an alternative
-			for i := range s.assignments {
-				if i >= int(s.cnf.NumVars) {
-					break
-				}
-				if s.assignments[i].Level == 0 && !s.isEliminatedVar(uint32(i)) {
-					posU := uint32(i)
-					negU := uint32(i) | (1 << 31)
-					if !s.unitLearnedClauses[posU] && !s.unitLearnedClauses[negU] {
-						varIdx = uint32(i)
-						if int(varIdx) < len(s.savedPhase) {
-							phase = s.savedPhase[varIdx]
-						}
-						break
-					}
-				}
-			}
-		}
-		
+
 		// IMPROVEMENT #3: Force exploration diversity when stuck
 		// Only override VSIDS if same variable selected too many times
 		if int(varIdx) < len(s.decidedVarSet) && s.decidedVarSet[varIdx] {
@@ -4492,39 +4395,32 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 
 	// Immediate propagation for unit clauses
-	// CRITICAL: Do NOT declare UNSAT if the unit clause conflicts with a decision at the current level.
-	// Instead, let the backtracking handle flipping the decision. UNSAT should only be declared if:
-	// 1. The learned clause is truly empty (0 literals), OR
-	// 2. The conflict is at level 0 (no decisions to backtrack), OR
-	// 3. The conflicting assignment was propagated (not decided) at the same level
+	// Propagate at current level (use level 1 for root to distinguish from unassigned)
 	if len(s.tmpLearnedLits) == 1 {
 		lit := s.tmpLearnedLits[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
 		
-		// Add to unitLearnedClauses map to prevent deciding on this variable
-		unitKey := varIdx
-		if lit.IsNegated() {
-			unitKey |= (1 << 31)
+		propLevel := s.level
+		if propLevel == 0 {
+			propLevel = 1
 		}
-		s.unitLearnedClauses[unitKey] = true
 		
-		if s.assignments[varIdx].Level == 0 {
-			// Propagate immediately
-			s.assignments[varIdx] = Assignment{Value: litValue, Level: s.level}
-			s.varLevel[varIdx] = s.level
+		if s.assignments[varIdx].Level != 0 {
+			// Already assigned - check for conflict
+			if s.assignments[varIdx].Value != litValue {
+				if s.level == 0 || s.implication[varIdx] != nil {
+					s.emptyClauseFound = true
+					return 0
+				}
+			}
+		} else {
+			// Not assigned - propagate
+			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
+			s.varLevel[varIdx] = propLevel
 			s.trail = append(s.trail, int(varIdx))
 			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 			s.propagations++
-		} else if s.assignments[varIdx].Value != litValue {
-			// Conflict with existing assignment at same level
-			// Check if this is a decision (implication is nil) or propagation (implication is set)
-			if s.assignments[varIdx].Level == s.level && s.implication[varIdx] != nil {
-				// Conflicting propagation at same level = UNSAT
-				s.emptyClauseFound = true
-				return 0
-			}
-			// If it's a decision, let backtracking handle flipping it (don't set emptyClauseFound)
 		}
 	}
 	return backjumpLevel
