@@ -1651,16 +1651,12 @@ func (s *CDCLSolver) restart() {
 	s.lbdCount = 0
 	
 	// CRITICAL: Clear tmpFlippedVars on restart
+	// tmpFlippedVars tracks variables flipped at level 1 to detect exhaustion
+	// But it must be cleared on restart since all assignments are cleared
+	// Failure to clear causes false UNSAT (variable flipped in old context blocks new search)
 	for k := range s.tmpFlippedVars {
 		s.tmpFlippedVars[k] = false
 	}
-	
-	// CRITICAL: Clear unit learned clauses on restart
-	// Unit clauses are context-specific and invalid after restart
-	for k := range s.unitLearnedClauses {
-		delete(s.unitLearnedClauses, k)
-	}
-	
 	s.lastConflictLBD = 0
 	s.backjumpLevel = 0
 
@@ -3524,8 +3520,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			
 		} else if s.assignments[varIdx].Value != value {
 			// Assigned opposite value - CONFLICT!
-			// This can happen when unit clauses learned in different contexts conflict.
-			// We treat it as a normal conflict and let 1-UIP analyze it.
+			
 			lit := cnf.NewLiteral(varIdx, isNegated)
 			return true, &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 		}
@@ -3714,6 +3709,32 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
+
+	// STANDARD UNIT PROPAGATION: Scan learned clauses for unit propagation
+	// Learned clauses >= 2 literals are watched above, but unit learned clauses
+	// (size=1) are not watched and must be scanned explicitly.
+	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
+		if s.learnedSizes[learnedIdx] != 1 {
+			continue
+		}
+		literals := s.getLearnedClauseLiterals(learnedIdx)
+		if len(literals) != 1 {
+			continue
+		}
+		lit := literals[0]
+		varIdx := lit.Var()
+		litValue := !lit.IsNegated()
+		if s.assignments[varIdx].Level == 0 {
+			s.assignments[varIdx] = Assignment{Value: litValue, Level: s.level}
+			s.varLevel[varIdx] = s.level
+			s.trail = append(s.trail, int(varIdx))
+			s.implication[varIdx] = &cnf.Clause{Literals: literals, Learned: true}
+			s.propagations++
+		} else if s.assignments[varIdx].Value != litValue {
+			// Conflict: unit clause conflicts with existing assignment
+			return true, &cnf.Clause{Literals: literals, Learned: true}
+		}
+	}
 
 	return false, nil
 }
@@ -4730,33 +4751,6 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 		}
 
-		// CRITICAL FIX: Track unit learned clauses for propagation and variable selection
-		// Unit clauses are NOT watched by watched literals scheme, so we track them separately
-		// CRITICAL: Only track unit clauses learned at level 1 (global constraints)
-		// Unit clauses learned at higher levels are context-specific and become invalid
-		// after backjump/restart, causing spurious conflicts.
-		if len(s.tmpLearnedLits) == 1 && s.level == 1 {
-			lit := s.tmpLearnedLits[0]
-			unitKey := lit.Var()
-			if lit.IsNegated() {
-				unitKey |= (1 << 31)
-			}
-			// CRITICAL: Check for conflicting unit clause at level 1 = UNSAT
-			// If we already have the opposite polarity unit clause learned at level 1,
-			// we have conflicting global constraints which proves UNSAT.
-			oppositeKey := unitKey ^ (1 << 31) // Flip polarity bit
-			if s.unitLearnedClauses[oppositeKey] {
-				if s.verbose {
-					fmt.Printf("c [UNSAT] Conflicting unit clauses at level 1: var %d has both %c and %c\n",
-						lit.Var(), map[bool]byte{true:'-', false:'+'}[lit.IsNegated()],
-						map[bool]byte{true:'-', false:'+'}[!lit.IsNegated()])
-				}
-				s.emptyClauseFound = true
-				return 0
-			}
-			s.unitLearnedClauses[unitKey] = true
-		}
-
 		// OPTIMIZATION: Add canonical hash to hash table for O(1) duplicate detection
 		s.learnedClauseHashes[canonicalHash] = true
 
@@ -5025,18 +5019,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
 		s.removeLearnedClauseWatches(idx)
 		
-		// CRITICAL FIX: Remove unit clause from tracking map if it's a unit clause
-		if s.learnedSizes[idx] == 1 {
-			literals := s.getLearnedClauseLiterals(idx)
-			if len(literals) == 1 {
-				unitKey := literals[0].Var()
-				if literals[0].IsNegated() {
-					unitKey |= (1 << 31)
-				}
-				delete(s.unitLearnedClauses, unitKey)
-			}
-		}
-		
 		// Track literal region as free for reuse
 		offset := s.learnedOffsets[idx]
 		size := s.learnedSizes[idx]
@@ -5082,22 +5064,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseUseCount = s.clauseUseCount[:writeIdx]
 	s.clausePropCount = s.clausePropCount[:writeIdx]
 
-	// Step 5: Rebuild hash table and unit clause map from remaining clauses
+	// Step 5: Rebuild hash table from remaining clauses
 	s.learnedClauseHashes = make(map[uint64]bool, s.learnedActiveCount)
-	s.unitLearnedClauses = make(map[uint32]bool)
 	for i := 0; i < s.learnedActiveCount; i++ {
 		lits := s.getLearnedClauseLiterals(i)
 		hash := computeCanonicalHash(lits, s.tmpSortedLits)
 		s.learnedClauseHashes[hash] = true
-		
-		// Rebuild unit clause tracking
-		if len(lits) == 1 {
-			unitKey := lits[0].Var()
-			if lits[0].IsNegated() {
-				unitKey |= (1 << 31)
-			}
-			s.unitLearnedClauses[unitKey] = true
-		}
 	}
 
 	// Mark LBD order as dirty
