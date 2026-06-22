@@ -2095,9 +2095,12 @@ func (s *CDCLSolver) inprocessing() {
 		return
 	}
 
-	// 3. SAFE subsumption: Only use glue clauses (LBD ≤ 2) which are never deleted
+	// 3. SAFE subsumption: DISABLED - unsound bug (incorrectly removes clauses)
+	// Only use glue clauses (LBD ≤ 2) which are never deleted
 	// This is sound: subsumed original clauses are permanently redundant
-	s.inprocessSubsumptionSafe()
+	if false {
+		s.inprocessSubsumptionSafe()
+	}
 	if time.Since(startTime) > timeLimit {
 		return
 	}
