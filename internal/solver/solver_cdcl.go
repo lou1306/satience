@@ -158,6 +158,8 @@ type CDCLSolver struct {
 	tmpSortedLits []cnf.Literal // Temporary buffer for canonical clause sorting
 	tmpSubsumeSet     []bool   // Reusable bitmap for subsumption checking (avoids map allocation)
 	tmpSubsumeVars    []uint32 // Track variables in subsumption set for fast cleanup
+	tmpTautologySeen     []bool // Track variables seen in learned clause for tautology check
+	tmpTautologyPolarity []bool // Track polarity of variables for tautology check
 
 	// Clause database hash table for O(1) duplicate detection
 	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
@@ -353,6 +355,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpSortedLits:       make([]cnf.Literal, 0, 64),
 		tmpSubsumeSet:       make([]bool, formula.NumVars),
 		tmpSubsumeVars:      make([]uint32, 0, 64),
+		tmpTautologySeen:    make([]bool, formula.NumVars),
+		tmpTautologyPolarity: make([]bool, formula.NumVars),
 		learnedClauseHashes: make(map[uint64]bool, 2500),
 		learnedClauseBase:   int(formula.NumClauses),
 		unitLearnedClauses:  make(map[uint32]bool),
@@ -4400,32 +4404,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Get the conflicting clause literals directly
 	conflictLits := conflictClause.Literals
 
-	// CRITICAL FIX: Handle unit clause conflicts specially
-	// If the conflict clause is unit, we can't learn anything new
-	// This happens when a unit learned clause conflicts with an existing decision
-	// We must backtrack to the decision level and flip it
-	if len(conflictLits) == 1 {
-		// Unit clause conflict - backjump to the level where the variable was decided
-		lit := conflictLits[0]
-		varIdx := lit.Var()
-		decisionLevel := s.assignments[varIdx].Level
-		// Set backjump level to force flipping the decision at that level
-		s.backjumpLevel = decisionLevel
-		if s.verbose {
-			fmt.Printf("c [handleConflict] Unit clause conflict on var %d at level %d - backjumping to flip\n",
-				varIdx+1, decisionLevel)
-		}
-		// Decay VSIDS activity
-		s.vsids.decay()
-		s.vsids.decayLBD()
-		if s.conflicts % 100 == 0 {
-			for i := range s.clauseActivity {
-				s.clauseActivity[i] *= ClauseActivityDecay
-			}
-		}
-		return
-	}
-
 	// Bump activity for learned clause involved in conflict
 	if conflictClause.Learned {
 		// Find matching clause by comparing literals (expensive, so skip for now)
@@ -4557,24 +4535,29 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 
 	// 1-UIP: Resolve until exactly 1 literal remains at the current decision level
-	// KEY FIX: Dynamically find candidates by scanning trail, not pre-computing
-	// This ensures newly introduced literals at current level are also resolved
+	//
+	// Algorithm (MiniSat-style):
+	// 1. Start with conflict clause (all literals are false under current assignment)
+	// 2. While >1 literal at current level:
+	//    a. Pick most recently assigned literal at current level
+	//    b. Resolve with its reason clause (the clause that forced it)
+	//    c. This eliminates the literal and adds reason's other literals
+	// 3. Result: learned clause with exactly 1 literal at current level (the UIP)
+	//
+	// Key insight: The reason clause for variable X has the form:
+	//   (literal_for_X ∨ other_lits)
+	// where literal_for_X has the polarity that makes the clause unit when X is assigned.
+	// When we resolve, we're computing: (our_clause) ∨ (reason_clause)
+	// The literal for X cancels out (opposite polarities), leaving other_lits.
 
-	currentSize := len(conflictLits)
-	resolvedCount := 0
-
-	// 1-UIP: Resolve until exactly 1 literal remains at current decision level
-	// Uses MiniSat-style trail scanning (backwards from end) to respect temporal order
-	// This ensures we resolve on the most recently assigned literal at each step,
-	// which guarantees finding the true First Unique Implication Point (UIP).
-
-	// Track which variables we've resolved on to prevent cycles
+	// Reset resolved tracking
 	for i := range s.tmpResolved {
 		s.tmpResolved[i] = false
 	}
+	s.tmpResolvedVars = s.tmpResolvedVars[:0]
 
-	// OPTIMIZATION: Count current-level trail elements first to pre-allocate candidate list
-	// This avoids reallocations during resolution when new literals are added
+	// Build initial candidate list: literals at current level, in reverse trail order
+	// Reverse trail order = most recently assigned first (MiniSat standard)
 	currentLevelCount := 0
 	for i := len(s.trail) - 1; i >= 0; i-- {
 		if s.varLevel[uint32(s.trail[i])] == s.level {
@@ -4582,112 +4565,85 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// Pre-allocate candidate list to exact size needed
 	if cap(s.tmpCandidates) < currentLevelCount {
 		s.tmpCandidates = make([]resolveCandidate, currentLevelCount)
 	}
 	s.tmpCandidates = s.tmpCandidates[:0]
 
-	// Build list of trail positions at current level (in reverse trail order)
-	// This avoids scanning lower-level trail elements on every resolution step
-	// Only done once per conflict, saves O(trail_size) work per resolution
 	for i := len(s.trail) - 1; i >= 0; i-- {
-		if s.varLevel[uint32(s.trail[i])] == s.level {
-			varIdx := uint32(s.trail[i])
-			if s.tmpLiteralInClause[varIdx] {
-				// Get reason clause size for potential sorting heuristics
-				reasonClause := s.implication[varIdx]
-				reasonSize := 0
-				if reasonClause != nil {
-					reasonSize = len(reasonClause.Literals)
-				}
-				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
-					varIdx:     varIdx,
-					trailPos:   i,
-					reasonSize: reasonSize,
-				})
-			}
+		varIdx := uint32(s.trail[i])
+		if s.varLevel[varIdx] == s.level && s.tmpLiteralInClause[varIdx] {
+			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
+				varIdx:   varIdx,
+				trailPos: i,
+			})
 		}
 	}
 
-	// Process candidates in trail order (most recently assigned first)
-	// This is the standard MiniSat approach and guarantees finding the 1-UIP correctly
-	// Trail order respects the temporal sequence of implications
-	//
-	// OPTIMIZATION ATTEMPTED: Sort by reason clause size
-	// Result: Made performance WORSE on PHP instances (6085 vs 2364 conflicts)
-	// Reason: Trail order produces better 1-UIP clauses even if larger
-	// The first UIP found via trail order leads to better backjumping
-	//
-	// Conclusion: Keep standard MiniSat trail order - it's already optimal
+	// Process candidates in trail order
 	candidateIdx := 0
 	pathC := s.tmpLevelCount[s.level]
 
 	for pathC > 1 && candidateIdx < len(s.tmpCandidates) {
-		// Get next candidate from pre-filtered list
 		candidate := s.tmpCandidates[candidateIdx]
 		candidateIdx++
 		varIdx := candidate.varIdx
 
-		// Skip if already resolved
+		// Skip if already resolved on
 		if s.tmpResolved[varIdx] {
 			continue
 		}
 
-		// Check if this literal has a reason (not a decision)
+		// Must have a reason clause (not a decision)
 		if int(varIdx) >= len(s.implication) {
 			break
 		}
 		reasonClause := s.implication[varIdx]
 		if reasonClause == nil {
-			// Decision literal - cannot resolve
-			// CRITICAL FIX: If this is at current level, we can't achieve 1-UIP
-			// Break and return what we have (will trigger 1-UIP WARNING)
-			lvl := s.assignments[varIdx].Level
-			if lvl == s.level {
-	
+			// Decision at current level - cannot resolve further
+			// This means 1-UIP cannot be achieved (multiple decision literals at current level)
+			if s.assignments[varIdx].Level == s.level {
 				break
 			}
-			// Decision at lower level - skip but continue resolving
+			// Decision at lower level - skip but continue
 			continue
 		}
 
-		// Get reason clause literals directly from pointer
+		// CRITICAL: Verify the reason clause actually explains this assignment
+		// The reason clause should have exactly one unassigned literal when it propagated
+		// For now, just use it directly
+
 		reasonLits := reasonClause.Literals
 
-		// Resolve: remove varIdx, add reason literals
+		// Resolve: remove varIdx from our clause, add reason literals
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpResolved[varIdx] = true
 		s.tmpResolvedVars = append(s.tmpResolvedVars, varIdx)
 		s.tmpLevelCount[s.level]--
 		pathC--
 
-		// Add reason literals (except the one we resolved on)
-		// CORRECT RESOLUTION: Handle polarity - opposite polarities cancel
-		newLiterals := 0
-
+		// Add reason literals (skip the one being resolved on)
+		// Handle polarity: opposite polarities cancel during resolution
 		for _, lit := range reasonLits {
 			v := lit.Var()
 			if v == varIdx {
-				continue
+				continue // Skip the literal we're resolving on
 			}
+
 			litNegated := lit.IsNegated()
 			if s.tmpLiteralInClause[v] {
-				// Variable already in clause - check polarity
+				// Variable already in clause - check if polarities cancel
 				if s.tmpLiteralIsNegated[v] != litNegated {
-					// Opposite polarity - they cancel! Remove from clause
-
+					// Opposite polarities cancel: remove from clause
 					s.tmpLiteralInClause[v] = false
-					// CRITICAL FIX: Don't reset tmpLiteralIsNegated - it's used to track polarity
-					// when the variable is re-added. Actually, we should track cancelled state.
 					s.tmpLevelCount[s.varLevel[v]]--
 					if s.varLevel[v] == s.level {
 						pathC--
 					}
 				}
-				// Same polarity - do nothing (already in clause)
+				// Same polarity: already in clause, do nothing
 			} else {
-				// Variable not in clause - add it
+				// Add new literal to clause
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
@@ -4701,8 +4657,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
 						pathC++
-						// CRITICAL FIX: Find trail position for this variable
-						// 1-UIP requires processing in trail order (most recently assigned first)
+						// Find trail position for sorting
 						trailPos := -1
 						for i := len(s.trail) - 1; i >= 0; i-- {
 							if uint32(s.trail[i]) == v {
@@ -4716,19 +4671,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 						})
 					}
 				}
-				newLiterals++
 			}
 		}
 
-		resolvedCount++
-		currentSize = currentSize - 1 + newLiterals
-		
-		// CRITICAL FIX: Re-sort candidates by trail position after adding new literals
-		// New literals from reason clauses may have been assigned earlier than remaining candidates
-		// Processing in correct trail order is essential for finding the true 1-UIP
-		if newLiterals > 0 && len(s.tmpCandidates) > candidateIdx+1 {
-			// Sort remaining candidates by trail position (descending - most recent first)
-			for i := candidateIdx; i < len(s.tmpCandidates); i++ {
+		// Re-sort remaining candidates by trail position (most recent first)
+		// This ensures we always resolve on the most recently assigned literal
+		if candidateIdx < len(s.tmpCandidates) {
+			for i := candidateIdx; i < len(s.tmpCandidates)-1; i++ {
 				for j := i + 1; j < len(s.tmpCandidates); j++ {
 					if s.tmpCandidates[j].trailPos > s.tmpCandidates[i].trailPos {
 						s.tmpCandidates[i], s.tmpCandidates[j] = s.tmpCandidates[j], s.tmpCandidates[i]
@@ -4775,6 +4724,41 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// CRITICAL: Check for empty learned clause (UNSAT)
 	// This happens when 1-UIP analysis resolves away all literals
+	if len(s.tmpLearnedLits) == 0 {
+		if s.verbose {
+			fmt.Printf("c [learnClause] *** EMPTY CLAUSE at conflict %d - UNSAT ***\n", s.conflicts)
+		}
+		s.emptyClauseFound = true
+		return 0
+	}
+
+	// CRITICAL: Check for tautological learned clauses
+	// During resolution, we can accidentally create clauses with both polarities
+	// Such clauses are always satisfied and should never be learned
+	for _, lit := range s.tmpLearnedLits {
+		varIdx := lit.Var()
+		polarity := lit.IsNegated()
+		if s.tmpTautologySeen[varIdx] {
+			if s.tmpTautologyPolarity[varIdx] != polarity {
+				// Tautology detected - skip learning but return a backjump level
+				bjLevel := maxLevel
+				if bjLevel == 0 {
+					bjLevel = s.level - 1
+					if bjLevel < 1 {
+						bjLevel = 1
+					}
+				}
+				return bjLevel
+			}
+		}
+		s.tmpTautologySeen[varIdx] = true
+		s.tmpTautologyPolarity[varIdx] = polarity
+	}
+	// Clear tautology tracking for next use
+	for _, lit := range s.tmpLearnedLits {
+		s.tmpTautologySeen[lit.Var()] = false
+		s.tmpTautologyPolarity[lit.Var()] = false
+	}
 
 	if s.verbose {
 		fmt.Printf("c   FINAL: %d literals, LBD=%d, litsAtCurrent=%d\n", len(s.tmpLearnedLits), lbd, litsAtCurrentLevel)
@@ -4783,14 +4767,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				fmt.Printf("c     [%d] var=%d%c level=%d\n", i, lit.Var()+1, map[bool]byte{true:'-', false:'+'}[lit.IsNegated()], s.assignments[lit.Var()].Level)
 			}
 		}
-	}
-	if len(s.tmpLearnedLits) == 0 {
-		if s.verbose {
-			fmt.Printf("c [learnClause] *** EMPTY CLAUSE at conflict %d - UNSAT ***\n", s.conflicts)
-		}
-		// Mark for immediate UNSAT detection
-		s.emptyClauseFound = true
-		return 0 // Will trigger UNSAT in backtrack
 	}
 
 	// If 1-UIP didn't reduce to exactly 1 literal at current level, handle it
@@ -5004,35 +4980,28 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 			fmt.Printf("\n")
 		}
 
-		// CRITICAL FIX: Track and propagate unit learned clauses immediately
+		// CRITICAL: Handle unit learned clauses immediately
+		// Unit clauses must be propagated right away to detect conflicts early
 		if len(s.tmpLearnedLits) == 1 {
 			lit := s.tmpLearnedLits[0]
-			// Store as var index with polarity bit (bit 31 = negated)
-			unitKey := lit.Var()
-			if lit.IsNegated() {
-				unitKey |= (1 << 31)
-			}
-			s.unitLearnedClauses[unitKey] = true
-			
-			// IMMEDIATE PROPAGATION: Propagate unit clause now at backjump level
-			// This prevents the solver from deciding the opposite value
 			varIdx := lit.Var()
-			value := !lit.IsNegated()
+			requiredValue := !lit.IsNegated() // Literal must be true for clause to be satisfied
+			
 			if s.assignments[varIdx].Level == 0 {
-				// Not assigned - propagate immediately at current level (will be backjump level after backtrack)
-				s.assignments[varIdx] = Assignment{Value: value, Level: s.level}
+				// Unassigned - propagate now
+				s.assignments[varIdx] = Assignment{Value: requiredValue, Level: s.level}
 				s.varLevel[varIdx] = s.level
 				s.trail = append(s.trail, int(varIdx))
-				s.implication[varIdx] = &cnf.Clause{Literals: s.tmpLearnedLits, Learned: true}
+				s.implication[varIdx] = &cnf.Clause{Literals: append([]cnf.Literal(nil), s.tmpLearnedLits...), Learned: true}
 				s.propagations++
+			} else if s.assignments[varIdx].Value != requiredValue {
+				// Conflict! This unit clause contradicts existing assignment
+				// This means we have both (x) and (¬x) learned - formula is UNSAT
 				if s.verbose {
-					fmt.Printf("c [UNIT IMMEDIATE] Propagated %d%c at level %d\n",
-						varIdx+1, map[bool]byte{true:'+', false:'-'}[value], s.level)
+					fmt.Printf("c [UNIT CONFLICT] Learned unit clause contradicts assignment: var %d\n", varIdx+1)
 				}
-			} else if s.assignments[varIdx].Value != value {
-				// Already assigned opposite value - this is a conflict that should have been caught
-				// This shouldn't happen if unit propagation is working correctly
-				
+				s.emptyClauseFound = true
+				return s.level // Will trigger UNSAT detection
 			}
 		}
 
