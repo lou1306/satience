@@ -947,10 +947,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
+		// Subsumption elimination - DISABLED due to soundness bug (incorrectly removes clauses)
 		// Subsumption elimination - skip on medium/large instances (O(n^2))
 		// Threshold lowered from 50K to 1K clauses - subsumption overhead dominates on typical benchmarks
 		// Always run subsumption for small instances after VE to clean up resolvents
-		if preprocessConfig.EnableSubsumption && !isLargeInstance && (s.cnf.NumVars < 50 || s.cnf.NumClauses < 1000) {
+		if false && preprocessConfig.EnableSubsumption && !isLargeInstance && (s.cnf.NumVars < 50 || s.cnf.NumClauses < 1000) {
 			s.subsumptionElimination()
 		}
 
@@ -2847,6 +2848,13 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 				}
 			}
 		}
+		// CRITICAL: Verify model before returning SAT
+		if !s.verifyModel() {
+			if s.verbose {
+				fmt.Printf("c [ERROR] Model verification failed after inprocessing - should not happen!\n")
+			}
+			return UNKNOWN
+		}
 		return SAT
 	}
 
@@ -3410,7 +3418,25 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 		}
 
 		if s.allAssigned() {
+			// CRITICAL: Verify model before declaring SAT
+			// All variables assigned doesn't guarantee all clauses satisfied
 			if s.verbose {
+				fmt.Printf("c [SOLVE] All assigned, verifying model...\n")
+			}
+			if !s.verifyModel() {
+				if s.verbose {
+					fmt.Printf("c [SOLVE] Model verification FAILED - continuing search\n")
+				}
+				// Model invalid - something is wrong, treat as conflict
+				s.conflicts++
+				if !s.backtrack() {
+					return UNSAT
+				}
+				s.backjumpLevel = 0
+				continue
+			}
+			if s.verbose {
+				fmt.Printf("c [SOLVE] Model verification PASSED\n")
 				s.printStats()
 			}
 			return SAT
@@ -3612,7 +3638,10 @@ func (s *CDCLSolver) allAssigned() bool {
 // verifyModel checks if the current assignment satisfies all clauses
 // Returns true if model is valid, false otherwise
 func (s *CDCLSolver) verifyModel() bool {
-	for _, clause := range s.cnf.Clauses {
+	if s.verbose {
+		fmt.Printf("c [VERIFY] Checking %d clauses...\n", len(s.cnf.Clauses))
+	}
+	for ci, clause := range s.cnf.Clauses {
 		clauseSat := false
 		for _, lit := range clause.Literals {
 			assign := s.assignments[lit.Var()]
@@ -3624,7 +3653,15 @@ func (s *CDCLSolver) verifyModel() bool {
 		}
 		if !clauseSat {
 			if s.verbose {
-				fmt.Printf("c [ERROR] Clause not satisfied!\n")
+				fmt.Printf("c [VERIFY] Clause %d NOT satisfied: ", ci)
+				for _, lit := range clause.Literals {
+					if lit.IsNegated() {
+						fmt.Printf("-%d ", lit.Var()+1)
+					} else {
+						fmt.Printf("%d ", lit.Var()+1)
+					}
+				}
+				fmt.Println()
 			}
 			return false
 		}
