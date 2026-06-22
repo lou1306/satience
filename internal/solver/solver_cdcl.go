@@ -1398,13 +1398,7 @@ func (s *CDCLSolver) subsumeLearnedClauses(newClause *cnf.Clause) {
 		copy(litsCopy, lits)
 		tmpClause := &cnf.Clause{Literals: litsCopy, Learned: true}
 		if s.subsumes(newClause, tmpClause) {
-			// DEBUG: Track x21+ deletion
-			if len(lits) == 1 && lits[0].Var() == 20 && !lits[0].IsNegated() {
-				fmt.Printf("c [SUBSUME DELETE] x21+ unit clause at index %d subsumed by new clause\n", i)
-				for _, lit := range newClause.Literals {
-					fmt.Printf("c   New clause lit: %d%c\n", lit.Var()+1, map[bool]byte{true:'-', false:'+'}[lit.IsNegated()])
-				}
-			}
+
 			// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
 			s.removeLearnedClauseWatches(i)
 			
@@ -1526,10 +1520,7 @@ func (s *CDCLSolver) inprocessSubsumption() {
 				clauseJ := &cnf.Clause{Literals: litsJCopy, Learned: true}
 				if s.subsumes(clauseJ, clauseI) {
 					subsumed = true
-					// DEBUG: Track x21+ deletion
-					if len(litsI) == 1 && litsI[0].Var() == 20 && !litsI[0].IsNegated() {
-						fmt.Printf("c [INPROCESS SUBSUME] x21+ unit clause at index %d subsumed by clause at index %d\n", i, j)
-					}
+
 					break
 				}
 			}
@@ -3721,16 +3712,7 @@ func (s *CDCLSolver) propagateBinaryWatches() (bool, *cnf.Clause) {
 			blitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
 
 			if !blitTrue {
-				if s.verbose && s.conflicts > 280000 {
-					fmt.Printf("c [BINARY CONFLICT] Watch idx=%d, clauseIdx=%d, learnedIdx=%d, blit=%d\n",
-						watchIdx, watch.ClauseIdx, -watch.ClauseIdx-1, watch.Blit)
-					if watch.ClauseIdx < 0 {
-						learnedIdx := -watch.ClauseIdx - 1
-						if learnedIdx < len(s.learnedSizes) {
-							fmt.Printf("c   Clause size=%d, LBD=%d\n", s.learnedSizes[learnedIdx], s.clauseLBD[learnedIdx])
-						}
-					}
-				}
+
 				// Return conflict clause
 				if watch.ClauseIdx >= 0 {
 					return true, watch.Clause
@@ -3768,10 +3750,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		isNegated := (unitKey & (1 << 31)) != 0
 		value := !isNegated
 		
-		if s.verbose && varIdx == 20 {
-			fmt.Printf("c [UNIT MAP CHECK] x21%c in map, assignment level=%d value=%v\n",
-				map[bool]byte{true:'-', false:'+'}[isNegated], s.assignments[varIdx].Level, s.assignments[varIdx].Value)
-		}
+		
 		
 		if s.assignments[varIdx].Level == 0 {
 			// Not assigned - propagate
@@ -3782,15 +3761,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 			propagationCount++
 			s.propagations++
-			if s.verbose && varIdx == 20 {
-				fmt.Printf("c [UNIT MAP PROP] x21+ propagated at level %d\n", s.level)
-			}
+			
 		} else if s.assignments[varIdx].Value != value {
 			// Assigned opposite value - CONFLICT!
-			if s.verbose && varIdx == 20 {
-				fmt.Printf("c [UNIT MAP CONFLICT] x21+ conflicts with assignment %v at level %d\n",
-					s.assignments[varIdx].Value, s.assignments[varIdx].Level)
-			}
+			
 			lit := cnf.NewLiteral(varIdx, isNegated)
 			return true, &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 		}
@@ -4667,6 +4641,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		reasonClause := s.implication[varIdx]
 		if reasonClause == nil {
 			// Decision literal - cannot resolve
+			// CRITICAL FIX: If this is at current level, we can't achieve 1-UIP
+			// Break and return what we have (will trigger 1-UIP WARNING)
+			lvl := s.assignments[varIdx].Level
+			if lvl == s.level {
+	
+				break
+			}
+			// Decision at lower level - skip but continue resolving
 			continue
 		}
 
@@ -4683,13 +4665,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Add reason literals (except the one we resolved on)
 		// CORRECT RESOLUTION: Handle polarity - opposite polarities cancel
 		newLiterals := 0
-		if s.verbose && s.conflicts <= 50 {
-			fmt.Printf("c   [RESOLVE] Resolving on var %d, reason clause: ", varIdx+1)
-			for _, rl := range reasonLits {
-				fmt.Printf("%d%c ", rl.Var()+1, map[bool]byte{true:'-', false:'+'}[rl.IsNegated()])
-			}
-			fmt.Printf("\n")
-		}
+
 		for _, lit := range reasonLits {
 			v := lit.Var()
 			if v == varIdx {
@@ -4700,10 +4676,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				// Variable already in clause - check polarity
 				if s.tmpLiteralIsNegated[v] != litNegated {
 					// Opposite polarity - they cancel! Remove from clause
-					if s.verbose && s.conflicts <= 50 && v == 20 {
-						fmt.Printf("c   [CANCEL] x21 cancelled from clause\n")
-					}
+
 					s.tmpLiteralInClause[v] = false
+					// CRITICAL FIX: Don't reset tmpLiteralIsNegated - it's used to track polarity
+					// when the variable is re-added. Actually, we should track cancelled state.
 					s.tmpLevelCount[s.varLevel[v]]--
 					if s.varLevel[v] == s.level {
 						pathC--
@@ -4715,10 +4691,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
-				if s.verbose && s.conflicts <= 50 && v == 20 {
-					fmt.Printf("c   [ADD] x21%c added from reason clause (lit=%d, negated=%v)\n",
-						map[bool]byte{true:'-', false:'+'}[litNegated], v+1, litNegated)
-				}
+
 				lvl := s.varLevel[v]
 				if lvl <= s.level {
 					if !s.tmpLevelCountUsed[lvl] {
@@ -4728,8 +4701,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
 						pathC++
+						// CRITICAL FIX: Find trail position for this variable
+						// 1-UIP requires processing in trail order (most recently assigned first)
+						trailPos := -1
+						for i := len(s.trail) - 1; i >= 0; i-- {
+							if uint32(s.trail[i]) == v {
+								trailPos = i
+								break
+							}
+						}
 						s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
-							varIdx: v,
+							varIdx:   v,
+							trailPos: trailPos,
 						})
 					}
 				}
@@ -4739,6 +4722,20 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		resolvedCount++
 		currentSize = currentSize - 1 + newLiterals
+		
+		// CRITICAL FIX: Re-sort candidates by trail position after adding new literals
+		// New literals from reason clauses may have been assigned earlier than remaining candidates
+		// Processing in correct trail order is essential for finding the true 1-UIP
+		if newLiterals > 0 && len(s.tmpCandidates) > candidateIdx+1 {
+			// Sort remaining candidates by trail position (descending - most recent first)
+			for i := candidateIdx; i < len(s.tmpCandidates); i++ {
+				for j := i + 1; j < len(s.tmpCandidates); j++ {
+					if s.tmpCandidates[j].trailPos > s.tmpCandidates[i].trailPos {
+						s.tmpCandidates[i], s.tmpCandidates[j] = s.tmpCandidates[j], s.tmpCandidates[i]
+					}
+				}
+			}
+		}
 	}
 
 	// Calculate LBD BEFORE building learned clause (tmpLiteralInClause is cleared during build)
@@ -4778,6 +4775,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// CRITICAL: Check for empty learned clause (UNSAT)
 	// This happens when 1-UIP analysis resolves away all literals
+
 	if s.verbose {
 		fmt.Printf("c   FINAL: %d literals, LBD=%d, litsAtCurrent=%d\n", len(s.tmpLearnedLits), lbd, litsAtCurrentLevel)
 		if len(s.tmpLearnedLits) <= 10 {
@@ -4966,7 +4964,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		
 		// Copy literals to the slot
-		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
+copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 		
 		// Append metadata (use swap-remove compatible approach)
 		s.learnedOffsets = append(s.learnedOffsets, offset)
@@ -5034,11 +5032,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			} else if s.assignments[varIdx].Value != value {
 				// Already assigned opposite value - this is a conflict that should have been caught
 				// This shouldn't happen if unit propagation is working correctly
-				if s.verbose {
-					fmt.Printf("c [UNIT ERROR] Conflict detected during learning: %d%c vs assignment %v at level %d\n",
-						varIdx+1, map[bool]byte{true:'+', false:'-'}[value],
-						s.assignments[varIdx].Value, s.assignments[varIdx].Level)
-				}
+				
 			}
 		}
 
