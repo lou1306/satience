@@ -3682,6 +3682,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
 
 			if !blitTrue {
+				// Conflict at level 0 = UNSAT (no decisions to backtrack)
+				if s.level == 0 {
+					s.emptyClauseFound = true
+					s.watchLists[watchIdx] = watchList
+					return true, clause
+				}
 				if s.verbose {
 					fmt.Printf("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, learnedIdx=%d, blit=%d, level=%d\n",
 						watchIdx, watch.ClauseIdx, -watch.ClauseIdx-1, watch.Blit, s.level)
@@ -3732,6 +3738,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.propagations++
 		} else if s.assignments[varIdx].Value != litValue {
 			// Conflict: unit clause conflicts with existing assignment
+			// If at level 0, this is UNSAT
+			if s.level == 0 {
+				s.emptyClauseFound = true
+			}
 			return true, &cnf.Clause{Literals: literals, Learned: true}
 		}
 	}
