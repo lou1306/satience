@@ -4336,10 +4336,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		for _, lit := range reasonClause.Literals {
 			v := lit.Var()
+			litNegated := lit.IsNegated()
+			
+			// Skip the resolved variable - its negation in the reason cancels with the original
 			if v == varIdx {
 				continue
 			}
-			litNegated := lit.IsNegated()
 			if s.tmpLiteralInClause[v] {
 				if s.tmpLiteralIsNegated[v] != litNegated {
 					// Cancel: remove from clause
@@ -4411,8 +4413,19 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
+	// SPECIAL CASE: If learned clause is unit (1 literal) at current level, backjump to level 0
+	// to flip the decision. The unit literal represents a constraint that must be satisfied.
 	backjumpLevel := maxLevel
-	if backjumpLevel == 0 {
+	if len(s.tmpLearnedLits) == 1 {
+		// Unit clause: check if the literal's variable is at current level
+		lit := s.tmpLearnedLits[0]
+		if s.assignments[lit.Var()].Level == s.level {
+			// Unit literal at current level: backjump to 0 to flip the decision
+			backjumpLevel = 0
+		} else if backjumpLevel == 0 {
+			backjumpLevel = 1
+		}
+	} else if backjumpLevel == 0 {
 		backjumpLevel = 1
 	}
 
@@ -4469,10 +4482,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 
 	// Immediate propagation for unit clauses
+	// CRITICAL: Do NOT declare UNSAT if the unit clause conflicts with a decision at the current level.
+	// Instead, let the backtracking handle flipping the decision. UNSAT should only be declared if:
+	// 1. The learned clause is truly empty (0 literals), OR
+	// 2. The conflict is at level 0 (no decisions to backtrack), OR
+	// 3. The conflicting assignment was propagated (not decided) at the same level
 	if len(s.tmpLearnedLits) == 1 {
 		lit := s.tmpLearnedLits[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
+		
+		// Add to unitLearnedClauses map to prevent deciding on this variable
+		unitKey := varIdx
+		if lit.IsNegated() {
+			unitKey |= (1 << 31)
+		}
+		s.unitLearnedClauses[unitKey] = true
+		
 		if s.assignments[varIdx].Level == 0 {
 			// Propagate immediately
 			s.assignments[varIdx] = Assignment{Value: litValue, Level: s.level}
@@ -4481,11 +4507,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
 			s.propagations++
 		} else if s.assignments[varIdx].Value != litValue {
-			// Conflict with existing assignment at same level = UNSAT
-			if s.assignments[varIdx].Level == s.level {
+			// Conflict with existing assignment at same level
+			// Check if this is a decision (implication is nil) or propagation (implication is set)
+			if s.assignments[varIdx].Level == s.level && s.implication[varIdx] != nil {
+				// Conflicting propagation at same level = UNSAT
 				s.emptyClauseFound = true
 				return 0
 			}
+			// If it's a decision, let backtracking handle flipping it (don't set emptyClauseFound)
 		}
 	}
 	return backjumpLevel
@@ -4824,7 +4853,7 @@ func (s *CDCLSolver) backtrack() bool {
 
 	// Use backjump level if available, otherwise backtrack one level
 	bjLevel := s.backjumpLevel
-	if bjLevel <= 0 {
+	if bjLevel < 0 {
 		bjLevel = s.level - 1
 	}
 	// CRITICAL FIX: Allow bjLevel == s.level for unit clause flips
@@ -4834,9 +4863,8 @@ func (s *CDCLSolver) backtrack() bool {
 	if bjLevel > s.level {
 		bjLevel = s.level - 1
 	}
-	if bjLevel < 1 {
-		// Backjump level calculation failed - this indicates a problem with 1-UIP
-		// For level > 1, something is wrong with 1-UIP - return UNSAT
+	// Allow bjLevel=0 to backtrack to root level (needed for unit clause conflicts with decisions)
+	if bjLevel < 0 {
 		if s.verbose {
 			fmt.Printf("c [BACKTRACK] bjLevel=%d invalid at level %d - returning UNSAT\n", bjLevel, s.level)
 		}
@@ -4844,7 +4872,17 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 
 	// Find the decision point at the backjump level
-	decisionPoint := s.trailHead[bjLevel]
+	// SPECIAL CASE: If bjLevel=0, we're backtracking to root, so clear all decisions (start from trailHead[1])
+	var decisionPoint int
+	if bjLevel == 0 {
+		if len(s.trailHead) > 1 {
+			decisionPoint = s.trailHead[1]
+		} else {
+			decisionPoint = 0
+		}
+	} else {
+		decisionPoint = s.trailHead[bjLevel]
+	}
 	if decisionPoint >= len(s.trail) {
 		if s.verbose {
 			fmt.Printf("c [BACKTRACK] FAIL: decision point %d >= trail len %d at conflict %d\n", decisionPoint, len(s.trail), s.conflicts)
@@ -4877,6 +4915,12 @@ func (s *CDCLSolver) backtrack() bool {
 	// Reset conflicts at levels > bjLevel since we're backtracking
 	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
 		s.conflictsAtLevel[i] = 0
+	}
+
+	// SPECIAL CASE: If bjLevel=0, we've backtracked to root. Don't flip a decision -
+	// the unit clause will be propagated in the next iteration.
+	if bjLevel == 0 {
+		return true
 	}
 
 	// Flip the decision at the backjump level
