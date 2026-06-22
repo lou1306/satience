@@ -4832,7 +4832,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		if s.learnedClauseHashes[canonicalHash] {
 			// Don't learn this clause, but still return backjump level
-			return s.level - 1
+			// CRITICAL: Never return 0 - that's reserved for empty clause (UNSAT)
+			bjLevel := s.level - 1
+			if bjLevel < 1 {
+				bjLevel = 1
+			}
+			return bjLevel
 		}
 
 		// Check if we need to delete clauses
@@ -4978,31 +4983,6 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 				fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true:'-', false:'+'}[lit.IsNegated()])
 			}
 			fmt.Printf("\n")
-		}
-
-		// CRITICAL: Handle unit learned clauses immediately
-		// Unit clauses must be propagated right away to detect conflicts early
-		if len(s.tmpLearnedLits) == 1 {
-			lit := s.tmpLearnedLits[0]
-			varIdx := lit.Var()
-			requiredValue := !lit.IsNegated() // Literal must be true for clause to be satisfied
-			
-			if s.assignments[varIdx].Level == 0 {
-				// Unassigned - propagate now
-				s.assignments[varIdx] = Assignment{Value: requiredValue, Level: s.level}
-				s.varLevel[varIdx] = s.level
-				s.trail = append(s.trail, int(varIdx))
-				s.implication[varIdx] = &cnf.Clause{Literals: append([]cnf.Literal(nil), s.tmpLearnedLits...), Learned: true}
-				s.propagations++
-			} else if s.assignments[varIdx].Value != requiredValue {
-				// Conflict! This unit clause contradicts existing assignment
-				// This means we have both (x) and (¬x) learned - formula is UNSAT
-				if s.verbose {
-					fmt.Printf("c [UNIT CONFLICT] Learned unit clause contradicts assignment: var %d\n", varIdx+1)
-				}
-				s.emptyClauseFound = true
-				return s.level // Will trigger UNSAT detection
-			}
 		}
 
 		// Mark LBD order as dirty - will be rebuilt on next propagation
