@@ -4725,6 +4725,27 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 		}
 
+		// CRITICAL FIX: Track unit learned clauses for propagation and variable selection
+		// Unit clauses are NOT watched by watched literals scheme, so we track them separately
+		if len(s.tmpLearnedLits) == 1 {
+			lit := s.tmpLearnedLits[0]
+			unitKey := lit.Var()
+			if lit.IsNegated() {
+				unitKey |= (1 << 31)
+			}
+			// CRITICAL: Check for conflicting unit clause (UNSAT detection)
+			// If we already have the opposite polarity unit clause, we have UNSAT
+			oppositeKey := unitKey ^ (1 << 31)  // Flip polarity bit
+			if s.unitLearnedClauses[oppositeKey] {
+				if s.verbose {
+					fmt.Printf("c [UNSAT] Conflicting unit clauses detected: var %d has both polarities as unit clauses\n", lit.Var())
+				}
+				s.emptyClauseFound = true
+				return 0
+			}
+			s.unitLearnedClauses[unitKey] = true
+		}
+
 		// OPTIMIZATION: Add canonical hash to hash table for O(1) duplicate detection
 		s.learnedClauseHashes[canonicalHash] = true
 
@@ -4993,6 +5014,18 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
 		s.removeLearnedClauseWatches(idx)
 		
+		// CRITICAL FIX: Remove unit clause from tracking map if it's a unit clause
+		if s.learnedSizes[idx] == 1 {
+			literals := s.getLearnedClauseLiterals(idx)
+			if len(literals) == 1 {
+				unitKey := literals[0].Var()
+				if literals[0].IsNegated() {
+					unitKey |= (1 << 31)
+				}
+				delete(s.unitLearnedClauses, unitKey)
+			}
+		}
+		
 		// Track literal region as free for reuse
 		offset := s.learnedOffsets[idx]
 		size := s.learnedSizes[idx]
@@ -5038,12 +5071,22 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseUseCount = s.clauseUseCount[:writeIdx]
 	s.clausePropCount = s.clausePropCount[:writeIdx]
 
-	// Step 5: Rebuild hash table from remaining clauses
+	// Step 5: Rebuild hash table and unit clause map from remaining clauses
 	s.learnedClauseHashes = make(map[uint64]bool, s.learnedActiveCount)
+	s.unitLearnedClauses = make(map[uint32]bool)
 	for i := 0; i < s.learnedActiveCount; i++ {
 		lits := s.getLearnedClauseLiterals(i)
 		hash := computeCanonicalHash(lits, s.tmpSortedLits)
 		s.learnedClauseHashes[hash] = true
+		
+		// Rebuild unit clause tracking
+		if len(lits) == 1 {
+			unitKey := lits[0].Var()
+			if lits[0].IsNegated() {
+				unitKey |= (1 << 31)
+			}
+			s.unitLearnedClauses[unitKey] = true
+		}
 	}
 
 	// Mark LBD order as dirty
