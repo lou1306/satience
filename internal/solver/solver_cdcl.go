@@ -4958,12 +4958,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			score -= float64(propCount) * 2.0
 		}
 
-		// Protection for glue clauses
-		if lbd <= s.coreGlueLBDThreshold {
+		// Protection for glue clauses and ALL unit clauses
+		if size == 1 {
+			// NEVER delete unit clauses - they are global constraints
+			score = -100000.0
+		} else if lbd <= s.coreGlueLBDThreshold {
 			score = -10000.0
-			if size == 1 && s.verbose {
-				fmt.Printf("c [DELETE DEBUG] Protecting unit clause at index %d with LBD=%d\n", i, lbd)
-			}
 		} else if lbd == s.coreGlueLBDThreshold+1 {
 			score = -5000.0
 		} else if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
