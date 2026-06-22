@@ -4252,24 +4252,20 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 // Lower LBD = better clause (involves fewer decision levels).
 // Clauses with LBD=2 are "glue clauses" - most valuable, never delete.
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
-	// Note: s.conflicts already incremented in handleConflict()
-
 	if s.verbose && s.conflicts <= DebugConflictLimit {
 		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
 			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
 	}
 
-	// Fast cleanup from previous conflict: reset only touched variables (O(k) instead of O(n))
+	// Fast cleanup from previous conflict
 	for _, varIdx := range s.tmpTouchedVars {
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpLiteralIsNegated[varIdx] = false
 	}
-	// Clear only resolved variables (O(k) instead of O(n))
 	for _, varIdx := range s.tmpResolvedVars {
 		s.tmpResolved[varIdx] = false
 	}
 	s.tmpResolvedVars = s.tmpResolvedVars[:0]
-	// Clear only used levels (O(k) instead of O(max_level))
 	for _, lvl := range s.tmpLevelSet {
 		s.tmpLevelCount[lvl] = 0
 		s.tmpLevelSetUsed[lvl] = false
@@ -4279,16 +4275,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.tmpCandidates = s.tmpCandidates[:0]
 	s.tmpLevelSet = s.tmpLevelSet[:0]
 
-	// Ensure buffers are large enough for current level
-	requiredSize := s.level + 1
-	if requiredSize > len(s.tmpLevelCount) {
-		s.tmpLevelCount = make([]int, requiredSize+1)
-	}
-	if requiredSize > len(s.tmpLevelSetUsed) {
-		s.tmpLevelSetUsed = make([]bool, requiredSize+1)
-	}
-
-	// Add all literals from the conflicting clause
+	// Add conflict clause literals
 	if s.verbose {
 		fmt.Printf("c [1-UIP] ===== Conflict %d: %d literals at level %d =====\n", s.conflicts, len(conflictLits), s.level)
 		for i, lit := range conflictLits {
@@ -4312,120 +4299,61 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// 1-UIP: Resolve until exactly 1 literal remains at the current decision level
-	//
-	// Algorithm (MiniSat-style):
-	// 1. Start with conflict clause (all literals are false under current assignment)
-	// 2. While >1 literal at current level:
-	//    a. Pick most recently assigned literal at current level
-	//    b. Resolve with its reason clause (the clause that forced it)
-	//    c. This eliminates the literal and adds reason's other literals
-	// 3. Result: learned clause with exactly 1 literal at current level (the UIP)
-	//
-	// Key insight: The reason clause for variable X has the form:
-	//   (literal_for_X ∨ other_lits)
-	// where literal_for_X has the polarity that makes the clause unit when X is assigned.
-	// When we resolve, we're computing: (our_clause) ∨ (reason_clause)
-	// The literal for X cancels out (opposite polarities), leaving other_lits.
-
-	// Reset resolved tracking
-	for i := range s.tmpResolved {
-		s.tmpResolved[i] = false
-	}
-	s.tmpResolvedVars = s.tmpResolvedVars[:0]
-
-	// Build initial candidate list: literals at current level, in reverse trail order
-	// Reverse trail order = most recently assigned first (MiniSat standard)
-	currentLevelCount := 0
-	for i := len(s.trail) - 1; i >= 0; i-- {
-		if s.varLevel[uint32(s.trail[i])] == s.level {
-			currentLevelCount++
-		}
-	}
-
-	if cap(s.tmpCandidates) < currentLevelCount {
-		s.tmpCandidates = make([]resolveCandidate, currentLevelCount)
-	}
+	// 1-UIP: Resolve until exactly 1 literal at current level
+	currentCount := s.tmpLevelCount[s.level]
+	
+	// Build candidate list from trail (most recent first)
 	s.tmpCandidates = s.tmpCandidates[:0]
-
 	for i := len(s.trail) - 1; i >= 0; i-- {
 		varIdx := uint32(s.trail[i])
 		if s.varLevel[varIdx] == s.level && s.tmpLiteralInClause[varIdx] {
-			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
-				varIdx:   varIdx,
-				trailPos: i,
-			})
+			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx, trailPos: i})
 		}
 	}
 
-	// Process candidates in trail order
+	// Resolve on candidates until 1 UIP remains
 	candidateIdx := 0
-	pathC := s.tmpLevelCount[s.level]
-
-	for pathC > 1 && candidateIdx < len(s.tmpCandidates) {
+	for currentCount > 1 && candidateIdx < len(s.tmpCandidates) {
 		candidate := s.tmpCandidates[candidateIdx]
 		candidateIdx++
 		varIdx := candidate.varIdx
 
-		// Skip if already resolved on
 		if s.tmpResolved[varIdx] {
 			continue
 		}
 
-		// Must have a reason clause (not a decision)
-		if int(varIdx) >= len(s.implication) {
-			break
-		}
 		reasonClause := s.implication[varIdx]
 		if reasonClause == nil {
-			// Decision at current level - cannot resolve further
-			// This means 1-UIP cannot be achieved (multiple decision literals at current level)
-			if s.assignments[varIdx].Level == s.level {
-				break
-			}
-			// Decision at lower level - skip but continue
-			continue
+			continue // Decision, skip
 		}
 
-		// CRITICAL: Verify the reason clause actually explains this assignment
-		// The reason clause should have exactly one unassigned literal when it propagated
-		// For now, just use it directly
-
-		reasonLits := reasonClause.Literals
-
-		// Resolve: remove varIdx from our clause, add reason literals
+		// Resolve: remove varIdx, add reason literals
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpResolved[varIdx] = true
 		s.tmpResolvedVars = append(s.tmpResolvedVars, varIdx)
 		s.tmpLevelCount[s.level]--
-		pathC--
+		currentCount--
 
-		// Add reason literals (skip the one being resolved on)
-		// Handle polarity: opposite polarities cancel during resolution
-		for _, lit := range reasonLits {
+		for _, lit := range reasonClause.Literals {
 			v := lit.Var()
 			if v == varIdx {
-				continue // Skip the literal we're resolving on
+				continue
 			}
-
 			litNegated := lit.IsNegated()
 			if s.tmpLiteralInClause[v] {
-				// Variable already in clause - check if polarities cancel
 				if s.tmpLiteralIsNegated[v] != litNegated {
-					// Opposite polarities cancel: remove from clause
+					// Cancel: remove from clause
 					s.tmpLiteralInClause[v] = false
 					s.tmpLevelCount[s.varLevel[v]]--
 					if s.varLevel[v] == s.level {
-						pathC--
+						currentCount--
 					}
 				}
-				// Same polarity: already in clause, do nothing
 			} else {
-				// Add new literal to clause
+				// Add to clause
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
-
 				lvl := s.varLevel[v]
 				if lvl <= s.level {
 					if !s.tmpLevelCountUsed[lvl] {
@@ -4434,8 +4362,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					}
 					s.tmpLevelCount[lvl]++
 					if lvl == s.level {
-						pathC++
-						// Find trail position for sorting
+						currentCount++
+						// Find trail position
 						trailPos := -1
 						for i := len(s.trail) - 1; i >= 0; i-- {
 							if uint32(s.trail[i]) == v {
@@ -4443,33 +4371,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 								break
 							}
 						}
-						s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{
-							varIdx:   v,
-							trailPos: trailPos,
-						})
-					}
-				}
-			}
-		}
-
-		// Re-sort remaining candidates by trail position (most recent first)
-		// This ensures we always resolve on the most recently assigned literal
-		if candidateIdx < len(s.tmpCandidates) {
-			for i := candidateIdx; i < len(s.tmpCandidates)-1; i++ {
-				for j := i + 1; j < len(s.tmpCandidates); j++ {
-					if s.tmpCandidates[j].trailPos > s.tmpCandidates[i].trailPos {
-						s.tmpCandidates[i], s.tmpCandidates[j] = s.tmpCandidates[j], s.tmpCandidates[i]
+						s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: v, trailPos: trailPos})
 					}
 				}
 			}
 		}
 	}
 
-	// Calculate LBD and backjump level BEFORE building learned clause
-	// (tmpLiteralInClause is cleared during build)
+	// Calculate LBD and backjump level
 	lbd := 0
 	maxLevel := 0
-	backjumpLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := s.assignments[varIdx].Level
@@ -4478,260 +4389,57 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
 				lbd++
 			}
-			// Track highest and second-highest levels for backjumping
 			if lvl > maxLevel && lvl < s.level {
-				backjumpLevel = maxLevel  // Previous max becomes second-highest
 				maxLevel = lvl
-			} else if lvl > backjumpLevel && lvl < maxLevel {
-				backjumpLevel = lvl  // New second-highest
 			}
 		}
 	}
 
-	// Build the learned clause from remaining literals (using reusable buffer)
-	s.tmpLearnedLits = s.tmpLearnedLits[:0] // Clear but keep capacity
-	litsAtCurrentLevel := 0
-
-	// CRITICAL: Clear tmpLiteralInClause as we add literals to prevent duplicates
-	// tmpTouchedVars may have duplicate entries from multiple resolution steps
+	// Build learned clause
+	s.tmpLearnedLits = s.tmpLearnedLits[:0]
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
-			s.tmpLiteralInClause[varIdx] = false // Clear to prevent duplicate
-			lit := cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx])
-			s.tmpLearnedLits = append(s.tmpLearnedLits, lit)
-			lvl := s.assignments[varIdx].Level
-			if lvl == s.level {
-				litsAtCurrentLevel++
-			}
+			s.tmpLiteralInClause[varIdx] = false
+			s.tmpLearnedLits = append(s.tmpLearnedLits, cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx]))
 		}
 	}
 
-	// CRITICAL: Check for empty learned clause (UNSAT)
-	// This happens when 1-UIP analysis resolves away all literals
+	// Empty clause = UNSAT
 	if len(s.tmpLearnedLits) == 0 {
-		if s.verbose {
-			fmt.Printf("c [learnClause] *** EMPTY CLAUSE at conflict %d - UNSAT ***\n", s.conflicts)
-		}
 		s.emptyClauseFound = true
 		return 0
 	}
 
-	// CRITICAL: Check for tautological learned clauses
-	// During resolution, we can accidentally create clauses with both polarities
-	// Such clauses are always satisfied and should never be learned
-	for _, lit := range s.tmpLearnedLits {
-		varIdx := lit.Var()
-		polarity := lit.IsNegated()
-		if s.tmpTautologySeen[varIdx] {
-			if s.tmpTautologyPolarity[varIdx] != polarity {
-				// Tautology detected - skip learning but return a backjump level
-				bjLevel := maxLevel
-				if bjLevel == 0 {
-					bjLevel = s.level - 1
-					if bjLevel < 1 {
-						bjLevel = 1
-					}
-				}
-				return bjLevel
-			}
-		}
-		s.tmpTautologySeen[varIdx] = true
-		s.tmpTautologyPolarity[varIdx] = polarity
-	}
-	// Clear tautology tracking for next use
-	for _, lit := range s.tmpLearnedLits {
-		s.tmpTautologySeen[lit.Var()] = false
-		s.tmpTautologyPolarity[lit.Var()] = false
+	// Backjump level = second-highest in learned clause (= maxLevel)
+	backjumpLevel := maxLevel
+	if backjumpLevel == 0 {
+		backjumpLevel = 1
 	}
 
 	if s.verbose {
-		fmt.Printf("c   FINAL: %d literals, LBD=%d, litsAtCurrent=%d\n", len(s.tmpLearnedLits), lbd, litsAtCurrentLevel)
-		if len(s.tmpLearnedLits) <= 10 {
-			for i, lit := range s.tmpLearnedLits {
-				fmt.Printf("c     [%d] var=%d%c level=%d\n", i, lit.Var()+1, map[bool]byte{true:'-', false:'+'}[lit.IsNegated()], s.assignments[lit.Var()].Level)
-			}
-		}
+		fmt.Printf("c   FINAL: %d literals, LBD=%d, backjump=%d\n", len(s.tmpLearnedLits), lbd, backjumpLevel)
 	}
 
-	// If 1-UIP didn't reduce to exactly 1 literal at current level, handle it
-	// This means 1-UIP analysis failed - still learn the clause but don't backjump based on it
-	if litsAtCurrentLevel != 1 {
-		if s.verbose {
-			fmt.Printf("c [1-UIP WARNING] Failed to find UIP: %d literals at level %d (expected 1)\n", litsAtCurrentLevel, s.level)
-		}
-		// Return max level in clause for backjumping (standard backtracking)
-		// CRITICAL FIX: If maxLevel is 0 (all literals at current level), use current level - 1
-		bjLevel := maxLevel
-		if bjLevel == 0 {
-			bjLevel = s.level - 1
-			if bjLevel < 1 {
-				bjLevel = 1
-			}
-		}
-		return bjLevel
-	}
 
-	// CLAUSE MINIMIZATION via self-subsumption
-	// Try to remove literals from the learned clause by resolving with reason clauses
-	// This produces smaller, more general learned clauses
-	originalSize := len(s.tmpLearnedLits)
-	if originalSize <= s.minimizationMaxSize && lbd <= s.minimizationMaxLBD {
-		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
-		if s.verbose && len(s.tmpLearnedLits) < originalSize {
-			fmt.Printf("c [minimize] Clause reduced from %d to %d literals\n", originalSize, len(s.tmpLearnedLits))
-		}
-	}
-
-	// Only learn non-empty clauses
-	// TWO-TIER APPROACH: Separate glue clauses (LBD ≤ 3) from normal clauses
-	// Glue clauses: watched, kept forever, high priority
-	// Normal clauses: linear scan, deleted aggressively, keep only ~5K
-
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [debug] learnClause: conflict=%d, s.tmpLearnedLits=%d, lbd=%d\n", s.conflicts, len(s.tmpLearnedLits), lbd)
-	}
-
-	if len(s.tmpLearnedLits) > 0 {
-		// QUALITY FILTER: Don't learn very high-LBD clauses (LBD > LowQualityLBDThreshold)
-		// These clauses are too weak to be useful for propagation
-		// They span too many decision levels and don't prune search effectively
-		// Glucose standard: LBD ≤ 8, we match this for better clause database quality
-		LowQualityLBDThreshold := 8
-		if lbd > LowQualityLBDThreshold {
-			if s.verbose && s.conflicts <= DebugConflictLimit {
-				fmt.Printf("c [debug] Skipping low-quality clause: LBD=%d, size=%d (threshold: LBD<=8)\n", lbd, len(s.tmpLearnedLits))
-			}
-			// Use precomputed maxLevel from single pass above
-			backjumpLevel := maxLevel
-			if backjumpLevel == 0 {
-				backjumpLevel = 1
-			}
-			return backjumpLevel
-		}
-
-		// DUPLICATE DETECTION: Skip if this clause already exists
-		// OPTIMIZATION: Use hash table with canonical ordering for O(1) lookup
-		// Canonical hash ensures A∨B and B∨A are detected as duplicates
-		canonicalHash := computeCanonicalHash(s.tmpLearnedLits, s.tmpSortedLits)
-
-		if s.learnedClauseHashes[canonicalHash] {
-			// Don't learn this clause, but still return backjump level
-			// CRITICAL: Never return 0 - that's reserved for empty clause (UNSAT)
-			bjLevel := s.level - 1
-			if bjLevel < 1 {
-				bjLevel = 1
-			}
-			return bjLevel
-		}
-
-		// Check if we need to delete clauses
-		// Aggressive deletion: trigger when we have too many non-glue clauses
-		maxNormalClauses := 1500  // Reduced from 2000 for tighter database
-
-		// Immediate deletion trigger for high-LBD clauses
-		if lbd > 10 && s.learnedActiveCount > 1000 {
-			// Learned a very high-LBD clause and database is large - delete now
-			s.deleteLearnedClauses()
-		}
-
-		if s.normalClauseCount >= maxNormalClauses && lbd > GlueLBDThreshold {
-			// Delete oldest 50% of normal clauses (by age)
-			if s.verbose {
-				fmt.Printf("c [verbose] Deleting old normal clauses: %d normal clauses (limit %d)\n", s.normalClauseCount, maxNormalClauses)
-			}
-
-			// OPTIMIZATION: Use sort-based selection instead of O(n²) age ranking
-			// Collect all normal clause indices with their ages
-			type clauseAgeInfo struct {
-				idx  int
-				age  int
-			}
-			normalClauses := make([]clauseAgeInfo, 0, s.normalClauseCount)
-			for i := 0; i < s.learnedCapacity; i++ {
-				if s.learnedSizes[i] == 0 {
-					continue // Skip deleted
-				}
-				if s.clauseLBD[i] <= 3 {
-					continue // Skip glue clauses
-				}
-				normalClauses = append(normalClauses, clauseAgeInfo{
-					idx: i,
-					age: s.currentAge - s.clauseAge[i],
-				})
-			}
-			
-			// Sort by age (oldest first = highest age value)
-			// Using simple insertion sort for small arrays, falls back to sort.Slice for larger
-			if len(normalClauses) <= 32 {
-				// Insertion sort for small arrays (faster than sort.Slice for n < 32)
-				for i := 1; i < len(normalClauses); i++ {
-					key := normalClauses[i]
-					j := i - 1
-					for j >= 0 && normalClauses[j].age < key.age {
-						normalClauses[j+1] = normalClauses[j]
-						j--
-					}
-					normalClauses[j+1] = key
-				}
-			} else {
-				// Use sort.Slice for larger arrays
-				sort.Slice(normalClauses, func(i, j int) bool {
-					return normalClauses[i].age > normalClauses[j].age // Oldest first
-				})
-			}
-			
-			// Delete oldest 50% of normal clauses
-			toDelete := len(normalClauses) / 2
-			if toDelete > len(normalClauses) {
-				toDelete = len(normalClauses)
-			}
-			
-			deletedCount := 0
-			for i := 0; i < toDelete; i++ {
-				idx := normalClauses[i].idx
-				
-				// P1 OPTIMIZATION: Remove watches immediately when clause is deleted
-				s.removeLearnedClauseWatches(idx)
-				
-				// Mark for deletion and track free literal slot
-				offset := s.learnedOffsets[idx]
-				size := s.learnedSizes[idx]
-				s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
-				
-				s.learnedSizes[idx] = 0
-				s.clauseActivity[idx] = 0
-				s.clauseAge[idx] = 0
-				s.clauseLBD[idx] = 999999
-				s.clauseUseCount[idx] = 0
-				s.clausePropCount[idx] = 0
-				deletedCount++
-			}
-			
-			s.normalClauseCount -= deletedCount
-			s.learnedActiveCount -= deletedCount
-		}
-
-		// Store learned clause literals in contiguous pool (reuse free slots if available)
+	// Store learned clause in database
+	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
+		// Store literals in contiguous pool
 		var offset int
 		if len(s.literalFreeSlots) > 0 {
-			// Reuse a free slot
 			slot := s.literalFreeSlots[len(s.literalFreeSlots)-1]
 			s.literalFreeSlots = s.literalFreeSlots[:len(s.literalFreeSlots)-1]
 			offset = slot.offset
-			// Truncate literals array to reuse this region
 			if offset+len(s.tmpLearnedLits) > len(s.learnedLiterals) {
 				s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, offset+len(s.tmpLearnedLits)-len(s.learnedLiterals))...)
 			}
 		} else {
-			// Append to end
 			offset = len(s.learnedLiterals)
 			s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
 		}
 		
-		// Copy literals to the slot
-copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
+		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 		
-		// Append metadata (use swap-remove compatible approach)
+		// Append metadata
 		s.learnedOffsets = append(s.learnedOffsets, offset)
 		s.learnedSizes = append(s.learnedSizes, len(s.tmpLearnedLits))
 		s.clauseActivity = append(s.clauseActivity, 0.0)
@@ -4747,62 +4455,39 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 		s.learnedActiveCount++
 		s.learnedCapacity++
 
-		// Get clause index and literals for watch addition
+		// Add to watches
 		learnedIdx := s.learnedActiveCount - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
-		
-		// Add learned clause to watches
-		if s.watchInitialized {
+		if s.watchInitialized && len(literals) >= 2 {
 			tmpClause := &cnf.Clause{Literals: literals, Learned: true}
 			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 		}
 
-		// OPTIMIZATION: Add canonical hash to hash table for O(1) duplicate detection
-		s.learnedClauseHashes[canonicalHash] = true
-
-		// DEBUG: Print learned clause
-		if s.verbose {
-			fmt.Printf("c [LEARNED #%d] LBD=%d, size=%d: ", s.conflicts, lbd, len(s.tmpLearnedLits))
-			for _, lit := range s.tmpLearnedLits {
-				fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true:'-', false:'+'}[lit.IsNegated()])
-			}
-			fmt.Printf("\n")
-		}
-
-		// Mark LBD order as dirty - will be rebuilt on next propagation
-		s.lbdOrderDirty = true
-
-		// Enforce maxLearned limit by deleting clauses when exceeded
-		if s.learnedActiveCount > s.maxLearned {
-			s.deleteLearnedClauses()
-		}
-
-		// LBD-based VSIDS: bump variables in low-LBD clauses
+		// VSIDS bump
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
+	}
 
-		// Handle unit clauses: backjump to current level to flip the decision
-		if len(s.tmpLearnedLits) == 1 && backjumpLevel == 0 {
-			backjumpLevel = s.level
+
+	// Immediate propagation for unit clauses
+	if len(s.tmpLearnedLits) == 1 {
+		lit := s.tmpLearnedLits[0]
+		varIdx := lit.Var()
+		litValue := !lit.IsNegated()
+		if s.assignments[varIdx].Level == 0 {
+			// Propagate immediately
+			s.assignments[varIdx] = Assignment{Value: litValue, Level: s.level}
+			s.varLevel[varIdx] = s.level
+			s.trail = append(s.trail, int(varIdx))
+			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
+			s.propagations++
+		} else if s.assignments[varIdx].Value != litValue {
+			// Conflict with existing assignment at same level = UNSAT
+			if s.assignments[varIdx].Level == s.level {
+				s.emptyClauseFound = true
+				return 0
+			}
 		}
 	}
-
-	// Fallback for non-learned clauses or when backjump level is still 0
-	if backjumpLevel == 0 {
-		backjumpLevel = maxLevel
-		if backjumpLevel == 0 {
-			backjumpLevel = 1
-		}
-	}
-
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [debug] Backjump level calculated: %d (max in clause: %d, current level: %d)\n",
-			backjumpLevel, maxLevel, s.level)
-	}
-
-	s.lastConflictLBD = lbd
-	s.lbdSum += lbd
-	s.lbdCount++
-
 	return backjumpLevel
 }
 
