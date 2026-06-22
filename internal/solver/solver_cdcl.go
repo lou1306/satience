@@ -4741,6 +4741,19 @@ copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 			if lit.IsNegated() {
 				unitKey |= (1 << 31)
 			}
+			// CRITICAL: Check for conflicting unit clause at level 1 = UNSAT
+			// If we already have the opposite polarity unit clause learned at level 1,
+			// we have conflicting global constraints which proves UNSAT.
+			oppositeKey := unitKey ^ (1 << 31) // Flip polarity bit
+			if s.unitLearnedClauses[oppositeKey] {
+				if s.verbose {
+					fmt.Printf("c [UNSAT] Conflicting unit clauses at level 1: var %d has both %c and %c\n",
+						lit.Var(), map[bool]byte{true:'-', false:'+'}[lit.IsNegated()],
+						map[bool]byte{true:'-', false:'+'}[!lit.IsNegated()])
+				}
+				s.emptyClauseFound = true
+				return 0
+			}
 			s.unitLearnedClauses[unitKey] = true
 		}
 
