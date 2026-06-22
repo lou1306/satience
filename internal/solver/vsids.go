@@ -107,27 +107,27 @@ type VSIDS struct {
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
 	// Symmetry breaking: track activity momentum and decision recency
-	activityMomentum      []float64 // Rate of activity change (positive = increasing importance)
-	lastDecisionConflict  []int     // Last conflict where variable was decided (-1 if never)
+	activityMomentum       []float64 // Rate of activity change (positive = increasing importance)
+	lastDecisionConflict   []int     // Last conflict where variable was decided (-1 if never)
 	decisionRecencyPenalty []float64 // Penalty for recently decided variables
 	// CHB (Conflict History Based) heuristic
-	useCHB                bool      // Use CHB instead of VSIDS for variable selection
-	conflictFrequency     []float64 // Recent conflict frequency per variable (CHB)
-	chbDecayFactor        float64   // CHB decay factor (default 0.75 - aggressive decay)
-	chbDecayInterval      int       // CHB decay interval (default 50 conflicts)
-	chbWeight             float64   // Weight for CHB in hybrid scoring (default 1.0)
+	useCHB            bool      // Use CHB instead of VSIDS for variable selection
+	conflictFrequency []float64 // Recent conflict frequency per variable (CHB)
+	chbDecayFactor    float64   // CHB decay factor (default 0.75 - aggressive decay)
+	chbDecayInterval  int       // CHB decay interval (default 50 conflicts)
+	chbWeight         float64   // Weight for CHB in hybrid scoring (default 1.0)
 	// Configurable parameters (exposed for tuning)
-	initialDecayFactor    float64   // Initial decay factor (default 0.95)
-	decayRampUpConflicts  int       // Conflicts to reach max decay (default 10000)
-	lbdBonusScale         float64   // Scale factor for LBD bonus (default 2000.0)
-	lbdBonusDecay         float64   // Decay factor for LBD bonus (default 0.999)
-	baseBumpAmount        float64   // Base bump amount for clauses (default 50.0)
-	recencyPenaltyScale   float64   // Scale for recency penalty (default 50.0)
-	recencyPenaltyDecay   float64   // Decay for recency penalty (default 0.9)
-	recencyWindow         int       // Window for recency penalty (default 5 conflicts)
-	clauseInitBaseWeight  float64   // Base weight for clause initialization (default 10.0)
-	binaryClauseWeight    float64   // Weight for binary clauses (default 100.0)
-	activityResetScale    float64   // Scale for activity reset (default 0.5)
+	initialDecayFactor   float64 // Initial decay factor (default 0.95)
+	decayRampUpConflicts int     // Conflicts to reach max decay (default 10000)
+	lbdBonusScale        float64 // Scale factor for LBD bonus (default 2000.0)
+	lbdBonusDecay        float64 // Decay factor for LBD bonus (default 0.999)
+	baseBumpAmount       float64 // Base bump amount for clauses (default 50.0)
+	recencyPenaltyScale  float64 // Scale for recency penalty (default 50.0)
+	recencyPenaltyDecay  float64 // Decay for recency penalty (default 0.9)
+	recencyWindow        int     // Window for recency penalty (default 5 conflicts)
+	clauseInitBaseWeight float64 // Base weight for clause initialization (default 10.0)
+	binaryClauseWeight   float64 // Weight for binary clauses (default 100.0)
+	activityResetScale   float64 // Scale for activity reset (default 0.5)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -136,43 +136,43 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	initialDecay := 0.95
 	maxDecay := 0.999
 	v := &VSIDS{
-		activity:               make([]float64, numVars),
-		conflictParticipation:  make([]int, numVars),
-		decayFactor:            initialDecay,
-		inverseDecay:           1.0 / initialDecay,
-		useLRB:                 false,
-		lrbDecayInterval:       1024,
-		conflictCount:          0,
-		useLBD:                 true,
-		lbdBonus:               make([]float64, numVars),
-		maxDecayFactor:         maxDecay,
-		decayIncrement:         (maxDecay - initialDecay) / 10000.0,
-		heap:                   make(vsidsHeap, 0, numVars),
-		heapValid:              false,
-		decayInterval:          DefaultDecayInterval,
-		randomSeed:             0,
+		activity:              make([]float64, numVars),
+		conflictParticipation: make([]int, numVars),
+		decayFactor:           initialDecay,
+		inverseDecay:          1.0 / initialDecay,
+		useLRB:                false,
+		lrbDecayInterval:      1024,
+		conflictCount:         0,
+		useLBD:                true,
+		lbdBonus:              make([]float64, numVars),
+		maxDecayFactor:        maxDecay,
+		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
+		heap:                  make(vsidsHeap, 0, numVars),
+		heapValid:             false,
+		decayInterval:         DefaultDecayInterval,
+		randomSeed:            0,
 		// Symmetry breaking initialization
 		activityMomentum:       make([]float64, numVars),
 		lastDecisionConflict:   make([]int, numVars),
 		decisionRecencyPenalty: make([]float64, numVars),
 		// Default parameter values
-		initialDecayFactor:     initialDecay,
-		decayRampUpConflicts:   10000,
-		lbdBonusScale:          2000.0,
-		lbdBonusDecay:          0.999,
-		baseBumpAmount:         50.0,
-		recencyPenaltyScale:    50.0,
-		recencyPenaltyDecay:    0.9,
-		recencyWindow:          5,
-		clauseInitBaseWeight:   10.0,
-		binaryClauseWeight:     100.0,
-		activityResetScale:     0.5,
+		initialDecayFactor:   initialDecay,
+		decayRampUpConflicts: 10000,
+		lbdBonusScale:        2000.0,
+		lbdBonusDecay:        0.999,
+		baseBumpAmount:       50.0,
+		recencyPenaltyScale:  50.0,
+		recencyPenaltyDecay:  0.9,
+		recencyWindow:        5,
+		clauseInitBaseWeight: 10.0,
+		binaryClauseWeight:   100.0,
+		activityResetScale:   0.5,
 		// CHB initialization
-		useCHB:                 false,
-		conflictFrequency:      make([]float64, numVars),
-		chbDecayFactor:         0.75,
-		chbDecayInterval:       50,
-		chbWeight:              1.0,
+		useCHB:            false,
+		conflictFrequency: make([]float64, numVars),
+		chbDecayFactor:    0.75,
+		chbDecayInterval:  50,
+		chbWeight:         1.0,
 	}
 	for i := range v.lastDecisionConflict {
 		v.lastDecisionConflict[i] = -1
@@ -196,22 +196,6 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 		}
 	}
 	v.heapValid = false // Invalidate heap after modifying activities
-}
-
-// InitializeFromConflicts is DEPRECATED - investigated but did not improve performance
-// Tested on PHP instances with various conflict counts (10, 20, 50)
-// Result: Always worse than clause-structure initialization
-// PHP 6p5h: 4167 conflicts (conflict-based) vs 2364 conflicts (clause-based)
-//
-// Reason: Learning clauses during initialization pollutes the clause database
-// and biases search in suboptimal direction. Clause-structure initialization
-// (short clauses = higher activity) is already well-tuned for diverse instances.
-//
-// Keeping this function for future reference and potential re-investigation.
-func (v *VSIDS) InitializeFromConflicts(solver *CDCLSolver, numConflicts int) {
-	// Implementation removed - see deprecation note above
-	_ = solver
-	_ = numConflicts
 }
 
 // buildHeap rebuilds the activity heap from current activity scores
@@ -482,11 +466,11 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 		v.conflictParticipation[lit.Var()]++
 		// IMPROVEMENT #3: Reset activity after too many conflicts (prevent lock-in)
 		if v.conflictParticipation[lit.Var()] > 500 {
-			v.activity[lit.Var()] = 1.0  // Reset to prevent lock-in
+			v.activity[lit.Var()] = 1.0 // Reset to prevent lock-in
 			v.conflictParticipation[lit.Var()] = 0
-			v.heapValid = false  // Force heap rebuild
+			v.heapValid = false // Force heap rebuild
 		}
-		
+
 		// CHB: Track conflict frequency with aggressive bump
 		if v.useCHB {
 			v.conflictFrequency[lit.Var()] += bumpAmount
@@ -498,7 +482,7 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 	if v.useLRB && v.conflictCount%v.lrbDecayInterval == 0 {
 		v.decayLRB()
 	}
-	
+
 	// CHB: Periodic decay for conflict frequency
 	if v.useCHB && v.conflictCount%v.chbDecayInterval == 0 {
 		v.decayCHB()
@@ -526,13 +510,13 @@ func (v *VSIDS) decayCHB() {
 // Only decays every v.decayInterval conflicts to reduce heap rebuild overhead
 func (v *VSIDS) decay() {
 	v.conflictCount++
-	
+
 	// Lazy decay: only decay every decayInterval conflicts
 	// This reduces heap rebuilds while maintaining good variable selection quality
 	if v.conflictCount%v.decayInterval != 0 {
 		return
 	}
-	
+
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
 		v.decayFactor += v.decayIncrement
@@ -576,7 +560,7 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 		}
 
 		recencyPenalty := v.decisionRecencyPenalty[varIdx]
-		
+
 		// CHB: Use conflict frequency instead of VSIDS activity
 		var effectiveActivity float64
 		if v.useCHB {
@@ -584,7 +568,7 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 		} else {
 			effectiveActivity = v.activity[varIdx] + v.lbdBonus[varIdx] - recencyPenalty
 		}
-		
+
 		item.activity = effectiveActivity
 		v.heap.push(item)
 
@@ -609,7 +593,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 			v.randomSeed ^= v.randomSeed >> 7
 			v.randomSeed ^= v.randomSeed << 17
 			noise := (float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) - 0.5) * 0.01
-			
+
 			// CHB: Use conflict frequency instead of VSIDS activity
 			var baseActivity float64
 			if v.useCHB {
@@ -617,7 +601,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 			} else {
 				baseActivity = v.activity[i]
 			}
-			
+
 			effectiveActivity := baseActivity + v.lbdBonus[i] + noise*(baseActivity+v.lbdBonus[i])
 			if effectiveActivity > bestEffectiveActivity {
 				bestEffectiveActivity = effectiveActivity

@@ -91,10 +91,10 @@ func run() int {
 		s.SetRandomDecisionRate(*randomRate)
 	}
 	s.SetRandomSeed(*randomSeed)
-	
+
 	// Configure restart policy
 	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin, *restartKeepGlue)
-	
+
 	// Configure clause deletion policy
 	s.SetClauseDeletionParameters(*clauseDelLBD, *clauseDelAge, *clauseDelSize, *clauseDelActivity, *clauseDelKeepRatio)
 

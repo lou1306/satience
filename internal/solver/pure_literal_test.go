@@ -17,9 +17,9 @@ func TestPureLiteralSoundness1(t *testing.T) {
 	// x3 is still pure positive, setting x3=true satisfies clause 2
 	// All clauses satisfied -> SAT
 	clauses := []cnf.Clause{
-		newClause(1, 2),   // x1 ∨ x2
-		newClause(-2, 3),  // ¬x2 ∨ x3
-		newClause(1, 3),   // x1 ∨ x3
+		newClause(1, 2),  // x1 ∨ x2
+		newClause(-2, 3), // ¬x2 ∨ x3
+		newClause(1, 3),  // x1 ∨ x3
 	}
 
 	cnfFormula := &cnf.CNF{
@@ -65,9 +65,9 @@ func TestPureLiteralSoundness2(t *testing.T) {
 	// Setting x2=true satisfies clause 2
 	// But clause 3 is (¬x2), which becomes empty -> UNSAT
 	clauses := []cnf.Clause{
-		newClause(1),      // x1
-		newClause(-1, 2),  // ¬x1 ∨ x2
-		newClause(-2),     // ¬x2
+		newClause(1),     // x1
+		newClause(-1, 2), // ¬x1 ∨ x2
+		newClause(-2),    // ¬x2
 	}
 
 	cnfFormula := &cnf.CNF{
@@ -96,7 +96,7 @@ func TestPureLiteralSoundness2(t *testing.T) {
 	// So clause 2 becomes unit (x2)
 	// x2 is NOT pure anymore (appears in clause 2 positively, clause 3 negatively)
 	// So pure literal elimination should stop and return UNKNOWN
-	
+
 	if result == UNSAT {
 		t.Errorf("Expected SAT or UNKNOWN, got UNSAT (false conflict)")
 	}
@@ -111,8 +111,8 @@ func TestPureLiteralBug1(t *testing.T) {
 	// After x2 and x3 assigned, all clauses satisfied
 	// Remaining variables (x1) are assigned arbitrarily to complete the model
 	clauses := []cnf.Clause{
-		newClause(1, 2),   // x1 ∨ x2
-		newClause(-1, 3),  // ¬x1 ∨ x3
+		newClause(1, 2),  // x1 ∨ x2
+		newClause(-1, 3), // ¬x1 ∨ x3
 	}
 
 	cnfFormula := &cnf.CNF{
@@ -135,7 +135,7 @@ func TestPureLiteralBug1(t *testing.T) {
 	if result != SAT {
 		t.Errorf("Expected SAT (all clauses satisfied), got %v", result)
 	}
-	
+
 	// x2 and x3 should be assigned (pure positive)
 	if s.assignments[1].Level == 0 {
 		t.Errorf("x2 should be assigned (pure positive)")
@@ -143,7 +143,7 @@ func TestPureLiteralBug1(t *testing.T) {
 	if s.assignments[2].Level == 0 {
 		t.Errorf("x3 should be assigned (pure positive)")
 	}
-	
+
 	// x1 is assigned arbitrarily to complete the model (this is OK for preprocessing)
 	// The important thing is that the model satisfies all clauses
 }
@@ -153,8 +153,8 @@ func TestPureLiteralBug2(t *testing.T) {
 	// When we assign x1=true, clauses containing x1 should be satisfied (removed)
 	// Clauses containing ¬x1 should have ¬x1 removed
 	clauses := []cnf.Clause{
-		newClause(1, 2),   // x1 ∨ x2 (satisfied by x1=true)
-		newClause(-1, 3),  // ¬x1 ∨ x3 (becomes x3 after removing ¬x1)
+		newClause(1, 2),  // x1 ∨ x2 (satisfied by x1=true)
+		newClause(-1, 3), // ¬x1 ∨ x3 (becomes x3 after removing ¬x1)
 	}
 
 	cnfFormula := &cnf.CNF{
@@ -164,10 +164,10 @@ func TestPureLiteralBug2(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(cnfFormula)
-	
+
 	// Manually assign x1=true and simplify
 	conflict := s.simplifyAfterAssignment(0, true) // var 0 (x1), value true
-	
+
 	fmt.Println("\n=== Test: simplifyAfterAssignment ===")
 	fmt.Printf("Conflict: %v\n", conflict)
 	fmt.Printf("Remaining clauses: %d\n", len(s.cnf.Clauses))
@@ -178,7 +178,7 @@ func TestPureLiteralBug2(t *testing.T) {
 	if conflict {
 		t.Errorf("Should not be conflict")
 	}
-	
+
 	// Should have 1 clause remaining: (x3)
 	if len(s.cnf.Clauses) != 1 {
 		t.Errorf("Expected 1 clause, got %d", len(s.cnf.Clauses))
@@ -188,11 +188,11 @@ func TestPureLiteralBug2(t *testing.T) {
 func TestPureLiteralRealBug(t *testing.T) {
 	// This is the actual bug: pure literal elimination on real instances
 	// was causing soundness issues. Let's test a simple case that should work.
-	
+
 	// Instance: (x1 ∨ x2), (x1 ∨ ¬x2), (¬x1 ∨ x3), (¬x1 ∨ ¬x3)
 	// This is UNSAT (it's actually a contradiction)
 	// x1: both polarities
-	// x2: both polarities  
+	// x2: both polarities
 	// x3: both polarities
 	// No pure literals, should return UNKNOWN
 	clauses := []cnf.Clause{
@@ -220,7 +220,7 @@ func TestPureLiteralRealBug(t *testing.T) {
 	if result != UNKNOWN {
 		t.Errorf("Expected UNKNOWN (no pure literals), got %v", result)
 	}
-	
+
 	// No variables should be assigned
 	for i := uint32(0); i < 3; i++ {
 		if s.assignments[i].Level != 0 {
@@ -232,7 +232,7 @@ func TestPureLiteralRealBug(t *testing.T) {
 func TestPureLiteralSoundnessCritical(t *testing.T) {
 	// Critical soundness test: Pure literal should not cause false UNSAT
 	// This tests the actual bug that was reported
-	
+
 	// Create a SAT instance where pure literal elimination might cause issues
 	// Clauses: (x1 ∨ x2), (x1 ∨ x3), (x2 ∨ x3 ∨ x4), (x4)
 	// x1: pure positive
@@ -259,7 +259,7 @@ func TestPureLiteralSoundnessCritical(t *testing.T) {
 	if !result {
 		t.Errorf("Expected SAT, got UNSAT (false negative)")
 	}
-	
+
 	// Verify the model
 	assignments := s.GetAssignments()
 	for i, c := range clauses {
@@ -281,10 +281,10 @@ func TestPureLiteralSoundnessCritical(t *testing.T) {
 func TestPureLiteralWithPreprocessing(t *testing.T) {
 	// Test pure literal elimination through full preprocessing pipeline
 	// This is how it's actually used
-	
+
 	clauses := []cnf.Clause{
-		newClause(1, 2),   // x1 ∨ x2
-		newClause(-1, 3),  // ¬x1 ∨ x3
+		newClause(1, 2),  // x1 ∨ x2
+		newClause(-1, 3), // ¬x1 ∨ x3
 	}
 
 	cnfFormula := &cnf.CNF{

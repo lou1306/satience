@@ -921,8 +921,8 @@ func TestCDCLPhp5p6hSat(t *testing.T) {
 		NumVars: 30,
 		Clauses: []cnf.Clause{
 			// Each pigeon goes to at least one hole (pigeon i uses vars i*6+1 to i*6+6)
-			newClause(1, 2, 3, 4, 5, 6),   // Pigeon 1
-			newClause(7, 8, 9, 10, 11, 12), // Pigeon 2
+			newClause(1, 2, 3, 4, 5, 6),       // Pigeon 1
+			newClause(7, 8, 9, 10, 11, 12),    // Pigeon 2
 			newClause(13, 14, 15, 16, 17, 18), // Pigeon 3
 			newClause(19, 20, 21, 22, 23, 24), // Pigeon 4
 			newClause(25, 26, 27, 28, 29, 30), // Pigeon 5

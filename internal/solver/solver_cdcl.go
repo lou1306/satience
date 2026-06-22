@@ -46,7 +46,7 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	DefaultMaxLearned       = 10000  // Increased for better performance  // Maximum learned clauses before deletion
+	DefaultMaxLearned       = 10000 // Increased for better performance  // Maximum learned clauses before deletion
 	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
 	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
@@ -86,80 +86,80 @@ type literalFreeSlot struct {
 }
 
 type CDCLSolver struct {
-	cnf                 *cnf.CNF
-	assignments         []Assignment
-	trail               []int
-	varLevel            []int  // Cache of variable levels (avoids random assignments[].Level access)
-	trailHead           []int
-	level               int
-	vsids              *VSIDS
-	conflicts          int
-	implication        []*cnf.Clause // Clause pointer (nil for decisions)
-	iterations         int
-	propagations       int // Total propagations (assignments by unit propagation)
-	maxIter            int
+	cnf          *cnf.CNF
+	assignments  []Assignment
+	trail        []int
+	varLevel     []int // Cache of variable levels (avoids random assignments[].Level access)
+	trailHead    []int
+	level        int
+	vsids        *VSIDS
+	conflicts    int
+	implication  []*cnf.Clause // Clause pointer (nil for decisions)
+	iterations   int
+	propagations int // Total propagations (assignments by unit propagation)
+	maxIter      int
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals      []cnf.Literal // All learned clause literals in one contiguous slice
 	learnedOffsets       []int         // Start offset in learnedLiterals for each clause
 	learnedSizes         []int         // Number of literals in each clause (0 = deleted/tombstone)
 	clauseActivity       []float64
 	clauseAge            []int
-	clauseSize           []int // Track clause size for deletion (mirrors learnedSizes for speed)
-	clauseLBD            []int // Track LBD at time of learning
-	clauseUseCount       []int // Track how often clause used in conflict analysis
-	clausePropCount      []int // Track how many propagations clause caused
-	normalClauseCount    int   // Track number of non-glue clauses (LBD > 3)
-	learnedActiveCount   int   // Number of active clauses (excludes tombstones)
-	learnedCapacity      int   // Total capacity including tombstones
+	clauseSize           []int             // Track clause size for deletion (mirrors learnedSizes for speed)
+	clauseLBD            []int             // Track LBD at time of learning
+	clauseUseCount       []int             // Track how often clause used in conflict analysis
+	clausePropCount      []int             // Track how many propagations clause caused
+	normalClauseCount    int               // Track number of non-glue clauses (LBD > 3)
+	learnedActiveCount   int               // Number of active clauses (excludes tombstones)
+	learnedCapacity      int               // Total capacity including tombstones
 	literalFreeSlots     []literalFreeSlot // Free regions in learnedLiterals for reuse
-	currentAge         int
-	verbose            bool
-	decisions          int
-	backjumpLevel      int
-	maxLearned         int
-	minLearned         int // Minimum clauses to keep (aggressive deletion target)
-	savedPhase         []bool
-	restartBase        int
-	restartCount       int
-	lubyIndex          int
-	lbdSum             int
-	lbdCount           int
-	lastConflictLBD    int
-	conflictsAtLevel   []int   // Track conflicts per decision level
-	lastRandomDecision int     // Last conflict where we made random decision
-	randomDecisionRate      float64 // Probability of making a random decision (0.0 = never, 1.0 = always)
-	unitLearnedClauses map[uint32]bool // Map of variables with unit learned clauses (bit 31 = polarity)
-	randomDecisionPeriod int     // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
-	randomSeed            uint64  // Seed for deterministic random selection
-	lastDecisionVar         uint32  // Last variable chosen for decision
-	consecutiveFlips        int     // Count of consecutive decisions on same variable
+	currentAge           int
+	verbose              bool
+	decisions            int
+	backjumpLevel        int
+	maxLearned           int
+	minLearned           int // Minimum clauses to keep (aggressive deletion target)
+	savedPhase           []bool
+	restartBase          int
+	restartCount         int
+	lubyIndex            int
+	lbdSum               int
+	lbdCount             int
+	lastConflictLBD      int
+	conflictsAtLevel     []int           // Track conflicts per decision level
+	lastRandomDecision   int             // Last conflict where we made random decision
+	randomDecisionRate   float64         // Probability of making a random decision (0.0 = never, 1.0 = always)
+	unitLearnedClauses   map[uint32]bool // Map of variables with unit learned clauses (bit 31 = polarity)
+	randomDecisionPeriod int             // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
+	randomSeed           uint64          // Seed for deterministic random selection
+	lastDecisionVar      uint32          // Last variable chosen for decision
+	consecutiveFlips     int             // Count of consecutive decisions on same variable
 	// Exploration diversity tracking (IMPROVEMENT #3)
-	decidedVars           []uint32 // Variables decided during current search phase
-	decidedVarSet         []bool   // Fast lookup for decided variables
-	restartDecisionCount  int      // Decisions since last restart (for diversity reset)
-	minimizationMaxSize     int     // Skip minimization for clauses > this size (0=all)
-	minimizationMaxLBD      int     // Skip minimization for clauses with LBD > this (0=all)
-	minimizationMaxReasonSize int   // Skip resolution with reason clauses > this size
+	decidedVars               []uint32 // Variables decided during current search phase
+	decidedVarSet             []bool   // Fast lookup for decided variables
+	restartDecisionCount      int      // Decisions since last restart (for diversity reset)
+	minimizationMaxSize       int      // Skip minimization for clauses > this size (0=all)
+	minimizationMaxLBD        int      // Skip minimization for clauses with LBD > this (0=all)
+	minimizationMaxReasonSize int      // Skip resolution with reason clauses > this size
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
-	tmpLiteralInClause  []bool
-	tmpLiteralIsNegated []bool
-	tmpLevelCount       []int
-	tmpLevelCountUsed   []bool   // Track which levels have non-zero tmpLevelCount
-	tmpCandidates       []resolveCandidate
-	tmpLevelSet         []int    // For LBD calculation (replaces map)
-	tmpLevelSetUsed     []bool   // Track which levels are in tmpLevelSet
-	tmpResolved         []bool   // Track resolved variables in 1-UIP to prevent cycles
-	tmpResolvedVars     []uint32 // Track which variables were resolved (for fast reset)
-	tmpClauseHash uint64 // Hash for duplicate detection
-	tmpFlippedVars []bool // Track flipped variables at level 1 to prevent infinite loops
-	tmpTouchedVars []uint32 // Track which variables were modified (for fast reset)
-	tmpUnassignedVars []uint32 // Reusable buffer for random variable selection (avoids allocation)
-	tmpLearnedLits []cnf.Literal // Reusable buffer for learned clause literals
-	tmpSortedLits []cnf.Literal // Temporary buffer for canonical clause sorting
-	tmpSubsumeSet     []bool   // Reusable bitmap for subsumption checking (avoids map allocation)
-	tmpSubsumeVars    []uint32 // Track variables in subsumption set for fast cleanup
-	tmpTautologySeen     []bool // Track variables seen in learned clause for tautology check
-	tmpTautologyPolarity []bool // Track polarity of variables for tautology check
+	tmpLiteralInClause   []bool
+	tmpLiteralIsNegated  []bool
+	tmpLevelCount        []int
+	tmpLevelCountUsed    []bool // Track which levels have non-zero tmpLevelCount
+	tmpCandidates        []resolveCandidate
+	tmpLevelSet          []int         // For LBD calculation (replaces map)
+	tmpLevelSetUsed      []bool        // Track which levels are in tmpLevelSet
+	tmpResolved          []bool        // Track resolved variables in 1-UIP to prevent cycles
+	tmpResolvedVars      []uint32      // Track which variables were resolved (for fast reset)
+	tmpClauseHash        uint64        // Hash for duplicate detection
+	tmpFlippedVars       []bool        // Track flipped variables at level 1 to prevent infinite loops
+	tmpTouchedVars       []uint32      // Track which variables were modified (for fast reset)
+	tmpUnassignedVars    []uint32      // Reusable buffer for random variable selection (avoids allocation)
+	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
+	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
+	tmpSubsumeSet        []bool        // Reusable bitmap for subsumption checking (avoids map allocation)
+	tmpSubsumeVars       []uint32      // Track variables in subsumption set for fast cleanup
+	tmpTautologySeen     []bool        // Track variables seen in learned clause for tautology check
+	tmpTautologyPolarity []bool        // Track polarity of variables for tautology check
 
 	// Clause database hash table for O(1) duplicate detection
 	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
@@ -173,15 +173,15 @@ type CDCLSolver struct {
 	binaryClauseCount int           // Number of binary learned clauses (for statistics)
 
 	// LBD-based learned clause ordering for propagation prioritization
-	learnedClauseOrder  []int // Indices into learnedClauses/clauseLBD sorted by LBD
+	learnedClauseOrder []int // Indices into learnedClauses/clauseLBD sorted by LBD
 
 	// Variable elimination tracking for model reconstruction
-	eliminatedVars      []uint32                // List of eliminated variable indices
+	eliminatedVars      []uint32                 // List of eliminated variable indices
 	varElimDefinition   map[uint32][]cnf.Literal // Definition of eliminated var (resolvent that eliminated it)
-	varElimPolarity     map[uint32]bool         // Polarity of eliminated var in its definition
-	emptyClauseFound    bool   // Set when empty learned clause derived (UNSAT)
-	lbdOrderDirty       bool  // True if order needs rebuilding
-	lbdOrderLastRebuild int   // Conflict count when order was last rebuilt
+	varElimPolarity     map[uint32]bool          // Polarity of eliminated var in its definition
+	emptyClauseFound    bool                     // Set when empty learned clause derived (UNSAT)
+	lbdOrderDirty       bool                     // True if order needs rebuilding
+	lbdOrderLastRebuild int                      // Conflict count when order was last rebuilt
 
 	qhead int // Watched literals: next trail index to process
 
@@ -209,9 +209,9 @@ type CDCLSolver struct {
 	tmpLearnedLitBufferSize  int     // Buffer size for learned literals (default 64)
 	learnedClauseHashInitial int     // Initial capacity for learned clause hash table (default 2500)
 	// Restart policy parameters
-	restartGlucoseRatio      float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
-	restartGlucoseMinConflicts int   // Min conflicts before Glucose restarts kick in (default 50)
-	restartKeepGlueLBD       int     // Keep clauses with LBD ≤ this during restart (default 3)
+	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
+	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
+	restartKeepGlueLBD         int     // Keep clauses with LBD ≤ this during restart (default 3)
 	// Clause deletion scoring parameters
 	clauseDeletionLBDWeight      float64 // LBD score weight (default 200.0)
 	clauseDeletionAgeWeight      float64 // Age score weight (default 5.0)
@@ -259,7 +259,7 @@ func (s clauseInfoSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint64 {
 	// Copy literals to temporary buffer for sorting
 	tmpSorted = append(tmpSorted[:0], literals...)
-	
+
 	// Sort literals for canonical representation
 	// Simple insertion sort (efficient for small clauses)
 	for i := 1; i < len(tmpSorted); i++ {
@@ -271,7 +271,7 @@ func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint6
 		}
 		tmpSorted[j+1] = key
 	}
-	
+
 	// Compute hash from sorted literals
 	hash := uint64(len(tmpSorted))
 	for _, lit := range tmpSorted {
@@ -290,75 +290,75 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	formula.RebuildLiteralPool()
 
 	solver := &CDCLSolver{
-		cnf:                 formula,
-		assignments:         make([]Assignment, formula.NumVars),
-		trail:               make([]int, 0, formula.NumVars),
-		varLevel:            make([]int, formula.NumVars),
-		trailHead:           make([]int, 1),
-		qhead:               0,
-		level:               0,
-		vsids:               NewVSIDS(formula.NumVars),
-		conflicts:           0,
-		implication:         make([]*cnf.Clause, formula.NumVars),
-		iterations:          0,
-		maxIter:             0,
-		learnedLiterals:     make([]cnf.Literal, 0, 10000), // Pre-allocate for ~2500 clauses × avg 4 literals
-		learnedOffsets:      make([]int, 0, 2500),
-		learnedSizes:        make([]int, 0, 2500),
-		clauseActivity:      make([]float64, 0, 2500),
-		clauseAge:           make([]int, 0, 2500),
-		clauseSize:          make([]int, 0, 2500),
-		clauseLBD:           make([]int, 0, 2500),
-		clauseUseCount:      make([]int, 0, 2500),
-		clausePropCount:     make([]int, 0, 2500),
-		learnedActiveCount:  0,
-		learnedCapacity:     0,
-		literalFreeSlots:    make([]literalFreeSlot, 0, 64),
-		currentAge:          0,
-		verbose:             false,
-		decisions:           0,
-		backjumpLevel:       0,
-		maxLearned:          maxLearned,
-		minLearned:          minLearned,
-		savedPhase:          make([]bool, formula.NumVars),
-		restartBase:         restartBase,
-		restartCount:        0,
-		lubyIndex:           0,
-		lbdSum:              0,
-		lbdCount:            0,
-		randomDecisionRate:  0.0,
-		randomDecisionPeriod: 0,    // Default: DISABLED (causes 65% overhead with no measurable benefit)
-		randomSeed:          0,
-		learnedClauseOrder:  make([]int, 0),
-		lbdOrderDirty:       true,
-		lbdOrderLastRebuild: 0,
-		lastConflictLBD:     0,
-		conflictsAtLevel:    make([]int, formula.NumVars+1),
-		decidedVars:         make([]uint32, 0, formula.NumVars),
-		decidedVarSet:       make([]bool, formula.NumVars),
+		cnf:                  formula,
+		assignments:          make([]Assignment, formula.NumVars),
+		trail:                make([]int, 0, formula.NumVars),
+		varLevel:             make([]int, formula.NumVars),
+		trailHead:            make([]int, 1),
+		qhead:                0,
+		level:                0,
+		vsids:                NewVSIDS(formula.NumVars),
+		conflicts:            0,
+		implication:          make([]*cnf.Clause, formula.NumVars),
+		iterations:           0,
+		maxIter:              0,
+		learnedLiterals:      make([]cnf.Literal, 0, 10000), // Pre-allocate for ~2500 clauses × avg 4 literals
+		learnedOffsets:       make([]int, 0, 2500),
+		learnedSizes:         make([]int, 0, 2500),
+		clauseActivity:       make([]float64, 0, 2500),
+		clauseAge:            make([]int, 0, 2500),
+		clauseSize:           make([]int, 0, 2500),
+		clauseLBD:            make([]int, 0, 2500),
+		clauseUseCount:       make([]int, 0, 2500),
+		clausePropCount:      make([]int, 0, 2500),
+		learnedActiveCount:   0,
+		learnedCapacity:      0,
+		literalFreeSlots:     make([]literalFreeSlot, 0, 64),
+		currentAge:           0,
+		verbose:              false,
+		decisions:            0,
+		backjumpLevel:        0,
+		maxLearned:           maxLearned,
+		minLearned:           minLearned,
+		savedPhase:           make([]bool, formula.NumVars),
+		restartBase:          restartBase,
+		restartCount:         0,
+		lubyIndex:            0,
+		lbdSum:               0,
+		lbdCount:             0,
+		randomDecisionRate:   0.0,
+		randomDecisionPeriod: 0, // Default: DISABLED (causes 65% overhead with no measurable benefit)
+		randomSeed:           0,
+		learnedClauseOrder:   make([]int, 0),
+		lbdOrderDirty:        true,
+		lbdOrderLastRebuild:  0,
+		lastConflictLBD:      0,
+		conflictsAtLevel:     make([]int, formula.NumVars+1),
+		decidedVars:          make([]uint32, 0, formula.NumVars),
+		decidedVarSet:        make([]bool, formula.NumVars),
 		restartDecisionCount: 0,
-		lastRandomDecision:  -1000,
+		lastRandomDecision:   -1000,
 		// Pre-allocate reusable buffers
-		tmpLiteralInClause:  make([]bool, formula.NumVars),
-		tmpLiteralIsNegated: make([]bool, formula.NumVars),
-		tmpLevelCount:       make([]int, formula.NumVars+1),
-		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
-		tmpCandidates:       make([]resolveCandidate, 0, 100),
-		tmpLevelSet:         make([]int, 0, formula.NumVars),
-		tmpLevelSetUsed:     make([]bool, formula.NumVars+1),
-		tmpResolved:         make([]bool, formula.NumVars),
-		tmpResolvedVars:     make([]uint32, 0, formula.NumVars),
-		tmpFlippedVars:      make([]bool, formula.NumVars),
-		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
-		tmpUnassignedVars:   make([]uint32, 0, formula.NumVars),
-		tmpLearnedLits:      make([]cnf.Literal, 0, 64),
-		tmpSortedLits:       make([]cnf.Literal, 0, 64),
-		tmpSubsumeSet:       make([]bool, formula.NumVars),
-		tmpSubsumeVars:      make([]uint32, 0, 64),
-		tmpTautologySeen:    make([]bool, formula.NumVars),
+		tmpLiteralInClause:   make([]bool, formula.NumVars),
+		tmpLiteralIsNegated:  make([]bool, formula.NumVars),
+		tmpLevelCount:        make([]int, formula.NumVars+1),
+		tmpLevelCountUsed:    make([]bool, formula.NumVars+1),
+		tmpCandidates:        make([]resolveCandidate, 0, 100),
+		tmpLevelSet:          make([]int, 0, formula.NumVars),
+		tmpLevelSetUsed:      make([]bool, formula.NumVars+1),
+		tmpResolved:          make([]bool, formula.NumVars),
+		tmpResolvedVars:      make([]uint32, 0, formula.NumVars),
+		tmpFlippedVars:       make([]bool, formula.NumVars),
+		tmpTouchedVars:       make([]uint32, 0, formula.NumVars),
+		tmpUnassignedVars:    make([]uint32, 0, formula.NumVars),
+		tmpLearnedLits:       make([]cnf.Literal, 0, 64),
+		tmpSortedLits:        make([]cnf.Literal, 0, 64),
+		tmpSubsumeSet:        make([]bool, formula.NumVars),
+		tmpSubsumeVars:       make([]uint32, 0, 64),
+		tmpTautologySeen:     make([]bool, formula.NumVars),
 		tmpTautologyPolarity: make([]bool, formula.NumVars),
-		learnedClauseHashes: make(map[uint64]bool, 2500),
-		learnedClauseBase:   int(formula.NumClauses),
+		learnedClauseHashes:  make(map[uint64]bool, 2500),
+		learnedClauseBase:    int(formula.NumClauses),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
 		minimizationMaxLBD:        8,
@@ -371,16 +371,16 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		inprocessingInterval:     500,
 		inprocessingMaxClauses:   5000,
 		inprocessingTimeLimitMs:  200,
-		preprocessingMinClauses:  10,  // Lowered to enable inprocessing after aggressive VE
+		preprocessingMinClauses:  10, // Lowered to enable inprocessing after aggressive VE
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
 		varElimMaxVars:           20000,
 		varElimMaxClauses:        100000,
-		varElimMaxResolventSize:  50,     // Reduced from 100 (more conservative)
-		varElimMaxOccurrences:    200,    // Reduced from 500 (only eliminate low-occurrence vars)
-		varElimMinDeficiency:     0.0,    // Allow elimination even without clause reduction (MiniSat-style)
-		varElimMaxIterations:     100,    // Increased from 50 for better PHP performance
-		varElimMaxTimeMs:         500,    // Increased from 200ms for more thorough elimination
+		varElimMaxResolventSize:  50,  // Reduced from 100 (more conservative)
+		varElimMaxOccurrences:    200, // Reduced from 500 (only eliminate low-occurrence vars)
+		varElimMinDeficiency:     0.0, // Allow elimination even without clause reduction (MiniSat-style)
+		varElimMaxIterations:     100, // Increased from 50 for better PHP performance
+		varElimMaxTimeMs:         500, // Increased from 200ms for more thorough elimination
 		clauseDeletionMinLBD:     3,
 		glueClauseLBDThreshold:   2,
 		coreGlueLBDThreshold:     2,
@@ -391,9 +391,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLearnedLitBufferSize:  64,
 		learnedClauseHashInitial: 2500,
 		// Restart policy defaults (aggressive for better performance on random instances)
-		restartGlucoseRatio:      3.0,     // Less aggressive (MiniSat-style)
-		restartGlucoseMinConflicts: 100,   // Wait for more conflicts
-		restartKeepGlueLBD:       3,
+		restartGlucoseRatio:        3.0, // Less aggressive (MiniSat-style)
+		restartGlucoseMinConflicts: 100, // Wait for more conflicts
+		restartKeepGlueLBD:         3,
 		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
 		clauseDeletionLBDWeight:      200.0,
 		clauseDeletionAgeWeight:      5.0,
@@ -629,7 +629,7 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 		base = 1000
 	}
 	s.restartBase = base
-	
+
 	if glucoseRatio < 1.0 {
 		glucoseRatio = 1.0
 	}
@@ -637,12 +637,12 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 		glucoseRatio = 5.0
 	}
 	s.restartGlucoseRatio = glucoseRatio
-	
+
 	if minConflicts < 0 {
 		minConflicts = 0
 	}
 	s.restartGlucoseMinConflicts = minConflicts
-	
+
 	if keepGlueLBD < 2 {
 		keepGlueLBD = 2
 	}
@@ -673,7 +673,7 @@ func (s *CDCLSolver) SetClauseDeletionParameters(
 	if keepRatio < 0.1 || keepRatio > 0.9 {
 		keepRatio = 0.5
 	}
-	
+
 	s.clauseDeletionLBDWeight = lbdWeight
 	s.clauseDeletionAgeWeight = ageWeight
 	s.clauseDeletionSizeWeight = sizeWeight
@@ -876,7 +876,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		s.initWatches()
 		return UNKNOWN
 	}
-	
+
 	// For large instances, use lightweight preprocessing
 	isLargeInstance := s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000
 	if isLargeInstance && s.verbose {
@@ -1026,7 +1026,7 @@ func (s *CDCLSolver) initWatches() {
 
 	numLits := int(s.cnf.NumVars) * 2
 	s.watchLists = make([][]cnf.Watch, numLits)
-	
+
 	// BINARY CLAUSE OPTIMIZATION: Separate watch lists for binary clauses
 	// Binary clauses use optimized propagation path (simpler logic, no inner loop)
 	s.watchListsBinary = make([][]cnf.Watch, numLits)
@@ -1083,7 +1083,7 @@ func (s *CDCLSolver) initWatches() {
 		}
 		avgWatches := float64(totalWatches) / float64(numLits)
 		avgBinaryWatches := float64(totalBinaryWatches) / float64(numLits)
-		fmt.Printf("c [verbose] Watched literals enabled: %d watch lists, %d total watches, %.1f avg per lit\n", 
+		fmt.Printf("c [verbose] Watched literals enabled: %d watch lists, %d total watches, %.1f avg per lit\n",
 			len(s.watchLists), totalWatches, avgWatches)
 		fmt.Printf("c [verbose] Binary clause watches: %d watches, %.1f avg per lit, %d binary clauses\n",
 			totalBinaryWatches, avgBinaryWatches, s.binaryClauseCount)
@@ -1133,7 +1133,7 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 
 	// Learned clause index is stored as negative: -learnedIdx-1
 	clauseIdx := -learnedIdx - 1
-	
+
 	// BINARY CLAUSE OPTIMIZATION: Route binary clauses to specialized watch lists
 	isBinary := len(literals) == 2
 	watchLists := s.watchLists
@@ -1162,23 +1162,23 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
 		return
 	}
-	
+
 	// Get clause literals to find watched literals
 	if s.learnedSizes[learnedIdx] < 2 {
 		return // Clause too short to have watches
 	}
-	
+
 	literals := s.getLearnedClauseLiterals(learnedIdx)
 	if len(literals) < 2 {
 		return
 	}
-	
+
 	lit0 := literals[0]
 	lit1 := literals[1]
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 	clauseIdx := -learnedIdx - 1
-	
+
 	// BINARY CLAUSE OPTIMIZATION: Check which watch list the clause is in
 	isBinary := len(literals) == 2
 	watchLists := s.watchLists
@@ -1188,7 +1188,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 			s.binaryClauseCount--
 		}
 	}
-	
+
 	// Remove watch from lit0's watch list
 	watchList0 := watchLists[idx0]
 	for i := range watchList0 {
@@ -1211,7 +1211,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 		}
 	}
 	watchLists[idx0] = watchList0
-	
+
 	// Remove watch from lit1's watch list
 	watchList1 := watchLists[idx1]
 	for i := range watchList1 {
@@ -1472,7 +1472,6 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 	return &cnf.Clause{Literals: literals, Learned: false}
 }
 
-
 // clauseSubsumes checks if c1 subsumes c2 (c1 is subset of c2)
 // Used by self-subsumption and variable elimination
 // c1 subsumes c2 if all literals in c1 are also in c2 (same var, same polarity)
@@ -1564,19 +1563,19 @@ func (s *CDCLSolver) shouldRestart() bool {
 	// Check Glucose-style adaptive restart first (if past min conflicts)
 	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 {
 		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
-		
+
 		// Glucose criterion: restart when recent LBD is much worse than average
 		// Configurable via restartGlucoseRatio (default 1.5×)
 		recentLBD := float64(s.lastConflictLBD)
 		if recentLBD > avgLBD*s.restartGlucoseRatio {
 			if s.verbose {
-				fmt.Printf("c [restart] Glucose: LBD %.1f > avg %.1f × %.2f\n", 
+				fmt.Printf("c [restart] Glucose: LBD %.1f > avg %.1f × %.2f\n",
 					recentLBD, avgLBD, s.restartGlucoseRatio)
 			}
 			return true
 		}
 	}
-	
+
 	// Fall back to Luby sequence (configurable base)
 	lubyValue := luby(s.lubyIndex + 1)
 	threshold := lubyValue * s.restartBase
@@ -1648,7 +1647,7 @@ func (s *CDCLSolver) restart() {
 	s.restartCount = s.conflicts
 	s.lbdSum = 0
 	s.lbdCount = 0
-	
+
 	// CRITICAL: Clear tmpFlippedVars on restart
 	// tmpFlippedVars tracks variables flipped at level 1 to detect exhaustion
 	// But it must be cleared on restart since all assignments are cleared
@@ -1787,12 +1786,11 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 	return UNKNOWN
 }
 
-
 func (s *CDCLSolver) inprocessing() {
 	// OPTIMIZATION: Lowered threshold from 500 to 50 clauses to enable inprocessing on PHP instances
 	// PHP 6p5h: 81 clauses, PHP 7p6h: 133 clauses, PHP 8p7h: 204 clauses - all now get inprocessing
 	// Inprocessing (subsumption, self-subsumption) helps reduce clause database and find conflicts faster
-	if s.cnf.NumClauses < 10 {  // Lowered to enable inprocessing after aggressive VE
+	if s.cnf.NumClauses < 10 { // Lowered to enable inprocessing after aggressive VE
 		return
 	}
 
@@ -1922,7 +1920,7 @@ func (s *CDCLSolver) inprocessVariableElimination() {
 				continue
 			}
 
-			deficiency := float64(posOcc + negOcc) - float64(resolventSize)
+			deficiency := float64(posOcc+negOcc) - float64(resolventSize)
 
 			if s.verbose && iter == 0 && varIdx < 5 {
 				fmt.Printf("c [inprocess] VE: var %d pos=%d neg=%d total=%d resolvent=%d deficiency=%.1f\n",
@@ -2401,10 +2399,6 @@ func (s *CDCLSolver) equivalenceDetection() SolveResult {
 	// Step 5: Substitute throughout formula
 	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
 
-	if s.verbose {
-		fmt.Printf("c [debug] Equivalence detection: processing %d clauses\n", len(s.cnf.Clauses))
-	}
-
 	for _, clause := range s.cnf.Clauses {
 		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
 		clauseChanged := false
@@ -2564,9 +2558,6 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		}
 		// CRITICAL: Verify model before returning SAT
 		if !s.verifyModel() {
-			if s.verbose {
-				fmt.Printf("c [ERROR] Model verification failed after inprocessing - should not happen!\n")
-			}
 			return UNKNOWN
 		}
 		return SAT
@@ -2584,16 +2575,13 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 //   - Subsumption check: filter resolvents subsumed by existing clauses
 //   - Time limit: abort if VE takes too long
 //   - Iteration limit: max variables eliminated per pass
+//
 // CRITICAL: Processes one variable at a time and re-computes elimination candidates after each elimination
 func (s *CDCLSolver) variableElimination() SolveResult {
 	if s.verbose {
 		fmt.Printf("c [verbose] VE DEBUG: starting with %d variables, %d clauses\n",
 			s.cnf.NumVars, s.cnf.NumClauses)
 	}
-	
-
-
-
 
 	eliminatedCount := 0
 	clausesRemoved := 0
@@ -2612,7 +2600,7 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 				break
 			}
 		}
-		
+
 		// Check iteration limit
 		if s.varElimMaxIterations > 0 && iterCount >= s.varElimMaxIterations {
 			if s.verbose {
@@ -2652,7 +2640,7 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			posOcc := posCount[varIdx]
 			negOcc := negCount[varIdx]
-			
+
 			// Skip if variable doesn't appear in both polarities
 			if posOcc == 0 || negOcc == 0 {
 				continue
@@ -2679,16 +2667,16 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			// DEFICIENCY HEURISTIC: Only eliminate if we're removing more clauses than adding
 			// deficiency = (posClauses + negClauses) - (posClauses * negClauses)
 			// Positive deficiency = net clause reduction
-			deficiency := float64(posOcc + negOcc) - float64(resolventSize)
-			
+			deficiency := float64(posOcc+negOcc) - float64(resolventSize)
+
 			// Apply minimum deficiency threshold if configured
 			if s.varElimMinDeficiency > 0.0 && deficiency < s.varElimMinDeficiency {
 				continue
 			}
 
 			// Select variable with: 1) smallest resolvent, 2) highest deficiency as tiebreaker
-			if resolventSize < bestResolventSize || 
-			   (resolventSize == bestResolventSize && deficiency > bestDeficiency) {
+			if resolventSize < bestResolventSize ||
+				(resolventSize == bestResolventSize && deficiency > bestDeficiency) {
 				bestVar = varIdx
 				bestResolventSize = resolventSize
 				bestDeficiency = deficiency
@@ -2709,15 +2697,10 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		negCls := negClauses[varIdx]
 		originalClauses := len(posCls) + len(negCls)
 
-		if s.verbose {
-			fmt.Printf("c [debug] Eliminating var %d (resolvent size=%d, deficiency=%.1f, pos=%d, neg=%d)\n",
-				varIdx, bestResolventSize, bestDeficiency, len(posCls), len(negCls))
-		}
-
 		// Generate resolvents with subsumption filtering
 		newResolvents := make([]cnf.Clause, 0)
 		resolventHashes := make(map[uint64]bool) // Duplicate detection
-		
+
 		for _, pIdx := range posCls {
 			for _, nIdx := range negCls {
 				posClause := s.cnf.Clauses[pIdx]
@@ -2733,19 +2716,19 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 						}
 						return UNSAT
 					}
-					
+
 					// Skip tautologies
 					if s.isTautology(resolvent) {
 						continue
 					}
-					
+
 					// DUPLICATE DETECTION: Skip if we already generated this resolvent
 					hash := computeCanonicalHash(resolvent.Literals, s.tmpSortedLits)
 					if resolventHashes[hash] {
 						continue
 					}
 					resolventHashes[hash] = true
-					
+
 					// SUBSUMPTION CHECK: Skip if subsumed by existing clause
 					// (expensive, so only check for small resolvents)
 					if len(resolvent.Literals) <= 5 {
@@ -2760,7 +2743,7 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 							continue
 						}
 					}
-					
+
 					newResolvents = append(newResolvents, *resolvent)
 				}
 			}
@@ -2769,11 +2752,6 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		// Check deficiency again with actual resolvent count (after filtering)
 		actualDeficiency := float64(originalClauses) - float64(len(newResolvents))
 		if s.varElimMinDeficiency > 0.0 && actualDeficiency < s.varElimMinDeficiency {
-			// Not worth eliminating after filtering
-			if s.verbose {
-				fmt.Printf("c [debug] Skipping var %d: actual deficiency %.1f < threshold %.1f\n",
-					varIdx, actualDeficiency, s.varElimMinDeficiency)
-			}
 			// Mark this variable as uneliminatable by zeroing its counts
 			posCount[varIdx] = 0
 			negCount[varIdx] = 0
@@ -2796,11 +2774,6 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 		s.varElimPolarity[varIdx] = true
 
 		s.eliminatedVars = append(s.eliminatedVars, varIdx)
-		
-		if s.verbose {
-			fmt.Printf("c [debug] Eliminating var %d (resolvent size=%d, deficiency=%.1f, pos=%d, neg=%d)\n",
-				varIdx, bestResolventSize, bestDeficiency, len(posCls), len(negCls))
-		}
 		// Assign eliminated variable so VSIDS does not select it
 		s.assignments[varIdx] = Assignment{
 			Value: s.varElimPolarity[varIdx],
@@ -2842,8 +2815,6 @@ func (s *CDCLSolver) variableElimination() SolveResult {
 			eliminatedCount, clausesRemoved, s.cnf.NumClauses)
 
 	}
-	
-
 
 	return UNKNOWN
 }
@@ -2957,9 +2928,6 @@ func (s *CDCLSolver) reconstructEliminatedVars() {
 			Level: 1, // Mark as assigned (not a decision)
 		}
 
-		if s.verbose {
-			fmt.Printf("c [debug] Reconstructed var %d = %v from definition\n", varIdx, defValue)
-		}
 	}
 }
 
@@ -3041,7 +3009,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 				}
 			}
 			// Base activity + bonus for constrained variables
-			s.vsids.activity[i] = 1.0 + float64(occurrences) * 0.5
+			s.vsids.activity[i] = 1.0 + float64(occurrences)*0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
@@ -3051,7 +3019,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 		if s.iterations%IterationReportInterval == 0 && s.verbose {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
-			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
+			fmt.Printf("c [progress] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
 				s.iterations, s.conflicts, s.level, s.learnedActiveCount, mem.Alloc/1024/1024)
 		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
@@ -3193,7 +3161,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				}
 			}
 			// Base activity + bonus for constrained variables
-			s.vsids.activity[i] = 1.0 + float64(occurrences) * 0.5
+			s.vsids.activity[i] = 1.0 + float64(occurrences)*0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
@@ -3211,7 +3179,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		if s.iterations%IterationReportInterval == 0 && s.verbose {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
-			fmt.Printf("c [debug] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
+			fmt.Printf("c [progress] Iter %d, Conflicts %d, Level %d, Learned %d, Alloc=%dMB\n",
 				s.iterations, s.conflicts, s.level, s.learnedActiveCount, mem.Alloc/1024/1024)
 		}
 		if s.maxIter > 0 && s.iterations > s.maxIter {
@@ -3266,9 +3234,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 			// Verify model satisfies all clauses
 			if !s.verifyModel() {
-				if s.verbose {
-					fmt.Printf("c [ERROR] Model verification failed - continuing search\n")
-				}
 				// Model is invalid - this shouldn't happen, indicates a bug
 				// For now, return UNSAT to avoid returning wrong SAT
 				return UNSAT
@@ -3374,9 +3339,9 @@ func (s *CDCLSolver) propagateBinaryWatches() (bool, *cnf.Clause) {
 
 		varIdx := uint32(lit)
 		value := s.assignments[varIdx].Value
-		
+
 		// Inline LitToIndex
-		watchIdx := int(varIdx)<<1
+		watchIdx := int(varIdx) << 1
 		if value {
 			watchIdx |= 1 // negated literal watches false when var is true
 		}
@@ -3386,17 +3351,17 @@ func (s *CDCLSolver) propagateBinaryWatches() (bool, *cnf.Clause) {
 
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
-			
+
 			// Get the other literal in the binary clause (it's always at index 1-blitIndex)
 			blitIdx := watch.Blit
-			
+
 			// Inline IndexToLit
 			blitVarIdx := blitIdx >> 1
 			blitNegated := (blitIdx & 1) != 0
-			
+
 			// Use varLevel cache
 			blitLevel := s.varLevel[blitVarIdx]
-			
+
 			if blitLevel != 0 {
 				blitValue := s.assignments[blitVarIdx].Value
 				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
@@ -3410,7 +3375,7 @@ func (s *CDCLSolver) propagateBinaryWatches() (bool, *cnf.Clause) {
 			if blitLevel == 0 {
 				// Other literal is unassigned - propagate it
 				blitLit := cnf.IndexToLit(int(blitIdx))
-				
+
 				// Get clause for conflict reporting
 				var clause *cnf.Clause
 				if watch.ClauseIdx >= 0 {
@@ -3427,7 +3392,7 @@ func (s *CDCLSolver) propagateBinaryWatches() (bool, *cnf.Clause) {
 					copy(literalsCopy, literals)
 					clause = &cnf.Clause{Literals: literalsCopy, Learned: true}
 				}
-				
+
 				s.assignLiteralByClause(blitLit, s.level, clause)
 				s.propagations++
 				continue
@@ -3519,10 +3484,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		varIdx := uint32(lit)
 		value := s.assignments[varIdx].Value
-		
+
 		// OPTIMIZATION: Inline LitToIndex - avoids function call overhead
 		// lit index = varIdx * 2 + (1 if negated else 0)
-		watchIdx := int(varIdx)<<1
+		watchIdx := int(varIdx) << 1
 		if value {
 			watchIdx |= 1 // negated literal watches false when var is true
 		}
@@ -3552,14 +3517,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clause = &cnf.Clause{Literals: clauseLitsCopy, Learned: true}
 			}
 			blitIdx := watch.Blit
-			
+
 			// Inline IndexToLit
 			blitVarIdx := blitIdx >> 1
 			blitNegated := (blitIdx & 1) != 0
-			
+
 			// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
 			blitLevel := s.varLevel[blitVarIdx]
-			
+
 			if blitLevel != 0 {
 				blitValue := s.assignments[blitVarIdx].Value
 				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
@@ -3579,7 +3544,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			for j := 0; j < len(clauseLits); j++ {
 				clauseLit := clauseLits[j]
 				clauseLitVar := clauseLit.Var()
-				
+
 				// Skip the watched literals themselves
 				// OPTIMIZATION 4: Compare uint32 variables instead of full Literal type
 				if clauseLitVar == watchLitVar || clauseLitVar == blitLitVar {
@@ -3646,7 +3611,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// No replacement found - check if we can propagate or have conflict
 			// Re-read blitLevel - may have changed during replacement search
 			blitLevel = s.assignments[blitVarIdx].Level
-			
+
 			if blitLevel == 0 {
 				blitLit := cnf.IndexToLit(int(blitIdx))
 				s.assignLiteralByClause(blitLit, s.level, clause)
@@ -3678,7 +3643,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					// Print conflict clause literals
 					fmt.Printf("c   Conflict clause: ")
 					for _, cl := range clause.Literals {
-						fmt.Printf("%d%c ", cl.Var()+1, map[bool]byte{true:'-', false:'+'}[cl.IsNegated()])
+						fmt.Printf("%d%c ", cl.Var()+1, map[bool]byte{true: '-', false: '+'}[cl.IsNegated()])
 					}
 					fmt.Printf("\n")
 				}
@@ -3965,13 +3930,13 @@ func (s *CDCLSolver) decide() bool {
 		} else {
 			s.restartDecisionCount = 0
 		}
-		
+
 		// Track this decision for diversity
 		if int(varIdx) < len(s.decidedVarSet) && !s.decidedVarSet[varIdx] {
 			s.decidedVarSet[varIdx] = true
 			s.decidedVars = append(s.decidedVars, varIdx)
 		}
-		
+
 		// Use saved phase from previous decisions (phase saving heuristic)
 		// This remembers the polarity that worked well in previous search attempts
 		if int(varIdx) < len(s.savedPhase) {
@@ -4109,12 +4074,12 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay()
 	s.vsids.decayLBD()
-	
+
 	// OPTIMIZATION 2A: Lazy clause activity decay
 	// Decay clause activity every 100 conflicts instead of every conflict
 	// This reduces GC pressure and CPU overhead while maintaining search quality
 	// Standard solvers (MiniSat, Glucose) use lazy decay for both variables and clauses
-	if s.conflicts % 100 == 0 {
+	if s.conflicts%100 == 0 {
 		for i := range s.clauseActivity {
 			s.clauseActivity[i] *= ClauseActivityDecay
 		}
@@ -4166,7 +4131,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 // Clauses with LBD=2 are "glue clauses" - most valuable, never delete.
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [debug] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
+		fmt.Printf("c [conflict] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
 			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
 	}
 
@@ -4214,7 +4179,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount := s.tmpLevelCount[s.level]
-	
+
 	// Build candidate list from trail (most recent first)
 	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
@@ -4250,7 +4215,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		for _, lit := range reasonClause.Literals {
 			v := lit.Var()
 			litNegated := lit.IsNegated()
-			
+
 			// Skip the resolved variable - its negation in the reason cancels with the original
 			if v == varIdx {
 				continue
@@ -4346,7 +4311,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		fmt.Printf("c   FINAL: %d literals, LBD=%d, backjump=%d\n", len(s.tmpLearnedLits), lbd, backjumpLevel)
 	}
 
-
 	// Store learned clause in database
 	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
 		// Store literals in contiguous pool
@@ -4362,9 +4326,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			offset = len(s.learnedLiterals)
 			s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
 		}
-		
+
 		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
-		
+
 		// Append metadata
 		s.learnedOffsets = append(s.learnedOffsets, offset)
 		s.learnedSizes = append(s.learnedSizes, len(s.tmpLearnedLits))
@@ -4393,19 +4357,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
 	}
 
-
 	// Immediate propagation for unit clauses
 	// Propagate at current level (use level 1 for root to distinguish from unassigned)
 	if len(s.tmpLearnedLits) == 1 {
 		lit := s.tmpLearnedLits[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
-		
+
 		propLevel := s.level
 		if propLevel == 0 {
 			propLevel = 1
 		}
-		
+
 		if s.assignments[varIdx].Level != 0 {
 			// Already assigned - check for conflict
 			if s.assignments[varIdx].Value != litValue {
@@ -4626,10 +4589,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 		idx := clauses[i].idx
 		deleted[idx] = true
-		
+
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
 		s.removeLearnedClauseWatches(idx)
-		
+
 		// Track literal region as free for reuse
 		offset := s.learnedOffsets[idx]
 		size := s.learnedSizes[idx]
@@ -4643,7 +4606,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		if deleted[readIdx] {
 			continue // Skip deleted slots
 		}
-		
+
 		if writeIdx != readIdx {
 			// Move clause metadata from readIdx to writeIdx
 			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
@@ -4654,7 +4617,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			s.clauseLBD[writeIdx] = s.clauseLBD[readIdx]
 			s.clauseUseCount[writeIdx] = s.clauseUseCount[readIdx]
 			s.clausePropCount[writeIdx] = s.clausePropCount[readIdx]
-			
+
 			// CRITICAL: Update all watches referencing this clause
 			s.updateWatchClauseIndices(writeIdx, readIdx)
 		}
@@ -4664,7 +4627,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Step 4: Update active count and capacity
 	s.learnedActiveCount = writeIdx
 	s.learnedCapacity = writeIdx
-	
+
 	// Truncate metadata arrays (no reallocation, just update length)
 	s.learnedOffsets = s.learnedOffsets[:writeIdx]
 	s.learnedSizes = s.learnedSizes[:writeIdx]
@@ -4698,7 +4661,7 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 	// Watch stores ClauseIdx as negative for learned clauses: -learnedIdx-1
 	oldClauseIdx := -oldIdx - 1
 	newClauseIdx := -newIdx - 1
-	
+
 	for litIdx := range s.watchLists {
 		watchList := s.watchLists[litIdx]
 		for i := range watchList {
