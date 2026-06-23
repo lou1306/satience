@@ -46,8 +46,8 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	DefaultMaxLearned       = 10000 // Increased for better performance  // Maximum learned clauses before deletion
-	DefaultMinLearned       = 2000  // Target clauses after deletion (20% reduction)
+	DefaultMaxLearned       = 2000  // tuned for PHP instances (need <500), tradeoff on medium instances
+	DefaultMinLearned       = 1000  // Target clauses after deletion (50% reduction)
 	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
@@ -4071,6 +4071,12 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
+	// Delete learned clauses if database exceeded maxLearned by 50%
+	// This allows some growth while preventing explosion
+	if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
+		s.deleteLearnedClauses()
+	}
+
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay()
 	s.vsids.decayLBD()
@@ -4422,8 +4428,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 // - LBD=3 AND size≤3 AND age<50: Very good, protect unless very old (score=-500)
 
 // Deletion Trigger:
-// When learned clause count exceeds maxLearned (default 10,000), delete down to
-// minLearned (default 5,000) - aggressive 50% reduction.
+// When learned clause count exceeds maxLearned (default 200), delete down to
+// minLearned (default 100) - aggressive 50% reduction (MiniSat-style).
 
 // Scoring Formula:
 // score = age*10 + LBD*50 + size*5 - activity*20 + bonuses/penalties
