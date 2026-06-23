@@ -162,6 +162,8 @@ type CDCLSolver struct {
 	lastRandomDecision   int             // Last conflict where we made random decision
 	randomDecisionRate   float64         // Probability of making a random decision (0.0 = never, 1.0 = always)
 	unitLearnedClauses   map[uint32]bool // Map of variables with unit learned clauses (bit 31 = polarity)
+	learnedUnitLiteral   cnf.Literal     // Unit literal learned in last conflict (for propagation after backtrack)
+	hasLearnedUnit       bool            // True if learnedUnitLiteral is valid
 	randomDecisionPeriod int             // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
 	randomSeed           uint64          // Seed for deterministic random selection
 	lastDecisionVar      uint32          // Last variable chosen for decision
@@ -3083,6 +3085,19 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
+			// Propagate learned unit literal after backtrack
+			if s.hasLearnedUnit {
+				lit := s.learnedUnitLiteral
+				varIdx := lit.Var()
+				litValue := !lit.IsNegated()
+				s.assignments[varIdx] = Assignment{Value: litValue, Level: 0}
+				s.varLevel[varIdx] = 0
+				s.trail = append(s.trail, int(varIdx))
+				s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
+				s.propagations++
+				s.hasLearnedUnit = false
+			}
+
 			// Trigger inprocessing at configured interval
 			// For small instances (< 100 vars), trigger earlier but not too frequently
 			inprocessingInterval := s.inprocessingInterval
@@ -3241,6 +3256,19 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				return UNSAT
 			}
 			s.backjumpLevel = 0
+
+			// Propagate learned unit literal after backtrack
+			if s.hasLearnedUnit {
+				lit := s.learnedUnitLiteral
+				varIdx := lit.Var()
+				litValue := !lit.IsNegated()
+				s.assignments[varIdx] = Assignment{Value: litValue, Level: 0}
+				s.varLevel[varIdx] = 0
+				s.trail = append(s.trail, int(varIdx))
+				s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
+				s.propagations++
+				s.hasLearnedUnit = false
+			}
 
 			// Trigger inprocessing at configured interval
 			// For small instances (< 100 vars), trigger earlier but not too frequently
@@ -4090,6 +4118,9 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
 
+	// Clear empty clause flag for new conflict analysis
+	s.emptyClauseFound = false
+
 	// Get the conflicting clause literals directly
 	conflictLits := conflictClause.Literals
 
@@ -4396,35 +4427,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
 	}
 
-	// Immediate propagation for unit clauses
-	// Propagate at current level (use level 1 for root to distinguish from unassigned)
-	if len(s.tmpLearnedLits) == 1 {
-		lit := s.tmpLearnedLits[0]
-		varIdx := lit.Var()
-		litValue := !lit.IsNegated()
-
-		propLevel := s.level
-		if propLevel == 0 {
-			propLevel = 1
-		}
-
-		if s.assignments[varIdx].Level != 0 {
-			// Already assigned - check for conflict
-			if s.assignments[varIdx].Value != litValue {
-				if s.level == 0 || s.implication[varIdx] != nil {
-					s.emptyClauseFound = true
-					return 0
-				}
-			}
-		} else {
-			// Not assigned - propagate
-			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
-			s.varLevel[varIdx] = propLevel
-			s.trail = append(s.trail, int(varIdx))
-			s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
-			s.propagations++
-		}
+	// Store unit literal for propagation after backtrack
+	s.hasLearnedUnit = len(s.tmpLearnedLits) == 1
+	if s.hasLearnedUnit {
+		s.learnedUnitLiteral = s.tmpLearnedLits[0]
 	}
+
 	return backjumpLevel
 }
 
