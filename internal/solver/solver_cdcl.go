@@ -4147,12 +4147,11 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
-	// TEMPORARILY DISABLED: Clause deletion causes corruption due to stale implication pointers
 	// Delete learned clauses when database exceeds maxLearned by 50%
 	// This prevents memory explosion while keeping useful clauses
-	// if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
-	// 	s.deleteLearnedClauses()
-	// }
+	if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
+		s.deleteLearnedClauses()
+	}
 
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay()
@@ -4493,18 +4492,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Store learned clause in database
 	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
 		// Store literals in contiguous pool
-		var offset int
-		if len(s.literalFreeSlots) > 0 {
-			slot := s.literalFreeSlots[len(s.literalFreeSlots)-1]
-			s.literalFreeSlots = s.literalFreeSlots[:len(s.literalFreeSlots)-1]
-			offset = slot.offset
-			if offset+len(s.tmpLearnedLits) > len(s.learnedLiterals) {
-				s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, offset+len(s.tmpLearnedLits)-len(s.learnedLiterals))...)
-			}
-		} else {
-			offset = len(s.learnedLiterals)
-			s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
-		}
+		// DISABLED: Reusing literal slots causes corruption when implication pointers become stale
+		// Proper fix: change implication storage from pointers to indices
+		offset := len(s.learnedLiterals)
+		s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
 
 		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
 
@@ -4778,10 +4769,11 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
 		s.removeLearnedClauseWatches(idx)
 
-		// Track literal region as free for reuse
-		offset := s.learnedOffsets[idx]
-		size := s.learnedSizes[idx]
-		s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
+		// DISABLED: Tracking free slots causes corruption when implication pointers become stale
+		// Proper fix: change implication storage from pointers to indices
+		// offset := s.learnedOffsets[idx]
+		// size := s.learnedSizes[idx]
+		// s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
 	}
 
 	// Step 3: Swap-remove - move active clauses into deleted slots
