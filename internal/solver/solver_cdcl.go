@@ -46,8 +46,10 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	DefaultMaxLearned       = 2000  // tuned for PHP instances (need <500), tradeoff on medium instances
-	DefaultMinLearned       = 1000  // Target clauses after deletion (50% reduction)
+	// Fixed clause database size - tuned for best overall performance on MiniSat fast suite
+	// maxLearned=2000 gives best balance: small enough for fast propagation on PHP,
+	// large enough for medium instances (600-2500 vars)
+	DefaultMaxLearned       = 2000  // Fixed clause database limit
 	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
@@ -283,7 +285,7 @@ func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint6
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := DefaultMaxLearned
-	minLearned := DefaultMinLearned
+	minLearned := maxLearned / 2
 	restartBase := DefaultRestartBase
 
 	// Ensure literal pool is built for efficient propagation
@@ -4071,8 +4073,8 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
-	// Delete learned clauses if database exceeded maxLearned by 50%
-	// This allows some growth while preventing explosion
+	// Delete learned clauses when database exceeds maxLearned by 50%
+	// This prevents memory explosion while keeping useful clauses
 	if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
 		s.deleteLearnedClauses()
 	}
