@@ -46,10 +46,8 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	// Fixed clause database size - tuned for best overall performance on MiniSat fast suite
-	// maxLearned=2000 gives best balance: small enough for fast propagation on PHP,
-	// large enough for medium instances (600-2500 vars)
-	DefaultMaxLearned       = 2000  // Fixed clause database limit
+	// Base clause database size - scaled with instance size by calculateMaxLearned()
+	DefaultMaxLearnedBase   = 2000  // Base clause database limit
 	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	ClauseActivityDecay     = 0.95  // Clause activity decay factor
@@ -68,6 +66,39 @@ const (
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
 )
+
+// calculateMaxLearned scales the clause database limit with instance size.
+func calculateMaxLearned(numVars uint32, numClauses int) int {
+	maxLearned := DefaultMaxLearnedBase
+
+	if numVars >= 50000 {
+		maxLearned = 32000
+	} else if numVars >= 10000 {
+		maxLearned = 16000
+	} else if numVars >= 5000 {
+		maxLearned = 8000
+	} else if numVars >= 1000 {
+		maxLearned = 4000
+	}
+
+	if numVars > 0 {
+		density := float64(numClauses) / float64(numVars)
+		if density > 10.0 {
+			maxLearned = int(float64(maxLearned) * 1.5)
+		} else if density < 3.0 {
+			maxLearned = int(float64(maxLearned) * 0.75)
+		}
+	}
+
+	if maxLearned < 500 {
+		maxLearned = 500
+	}
+	if maxLearned > 100000 {
+		maxLearned = 100000
+	}
+
+	return maxLearned
+}
 
 // CDCLSolver implements a CDCL SAT solver with modern techniques.
 //
@@ -284,7 +315,7 @@ func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint6
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := DefaultMaxLearned
+	maxLearned := calculateMaxLearned(formula.NumVars, formula.NumClauses)
 	minLearned := maxLearned / 2
 	restartBase := DefaultRestartBase
 
@@ -304,15 +335,15 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		implication:          make([]*cnf.Clause, formula.NumVars),
 		iterations:           0,
 		maxIter:              0,
-		learnedLiterals:      make([]cnf.Literal, 0, 10000), // Pre-allocate for ~2500 clauses × avg 4 literals
-		learnedOffsets:       make([]int, 0, 2500),
-		learnedSizes:         make([]int, 0, 2500),
-		clauseActivity:       make([]float64, 0, 2500),
-		clauseAge:            make([]int, 0, 2500),
-		clauseSize:           make([]int, 0, 2500),
-		clauseLBD:            make([]int, 0, 2500),
-		clauseUseCount:       make([]int, 0, 2500),
-		clausePropCount:      make([]int, 0, 2500),
+		learnedLiterals:      make([]cnf.Literal, 0, maxLearned*4),
+		learnedOffsets:       make([]int, 0, maxLearned),
+		learnedSizes:         make([]int, 0, maxLearned),
+		clauseActivity:       make([]float64, 0, maxLearned),
+		clauseAge:            make([]int, 0, maxLearned),
+		clauseSize:           make([]int, 0, maxLearned),
+		clauseLBD:            make([]int, 0, maxLearned),
+		clauseUseCount:       make([]int, 0, maxLearned),
+		clausePropCount:      make([]int, 0, maxLearned),
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		literalFreeSlots:     make([]literalFreeSlot, 0, 64),
@@ -359,7 +390,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpSubsumeVars:       make([]uint32, 0, 64),
 		tmpTautologySeen:     make([]bool, formula.NumVars),
 		tmpTautologyPolarity: make([]bool, formula.NumVars),
-		learnedClauseHashes:  make(map[uint64]bool, 2500),
+		learnedClauseHashes:  make(map[uint64]bool, maxLearned),
 		learnedClauseBase:    int(formula.NumClauses),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
@@ -804,7 +835,7 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c Conflicts:     %d\n", stats.Conflicts)
 	fmt.Printf("c Decisions:     %d\n", stats.Decisions)
 	fmt.Printf("c Iterations:    %d\n", stats.Iterations)
-	fmt.Printf("c Learned:       %d\n", stats.LearnedClauses)
+	fmt.Printf("c Learned:       %d / %d (maxLearned)\n", stats.LearnedClauses, s.maxLearned)
 	fmt.Printf("c Max Level:     %d\n", stats.MaxLevel)
 	if stats.AvgClauseSize > 0 {
 		fmt.Printf("c Avg Clause:  %d lits (min=%d, max=%d)\n",
