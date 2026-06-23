@@ -162,8 +162,6 @@ type CDCLSolver struct {
 	lastRandomDecision   int             // Last conflict where we made random decision
 	randomDecisionRate   float64         // Probability of making a random decision (0.0 = never, 1.0 = always)
 	unitLearnedClauses   map[uint32]bool // Map of variables with unit learned clauses (bit 31 = polarity)
-	learnedUnitLiteral   cnf.Literal     // Unit literal learned in last conflict (for propagation after backtrack)
-	hasLearnedUnit       bool            // True if learnedUnitLiteral is valid
 	randomDecisionPeriod int             // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
 	randomSeed           uint64          // Seed for deterministic random selection
 	lastDecisionVar      uint32          // Last variable chosen for decision
@@ -3085,19 +3083,6 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
-			// Propagate learned unit literal after backtrack
-			if s.hasLearnedUnit {
-				lit := s.learnedUnitLiteral
-				varIdx := lit.Var()
-				litValue := !lit.IsNegated()
-				s.assignments[varIdx] = Assignment{Value: litValue, Level: 0}
-				s.varLevel[varIdx] = 0
-				s.trail = append(s.trail, int(varIdx))
-				s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
-				s.propagations++
-				s.hasLearnedUnit = false
-			}
-
 			// Trigger inprocessing at configured interval
 			// For small instances (< 100 vars), trigger earlier but not too frequently
 			inprocessingInterval := s.inprocessingInterval
@@ -3256,19 +3241,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				return UNSAT
 			}
 			s.backjumpLevel = 0
-
-			// Propagate learned unit literal after backtrack
-			if s.hasLearnedUnit {
-				lit := s.learnedUnitLiteral
-				varIdx := lit.Var()
-				litValue := !lit.IsNegated()
-				s.assignments[varIdx] = Assignment{Value: litValue, Level: 0}
-				s.varLevel[varIdx] = 0
-				s.trail = append(s.trail, int(varIdx))
-				s.implication[varIdx] = &cnf.Clause{Literals: []cnf.Literal{lit}, Learned: true}
-				s.propagations++
-				s.hasLearnedUnit = false
-			}
 
 			// Trigger inprocessing at configured interval
 			// For small instances (< 100 vars), trigger earlier but not too frequently
@@ -3499,6 +3471,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// This must run even if trail is empty (after backtrack to level 0)
 	// Learned clauses >= 2 literals are watched, but unit learned clauses
 	// (size=1) are not watched and must be scanned explicitly.
+	unitCount := 0
 	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
 		if s.learnedSizes[learnedIdx] != 1 {
 			continue
@@ -3507,22 +3480,37 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		if len(literals) != 1 {
 			continue
 		}
+		unitCount++
 		lit := literals[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
+		if s.verbose {
+			fmt.Printf("c [UNIT SCAN] idx=%d, var=%d, level=%d\n", learnedIdx, varIdx+1, s.assignments[varIdx].Level)
+		}
 		if s.assignments[varIdx].Level == 0 {
-			// Use level 1 for root-level propagation (distinguishes from unassigned)
-			propLevel := s.level
-			if propLevel == 0 {
-				propLevel = 1
+			// Propagate at level 1 (to distinguish from unassigned and for proper 1-UIP operation)
+			propLevel := 1
+			if s.verbose {
+				fmt.Printf("c [UNIT PROP] var=%d, value=%v, level=%d\n", varIdx+1, litValue, propLevel)
 			}
 			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
 			s.varLevel[varIdx] = propLevel
 			s.trail = append(s.trail, int(varIdx))
-			s.implication[varIdx] = &cnf.Clause{Literals: literals, Learned: true}
+			// Make a copy of literals to avoid issues when learned clause pool is modified
+			litsCopy := make([]cnf.Literal, len(literals))
+			copy(litsCopy, literals)
+			s.implication[varIdx] = &cnf.Clause{Literals: litsCopy, Learned: true}
 			s.propagations++
 		} else if s.assignments[varIdx].Value != litValue {
 			// Conflict: unit clause conflicts with existing assignment
+			// Check if existing assignment was also from a unit (not a decision)
+			if s.implication[varIdx] != nil && len(s.implication[varIdx].Literals) == 1 {
+				// Both are unit propagations - conflicting units, UNSAT
+				if s.verbose {
+					fmt.Printf("c [propagate] Conflicting units: var=%d, existing=%v, new=%v - UNSAT\n", varIdx+1, s.assignments[varIdx].Value, litValue)
+				}
+				s.emptyClauseFound = true
+			}
 			if s.level == 0 {
 				s.emptyClauseFound = true
 			}
@@ -3778,11 +3766,7 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 			}
 
 			if unassignedCount == 1 && falseCount == size-1 {
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
-				s.assignLiteralByClause(unassignedLit, assignLevel, clause)
+				s.assignLiteralByClause(unassignedLit, s.level, clause)
 				unitPropagated = true
 				break
 			}
@@ -3836,12 +3820,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 			}
 
 			if unassignedCount == 1 && falseCount == clauseSize-1 {
-				assignLevel := s.level
-				if assignLevel == 0 {
-					assignLevel = 1
-				}
 				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
-				s.assignLiteralByClause(unassignedLit, assignLevel, tmpClause)
+				s.assignLiteralByClause(unassignedLit, s.level, tmpClause)
 				unitPropagated = true
 				// Track propagation count for this learned clause
 				if learnedIdx < len(s.clausePropCount) {
@@ -4081,7 +4061,6 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clause *cnf.Claus
 }
 
 // assignLiteralByClause assigns a literal with a clause pointer as reason
-// O(1) - just stores the pointer directly
 func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *cnf.Clause) {
 	varIdx := lit.Var()
 
@@ -4097,7 +4076,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clause *c
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 
-	// Store clause pointer directly - O(1), no lookup needed!
+	// Store clause pointer directly
 	s.implication[varIdx] = clause
 
 	// Save phase for ALL assignments (consistent with assignLiteral)
@@ -4118,6 +4097,39 @@ func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
 
+	// If empty clause was already detected (e.g., during propagation), skip learning
+	if s.emptyClauseFound {
+		return
+	}
+
+	// Check if conflict clause is a unit that conflicts with an existing assignment
+	// This indicates UNSAT (two conflicting unit clauses)
+	if len(conflictClause.Literals) == 1 {
+		lit := conflictClause.Literals[0]
+		varIdx := lit.Var()
+		litValue := !lit.IsNegated()
+		if s.assignments[varIdx].Level != 0 || s.varLevel[varIdx] != 0 {
+			if s.assignments[varIdx].Value != litValue {
+				// Variable assigned with opposite value
+				// Check if existing assignment was from a unit propagation (not a decision)
+				if s.implication[varIdx] != nil && len(s.implication[varIdx].Literals) == 1 {
+					// Both are unit propagations - conflicting units, UNSAT
+					if s.verbose {
+						fmt.Printf("c [handleConflict] Conflicting units on var %d: existing=%v (from unit), new=%v - UNSAT\n", varIdx+1, s.assignments[varIdx].Value, litValue)
+					}
+					s.emptyClauseFound = true
+					return
+				}
+				// Existing assignment was a decision - not UNSAT, just a conflict
+			}
+			// Variable already assigned with same value - redundant unit, skip
+			if s.verbose {
+				fmt.Printf("c [handleConflict] Redundant unit on var %d - skipping\n", varIdx+1)
+			}
+			return
+		}
+	}
+
 	// Clear empty clause flag for new conflict analysis
 	s.emptyClauseFound = false
 
@@ -4135,11 +4147,12 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
+	// TEMPORARILY DISABLED: Clause deletion causes corruption due to stale implication pointers
 	// Delete learned clauses when database exceeds maxLearned by 50%
 	// This prevents memory explosion while keeping useful clauses
-	if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
-		s.deleteLearnedClauses()
-	}
+	// if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
+	// 	s.deleteLearnedClauses()
+	// }
 
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay()
@@ -4261,6 +4274,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// Resolve on candidates until 1 UIP remains
 	candidateIdx := 0
+	resolveStep := 0
 	for currentCount > 1 && candidateIdx < len(s.tmpCandidates) {
 		candidate := s.tmpCandidates[candidateIdx]
 		candidateIdx++
@@ -4272,7 +4286,38 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		reasonClause := s.implication[varIdx]
 		if reasonClause == nil {
+			if s.verbose {
+				fmt.Printf("c [1-UIP] Step %d: var %d is decision (no reason), skip\n", resolveStep, varIdx+1)
+			}
 			continue // Decision, skip
+		}
+
+		// Check for tautologies in reason clause
+		if s.verbose {
+			reasonSeen := make(map[uint32]bool)
+			reasonIsTaut := false
+			for _, rl := range reasonClause.Literals {
+				if reasonSeen[rl.Var()] {
+					reasonIsTaut = true
+					break
+				}
+				reasonSeen[rl.Var()] = true
+			}
+			if reasonIsTaut {
+				fmt.Printf("c [1-UIP] Step %d: WARNING - reason clause for var %d is TAUTOLOGY: ", resolveStep, varIdx+1)
+				for _, rl := range reasonClause.Literals {
+					fmt.Printf("%d%c ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()])
+				}
+				fmt.Printf("\n")
+			}
+		}
+
+		if s.verbose {
+			fmt.Printf("c [1-UIP] Step %d: Resolving on var %d, reason clause: ", resolveStep, varIdx+1)
+			for _, rl := range reasonClause.Literals {
+				fmt.Printf("%d%c ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()])
+			}
+			fmt.Printf("\n")
 		}
 
 		// Resolve: remove varIdx, add reason literals
@@ -4288,19 +4333,32 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 			// Skip the resolved variable - its negation in the reason cancels with the original
 			if v == varIdx {
+				if s.verbose {
+					fmt.Printf("c [1-UIP]   Skip resolved var %d\n", v+1)
+				}
 				continue
 			}
 			if s.tmpLiteralInClause[v] {
 				if s.tmpLiteralIsNegated[v] != litNegated {
 					// Cancel: remove from clause
+					if s.verbose {
+						fmt.Printf("c [1-UIP]   CANCEL var %d (neg=%v vs %v)\n", v+1, s.tmpLiteralIsNegated[v], litNegated)
+					}
 					s.tmpLiteralInClause[v] = false
 					s.tmpLevelCount[s.varLevel[v]]--
 					if s.varLevel[v] == s.level {
 						currentCount--
 					}
+				} else {
+					if s.verbose {
+						fmt.Printf("c [1-UIP]   Keep var %d (same polarity)\n", v+1)
+					}
 				}
 			} else {
 				// Add to clause
+				if s.verbose {
+					fmt.Printf("c [1-UIP]   ADD var %d, neg=%v, level=%d\n", v+1, litNegated, s.varLevel[v])
+				}
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
@@ -4326,6 +4384,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				}
 			}
 		}
+		resolveStep++
 	}
 
 	// Calculate LBD and backjump level
@@ -4356,6 +4415,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// Empty clause = UNSAT
 	if len(s.tmpLearnedLits) == 0 {
+		if s.verbose {
+			fmt.Printf("c [learnClause] Empty clause learned - UNSAT\n")
+		}
 		s.emptyClauseFound = true
 		return 0
 	}
@@ -4379,6 +4441,53 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	if s.verbose {
 		fmt.Printf("c   FINAL: %d literals, LBD=%d, backjump=%d\n", len(s.tmpLearnedLits), lbd, backjumpLevel)
+	}
+
+	// Check for tautologies (both polarities of same variable)
+	// This can happen due to bugs in conflict analysis
+	seen := make(map[uint32]bool)
+	for _, lit := range s.tmpLearnedLits {
+		varIdx := lit.Var()
+		if seen[varIdx] {
+			// Tautology detected - skip learning this clause
+			if s.verbose {
+				fmt.Printf("c [learnClause] TAUTOLOGY detected in learned clause - skipping\n")
+			}
+			return backjumpLevel
+		}
+		seen[varIdx] = true
+	}
+
+	// Check for conflicting unit clauses
+	if len(s.tmpLearnedLits) == 1 {
+		lit := s.tmpLearnedLits[0]
+		varIdx := lit.Var()
+		litValue := !lit.IsNegated()
+		if s.verbose {
+			fmt.Printf("c [learnClause] Learning unit: var=%d, value=%v\n", varIdx+1, litValue)
+		}
+		// Check if opposite unit already exists
+		for i := 0; i < s.learnedCapacity; i++ {
+			if s.learnedSizes[i] != 1 {
+				continue
+			}
+			existingLits := s.getLearnedClauseLiterals(i)
+			if len(existingLits) != 1 {
+				continue
+			}
+			existingLit := existingLits[0]
+			if existingLit.Var() == varIdx {
+				existingValue := !existingLit.IsNegated()
+				if existingValue != litValue {
+					// Conflicting unit found - UNSAT
+					if s.verbose {
+						fmt.Printf("c [learnClause] Conflicting unit on var %d: existing=%v, new=%v - UNSAT\n", varIdx+1, existingValue, litValue)
+					}
+					s.emptyClauseFound = true
+					return 0
+				}
+			}
+		}
 	}
 
 	// Store learned clause in database
@@ -4425,12 +4534,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		// VSIDS bump
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
-	}
-
-	// Store unit literal for propagation after backtrack
-	s.hasLearnedUnit = len(s.tmpLearnedLits) == 1
-	if s.hasLearnedUnit {
-		s.learnedUnitLiteral = s.tmpLearnedLits[0]
 	}
 
 	return backjumpLevel
@@ -4629,12 +4732,47 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 	// Step 2: Mark clauses for deletion and track free literal slots
 	// CRITICAL FIX: Remove watches BEFORE marking as deleted
+	// PROTECTION: Don't delete clauses that are used as implication reasons
 	deleted := make([]bool, s.learnedCapacity)
+	clauseUsedAsReason := make([]bool, s.learnedCapacity)
+	
+	// Mark clauses used as implications by comparing clause content
+	protectedCount := 0
+	for _, imp := range s.implication {
+		if imp != nil && imp.Learned && len(imp.Literals) > 0 {
+			// Find matching clause by comparing literals
+			for i := 0; i < s.learnedActiveCount; i++ {
+				if s.learnedSizes[i] != len(imp.Literals) {
+					continue
+				}
+				lits := s.getLearnedClauseLiterals(i)
+				match := true
+				for j := range imp.Literals {
+					if lits[j] != imp.Literals[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					clauseUsedAsReason[i] = true
+					protectedCount++
+					break
+				}
+			}
+		}
+	}
+	if s.verbose && protectedCount > 0 {
+		fmt.Printf("c [deleteLearnedClauses] Protected %d clauses used as implications\n", protectedCount)
+	}
+	
 	for i := 0; i < toDelete; i++ {
 		if clauses[i].score < 0 {
 			break // Don't delete protected clauses
 		}
 		idx := clauses[i].idx
+		if clauseUsedAsReason[idx] {
+			continue // Don't delete clauses used as implications
+		}
 		deleted[idx] = true
 
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
@@ -4808,11 +4946,6 @@ func (s *CDCLSolver) backtrack() bool {
 
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
-
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		fmt.Printf("c [BACKTRACK] Backjumping from level %d to %d, var %d, trail[%d:%d]\n",
-			s.level, bjLevel, decisionVar+1, decisionPoint, len(s.trail))
-	}
 
 	// Clear all assignments from decisionPoint onwards
 	for i := decisionPoint; i < len(s.trail); i++ {
