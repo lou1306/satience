@@ -3514,6 +3514,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		}
 	}
 
+	// CRITICAL FIX: After unit propagation, reset qhead to process newly added trail elements
+	// Without this, trail elements from unit clauses are never processed through watch lists
+	if s.level < len(s.trailHead) {
+		s.qhead = s.trailHead[s.level]
+	} else {
+		s.qhead = 0
+	}
+
 	// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
 	if s.qhead >= len(s.trail) {
 		return false, nil
@@ -4057,7 +4065,10 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx int) {
 	varIdx := lit.Var()
 
-	if s.assignments[varIdx].Level != 0 {
+	// CRITICAL FIX: Check implication instead of Level != 0
+	// Level 0 can mean both "unassigned" AND "assigned at level 0" after backtracking
+	// implication[varIdx] != -1 properly indicates the variable is already assigned
+	if s.implication[varIdx] != -1 {
 		return
 	}
 
@@ -4260,6 +4271,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.tmpTouchedVars = append(s.tmpTouchedVars, varIdx)
 			lvl := s.assignments[varIdx].Level
 			if lvl <= s.level {
+				// Ensure arrays are large enough for this level
+				if lvl >= len(s.tmpLevelCountUsed) {
+					newSize := lvl + 1
+					newCountUsed := make([]bool, newSize)
+					newLevelCount := make([]int, newSize)
+					copy(newCountUsed, s.tmpLevelCountUsed)
+					copy(newLevelCount, s.tmpLevelCount)
+					s.tmpLevelCountUsed = newCountUsed
+					s.tmpLevelCount = newLevelCount
+				}
 				if !s.tmpLevelCountUsed[lvl] {
 					s.tmpLevelCountUsed[lvl] = true
 					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
@@ -4420,10 +4441,19 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := s.assignments[varIdx].Level
-			if lvl >= 0 && !s.tmpLevelSetUsed[lvl] {
-				s.tmpLevelSetUsed[lvl] = true
-				s.tmpLevelSet = append(s.tmpLevelSet, lvl)
-				lbd++
+			if lvl >= 0 {
+				// Ensure arrays are large enough for this level
+				if lvl >= len(s.tmpLevelSetUsed) {
+					newSize := lvl + 1
+					newSetUsed := make([]bool, newSize)
+					copy(newSetUsed, s.tmpLevelSetUsed)
+					s.tmpLevelSetUsed = newSetUsed
+				}
+				if !s.tmpLevelSetUsed[lvl] {
+					s.tmpLevelSetUsed[lvl] = true
+					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
+					lbd++
+				}
 			}
 			if lvl > maxLevel && lvl < s.level {
 				maxLevel = lvl
