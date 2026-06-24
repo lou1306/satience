@@ -141,6 +141,8 @@ type CDCLSolver struct {
 	clauseLBD            []int             // Track LBD at time of learning
 	clauseUseCount       []int             // Track how often clause used in conflict analysis
 	clausePropCount      []int             // Track how many propagations clause caused
+	clauseScore          []float64         // Cached deletion scores (incremental scoring optimization)
+	scoreDirty           []bool            // Track which clause scores need recomputation
 	normalClauseCount    int               // Track number of non-glue clauses (LBD > 3)
 	learnedActiveCount   int               // Number of active clauses (excludes tombstones)
 	learnedCapacity      int               // Total capacity including tombstones
@@ -346,6 +348,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		clauseLBD:            make([]int, 0, maxLearned),
 		clauseUseCount:       make([]int, 0, maxLearned),
 		clausePropCount:      make([]int, 0, maxLearned),
+		clauseScore:          make([]float64, 0, maxLearned), // Incremental scoring
+		scoreDirty:           make([]bool, 0, maxLearned),    // Track dirty scores
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		literalFreeSlots:     make([]literalFreeSlot, 0, 64),
@@ -3874,6 +3878,7 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				// Track propagation count for this learned clause
 				if learnedIdx < len(s.clausePropCount) {
 					s.clausePropCount[learnedIdx]++
+					s.markClauseDirty(learnedIdx) // Mark score as needing update
 				}
 				break
 			}
@@ -4229,6 +4234,10 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	if s.conflicts%100 == 0 {
 		for i := range s.clauseActivity {
 			s.clauseActivity[i] *= ClauseActivityDecay
+		}
+		// Mark all scores as dirty since activity changed
+		for i := range s.scoreDirty {
+			s.scoreDirty[i] = true
 		}
 	}
 
@@ -4610,6 +4619,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.clauseLBD = append(s.clauseLBD, lbd)
 		s.clauseUseCount = append(s.clauseUseCount, 0)
 		s.clausePropCount = append(s.clausePropCount, 0)
+		// Initialize score for new clause (it's dirty by definition since it's new)
+		s.clauseScore = append(s.clauseScore, 0.0)
+		s.scoreDirty = append(s.scoreDirty, true)
 		if lbd > 3 {
 			s.normalClauseCount++
 		}
@@ -4758,9 +4770,86 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 	return minimized
 }
 
+// computeClauseScore calculates the deletion score for a clause
+// Higher score = more likely to delete
+// Used for incremental scoring optimization
+func (s *CDCLSolver) computeClauseScore(idx int) float64 {
+	lbd := s.clauseLBD[idx]
+	size := s.learnedSizes[idx]
+	age := s.currentAge - s.clauseAge[idx]
+	activity := s.clauseActivity[idx]
+	useCount := s.clauseUseCount[idx]
+	propCount := s.clausePropCount[idx]
+
+	// Calculate deletion score (higher = delete first)
+	score := float64(lbd) * s.clauseDeletionLBDWeight
+	score += float64(age) * s.clauseDeletionAgeWeight
+	score += float64(size) * s.clauseDeletionSizeWeight
+	score -= activity * s.clauseDeletionActivityWeight
+
+	if useCount > s.clauseDeletionUseCountHigh {
+		score -= float64(useCount) * 15.0
+	} else if useCount > 0 {
+		score -= float64(useCount) * 3.0
+	}
+	if propCount > s.clauseDeletionPropCountHigh {
+		score -= float64(propCount) * 8.0
+	} else if propCount > 0 {
+		score -= float64(propCount) * 2.0
+	}
+
+	// Protection for glue clauses and ALL unit clauses
+	if size == 1 {
+		// NEVER delete unit clauses - they are global constraints
+		score = -100000.0
+	} else if lbd <= s.coreGlueLBDThreshold {
+		score = -10000.0
+	} else if lbd == s.coreGlueLBDThreshold+1 {
+		score = -5000.0
+	} else if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
+		score = -1000.0
+	}
+
+	// Force deletion for high-LBD clauses
+	if lbd > s.clauseDeletionHighLBD1 {
+		score += s.clauseDeletionHighLBDBonus1
+	}
+	if lbd > s.clauseDeletionHighLBD2 {
+		score += s.clauseDeletionHighLBDBonus2
+	}
+
+	return score
+}
+
+// markClauseDirty marks a clause's score as needing recomputation
+// Called when clause activity, useCount, or propCount changes
+func (s *CDCLSolver) markClauseDirty(idx int) {
+	if idx >= 0 && idx < len(s.scoreDirty) {
+		s.scoreDirty[idx] = true
+	}
+}
+
+// updateScoresIncrementally recomputes scores only for dirty clauses
+// This is O(dirty clauses) instead of O(all clauses)
+func (s *CDCLSolver) updateScoresIncrementally() {
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedSizes[i] == 0 {
+			continue // Skip tombstones
+		}
+		if s.scoreDirty[i] {
+			s.clauseScore[i] = s.computeClauseScore(i)
+			s.scoreDirty[i] = false
+		}
+	}
+}
+
 func (s *CDCLSolver) deleteLearnedClauses() {
 	// LBD-based clause deletion using SWAP-REMOVE to avoid array rebuilding
 	// This preserves memory pool benefits and eliminates allocations during deletion
+
+	// OPTIMIZATION #3: Incremental scoring - only recompute dirty scores
+	// This reduces scoring cost from O(n) to O(changed clauses)
+	s.updateScoresIncrementally()
 
 	// OPTIMIZATION #2: Ensure buffers are large enough and reuse them
 	if cap(s.tmpClauseInfo) < s.learnedCapacity {
@@ -4778,59 +4867,16 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		if s.learnedSizes[i] == 0 {
 			continue // Skip tombstones
 		}
-		lbd := s.clauseLBD[i]
-		size := s.learnedSizes[i]
-		age := s.currentAge - s.clauseAge[i]
-		activity := s.clauseActivity[i]
-		useCount := s.clauseUseCount[i]
-		propCount := s.clausePropCount[i]
-
-		// Calculate deletion score (higher = delete first)
-		score := float64(lbd) * s.clauseDeletionLBDWeight
-		score += float64(age) * s.clauseDeletionAgeWeight
-		score += float64(size) * s.clauseDeletionSizeWeight
-		score -= activity * s.clauseDeletionActivityWeight
-
-		if useCount > s.clauseDeletionUseCountHigh {
-			score -= float64(useCount) * 15.0
-		} else if useCount > 0 {
-			score -= float64(useCount) * 3.0
-		}
-		if propCount > s.clauseDeletionPropCountHigh {
-			score -= float64(propCount) * 8.0
-		} else if propCount > 0 {
-			score -= float64(propCount) * 2.0
-		}
-
-		// Protection for glue clauses and ALL unit clauses
-		if size == 1 {
-			// NEVER delete unit clauses - they are global constraints
-			score = -100000.0
-		} else if lbd <= s.coreGlueLBDThreshold {
-			score = -10000.0
-		} else if lbd == s.coreGlueLBDThreshold+1 {
-			score = -5000.0
-		} else if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
-			score = -1000.0
-		}
-
-		// Force deletion for high-LBD clauses
-		if lbd > s.clauseDeletionHighLBD1 {
-			score += s.clauseDeletionHighLBDBonus1
-		}
-		if lbd > s.clauseDeletionHighLBD2 {
-			score += s.clauseDeletionHighLBDBonus2
-		}
-
+		// OPTIMIZATION #3: Use cached score instead of recomputing
 		clauses = append(clauses, clauseInfo{
 			idx:       i,
-			lbd:       lbd,
-			size:      size,
-			age:       age,
-			activity:  activity,
-			useCount:  useCount,
-			propCount: propCount,
-			score:     score,
+			lbd:       s.clauseLBD[i],
+			size:      s.learnedSizes[i],
+			age:       s.currentAge - s.clauseAge[i],
+			activity:  s.clauseActivity[i],
+			useCount:  s.clauseUseCount[i],
+			propCount: s.clausePropCount[i],
+			score:     s.clauseScore[i], // Use cached score
 		})
 	}
 
@@ -4922,6 +4968,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			s.clauseLBD[writeIdx] = s.clauseLBD[readIdx]
 			s.clauseUseCount[writeIdx] = s.clauseUseCount[readIdx]
 			s.clausePropCount[writeIdx] = s.clausePropCount[readIdx]
+			s.clauseScore[writeIdx] = s.clauseScore[readIdx]
+			s.scoreDirty[writeIdx] = s.scoreDirty[readIdx]
 
 			// CRITICAL: Update all watches referencing this clause
 			s.updateWatchClauseIndices(writeIdx, readIdx)
@@ -4942,6 +4990,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseLBD = s.clauseLBD[:writeIdx]
 	s.clauseUseCount = s.clauseUseCount[:writeIdx]
 	s.clausePropCount = s.clausePropCount[:writeIdx]
+	s.clauseScore = s.clauseScore[:writeIdx]
+	s.scoreDirty = s.scoreDirty[:writeIdx]
 
 	// OPTIMIZATION #1: Rebuild unit clause list after swap-remove
 	// Indices changed during swap, so rebuild from scratch
