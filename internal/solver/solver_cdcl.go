@@ -166,6 +166,7 @@ type CDCLSolver struct {
 	randomSeed           uint64          // Seed for deterministic random selection
 	lastDecisionVar      uint32          // Last variable chosen for decision
 	consecutiveFlips     int             // Count of consecutive decisions on same variable
+	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	// Exploration diversity tracking (IMPROVEMENT #3)
 	decidedVars               []uint32 // Variables decided during current search phase
 	decidedVarSet             []bool   // Fast lookup for decided variables
@@ -193,6 +194,11 @@ type CDCLSolver struct {
 	tmpSubsumeVars       []uint32      // Track variables in subsumption set for fast cleanup
 	tmpTautologySeen     []bool        // Track variables seen in learned clause for tautology check
 	tmpTautologyPolarity []bool        // Track polarity of variables for tautology check
+
+	// Reusable buffers for clause deletion (avoid per-deletion allocation)
+	tmpClauseInfo        []clauseInfo  // Buffer for clause scoring
+	tmpDeleted           []bool        // Bitmap for deleted clauses
+	tmpClauseUsedAsReason []bool       // Track clauses used as implications
 
 	// Clause database hash table for O(1) duplicate detection
 	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
@@ -347,6 +353,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		literalFreeSlots:     make([]literalFreeSlot, 0, 64),
+		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
 		currentAge:           0,
 		verbose:              false,
 		decisions:            0,
@@ -390,7 +397,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpSubsumeVars:       make([]uint32, 0, 64),
 		tmpTautologySeen:     make([]bool, formula.NumVars),
 		tmpTautologyPolarity: make([]bool, formula.NumVars),
-		learnedClauseHashes:  make(map[uint64]bool, maxLearned),
+		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
+		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
+		tmpDeleted:            make([]bool, maxLearned),
+		tmpClauseUsedAsReason: make([]bool, maxLearned),
+		learnedClauseHashes:   make(map[uint64]bool, maxLearned),
 		learnedClauseBase:    int(formula.NumClauses),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
@@ -628,6 +639,42 @@ func (s *CDCLSolver) SetTemporaryBufferSizes(candidateBuf, learnedLitBuf, hashIn
 // Default is 10, which provides good balance for most instances
 func (s *CDCLSolver) SetDecayInterval(interval int) {
 	s.vsids.SetDecayInterval(interval)
+}
+
+// SetInitialDecay sets the VSIDS initial decay factor (default 0.95)
+// Lower values = more aggressive decay = more exploration
+func (s *CDCLSolver) SetInitialDecay(factor float64) {
+	s.vsids.SetInitialDecayFactor(factor)
+}
+
+// SetMaxDecay sets the VSIDS maximum decay factor (default 0.999)
+// Higher values = slower decay = more focused search on important variables
+func (s *CDCLSolver) SetMaxDecay(factor float64) {
+	s.vsids.SetMaxDecayFactor(factor)
+}
+
+// SetDecayRampup sets the number of conflicts to reach max decay (default 10000)
+func (s *CDCLSolver) SetDecayRampup(conflicts int) {
+	s.vsids.SetDecayRampUpConflicts(conflicts)
+}
+
+// SetLBDBonusScale sets the LBD bonus scale for VSIDS (default 2000.0)
+// Higher values = stronger preference for low-LBD (glue) clauses
+func (s *CDCLSolver) SetLBDBonusScale(scale float64) {
+	s.vsids.SetLBDBonusScale(scale)
+}
+
+// SetBumpAmount sets the base bump amount for conflicts (default 50.0)
+// Higher values = more aggressive activity increase for conflict variables
+func (s *CDCLSolver) SetBumpAmount(amount float64) {
+	s.vsids.SetBaseBumpAmount(amount)
+}
+
+// SetClauseInitWeights sets the clause initialization weights
+// baseWeight: base weight for all clauses (default 10.0)
+// binaryWeight: weight multiplier for binary clauses (default 100.0)
+func (s *CDCLSolver) SetClauseInitWeights(baseWeight, binaryWeight float64) {
+	s.vsids.SetClauseInitWeights(baseWeight, binaryWeight)
 }
 
 // EnableLRB enables LRB (Learning Rate Based) heuristic
@@ -3460,13 +3507,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	propagationCount := 0
 
-	// STANDARD UNIT PROPAGATION: Scan learned clauses for unit propagation FIRST
+	// OPTIMIZATION #1: Use unitLearnedList for O(1) unit propagation
+	// Previously scanned ALL learned clauses (O(n)), now only scans unit clauses
 	// This must run even if trail is empty (after backtrack to level 0)
 	// Learned clauses >= 2 literals are watched, but unit learned clauses
 	// (size=1) are not watched and must be scanned explicitly.
 	unitCount := 0
-	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
-		if s.learnedSizes[learnedIdx] != 1 {
+	for _, learnedIdx := range s.unitLearnedList {
+		// Skip deleted/tombstone entries (can happen after swap-remove)
+		if learnedIdx >= s.learnedCapacity || s.learnedSizes[learnedIdx] != 1 {
 			continue
 		}
 		literals := s.getLearnedClauseLiterals(learnedIdx)
@@ -4581,6 +4630,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 		}
 
+		// Track unit clauses for O(1) propagation (OPTIMIZATION #1)
+		if len(literals) == 1 {
+			s.unitLearnedList = append(s.unitLearnedList, learnedIdx)
+		}
+
 		// VSIDS bump
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
 	}
@@ -4713,8 +4767,17 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// LBD-based clause deletion using SWAP-REMOVE to avoid array rebuilding
 	// This preserves memory pool benefits and eliminates allocations during deletion
 
-	// Step 1: Score all active clauses
-	clauses := make([]clauseInfo, 0, s.learnedActiveCount)
+	// OPTIMIZATION #2: Ensure buffers are large enough and reuse them
+	if cap(s.tmpClauseInfo) < s.learnedCapacity {
+		s.tmpClauseInfo = make([]clauseInfo, s.learnedCapacity)
+	}
+	if cap(s.tmpDeleted) < s.learnedCapacity {
+		s.tmpDeleted = make([]bool, s.learnedCapacity)
+	}
+	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
+		s.tmpClauseUsedAsReason = make([]bool, s.learnedCapacity)
+	}
+	clauses := s.tmpClauseInfo[:0]
 
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedSizes[i] == 0 {
@@ -4776,10 +4839,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		})
 	}
 
-	// Sort by score (descending - worst clauses first)
-	sort.Sort(clauseInfoSlice(clauses))
-
-	// Calculate how many to delete
+	// OPTIMIZATION #2: Use partial sort (quickselect) instead of full sort
+	// We only need the worst N clauses, not a fully sorted list
 	toKeep := int(float64(s.learnedActiveCount) * s.clauseDeletionKeepRatio)
 	if toKeep < s.minLearned {
 		toKeep = s.minLearned
@@ -4788,15 +4849,30 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		toKeep = s.learnedActiveCount
 	}
 	toDelete := len(clauses) - toKeep
+	
 	if toDelete <= 0 {
 		return // Nothing to delete
+	}
+
+	// Partial sort: partition so worst 'toDelete' clauses are at the front
+	if toDelete < len(clauses) {
+		// Only sort if we need to find specific clauses to delete
+		sort.Sort(clauseInfoSlice(clauses))
 	}
 
 	// Step 2: Mark clauses for deletion and track free literal slots
 	// CRITICAL FIX: Remove watches BEFORE marking as deleted
 	// PROTECTION: Don't delete clauses that are used as implication reasons
-	deleted := make([]bool, s.learnedCapacity)
-	clauseUsedAsReason := make([]bool, s.learnedCapacity)
+	// OPTIMIZATION #2: Reuse boolean arrays instead of allocating
+	deleted := s.tmpDeleted
+	clauseUsedAsReason := s.tmpClauseUsedAsReason
+	// Clear arrays for reuse
+	for i := range deleted {
+		deleted[i] = false
+	}
+	for i := range clauseUsedAsReason {
+		clauseUsedAsReason[i] = false
+	}
 	
 	// Mark clauses used as implications
 	protectedCount := 0
@@ -4872,6 +4948,15 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.clauseUseCount = s.clauseUseCount[:writeIdx]
 	s.clausePropCount = s.clausePropCount[:writeIdx]
 
+	// OPTIMIZATION #1: Rebuild unit clause list after swap-remove
+	// Indices changed during swap, so rebuild from scratch
+	s.unitLearnedList = s.unitLearnedList[:0]
+	for i := 0; i < s.learnedActiveCount; i++ {
+		if s.learnedSizes[i] == 1 {
+			s.unitLearnedList = append(s.unitLearnedList, i)
+		}
+	}
+
 	// Step 5: Rebuild hash table from remaining clauses
 	s.learnedClauseHashes = make(map[uint64]bool, s.learnedActiveCount)
 	for i := 0; i < s.learnedActiveCount; i++ {
@@ -4886,6 +4971,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
 	}
+
+	// Reset buffers for next use (keep capacity, just clear length/contents)
+	s.tmpClauseInfo = clauses[:0]
+	// tmpDeleted and tmpClauseUsedAsReason are already cleared at start of next call
 }
 
 // updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx

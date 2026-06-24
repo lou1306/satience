@@ -39,6 +39,17 @@ func run() int {
 	clauseDelSize := flag.Float64("clause-del-size", 10.0, "Size score weight for clause deletion (default=10.0)")
 	clauseDelActivity := flag.Float64("clause-del-activity", 100.0, "Activity protection weight (default=100.0)")
 	clauseDelKeepRatio := flag.Float64("clause-del-keep-ratio", 0.5, "Ratio of clauses to keep during deletion (default=0.5)")
+	// VSIDS parameters
+	decayInterval := flag.Int("decay-interval", 10, "VSIDS decay interval - conflicts between activity decays (default=10)")
+	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95)")
+	maxDecay := flag.Float64("max-decay", 0.999, "VSIDS maximum decay factor (default=0.999)")
+	decayRampup := flag.Int("decay-rampup", 10000, "Conflicts to reach max decay (default=10000)")
+	lbdScale := flag.Float64("lbd-scale", 2000.0, "LBD bonus scale for VSIDS (default=2000.0)")
+	bumpAmount := flag.Float64("bump-amount", 50.0, "Base bump amount for conflicts (default=50.0)")
+	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
+	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
+	// Inprocessing parameters
+	inprocessingInterval := flag.Int("inprocessing-interval", 500, "Run inprocessing every N conflicts (default=500, 0=disabled)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -97,6 +108,20 @@ func run() int {
 
 	// Configure clause deletion policy
 	s.SetClauseDeletionParameters(*clauseDelLBD, *clauseDelAge, *clauseDelSize, *clauseDelActivity, *clauseDelKeepRatio)
+
+	// Configure VSIDS parameters
+	s.SetDecayInterval(*decayInterval)
+	s.SetInitialDecay(*initialDecay)
+	s.SetMaxDecay(*maxDecay)
+	s.SetDecayRampup(*decayRampup)
+	s.SetLBDBonusScale(*lbdScale)
+	s.SetBumpAmount(*bumpAmount)
+	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
+
+	// Configure inprocessing
+	if *inprocessingInterval > 0 {
+		s.SetInprocessingInterval(*inprocessingInterval)
+	}
 
 	// Configure clause minimization
 	switch *minimize {
