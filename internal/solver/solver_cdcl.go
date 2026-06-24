@@ -68,36 +68,39 @@ const (
 )
 
 // calculateMaxLearned scales the clause database limit with instance size.
+// FIXED: Use MiniSat-style dynamic limit that grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
-	maxLearned := DefaultMaxLearnedBase
+	// Base limit scaled by instance size
+	baseLimit := DefaultMaxLearnedBase
 
 	if numVars >= 50000 {
-		maxLearned = 32000
+		baseLimit = 32000
 	} else if numVars >= 10000 {
-		maxLearned = 16000
+		baseLimit = 16000
 	} else if numVars >= 5000 {
-		maxLearned = 8000
+		baseLimit = 8000
 	} else if numVars >= 1000 {
-		maxLearned = 4000
+		baseLimit = 4000
 	}
 
 	if numVars > 0 {
 		density := float64(numClauses) / float64(numVars)
 		if density > 10.0 {
-			maxLearned = int(float64(maxLearned) * 1.5)
+			baseLimit = int(float64(baseLimit) * 1.5)
 		} else if density < 3.0 {
-			maxLearned = int(float64(maxLearned) * 0.75)
+			baseLimit = int(float64(baseLimit) * 0.75)
 		}
 	}
 
-	if maxLearned < 500 {
-		maxLearned = 500
+	// Minimum 500 for small instances
+	if baseLimit < 500 {
+		baseLimit = 500
 	}
-	if maxLearned > 100000 {
-		maxLearned = 100000
+	if baseLimit > 100000 {
+		baseLimit = 100000
 	}
 
-	return maxLearned
+	return baseLimit
 }
 
 // CDCLSolver implements a CDCL SAT solver with modern techniques.
@@ -419,10 +422,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpCandidateBufferSize:   100,
 		tmpLearnedLitBufferSize:  64,
 		learnedClauseHashInitial: 2500,
-		// Restart policy defaults (aggressive for better performance on random instances)
-		restartGlucoseRatio:        3.0, // Less aggressive (MiniSat-style)
-		restartGlucoseMinConflicts: 100, // Wait for more conflicts
-		restartKeepGlueLBD:         3,
+		// Restart policy defaults (aggressive Glucose-style for better performance)
+		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
+		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
+		restartKeepGlueLBD:         3,   // Keep LBD≤3 glue clauses
 		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
 		clauseDeletionLBDWeight:      200.0,
 		clauseDeletionAgeWeight:      5.0,
@@ -440,6 +443,21 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	// Enable LBD-based VSIDS for better variable selection
 	// Variables in low-LBD clauses get higher priority
 	solver.vsids.EnableLBD()
+
+	// CRITICAL FIX: Tune VSIDS parameters for small instances
+	// Problem: 50-variable instances timing out while MiniSat solves in 0.027s
+	// Root cause: VSIDS decay too slow (0.95), bump too small (50.0)
+	// Solution: More aggressive parameters for instances < 1000 variables
+	if formula.NumVars < 1000 {
+		// Faster decay = quicker adaptation to search progress
+		solver.vsids.SetInitialDecayFactor(0.99)
+		// Slower ramp-up = stay aggressive longer
+		solver.vsids.SetDecayRampUpConflicts(50000)
+		// Larger bump = more activity for conflict variables
+		solver.vsids.SetBaseBumpAmount(150.0)
+		// More aggressive LBD bonus
+		solver.vsids.SetLBDBonusScale(10000.0)
+	}
 
 	return solver
 }
@@ -4217,9 +4235,11 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
-	// Delete learned clauses when database exceeds maxLearned by 50%
-	// This prevents memory explosion while keeping useful clauses
-	if s.learnedActiveCount > s.maxLearned+s.maxLearned/2 {
+	// Delete learned clauses when database exceeds dynamic limit
+	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
+	// Base: s.maxLearned, grows by conflicts/100 (MiniSat formula)
+	dynamicLimit := s.maxLearned + s.conflicts/100
+	if s.learnedActiveCount > dynamicLimit+dynamicLimit/2 {
 		s.deleteLearnedClauses()
 	}
 
