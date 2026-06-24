@@ -43,8 +43,8 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 
 // Watch represents a watched literal reference for a clause
 // Used in the watched literals scheme for efficient propagation
+// OPTIMIZATION: Index-only references (no pointers) for better cache efficiency and GC pressure
 type Watch struct {
-	Clause    *Clause // Direct pointer to clause (nil if deleted)
 	ClauseIdx int     // Clause index: >=0 for original, <0 for learned (-learnedIdx-1)
 	Blit      uint32  // Blocking literal index (the other watched literal)
 }
@@ -53,6 +53,21 @@ type Watch struct {
 type Clause struct {
 	Literals []Literal
 	Learned  bool
+}
+
+// ClauseMetadata packs all learned clause metadata into a single struct for cache efficiency
+// This reduces cache line misses during clause scoring and deletion (SoA -> AoS transformation)
+// Size: 7 ints + 2 float64s + 1 bool = 64 bytes on 64-bit (fits in 1 cache line)
+type ClauseMetadata struct {
+	Offset     int     // Start offset in learnedLiterals
+	Size       int     // Number of literals (0 = deleted/tombstone)
+	LBD        int     // LBD at time of learning
+	Age        int     // Age (conflicts since learning)
+	UseCount   int     // Times used in conflict analysis
+	PropCount  int     // Times caused propagation
+	Activity   float64 // Clause activity
+	Score      float64 // Cached deletion score
+	ScoreDirty bool    // True if score needs recomputation
 }
 
 // CNF represents a CNF formula

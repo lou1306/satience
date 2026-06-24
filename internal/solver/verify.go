@@ -11,31 +11,41 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 		return nil
 	}
 
-	clauseWatchCount := make(map[*cnf.Clause]int)
+	// Track watch counts per clause using ClauseIdx instead of pointer
+	clauseWatchCount := make(map[int]int)
 
 	for litIdx := 0; litIdx < len(s.watchLists); litIdx++ {
 		watches := s.watchLists[litIdx]
 		for i, watch := range watches {
-			// Skip nil watches (deleted clauses)
-			if watch.Clause == nil {
-				continue
-			}
-
-			clause := watch.Clause
 			blitIdx := int(watch.Blit)
 
 			if blitIdx < 0 || blitIdx >= len(s.watchLists) {
 				return fmt.Errorf("watch %d at litIdx %d has invalid blitIdx %d (%s)", i, litIdx, blitIdx, reason)
 			}
 
-			clauseWatchCount[clause]++
+			// Get clause literals using ClauseIdx
+			var clauseLits []cnf.Literal
+			if watch.ClauseIdx >= 0 {
+				if watch.ClauseIdx >= len(s.cnf.Clauses) {
+					return fmt.Errorf("watch has invalid ClauseIdx %d (%s)", watch.ClauseIdx, reason)
+				}
+				clauseLits = s.cnf.Clauses[watch.ClauseIdx].Literals
+			} else {
+				learnedIdx := -watch.ClauseIdx - 1
+				if learnedIdx >= len(s.learnedSizes) || s.learnedSizes[learnedIdx] == 0 {
+					continue // Skip deleted clauses
+				}
+				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
+			}
 
-			if len(clause.Literals) < 2 {
-				return fmt.Errorf("clause has %d literals (need at least 2 for watches) (%s)", len(clause.Literals), reason)
+			clauseWatchCount[watch.ClauseIdx]++
+
+			if len(clauseLits) < 2 {
+				return fmt.Errorf("clause has %d literals (need at least 2 for watches) (%s)", len(clauseLits), reason)
 			}
 
 			found := false
-			for _, lit := range clause.Literals {
+			for _, lit := range clauseLits {
 				idx := cnf.LitToIndex(lit)
 				if idx == litIdx {
 					found = true
@@ -44,11 +54,11 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 			}
 
 			if !found {
-				return fmt.Errorf("watch at litIdx %d doesn't match any literal in clause (lits=%v) (%s)", litIdx, clause.Literals, reason)
+				return fmt.Errorf("watch at litIdx %d doesn't match any literal in clause (%s)", litIdx, reason)
 			}
 
 			found = false
-			for _, lit := range clause.Literals {
+			for _, lit := range clauseLits {
 				idx := cnf.LitToIndex(lit)
 				if idx == blitIdx {
 					found = true
@@ -57,18 +67,18 @@ func (s *CDCLSolver) VerifyWatchInvariants(reason string) error {
 			}
 
 			if !found {
-				return fmt.Errorf("blitIdx %d doesn't match any literal in clause (lits=%v) (%s)", blitIdx, clause.Literals, reason)
+				return fmt.Errorf("blitIdx %d doesn't match any literal in clause (%s)", blitIdx, reason)
 			}
 
 			if litIdx == blitIdx {
-				return fmt.Errorf("watch at litIdx %d has same blitIdx (clause) (%s)", litIdx, reason)
+				return fmt.Errorf("watch at litIdx %d has same blitIdx (%s)", litIdx, reason)
 			}
 		}
 	}
 
-	for clause, count := range clauseWatchCount {
+	for clauseIdx, count := range clauseWatchCount {
 		if count != 2 {
-			return fmt.Errorf("clause %p has %d watches instead of 2 (%s)", clause, count, reason)
+			return fmt.Errorf("clause %d has %d watches instead of 2 (%s)", clauseIdx, count, reason)
 		}
 	}
 
