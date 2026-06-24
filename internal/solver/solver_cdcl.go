@@ -4990,7 +4990,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		if impIdx < -1 {
 			// Learned clause implication
 			learnedIdx := -impIdx - 1
-			if learnedIdx < s.learnedActiveCount && s.learnedSizes[learnedIdx] > 0 {
+			// CRITICAL FIX: Check learnedCapacity, not learnedActiveCount
+			// Active clauses can exist at indices >= learnedActiveCount before deletion
+			if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
 				clauseUsedAsReason[learnedIdx] = true
 				protectedCount++
 			}
@@ -5042,6 +5044,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 			// CRITICAL: Update all watches referencing this clause
 			s.updateWatchClauseIndices(writeIdx, readIdx)
+			// CRITICAL: Update implication array (reason clause references)
+			s.updateImplicationClauseIndices(writeIdx, readIdx)
 		}
 		writeIdx++
 	}
@@ -5084,12 +5088,36 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 	oldClauseIdx := -oldIdx - 1
 	newClauseIdx := -newIdx - 1
 
+	// Update regular watch lists
 	for litIdx := range s.watchLists {
 		watchList := s.watchLists[litIdx]
 		for i := range watchList {
 			if watchList[i].ClauseIdx == oldClauseIdx {
 				watchList[i].ClauseIdx = newClauseIdx
 			}
+		}
+	}
+	// CRITICAL FIX: Also update binary clause watch lists
+	for litIdx := range s.watchListsBinary {
+		watchList := s.watchListsBinary[litIdx]
+		for i := range watchList {
+			if watchList[i].ClauseIdx == oldClauseIdx {
+				watchList[i].ClauseIdx = newClauseIdx
+			}
+		}
+	}
+}
+
+// updateImplicationClauseIndices updates the implication array when a clause is moved from oldIdx to newIdx
+// This is called during swap-remove in deleteLearnedClauses()
+// CRITICAL: Without this, 1-UIP conflict analysis uses WRONG reason clauses, causing unsoundness
+func (s *CDCLSolver) updateImplicationClauseIndices(newIdx, oldIdx int) {
+	oldClauseIdx := -oldIdx - 1
+	newClauseIdx := -newIdx - 1
+
+	for varIdx := range s.implication {
+		if s.implication[varIdx] == oldClauseIdx {
+			s.implication[varIdx] = newClauseIdx
 		}
 	}
 }
