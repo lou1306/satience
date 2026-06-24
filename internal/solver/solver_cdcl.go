@@ -70,17 +70,20 @@ const (
 // calculateMaxLearned scales the clause database limit with instance size.
 // FIXED: Use MiniSat-style dynamic limit that grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
-	// Base limit scaled by instance size
-	baseLimit := DefaultMaxLearnedBase
+	// MiniSat-style: base limit of 100, scales slowly with instance size
+	baseLimit := 100
 
+	// Scale base with instance size (but much more conservatively than before)
 	if numVars >= 50000 {
-		baseLimit = 32000
+		baseLimit = 2000
 	} else if numVars >= 10000 {
-		baseLimit = 16000
+		baseLimit = 1000
 	} else if numVars >= 5000 {
-		baseLimit = 8000
+		baseLimit = 500
 	} else if numVars >= 1000 {
-		baseLimit = 4000
+		baseLimit = 300
+	} else if numVars >= 100 {
+		baseLimit = 200
 	}
 
 	if numVars > 0 {
@@ -92,9 +95,9 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 		}
 	}
 
-	// Minimum 500 for small instances
-	if baseLimit < 500 {
-		baseLimit = 500
+	// Minimum 100 for tiny instances
+	if baseLimit < 100 {
+		baseLimit = 100
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
@@ -457,6 +460,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		solver.vsids.SetBaseBumpAmount(150.0)
 		// More aggressive LBD bonus
 		solver.vsids.SetLBDBonusScale(10000.0)
+		// More aggressive clause minimization for small instances
+		solver.minimizationMaxReasonSize = 50 // Allow larger reason clauses for more minimization
 	}
 
 	return solver
@@ -4547,6 +4552,46 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		s.emptyClauseFound = true
 		return 0
+	}
+
+	// CRITICAL FIX: Apply clause minimization via self-subsumption
+	// This reduces learned clause size and LBD, enabling propagation
+	// Disabled for clauses ≤2 literals (already minimal)
+	originalSize := len(s.tmpLearnedLits)
+	originalLBD := lbd
+	if len(s.tmpLearnedLits) > 2 {
+		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
+		
+		// Recalculate LBD after minimization (CRITICAL - LBD may have decreased)
+		// Must reset tmpLevelSetUsed since it was used for original LBD calculation
+		lbd = 0
+		maxLevel = 0
+		for i := range s.tmpLevelSetUsed {
+			s.tmpLevelSetUsed[i] = false
+		}
+		for _, lit := range s.tmpLearnedLits {
+			varIdx := lit.Var()
+			lvl := s.assignments[varIdx].Level
+			if lvl >= 0 {
+				if lvl >= len(s.tmpLevelSetUsed) {
+					newSize := lvl + 1
+					newSetUsed := make([]bool, newSize)
+					s.tmpLevelSetUsed = newSetUsed
+				}
+				if !s.tmpLevelSetUsed[lvl] {
+					s.tmpLevelSetUsed[lvl] = true
+					lbd++
+				}
+				if lvl > maxLevel && lvl < s.level {
+					maxLevel = lvl
+				}
+			}
+		}
+		
+		if s.verbose && originalSize > len(s.tmpLearnedLits) {
+			fmt.Printf("c [minimize] Reduced: %d→%d literals, LBD %d→%d\n",
+				originalSize, len(s.tmpLearnedLits), originalLBD, lbd)
+		}
 	}
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
