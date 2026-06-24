@@ -68,22 +68,21 @@ const (
 )
 
 // calculateMaxLearned scales the clause database limit with instance size.
-// FIXED: Use MiniSat-style dynamic limit that grows with conflicts
+// MiniSat-style: base limit proportional to variables, grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
-	// MiniSat-style: base limit of 100, scales slowly with instance size
-	baseLimit := 100
+	// Base limit: proportional to number of variables (MiniSat uses ~6*vars initially)
+	// This gives small instances room to learn, large instances don't explode
+	baseLimit := int(numVars) * 6
 
-	// Scale base with instance size (but much more conservatively than before)
+	// Scale with instance size
 	if numVars >= 50000 {
-		baseLimit = 2000
+		baseLimit = 16000
 	} else if numVars >= 10000 {
-		baseLimit = 1000
+		baseLimit = 8000
 	} else if numVars >= 5000 {
-		baseLimit = 500
+		baseLimit = 4000
 	} else if numVars >= 1000 {
-		baseLimit = 300
-	} else if numVars >= 100 {
-		baseLimit = 200
+		baseLimit = 2000
 	}
 
 	if numVars > 0 {
@@ -95,9 +94,9 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 		}
 	}
 
-	// Minimum 100 for tiny instances
-	if baseLimit < 100 {
-		baseLimit = 100
+	// Minimum 300 for tiny instances (enough to learn useful clauses)
+	if baseLimit < 300 {
+		baseLimit = 300
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
@@ -4248,8 +4247,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 
 	// Delete learned clauses when database exceeds dynamic limit
 	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
-	// Base: s.maxLearned, grows by conflicts/100 (MiniSat formula)
-	dynamicLimit := s.maxLearned + s.conflicts/100
+	// Formula: base + conflicts/50 (MiniSat uses similar growth rate)
+	// Trigger deletion at 150% of limit (MiniSat-style)
+	dynamicLimit := s.maxLearned + s.conflicts/50
 	if s.learnedActiveCount > dynamicLimit+dynamicLimit/2 {
 		s.deleteLearnedClauses()
 	}
