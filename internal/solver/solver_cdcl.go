@@ -196,13 +196,9 @@ type CDCLSolver struct {
 	tmpTautologyPolarity []bool        // Track polarity of variables for tautology check
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
-	tmpClauseInfo        []clauseInfo  // Buffer for clause scoring
-	tmpDeleted           []bool        // Bitmap for deleted clauses
-	tmpClauseUsedAsReason []bool       // Track clauses used as implications
-
-	// Clause database hash table for O(1) duplicate detection
-	// Stores canonical hashes (sorted literals) to detect A∨B == B∨A
-	learnedClauseHashes map[uint64]bool
+	tmpClauseInfo         []clauseInfo  // Buffer for clause scoring
+	tmpDeleted            []bool        // Bitmap for deleted clauses
+	tmpClauseUsedAsReason []bool        // Track clauses used as implications
 
 	// Watched literals infrastructure
 	watchLists        [][]cnf.Watch // watchLists[lit] = clauses watching lit
@@ -401,8 +397,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
 		tmpDeleted:            make([]bool, maxLearned),
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
-		learnedClauseHashes:   make(map[uint64]bool, maxLearned),
-		learnedClauseBase:    int(formula.NumClauses),
+		learnedClauseBase:     int(formula.NumClauses),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
 		minimizationMaxLBD:        8,
@@ -4955,14 +4950,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		if s.learnedSizes[i] == 1 {
 			s.unitLearnedList = append(s.unitLearnedList, i)
 		}
-	}
-
-	// Step 5: Rebuild hash table from remaining clauses
-	s.learnedClauseHashes = make(map[uint64]bool, s.learnedActiveCount)
-	for i := 0; i < s.learnedActiveCount; i++ {
-		lits := s.getLearnedClauseLiterals(i)
-		hash := computeCanonicalHash(lits, s.tmpSortedLits)
-		s.learnedClauseHashes[hash] = true
 	}
 
 	// Mark LBD order as dirty
