@@ -462,6 +462,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		solver.vsids.SetLBDBonusScale(10000.0)
 		// More aggressive clause minimization for small instances
 		solver.minimizationMaxReasonSize = 50 // Allow larger reason clauses for more minimization
+		// Much more aggressive restarts for small instances
+		// Luby base: 100 → 10 (restart 10× more frequently)
+		solver.restartBase = 10
+		// Glucose restart: start earlier and more aggressive
+		solver.restartGlucoseRatio = 1.2 // Restart when LBD > 1.2× avg (very aggressive)
+		solver.restartGlucoseMinConflicts = 20 // Start adaptive restarts after 20 conflicts
 	}
 
 	return solver
