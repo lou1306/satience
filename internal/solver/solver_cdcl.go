@@ -200,9 +200,6 @@ type CDCLSolver struct {
 	learnedClauseOrder []int // Indices into learnedClauses/clauseLBD sorted by LBD
 
 	// Variable elimination tracking for model reconstruction
-	eliminatedVars      []uint32                 // List of eliminated variable indices
-	varElimDefinition   map[uint32][]cnf.Literal // Definition of eliminated var (resolvent that eliminated it)
-	varElimPolarity     map[uint32]bool          // Polarity of eliminated var in its definition
 	emptyClauseFound    bool                     // Set when empty learned clause derived (UNSAT)
 	lbdOrderDirty       bool                     // True if order needs rebuilding
 	lbdOrderLastRebuild int                      // Conflict count when order was last rebuilt
@@ -216,13 +213,6 @@ type CDCLSolver struct {
 	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
 	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
 	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
-	varElimMaxVars           int     // Skip variable elimination if > N vars (default 20000)
-	varElimMaxClauses        int     // Skip variable elimination if > N clauses (default 100000)
-	varElimMaxResolventSize  int     // Max resolvent size for variable elimination (default 100)
-	varElimMaxOccurrences    int     // Max occurrences of variable to eliminate (default 500)
-	varElimMinDeficiency     float64 // Min deficiency ratio for elimination (default 1.0 = require clause reduction)
-	varElimMaxIterations     int     // Max variables to eliminate per pass (default 100)
-	varElimMaxTimeMs         int     // Time limit for VE in ms (default 500)
 	clauseDeletionMinLBD     int     // Minimum LBD to consider for deletion (default 3)
 	glueClauseLBDThreshold   int     // LBD ≤ this are glue clauses (default 2)
 	coreGlueLBDThreshold     int     // LBD ≤ this are core glue (never delete, default 2)
@@ -382,9 +372,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		minimizationMaxLBD:        8,
 		minimizationMaxReasonSize: 15,
 		// Variable elimination tracking
-		eliminatedVars:    make([]uint32, 0),
-		varElimDefinition: make(map[uint32][]cnf.Literal),
-		varElimPolarity:   make(map[uint32]bool),
 		// Configurable parameters with defaults
 		inprocessingInterval:     500,
 		inprocessingMaxClauses:   5000,
@@ -392,13 +379,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		preprocessingMinClauses:  10, // Lowered to enable inprocessing after aggressive VE
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
-		varElimMaxVars:           20000,
-		varElimMaxClauses:        100000,
-		varElimMaxResolventSize:  50,  // Reduced from 100 (more conservative)
-		varElimMaxOccurrences:    200, // Reduced from 500 (only eliminate low-occurrence vars)
-		varElimMinDeficiency:     0.0, // Allow elimination even without clause reduction (MiniSat-style)
-		varElimMaxIterations:     100, // Increased from 50 for better PHP performance
-		varElimMaxTimeMs:         500, // Increased from 200ms for more thorough elimination
 		clauseDeletionMinLBD:     3,
 		glueClauseLBDThreshold:   2,
 		coreGlueLBDThreshold:     2,
@@ -902,14 +882,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 
-		// Variable elimination - DISABLED (Phase 1 WIP)
 		// Single-pass VE with pos=1 restriction is sound in theory, but implementation has bugs
 		// TODO: Fix variableEliminationSinglePass() to properly handle clause index changes
 		// For now, use original variableElimination() which is also disabled due to soundness bugs
 		// clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
 		// if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
-		// 	veResult := s.variableEliminationSinglePass()
-		// 	if veResult == UNSAT {
 		// 		return UNSAT
 		// 	}
 		// }
@@ -957,20 +934,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 
 	// Clear assignments made during preprocessing passes
-	// EXCEPT for eliminated variables - keep them assigned so VSIDS doesn't select them
 	for i := range s.assignments {
-		// Keep eliminated variables assigned
-		isEliminated := false
-		for _, elimVar := range s.eliminatedVars {
-			if elimVar == uint32(i) {
-				isEliminated = true
-				break
-			}
-		}
-		if !isEliminated {
-			s.assignments[i] = Assignment{}
-			s.varLevel[i] = 0
-		}
+		s.assignments[i] = Assignment{}
+		s.varLevel[i] = 0
 	}
 	s.trail = s.trail[:0]
 	s.trailHead = []int{0}
@@ -1834,173 +1800,6 @@ func (s *CDCLSolver) inprocessing() {
 // Lighter version of variableElimination() with shorter time limit and fewer iterations
 // Only eliminates variables with positive deficiency (net clause reduction)
 // Does NOT track eliminated variables for model reconstruction (too complex during search)
-func (s *CDCLSolver) inprocessVariableElimination() {
-	if s.verbose {
-		fmt.Printf("c [inprocess] Variable elimination during search: %d vars, %d clauses, maxOcc=%d, maxRes=%d\n",
-			s.cnf.NumVars, s.cnf.NumClauses, s.varElimMaxOccurrences, s.varElimMaxResolventSize)
-	}
-
-	startTime := time.Now()
-	// Aggressive time limit for inprocessing VE - PHP instances need more time
-	timeLimit := 500 * time.Millisecond
-	maxIters := 2 // Eliminate only 1-2 vars per call to prevent clause explosion (MiniSat-style gradual elimination)
-	eliminatedCount := 0
-
-	for iter := 0; iter < maxIters; iter++ {
-		if time.Since(startTime) > timeLimit {
-			break
-		}
-
-		// Count occurrences
-		posCount := make([]int, s.cnf.NumVars)
-		negCount := make([]int, s.cnf.NumVars)
-		posClauses := make(map[uint32][]int)
-		negClauses := make(map[uint32][]int)
-
-		for clauseIdx, clause := range s.cnf.Clauses {
-			for _, lit := range clause.Literals {
-				varIdx := lit.Var()
-				if lit.IsNegated() {
-					negCount[varIdx]++
-					negClauses[varIdx] = append(negClauses[varIdx], clauseIdx)
-				} else {
-					posCount[varIdx]++
-					posClauses[varIdx] = append(posClauses[varIdx], clauseIdx)
-				}
-			}
-		}
-
-		// Find best eliminatable variable
-		bestVar := uint32(0)
-		// For inprocessing, use conservative thresholds to avoid clause explosion
-		bestResolventSize := 1000 // Only eliminate if resolvent is small
-		bestDeficiency := -100.0  // Allow some clause blowup but not extreme
-		hasEliminatable := false
-
-		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
-			posOcc := posCount[varIdx]
-			negOcc := negCount[varIdx]
-
-			if posOcc == 0 || negOcc == 0 {
-				continue
-			}
-
-			totalOcc := posOcc + negOcc
-			// For inprocessing, use conservative thresholds
-			maxOcc := 500 // Skip high-occurrence variables
-			if totalOcc > maxOcc {
-				continue
-			}
-
-			resolventSize := posOcc * negOcc
-
-			// For inprocessing, only eliminate if resolvent is manageable
-			maxResolvent := 2000 // Skip if resolvent would be too large
-			if resolventSize > maxResolvent {
-				continue
-			}
-
-			deficiency := float64(posOcc+negOcc) - float64(resolventSize)
-
-			if s.verbose && iter == 0 && varIdx < 5 {
-				fmt.Printf("c [inprocess] VE: var %d pos=%d neg=%d total=%d resolvent=%d deficiency=%.1f\n",
-					varIdx, posOcc, negOcc, totalOcc, resolventSize, deficiency)
-			}
-
-			if resolventSize < bestResolventSize ||
-				(resolventSize == bestResolventSize && deficiency > bestDeficiency) {
-				bestVar = varIdx
-				bestResolventSize = resolventSize
-				bestDeficiency = deficiency
-				hasEliminatable = true
-			}
-		}
-
-		if !hasEliminatable {
-			if s.verbose && iter == 0 {
-				fmt.Printf("c [inprocess] VE: no eliminatable variables found\n")
-			}
-			break
-		}
-
-		if s.verbose && iter == 0 {
-			fmt.Printf("c [inprocess] VE: checking %d vars, bestVar=%d, bestResolvent=%d, bestDeficiency=%.1f\n",
-				s.cnf.NumVars, bestVar, bestResolventSize, bestDeficiency)
-		}
-
-		// Eliminate the variable
-		varIdx := bestVar
-		posCls := posClauses[varIdx]
-		negCls := negClauses[varIdx]
-
-		// Generate resolvents
-		newResolvents := make([]*cnf.Clause, 0)
-		resolventHashes := make(map[uint64]bool)
-
-		for _, pIdx := range posCls {
-			for _, nIdx := range negCls {
-				posClause := s.cnf.Clauses[pIdx]
-				negClause := s.cnf.Clauses[nIdx]
-
-				resolvent := s.resolveOnVarElim(posClause, negClause, varIdx)
-				if resolvent != nil {
-					if len(resolvent.Literals) == 0 {
-						// Empty clause found - should not happen during search on satisfiable instances
-						return
-					}
-
-					if s.isTautology(resolvent) {
-						continue
-					}
-
-					hash := s.clauseHash(resolvent)
-					if !resolventHashes[hash] {
-						resolventHashes[hash] = true
-						newResolvents = append(newResolvents, resolvent)
-					}
-				}
-			}
-		}
-
-		// Remove old clauses and add resolvents
-		// Mark clauses for removal (those containing varIdx)
-		toRemove := make(map[int]bool)
-		for _, idx := range posCls {
-			toRemove[idx] = true
-		}
-		for _, idx := range negCls {
-			toRemove[idx] = true
-		}
-
-		// Build new clause list
-		newClauses := make([]cnf.Clause, 0, s.cnf.NumClauses-len(posCls)-len(negCls)+len(newResolvents))
-		for i, clause := range s.cnf.Clauses {
-			if !toRemove[i] {
-				newClauses = append(newClauses, clause)
-			}
-		}
-		for _, resolvent := range newResolvents {
-			newClauses = append(newClauses, *resolvent)
-		}
-
-		s.cnf.Clauses = newClauses
-		s.cnf.NumClauses = len(newClauses)
-		s.cnf.RebuildLiteralPool()
-
-		eliminatedCount++
-	}
-
-	if s.verbose && eliminatedCount > 0 {
-		elapsed := time.Since(startTime)
-		fmt.Printf("c [inprocess] VE eliminated %d variables in %.1fms, now %d clauses\n",
-			eliminatedCount, float64(elapsed.Nanoseconds())/1e6, s.cnf.NumClauses)
-	}
-}
-
-// inprocessPureLiteralElimination performs pure literal elimination during search
-// Assigns variables appearing in only one polarity, removes satisfied clauses
-// Can create cascade: assigning pure literals may make other variables pure
-// Does NOT track eliminated variables for model reconstruction (too complex during search)
 func (s *CDCLSolver) inprocessPureLiteralElimination() {
 	if s.verbose {
 		fmt.Printf("c [inprocess] Pure literal elimination during search: %d vars, %d clauses\n",
@@ -2512,16 +2311,6 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		if s.verbose {
 			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
 		}
-		// CRITICAL: Don't return SAT if there are eliminated variables
-		// The eliminated variables need to be reconstructed from their definitions
-		// Let CDCL solve the (now empty) formula, then reconstruct
-		if len(s.eliminatedVars) > 0 {
-			if s.verbose {
-				fmt.Printf("c [verbose] Pure literal elimination: deferring SAT to allow model reconstruction (%d eliminated vars)\n",
-					len(s.eliminatedVars))
-			}
-			return UNKNOWN
-		}
 		// Assign all remaining unassigned variables arbitrarily
 		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
 			if s.assignments[varIdx].Level == 0 {
@@ -2557,572 +2346,9 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 //   - Iteration limit: max variables eliminated per pass
 //
 // CRITICAL: Processes one variable at a time and re-computes elimination candidates after each elimination
-func (s *CDCLSolver) variableElimination() SolveResult {
-	if s.verbose {
-		fmt.Printf("c [verbose] VE DEBUG: starting with %d variables, %d clauses\n",
-			s.cnf.NumVars, s.cnf.NumClauses)
-	}
-
-	eliminatedCount := 0
-	clausesRemoved := 0
-	startTime := time.Now()
-	iterCount := 0
-
-	// Keep eliminating variables until no more can be eliminated
-	for {
-		// Check time limit
-		if s.varElimMaxTimeMs > 0 {
-			elapsed := time.Since(startTime).Milliseconds()
-			if elapsed > int64(s.varElimMaxTimeMs) {
-				if s.verbose {
-					fmt.Printf("c [verbose] Variable elimination: time limit reached (%dms)\n", elapsed)
-				}
-				break
-			}
-		}
-
-		// Check iteration limit
-		if s.varElimMaxIterations > 0 && iterCount >= s.varElimMaxIterations {
-			if s.verbose {
-				fmt.Printf("c [verbose] Variable elimination: iteration limit reached (%d vars)\n", iterCount)
-			}
-			break
-		}
-		// Count occurrences of each variable (positive and negative)
-		posCount := make([]int, s.cnf.NumVars)
-		negCount := make([]int, s.cnf.NumVars)
-		posClauses := make(map[uint32][]int) // varIdx -> clause indices
-		negClauses := make(map[uint32][]int)
-
-		for clauseIdx, clause := range s.cnf.Clauses {
-			for _, lit := range clause.Literals {
-				varIdx := lit.Var()
-				if lit.IsNegated() {
-					negCount[varIdx]++
-					negClauses[varIdx] = append(negClauses[varIdx], clauseIdx)
-				} else {
-					posCount[varIdx]++
-					posClauses[varIdx] = append(posClauses[varIdx], clauseIdx)
-				}
-			}
-		}
-
-		// Find best eliminatable variable using bounded heuristics
-		// CRITICAL FIX: Only eliminate variables with posOcc=1 for sound model reconstruction
-		// When pos=1, the definition is simply: x = ¬A (where (x ∨ A) is the positive clause)
-		// When pos>1, concatenating all positive clause literals produces incorrect definitions
-		bestVar := uint32(0)
-		maxResolventSize := s.varElimMaxResolventSize + 1
-		bestResolventSize := maxResolventSize
-		bestDeficiency := -1.0 // Higher = better (more clauses removed than added)
-		hasEliminatable := false
-
-		for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
-			posOcc := posCount[varIdx]
-			negOcc := negCount[varIdx]
-
-			// Skip if variable doesn't appear in both polarities
-			if posOcc == 0 || negOcc == 0 {
-				continue
-			}
-
-			// CRITICAL: Only eliminate variables with SINGLE positive clause (pos=1)
-			// This guarantees sound model reconstruction
-			if posOcc != 1 {
-				continue
-			}
-
-			// OCCURRENCE CUTOFF: Skip variables appearing in too many clauses
-			totalOcc := posOcc + negOcc
-			if totalOcc > s.varElimMaxOccurrences {
-				continue
-			}
-
-			// RESOLVENT SIZE BOUND: Skip if product exceeds threshold
-			resolventSize := posOcc * negOcc
-			if resolventSize > s.varElimMaxResolventSize {
-				continue
-			}
-
-			// DEFICIENCY HEURISTIC: Only eliminate if we're removing more clauses than adding
-			// deficiency = (posClauses + negClauses) - (posClauses * negClauses)
-			// Positive deficiency = net clause reduction
-			deficiency := float64(posOcc+negOcc) - float64(resolventSize)
-
-			// Apply minimum deficiency threshold if configured
-			if s.varElimMinDeficiency > 0.0 && deficiency < s.varElimMinDeficiency {
-				continue
-			}
-
-			// Select variable with: 1) smallest resolvent, 2) highest deficiency as tiebreaker
-			if resolventSize < bestResolventSize ||
-				(resolventSize == bestResolventSize && deficiency > bestDeficiency) {
-				bestVar = varIdx
-				bestResolventSize = resolventSize
-				bestDeficiency = deficiency
-				hasEliminatable = true
-			}
-		}
-
-		if !hasEliminatable {
-			if s.verbose && eliminatedCount == 0 {
-				fmt.Printf("c [verbose] Variable elimination: no variables to eliminate\n")
-			}
-			break // No more variables to eliminate
-		}
-
-		// Eliminate the best variable
-		varIdx := bestVar
-		posCls := posClauses[varIdx]
-		negCls := negClauses[varIdx]
-		originalClauses := len(posCls) + len(negCls)
-
-		// Generate resolvents with subsumption filtering
-		newResolvents := make([]cnf.Clause, 0)
-		resolventHashes := make(map[uint64]bool) // Duplicate detection
-
-		for _, pIdx := range posCls {
-			for _, nIdx := range negCls {
-				posClause := s.cnf.Clauses[pIdx]
-				negClause := s.cnf.Clauses[nIdx]
-
-				// Resolve on varIdx
-				resolvent := s.resolveOnVarElim(posClause, negClause, varIdx)
-				if resolvent != nil {
-					// Check for empty clause (UNSAT)
-					if len(resolvent.Literals) == 0 {
-						if s.verbose {
-							fmt.Printf("c [verbose] Variable elimination: empty clause found (UNSAT)\n")
-						}
-						return UNSAT
-					}
-
-					// Skip tautologies
-					if s.isTautology(resolvent) {
-						continue
-					}
-
-					// DUPLICATE DETECTION: Skip if we already generated this resolvent
-					hash := computeCanonicalHash(resolvent.Literals, s.tmpSortedLits)
-					if resolventHashes[hash] {
-						continue
-					}
-					resolventHashes[hash] = true
-
-					// SUBSUMPTION CHECK: Skip if subsumed by existing clause
-					// (expensive, so only check for small resolvents)
-					if len(resolvent.Literals) <= 5 {
-						subsumed := false
-						for _, existing := range s.cnf.Clauses {
-							if clauseSubsumes(&existing, resolvent) {
-								subsumed = true
-								break
-							}
-						}
-						if subsumed {
-							continue
-						}
-					}
-
-					newResolvents = append(newResolvents, *resolvent)
-				}
-			}
-		}
-
-		// Check deficiency again with actual resolvent count (after filtering)
-		actualDeficiency := float64(originalClauses) - float64(len(newResolvents))
-		if s.varElimMinDeficiency > 0.0 && actualDeficiency < s.varElimMinDeficiency {
-			// Mark this variable as uneliminatable by zeroing its counts
-			posCount[varIdx] = 0
-			negCount[varIdx] = 0
-			continue
-		}
-
-		// Store definition for model reconstruction
-		// With pos=1 restriction, there's exactly one positive clause: (x ∨ A)
-		// Reconstruction rule: x = ¬A (x is true iff A is false)
-		allALits := make([]cnf.Literal, 0)
-		for _, pIdx := range posCls {
-			posClause := s.cnf.Clauses[pIdx]
-			for _, lit := range posClause.Literals {
-				if lit.Var() != varIdx {
-					allALits = append(allALits, lit)
-				}
-			}
-		}
-		s.varElimDefinition[varIdx] = allALits
-		s.varElimPolarity[varIdx] = true
-
-		s.eliminatedVars = append(s.eliminatedVars, varIdx)
-		// Assign eliminated variable so VSIDS does not select it
-		s.assignments[varIdx] = Assignment{
-			Value: s.varElimPolarity[varIdx],
-			Level: 1,
-		}
-		eliminatedCount++
-		iterCount++
-		clausesRemoved += originalClauses
-
-		// Build new clause list: keep clauses that don't contain varIdx, add resolvents
-		newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses)-originalClauses+len(newResolvents))
-		for _, clause := range s.cnf.Clauses {
-			keep := true
-			for _, lit := range clause.Literals {
-				if lit.Var() == varIdx {
-					keep = false
-					break
-				}
-			}
-			if keep {
-				newClauses = append(newClauses, clause)
-			}
-		}
-		newClauses = append(newClauses, newResolvents...)
-		s.cnf.Clauses = newClauses
-		s.cnf.NumClauses = len(newClauses)
-
-		// Zero out VSIDS activity for eliminated variable
-		s.vsids.activity[varIdx] = 0.0
-	}
-
-	// Zero out activity for all eliminated variables
-	for _, varIdx := range s.eliminatedVars {
-		s.vsids.activity[varIdx] = 0.0
-	}
-
-	if s.verbose && eliminatedCount > 0 {
-		fmt.Printf("c [VE DEBUG] Eliminated %d variables, removed %d clauses, %d clauses remaining\n",
-			eliminatedCount, clausesRemoved, s.cnf.NumClauses)
-
-	}
-
-	return UNKNOWN
-}
 
 // variableEliminationSinglePass eliminates variables with pos=1 from the ORIGINAL formula only
 // This is sound because definitions don't have transitive dependencies
-// Definition: x = ¬A where (x ∨ A) is the single positive clause in the original formula
-func (s *CDCLSolver) variableEliminationSinglePass() SolveResult {
-	if s.verbose {
-		fmt.Printf("c [VE] Starting single-pass VE (pos=1 from original formula)...\n")
-	}
-
-	startTime := time.Now()
-	eliminatedCount := 0
-
-	// Count occurrences ONCE from original clause set
-	posClausesMap := make(map[uint32][]int)
-	negClausesMap := make(map[uint32][]int)
-
-	for clauseIdx, clause := range s.cnf.Clauses {
-		for _, lit := range clause.Literals {
-			varIdx := lit.Var()
-			if lit.IsNegated() {
-				negClausesMap[varIdx] = append(negClausesMap[varIdx], clauseIdx)
-			} else {
-				posClausesMap[varIdx] = append(posClausesMap[varIdx], clauseIdx)
-			}
-		}
-	}
-
-	// Find candidates: pos=1, deficiency > 0, small resolvent
-	type candidate struct {
-		varIdx     uint32
-		posClause  int
-		negClauses []int
-		deficiency float64
-	}
-	var candidates []candidate
-
-	for varIdx, posCls := range posClausesMap {
-		negCls := negClausesMap[varIdx]
-		if len(posCls) != 1 || len(negCls) == 0 {
-			continue
-		}
-		totalOcc := 1 + len(negCls)
-		if totalOcc > 100 {
-			continue
-		}
-		resolventSize := len(negCls)
-		if resolventSize > 30 {
-			continue
-		}
-		deficiency := float64(totalOcc) - float64(resolventSize)
-		if deficiency <= 0 {
-			continue
-		}
-		candidates = append(candidates, candidate{
-			varIdx:     varIdx,
-			posClause:  posCls[0],
-			negClauses: negCls,
-			deficiency: deficiency,
-		})
-	}
-
-	// Sort by deficiency
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].deficiency > candidates[j].deficiency
-	})
-
-	if s.verbose && len(candidates) > 0 {
-		fmt.Printf("c [VE] Found %d candidates from original formula\n", len(candidates))
-	}
-
-	// Track eliminated variables to avoid dependencies
-	eliminatedSet := make(map[uint32]bool)
-
-	for _, cand := range candidates {
-		varIdx := cand.varIdx
-
-		// Skip if already eliminated or appears in another eliminated var's definition
-		if eliminatedSet[varIdx] {
-			continue
-		}
-		skip := false
-		for elimVar := range eliminatedSet {
-			for _, lit := range s.varElimDefinition[elimVar] {
-				if lit.Var() == varIdx {
-					skip = true
-					break
-				}
-			}
-			if skip {
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-
-		// Check if positive clause still exists and contains varIdx
-		pIdx := cand.posClause
-		if pIdx >= len(s.cnf.Clauses) {
-			continue
-		}
-		posClause := s.cnf.Clauses[pIdx]
-		hasVar := false
-		for _, lit := range posClause.Literals {
-			if lit.Var() == varIdx {
-				hasVar = true
-				break
-			}
-		}
-		if !hasVar {
-			continue
-		}
-
-		// Collect valid negative clauses
-		validNeg := make([]int, 0)
-		for _, nIdx := range cand.negClauses {
-			if nIdx >= len(s.cnf.Clauses) {
-				continue
-			}
-			negClause := s.cnf.Clauses[nIdx]
-			for _, lit := range negClause.Literals {
-				if lit.Var() == varIdx {
-					validNeg = append(validNeg, nIdx)
-					break
-				}
-			}
-		}
-
-		if len(validNeg) == 0 {
-			continue
-		}
-
-		// Generate resolvents
-		newResolvents := make([]cnf.Clause, 0)
-		resolventHashes := make(map[uint64]bool)
-
-		for _, nIdx := range validNeg {
-			resolvent := s.resolveOnVarElim(posClause, s.cnf.Clauses[nIdx], varIdx)
-			if resolvent != nil {
-				if len(resolvent.Literals) == 0 {
-					return UNSAT
-				}
-				if s.isTautology(resolvent) {
-					continue
-				}
-				hash := computeCanonicalHash(resolvent.Literals, s.tmpSortedLits)
-				if resolventHashes[hash] {
-					continue
-				}
-				resolventHashes[hash] = true
-				if len(resolvent.Literals) <= 5 {
-					subsumed := false
-					for _, existing := range s.cnf.Clauses {
-						if clauseSubsumes(&existing, resolvent) {
-							subsumed = true
-							break
-						}
-					}
-					if subsumed {
-						continue
-					}
-				}
-				newResolvents = append(newResolvents, *resolvent)
-			}
-		}
-
-		// Store definition: x = ¬A where A are non-x literals from positive clause
-		defLits := make([]cnf.Literal, 0)
-		for _, lit := range posClause.Literals {
-			if lit.Var() != varIdx {
-				defLits = append(defLits, lit)
-			}
-		}
-		s.varElimDefinition[varIdx] = defLits
-		s.varElimPolarity[varIdx] = true
-		s.eliminatedVars = append(s.eliminatedVars, varIdx)
-		s.assignments[varIdx] = Assignment{Value: true, Level: 1}
-		eliminatedSet[varIdx] = true
-		eliminatedCount++
-
-		// Replace clauses: remove all clauses containing varIdx, add resolvents
-		newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses)-1-len(validNeg)+len(newResolvents))
-		for i, clause := range s.cnf.Clauses {
-			keep := true
-			for _, lit := range clause.Literals {
-				if lit.Var() == varIdx {
-					keep = false
-					break
-				}
-			}
-			if keep && i != pIdx {
-				newClauses = append(newClauses, clause)
-			}
-		}
-		newClauses = append(newClauses, newResolvents...)
-		s.cnf.Clauses = newClauses
-		s.cnf.NumClauses = len(newClauses)
-		s.vsids.activity[varIdx] = 0.0
-
-		// Time limit check
-		if s.varElimMaxTimeMs > 0 {
-			if time.Since(startTime).Milliseconds() > int64(s.varElimMaxTimeMs) {
-				break
-			}
-		}
-	}
-
-	if s.verbose && eliminatedCount > 0 {
-		fmt.Printf("c [VE] Eliminated %d variables, %d clauses remaining\n", eliminatedCount, s.cnf.NumClauses)
-	}
-	return UNKNOWN
-}
-
-// resolveOnVarElim resolves two clauses on a variable (for variable elimination)
-// Returns nil if resolvent is empty or tautological
-func (s *CDCLSolver) resolveOnVarElim(clause1, clause2 cnf.Clause, varIdx uint32) *cnf.Clause {
-	// Find the literals for varIdx
-	var lit1, lit2 cnf.Literal
-	found1, found2 := false, false
-
-	for _, lit := range clause1.Literals {
-		if lit.Var() == varIdx {
-			lit1 = lit
-			found1 = true
-			break
-		}
-	}
-	for _, lit := range clause2.Literals {
-		if lit.Var() == varIdx {
-			lit2 = lit
-			found2 = true
-			break
-		}
-	}
-
-	if !found1 || !found2 {
-		return nil
-	}
-
-	// Check if they have opposite polarity (required for resolution)
-	if lit1.IsNegated() == lit2.IsNegated() {
-		return nil
-	}
-
-	// Build resolvent (all literals except the resolved variable)
-	resolventLits := make([]cnf.Literal, 0, len(clause1.Literals)+len(clause2.Literals)-2)
-	for _, lit := range clause1.Literals {
-		if lit.Var() != varIdx {
-			resolventLits = append(resolventLits, lit)
-		}
-	}
-	for _, lit := range clause2.Literals {
-		if lit.Var() != varIdx {
-			resolventLits = append(resolventLits, lit)
-		}
-	}
-
-	if len(resolventLits) == 0 {
-		// Empty clause = UNSAT
-		return &cnf.Clause{Literals: make([]cnf.Literal, 0)}
-	}
-
-	return &cnf.Clause{Literals: resolventLits, Learned: false}
-}
-
-// reconstructEliminatedVars reconstructs assignments for eliminated variables
-// Must be called after solving returns SAT
-func (s *CDCLSolver) reconstructEliminatedVars() {
-	if len(s.eliminatedVars) == 0 {
-		return
-	}
-
-	if s.verbose {
-		fmt.Printf("c [verbose] Reconstructing %d eliminated variables\n", len(s.eliminatedVars))
-	}
-
-	// Reconstruct in reverse elimination order (last eliminated first)
-	for i := len(s.eliminatedVars) - 1; i >= 0; i-- {
-		varIdx := s.eliminatedVars[i]
-		defLits, exists := s.varElimDefinition[varIdx]
-		if !exists {
-			continue
-		}
-
-		// Evaluate the definition for pos=1 elimination
-		// Variable x was eliminated with single positive clause: (x ∨ A₁ ∨ A₂ ∨ ... ∨ Aₙ)
-		// Reconstruction rule: x = ¬(A₁ ∨ A₂ ∨ ... ∨ Aₙ) = ¬A₁ ∧ ¬A₂ ∧ ... ∧ ¬Aₙ
-		// In other words: x is true IFF all literals in the definition are false
-		allFalse := true
-		for _, lit := range defLits {
-			litVar := lit.Var()
-			if int(litVar) >= len(s.assignments) {
-				continue
-			}
-			assign := s.assignments[litVar]
-			if assign.Level == 0 {
-				// Unassigned variable in definition - can't determine, treat as false (conservative)
-				continue
-			}
-			litValue := assign.Value
-			if lit.IsNegated() {
-				litValue = !litValue
-			}
-			if litValue {
-				// A literal in the definition is true, so x must be false
-				allFalse = false
-				break
-			}
-		}
-		// x = ¬(OR of definition literals)
-		defValue := allFalse
-
-		// If definition is empty (unit clause (x) was eliminated), x must be true
-		if len(defLits) == 0 {
-			defValue = true
-		}
-
-		s.assignments[varIdx] = Assignment{
-			Value: defValue,
-			Level: 1, // Mark as assigned (not a decision)
-		}
-
-	}
-}
-
 // Solve determines if the CNF formula is satisfiable.
 //
 // Returns true if SAT, false if UNSAT or UNKNOWN.
@@ -3174,15 +2400,8 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 
 	// Initialize VSIDS with clause-length weighted activity BEFORE search
 	// Variables in shorter clauses get higher activity (more constrained = more important)
-	// Binary clauses get 100x base weight to strongly bias initial variable selection
+		// Binary clauses get 100x base weight to strongly bias initial variable selection
 
-	// Re-assign eliminated variables so VSIDS does not select them
-	for _, varIdx := range s.eliminatedVars {
-		s.assignments[varIdx] = Assignment{
-			Value: s.varElimPolarity[varIdx],
-			Level: 1,
-		}
-	}
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
 	// IMPROVEMENT #1: Improved VSIDS initialization after preprocessing
@@ -3356,15 +2575,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			s.vsids.activity[i] = 1.0 + float64(occurrences)*0.5
 		}
 	}
-	s.vsids.heapValid = false // Force heap rebuild
-
-	// Re-assign eliminated variables so VSIDS does not select them
-	for _, varIdx := range s.eliminatedVars {
-		s.assignments[varIdx] = Assignment{
-			Value: s.varElimPolarity[varIdx],
-			Level: 1,
-		}
-	}
+		s.vsids.heapValid = false // Force heap rebuild
 
 	for {
 		s.iterations++
@@ -3421,9 +2632,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 
 		if s.allAssigned() {
-			// Reconstruct eliminated variables before returning model
-			s.reconstructEliminatedVars()
-
 			// Verify model satisfies all clauses
 			if !s.verifyModel() {
 				// Model is invalid - this shouldn't happen, indicates a bug
@@ -4024,19 +3232,6 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 	return false, nil
 }
 
-// selectRandomUnassigned selects a random unassigned variable
-// OPTIMIZATION: Uses persistent tmpUnassignedVars buffer to avoid allocation
-
-// isEliminatedVar checks if a variable was eliminated during preprocessing
-func (s *CDCLSolver) isEliminatedVar(varIdx uint32) bool {
-	for _, elimVar := range s.eliminatedVars {
-		if elimVar == varIdx {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 	// Reuse persistent buffer - no allocation!
 	s.tmpUnassignedVars = s.tmpUnassignedVars[:0]
@@ -4143,7 +3338,7 @@ func (s *CDCLSolver) decide() bool {
 					if i >= int(s.cnf.NumVars) {
 						break
 					}
-					if s.assignments[i].Level == 0 && !s.isEliminatedVar(uint32(i)) && !s.decidedVarSet[i] {
+					if s.assignments[i].Level == 0 && !s.decidedVarSet[i] {
 						varIdx = uint32(i)
 						s.restartDecisionCount = 0
 						break
