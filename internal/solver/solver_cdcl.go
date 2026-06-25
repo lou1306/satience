@@ -1732,52 +1732,45 @@ func (s *CDCLSolver) inprocessing() {
 
 	initialClauses := s.cnf.NumClauses
 	startTime := time.Now()
-	timeLimit := 500 * time.Millisecond
-
-	// CRITICAL: Once inprocessing starts, it MUST complete fully.
-	// No early returns - we must always rebuild watches and reset qhead.
-	// Partial inprocessing leaves solver in inconsistent state.
+	timeLimit := 500 * time.Millisecond // Limit inprocessing time
 
 	// 1. Unit propagation (cheap, can find new units from learned clauses)
 	s.inprocessUnitPropagation()
-
-	// Check time limit BEFORE next technique (never break mid-operation)
 	if time.Since(startTime) > timeLimit {
-		if s.verbose {
-			fmt.Printf("c [inprocess] Time limit reached after unit propagation (%.1fms)\n", float64(time.Since(startTime).Nanoseconds())/1e6)
-		}
-		goto finalize
+		return
 	}
 
-	// 2. Blocked clause elimination (sound, removes redundant clauses)
+	// 2. Variable elimination DISABLED - soundness bug with variable tracking
+	// Preprocessing VE eliminates most vars, search handles the rest
+	if time.Since(startTime) > timeLimit {
+		return
+	}
+
+	// 3. Blocked clause elimination (sound, removes redundant clauses)
 	// Run every 200 conflicts (more expensive than subsumption)
 	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
 		s.inprocessBlockedClauseElimination()
 	}
-
-	// Check time limit BEFORE next technique (never break mid-operation)
 	if time.Since(startTime) > timeLimit {
-		if s.verbose {
-			fmt.Printf("c [inprocess] Time limit reached after BCE (%.1fms)\n", float64(time.Since(startTime).Nanoseconds())/1e6)
-		}
-		goto finalize
+		return
 	}
 
-	// 3. Self-subsumption (every 1000 conflicts, more expensive)
+	// 5. Self-subsumption (every 1000 conflicts, more expensive)
 	// Further reduce clause database after other simplifications
 	if s.conflicts%1000 == 0 && s.cnf.NumClauses < 5000 {
 		s.selfSubsumption()
 	}
+	if time.Since(startTime) > timeLimit {
+		return
+	}
 
-finalize:
 	removed := initialClauses - s.cnf.NumClauses
 	if s.verbose && removed != 0 {
 		elapsed := time.Since(startTime)
 		fmt.Printf("c [inprocess] Inprocessing complete: removed %d clauses in %.1fms\n", removed, float64(elapsed.Nanoseconds())/1e6)
 	}
 
-	// CRITICAL: ALWAYS rebuild watch lists after inprocessing
-	// Even if removed==0, techniques may have modified clauses in-place
+	// CRITICAL: Rebuild watch lists after clause database modifications
 	// Watch lists must reflect current clause database to avoid stale references
 	if s.watchInitialized {
 		s.watchLists = make([][]cnf.Watch, 2*s.cnf.NumVars)
