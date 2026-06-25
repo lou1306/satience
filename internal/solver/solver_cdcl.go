@@ -4999,6 +4999,13 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	if s.verbose && protectedCount > 0 {
 		fmt.Printf("c [deleteLearnedClauses] Protected %d clauses used as implications\n", protectedCount)
 	}
+
+	// Step 2.5: Build clause index mapping (old -> new) for implication updates
+	// Track where each clause moves to during swap-remove, or -1 if deleted
+	clauseIndexMap := make([]int, s.learnedCapacity)
+	for i := range clauseIndexMap {
+		clauseIndexMap[i] = -1
+	}
 	
 	for i := 0; i < toDelete; i++ {
 		if clauses[i].score < 0 {
@@ -5027,6 +5034,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			continue // Skip deleted slots
 		}
 
+		// Record mapping: clause at readIdx will move to writeIdx
+		clauseIndexMap[readIdx] = writeIdx
+
 		if writeIdx != readIdx {
 			// Move clause metadata from readIdx to writeIdx
 			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
@@ -5054,6 +5064,34 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.learnedOffsets = s.learnedOffsets[:writeIdx]
 	s.learnedSizes = s.learnedSizes[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
+
+	// CRITICAL FIX: Update implication array to reflect new clause indices
+	// After swap-remove, clauses have moved to new positions. Variables' reason clauses
+	// must be updated to point to the new locations, otherwise 1-UIP will resolve with
+	// wrong clauses, producing incorrect learned clauses and breaking soundness.
+	implicationUpdates := 0
+	implicationStale := 0
+	for varIdx := range s.implication {
+		if s.implication[varIdx] < -1 {
+			learnedIdx := -s.implication[varIdx] - 1
+			if learnedIdx < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
+				// Clause moved to new location, update implication
+				s.implication[varIdx] = -clauseIndexMap[learnedIdx] - 1
+				implicationUpdates++
+			} else if learnedIdx < len(clauseIndexMap) {
+				// BUG: Implication points to deleted clause (should have been protected)
+				// Reset to -1 (decision) to avoid using wrong clause
+				implicationStale++
+				if s.verbose && implicationStale <= 10 {
+					fmt.Printf("c [BUG] Stale implication: var %d -> clause %d (deleted, not protected)\n", varIdx+1, learnedIdx)
+				}
+				s.implication[varIdx] = -1
+			}
+		}
+	}
+	if s.verbose && (implicationUpdates > 0 || implicationStale > 0) {
+		fmt.Printf("c [deleteLearnedClauses] Implication updates: %d, stale: %d\n", implicationUpdates, implicationStale)
+	}
 
 	// OPTIMIZATION #1: Rebuild unit clause list after swap-remove
 	// Indices changed during swap, so rebuild from scratch
