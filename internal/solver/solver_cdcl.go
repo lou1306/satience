@@ -1733,13 +1733,6 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 }
 
 func (s *CDCLSolver) inprocessing() {
-	// OPTIMIZATION: Lowered threshold from 500 to 50 clauses to enable inprocessing on PHP instances
-	// PHP 6p5h: 81 clauses, PHP 7p6h: 133 clauses, PHP 8p7h: 204 clauses - all now get inprocessing
-	// Inprocessing (subsumption, self-subsumption) helps reduce clause database and find conflicts faster
-	if s.cnf.NumClauses < 10 { // Lowered to enable inprocessing after aggressive VE
-		return
-	}
-
 	if s.verbose {
 		fmt.Printf("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
 	}
@@ -1980,9 +1973,6 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 	// Only process original clauses (learned clauses change too frequently)
 	// Assignments are made at level 0 (permanent, never backtracked)
 	// This is sound: equivalent to preprocessing unit propagation
-	if s.cnf.NumClauses > 10000 {
-		return
-	}
 
 	// Collect all unit clauses first (avoid modifying during iteration)
 	type unitClause struct {
@@ -2467,7 +2457,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			if s.cnf.NumVars < 100 {
 				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
 			}
-			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
+			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
@@ -2618,7 +2608,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			if s.cnf.NumVars < 100 {
 				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
 			}
-			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 && s.cnf.NumClauses >= s.preprocessingMinClauses {
+			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
