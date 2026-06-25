@@ -1732,6 +1732,7 @@ func (s *CDCLSolver) inprocessing() {
 
 	initialClauses := s.cnf.NumClauses
 	startTime := time.Now()
+	timeLimit := 500 * time.Millisecond
 
 	// CRITICAL: Once inprocessing starts, it MUST complete fully.
 	// No early returns - we must always rebuild watches and reset qhead.
@@ -1740,10 +1741,26 @@ func (s *CDCLSolver) inprocessing() {
 	// 1. Unit propagation (cheap, can find new units from learned clauses)
 	s.inprocessUnitPropagation()
 
+	// Check time limit BEFORE next technique (never break mid-operation)
+	if time.Since(startTime) > timeLimit {
+		if s.verbose {
+			fmt.Printf("c [inprocess] Time limit reached after unit propagation (%.1fms)\n", float64(time.Since(startTime).Nanoseconds())/1e6)
+		}
+		goto finalize
+	}
+
 	// 2. Blocked clause elimination (sound, removes redundant clauses)
 	// Run every 200 conflicts (more expensive than subsumption)
 	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
 		s.inprocessBlockedClauseElimination()
+	}
+
+	// Check time limit BEFORE next technique (never break mid-operation)
+	if time.Since(startTime) > timeLimit {
+		if s.verbose {
+			fmt.Printf("c [inprocess] Time limit reached after BCE (%.1fms)\n", float64(time.Since(startTime).Nanoseconds())/1e6)
+		}
+		goto finalize
 	}
 
 	// 3. Self-subsumption (every 1000 conflicts, more expensive)
@@ -1752,6 +1769,7 @@ func (s *CDCLSolver) inprocessing() {
 		s.selfSubsumption()
 	}
 
+finalize:
 	removed := initialClauses - s.cnf.NumClauses
 	if s.verbose && removed != 0 {
 		elapsed := time.Since(startTime)
