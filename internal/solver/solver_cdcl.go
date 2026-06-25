@@ -117,12 +117,6 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 //
 // Fields are mostly private; use provided methods for interaction.
 
-// literalFreeSlot tracks a free region in the learnedLiterals pool for reuse
-type literalFreeSlot struct {
-	offset int // Start offset in learnedLiterals
-	size   int // Number of literals in this free slot
-}
-
 type CDCLSolver struct {
 	cnf          *cnf.CNF
 	assignments  []Assignment
@@ -144,7 +138,6 @@ type CDCLSolver struct {
 	normalClauseCount    int                   // Track number of non-glue clauses (LBD > 3)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
-	literalFreeSlots     []literalFreeSlot     // Free regions in learnedLiterals for reuse
 	currentAge           int
 	verbose              bool
 	decisions            int
@@ -190,10 +183,6 @@ type CDCLSolver struct {
 	tmpUnassignedVars    []uint32      // Reusable buffer for random variable selection (avoids allocation)
 	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
-	tmpSubsumeSet        []bool        // Reusable bitmap for subsumption checking (avoids map allocation)
-	tmpSubsumeVars       []uint32      // Track variables in subsumption set for fast cleanup
-	tmpTautologySeen     []bool        // Track variables seen in learned clause for tautology check
-	tmpTautologyPolarity []bool        // Track polarity of variables for tautology check
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpClauseInfo         []clauseInfo  // Buffer for clause scoring
@@ -343,7 +332,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
-		literalFreeSlots:     make([]literalFreeSlot, 0, 64),
 		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
 		currentAge:           0,
 		verbose:              false,
@@ -384,10 +372,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpUnassignedVars:    make([]uint32, 0, formula.NumVars),
 		tmpLearnedLits:       make([]cnf.Literal, 0, 64),
 		tmpSortedLits:        make([]cnf.Literal, 0, 64),
-		tmpSubsumeSet:        make([]bool, formula.NumVars),
-		tmpSubsumeVars:       make([]uint32, 0, 64),
-		tmpTautologySeen:     make([]bool, formula.NumVars),
-		tmpTautologyPolarity: make([]bool, formula.NumVars),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
 		tmpDeleted:            make([]bool, maxLearned),
@@ -522,21 +506,7 @@ func (s *CDCLSolver) SetInprocessingInterval(interval int) {
 	s.inprocessingInterval = interval
 }
 
-// SetInprocessingMaxClauses sets the maximum clauses for inprocessing (default 5000)
-func (s *CDCLSolver) SetInprocessingMaxClauses(max int) {
-	if max < 100 {
-		max = 100
-	}
-	s.inprocessingMaxClauses = max
-}
 
-// SetInprocessingTimeLimitMs sets the time limit for inprocessing in milliseconds (default 200)
-func (s *CDCLSolver) SetInprocessingTimeLimitMs(ms int) {
-	if ms < 50 {
-		ms = 50
-	}
-	s.inprocessingTimeLimitMs = ms
-}
 
 // SetPreprocessingThresholds sets the preprocessing size thresholds
 // minClauses: skip if < N clauses (default 50)
@@ -557,67 +527,11 @@ func (s *CDCLSolver) SetPreprocessingThresholds(minClauses, maxVars, maxClauses 
 	s.preprocessingMaxClauses = maxClauses
 }
 
-// SetVariableEliminationThresholds sets the variable elimination thresholds
-// maxVars: skip if > N vars (default 20000)
-// maxClauses: skip if > N clauses (default 100000)
-// maxResolventSize: max resolvent size (default 100)
-// maxOccurrences: max occurrences of variable to eliminate (default 500)
-// minDeficiency: min deficiency ratio (default 0.0 = disabled)
-func (s *CDCLSolver) SetVariableEliminationThresholds(maxVars, maxClauses, maxResolventSize int, maxOccurrences int, minDeficiency float64) {
-	if maxVars < 0 {
-		maxVars = 0
-	}
-	if maxClauses < 0 {
-		maxClauses = 0
-	}
-	if maxResolventSize < 0 {
-		maxResolventSize = 0
-	}
-	if maxOccurrences < 0 {
-		maxOccurrences = 0
-	}
-	if minDeficiency < 0.0 {
-		minDeficiency = 0.0
-	}
-	s.varElimMaxVars = maxVars
-	s.varElimMaxClauses = maxClauses
-	s.varElimMaxResolventSize = maxResolventSize
-	s.varElimMaxOccurrences = maxOccurrences
-	s.varElimMinDeficiency = minDeficiency
-}
 
-// SetClauseDeletionLBDThresholds sets the LBD thresholds for clause deletion
-// minLBD: minimum LBD to consider for deletion (default 3)
-// glueLBD: LBD ≤ this are glue clauses (default 2)
-// coreGlueLBD: LBD ≤ this are core glue, never delete (default 2)
-func (s *CDCLSolver) SetClauseDeletionLBDThresholds(minLBD, glueLBD, coreGlueLBD int) {
-	if minLBD < 0 {
-		minLBD = 0
-	}
-	if glueLBD < 0 {
-		glueLBD = 0
-	}
-	if coreGlueLBD < 0 {
-		coreGlueLBD = 0
-	}
-	s.clauseDeletionMinLBD = minLBD
-	s.glueClauseLBDThreshold = glueLBD
-	s.coreGlueLBDThreshold = coreGlueLBD
-}
 
-// SetClauseDeletionThresholds sets the size and age thresholds for clause deletion
-// largeSize: size threshold for large clause detection (default 15)
-// maxAge: age threshold for forced deletion (default 500)
-func (s *CDCLSolver) SetClauseDeletionThresholds(largeSize, maxAge int) {
-	if largeSize < 0 {
-		largeSize = 0
-	}
-	if maxAge < 0 {
-		maxAge = 0
-	}
-	s.largeClauseSizeThreshold = largeSize
-	s.maxClauseAgeThreshold = maxAge
-}
+
+
+
 
 // SetClauseActivityDecay sets the clause activity decay factor (default 0.95)
 func (s *CDCLSolver) SetClauseActivityDecay(decay float64) {
@@ -627,24 +541,7 @@ func (s *CDCLSolver) SetClauseActivityDecay(decay float64) {
 	s.clauseActivityDecay = decay
 }
 
-// SetTemporaryBufferSizes sets the buffer sizes for temporary allocations
-// candidateBuf: buffer size for resolve candidates (default 100)
-// learnedLitBuf: buffer size for learned literals (default 64)
-// hashInitial: initial capacity for learned clause hash table (default 2500)
-func (s *CDCLSolver) SetTemporaryBufferSizes(candidateBuf, learnedLitBuf, hashInitial int) {
-	if candidateBuf < 1 {
-		candidateBuf = 1
-	}
-	if learnedLitBuf < 1 {
-		learnedLitBuf = 1
-	}
-	if hashInitial < 1 {
-		hashInitial = 1
-	}
-	s.tmpCandidateBufferSize = candidateBuf
-	s.tmpLearnedLitBufferSize = learnedLitBuf
-	s.learnedClauseHashInitial = hashInitial
-}
+
 
 // SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
 // Higher values = fewer heap rebuilds but slower activity differentiation
@@ -701,13 +598,7 @@ func (s *CDCLSolver) EnableCHB() {
 	s.vsids.EnableCHB()
 }
 
-// SetCHBParameters configures CHB heuristic parameters
-// decayFactor: decay factor for conflict frequency (default 0.75, range 0.5-0.95)
-// decayInterval: decay every N conflicts (default 50)
-func (s *CDCLSolver) SetCHBParameters(decayFactor float64, decayInterval int) {
-	s.vsids.SetCHBDecayFactor(decayFactor)
-	s.vsids.SetCHBDecayInterval(decayInterval)
-}
+
 
 // SetRestartParameters configures restart policy parameters
 // base: Luby sequence base multiplier (default 20, range 1-1000)
@@ -5019,11 +4910,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 		// CRITICAL: Remove watches for deleted clause (P1 lazy watch removal)
 		s.removeLearnedClauseWatches(idx)
-
-		// Track literal region as free for reuse (SAFE NOW: implications use indices)
-		offset := s.learnedOffsets[idx]
-		size := s.learnedSizes[idx]
-		s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{offset: offset, size: size})
 	}
 
 	// Step 3: Swap-remove - move active clauses into deleted slots
