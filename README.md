@@ -26,6 +26,11 @@
 
 ### Preprocessing
 - **Unit Propagation** - Sound unit clause propagation before search
+- **Pure Literal Elimination** - Assigns pure literals during preprocessing
+- **Subsumption Elimination** - Removes subsumed clauses
+- **Self-Subsumption** - Shortens clauses via resolution
+- **Hyper-Binary Resolution** - Derives binary clauses from unit propagations
+- **Equivalence Detection** - Finds and substitutes equivalent literals (disabled by default due to soundness concerns)
 
 ### CLI Features
 - Model output (`-model`)
@@ -232,6 +237,7 @@ Thanks to the SAT research community for excellent benchmarks and test instances
 - Single-threaded only (by design)
 - No incremental solving (by design)
 - No proof/unsat core generation (by design)
+- **Variable elimination removed**: Attempted implementation produced unsound results (SAT instead of UNSAT on PHP instances)
 
 ## Out of Scope Features
 
@@ -241,4 +247,4 @@ Per project constraints, the following features are explicitly **out of scope**:
 - **Parallel solving**: Single-threaded only
 - **Incremental solving**: No assumption stack or incremental interface
 - **Proof generation**: No UNSAT core or resolution proof output
-- **Advanced preprocessing**: Beyond basic unit propagation (e.g., variable elimination, subsumption)
+- **Variable elimination**: Removed due to fundamental soundness issues—pos=1 elimination is unsound for general CNF where positive clauses are constraints rather than definitions

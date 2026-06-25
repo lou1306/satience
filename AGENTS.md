@@ -87,6 +87,11 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 
 ### Preprocessing
 - Unit propagation (sound and complete)
+- Pure literal elimination
+- Subsumption elimination
+- Self-subsumption
+- Hyper-binary resolution
+- Equivalence detection (disabled by default)
 
 ### CLI Features
 - `-model`: Print satisfying assignment
@@ -194,10 +199,10 @@ benchmark/eval_small_random.sh [n_instances]
 
 ### Not Planned (per constraints)
 - **Cardinality constraint detection**: PHP-like instances need specialized propagators for counting constraints. Expected 100-1000× speedup but requires fundamental architecture changes.
+- **Variable elimination**: Removed (June 2026) due to soundness bugs—pos=1 elimination produced wrong results on PHP instances (SAT instead of UNSAT)
 - Parallel solving
 - Incremental solving
 - Proof/unsat core generation
-- Advanced preprocessing (beyond unit propagation)
 
 ## Known Limitations
 
@@ -212,9 +217,16 @@ Some random instances timeout. This is due to:
 - VSIDS exploits community structure (absent in random instances)
 - Lack of advanced heuristics (CHB, LRB tuning needed)
 
+### Variable Elimination (Removed)
+Variable elimination was removed in June 2026 due to fundamental soundness issues:
+- **Root cause**: pos=1 elimination assumes positive clauses are definitions (x = ¬A), but in PHP they are constraints
+- **Symptom**: php_6p_5h_unsat.cnf returned SAT instead of UNSAT after VE
+- **Resolution**: Removed ~800 lines of VE code; solver now relies on core CDCL techniques only
+
 ## Recent Commits
 
 ```
+0845411 - Remove variable elimination (VE) due to soundness bugs
 ebb9fa8 - Implement swap-remove clause deletion to reduce GC pressure
 f53361a - Feature: Expose clause deletion scoring parameters as CLI options
 8c694c2 - Optimize: Update default restart policy to aggressive configuration
@@ -229,6 +241,7 @@ f53361a - Feature: Expose clause deletion scoring parameters as CLI options
 - Evaluation: 20 random instances < 200 vars, verify models for SAT
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
 - Compile with GOAMD64=v3 for AVX2/BMI2 optimizations
+- **Variable elimination removed**: ~800 lines deleted due to soundness bugs (June 2026)
 
 ## Swap-Remove Implementation Details
 
