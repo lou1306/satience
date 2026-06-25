@@ -56,11 +56,12 @@ var baselineInstances = []perfTestInstance{
 	},
 
 	// Medium instance with binary clauses
+	// Updated baseline after implication array fix (correct search behavior)
 	{
 		name:           "32baec6a0b794482e314a8a621d421a6.cnf",
 		expectedSAT:    true,
 		maxConflicts:   500,
-		maxDecisions:   1000,
+		maxDecisions:   2000,
 		maxTimeSeconds: 2.0,
 	},
 
