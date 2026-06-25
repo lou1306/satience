@@ -1293,9 +1293,6 @@ func (s *CDCLSolver) inprocessBlockedClauseElimination() {
 		return // Skip on large instances
 	}
 
-	startTime := time.Now()
-	timeLimit := 50 * time.Millisecond // Short time limit
-
 	removed := 0
 	keptClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
 
@@ -1314,10 +1311,6 @@ func (s *CDCLSolver) inprocessBlockedClauseElimination() {
 			removed++
 		} else {
 			keptClauses = append(keptClauses, clause)
-		}
-
-		if time.Since(startTime) > timeLimit {
-			break // Time limit reached
 		}
 	}
 
@@ -1739,36 +1732,24 @@ func (s *CDCLSolver) inprocessing() {
 
 	initialClauses := s.cnf.NumClauses
 	startTime := time.Now()
-	timeLimit := 500 * time.Millisecond // Limit inprocessing time
+
+	// CRITICAL: Once inprocessing starts, it MUST complete fully.
+	// No early returns - we must always rebuild watches and reset qhead.
+	// Partial inprocessing leaves solver in inconsistent state.
 
 	// 1. Unit propagation (cheap, can find new units from learned clauses)
 	s.inprocessUnitPropagation()
-	if time.Since(startTime) > timeLimit {
-		return
-	}
 
-	// 2. Variable elimination DISABLED - soundness bug with variable tracking
-	// Preprocessing VE eliminates most vars, search handles the rest
-	if time.Since(startTime) > timeLimit {
-		return
-	}
-
-	// 3. Blocked clause elimination (sound, removes redundant clauses)
+	// 2. Blocked clause elimination (sound, removes redundant clauses)
 	// Run every 200 conflicts (more expensive than subsumption)
 	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
 		s.inprocessBlockedClauseElimination()
 	}
-	if time.Since(startTime) > timeLimit {
-		return
-	}
 
-	// 5. Self-subsumption (every 1000 conflicts, more expensive)
+	// 3. Self-subsumption (every 1000 conflicts, more expensive)
 	// Further reduce clause database after other simplifications
 	if s.conflicts%1000 == 0 && s.cnf.NumClauses < 5000 {
 		s.selfSubsumption()
-	}
-	if time.Since(startTime) > timeLimit {
-		return
 	}
 
 	removed := initialClauses - s.cnf.NumClauses
@@ -1777,7 +1758,8 @@ func (s *CDCLSolver) inprocessing() {
 		fmt.Printf("c [inprocess] Inprocessing complete: removed %d clauses in %.1fms\n", removed, float64(elapsed.Nanoseconds())/1e6)
 	}
 
-	// CRITICAL: Rebuild watch lists after clause database modifications
+	// CRITICAL: ALWAYS rebuild watch lists after inprocessing
+	// Even if removed==0, techniques may have modified clauses in-place
 	// Watch lists must reflect current clause database to avoid stale references
 	if s.watchInitialized {
 		s.watchLists = make([][]cnf.Watch, 2*s.cnf.NumVars)
