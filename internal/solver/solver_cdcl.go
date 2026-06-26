@@ -183,6 +183,8 @@ type CDCLSolver struct {
 	tmpUnassignedVars    []uint32      // Reusable buffer for random variable selection (avoids allocation)
 	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
+	tmpMinimizedLits     []cnf.Literal // Reusable buffer for clause minimization (avoids allocation)
+	tmpIsGlue            []bool        // Bitmap for glue clause selection during restart (avoids allocation)
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpClauseInfo         []clauseInfo         // Buffer for clause scoring
@@ -368,6 +370,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpUnassignedVars:    make([]uint32, 0, formula.NumVars),
 		tmpLearnedLits:       make([]cnf.Literal, 0, 64),
 		tmpSortedLits:        make([]cnf.Literal, 0, 64),
+		tmpMinimizedLits:     make([]cnf.Literal, 0, 64),
+		tmpIsGlue:            make([]bool, maxLearned),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
 		tmpDeleted:            make([]bool, maxLearned),
@@ -1556,7 +1560,17 @@ func (s *CDCLSolver) restart() {
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
 	glueCount := 0
-	isGlue := make([]bool, len(s.learnedOffsets))
+	
+	// Ensure tmpIsGlue buffer is large enough
+	if cap(s.tmpIsGlue) < len(s.learnedOffsets) {
+		s.tmpIsGlue = make([]bool, len(s.learnedOffsets))
+	}
+	isGlue := s.tmpIsGlue[:len(s.learnedOffsets)]
+	
+	// Clear buffer
+	for i := range isGlue {
+		isGlue[i] = false
+	}
 
 	for i := 0; i < len(s.learnedOffsets); i++ {
 		lbd := s.learnedMetadata[i].LBD
@@ -1913,9 +1927,10 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 		s.assignments[i] = Assignment{}
 	}
 
-	// Initialize trail for preprocessing
-	s.trail = make([]int, 0)
-	s.trailHead = []int{0}
+	// Initialize trail for preprocessing (reuse capacity)
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.trailHead[0] = 0
 	s.level = 1
 
 	changed := true
@@ -3721,16 +3736,19 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			continue // Invalid clause
 		}
 
-		// Check for tautologies in reason clause
+		// Check for tautologies in reason clause (verbose mode only)
 		if s.verbose {
-			reasonSeen := make(map[uint32]bool)
 			reasonIsTaut := false
-			for _, rl := range reasonLits {
-				if reasonSeen[rl.Var()] {
-					reasonIsTaut = true
+			for i := 0; i < len(reasonLits); i++ {
+				for j := i + 1; j < len(reasonLits); j++ {
+					if reasonLits[i].Var() == reasonLits[j].Var() {
+						reasonIsTaut = true
+						break
+					}
+				}
+				if reasonIsTaut {
 					break
 				}
-				reasonSeen[rl.Var()] = true
 			}
 			if reasonIsTaut {
 				fmt.Printf("c [1-UIP] Step %d: WARNING - reason clause for var %d is TAUTOLOGY: ", resolveStep, varIdx+1)
@@ -4128,15 +4146,18 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		}
 	}
 
-	// Build final minimized clause from remaining literals
-	minimized := make([]cnf.Literal, 0, len(learnedLits))
+	// Build final minimized clause from remaining literals (use pre-allocated buffer)
+	s.tmpMinimizedLits = s.tmpMinimizedLits[:0]
 	for _, lit := range learnedLits {
 		if s.tmpLiteralInClause[lit.Var()] {
-			minimized = append(minimized, lit)
+			s.tmpMinimizedLits = append(s.tmpMinimizedLits, lit)
 		}
 	}
 
-	return minimized
+	// Return copy to avoid aliasing (caller expects ownership)
+	result := make([]cnf.Literal, len(s.tmpMinimizedLits))
+	copy(result, s.tmpMinimizedLits)
+	return result
 }
 
 // computeClauseScore calculates the deletion score for a clause
