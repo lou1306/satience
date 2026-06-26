@@ -3529,7 +3529,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Trigger deletion at 150% of limit (MiniSat-style)
 	dynamicLimit := s.maxLearned + s.conflicts/50
 	if s.learnedActiveCount > dynamicLimit+dynamicLimit/2 {
-		s.deleteLearnedClauses()
+		// s.deleteLearnedClauses() // DISABLED: soundness bug in swap-remove implementation
 	}
 
 	// Decay VSIDS activity every conflict (standard)
