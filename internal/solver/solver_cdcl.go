@@ -2454,7 +2454,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
-				s.inprocessing()
+				// s.inprocessing() // DISABLED: modifying clause database during search causes soundness bugs (trail/watch inconsistency)
 			}
 
 			if s.shouldRestart() {
@@ -2601,7 +2601,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
-				s.inprocessing()
+				// s.inprocessing() // DISABLED: modifying clause database during search causes soundness bugs (trail/watch inconsistency)
 			}
 
 			if s.shouldRestart() {
