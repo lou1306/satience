@@ -2472,15 +2472,11 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			if !s.verifyModel() {
 				if s.verbose {
-					fmt.Printf("c [SOLVE] Model verification FAILED - continuing search\n")
+					fmt.Printf("c [SOLVE] Model verification FAILED - returning UNKNOWN\n")
+					s.printStats()
 				}
-				// Model invalid - something is wrong, treat as conflict
-				s.conflicts++
-				if !s.backtrack() {
-					return UNSAT
-				}
-				s.backjumpLevel = 0
-				continue
+				// Model invalid - this indicates a bug, return UNKNOWN
+				return UNKNOWN
 			}
 			if s.verbose {
 				fmt.Printf("c [SOLVE] Model verification PASSED\n")
@@ -2617,9 +2613,12 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		if s.allAssigned() {
 			// Verify model satisfies all clauses
 			if !s.verifyModel() {
-				// Model is invalid - this shouldn't happen, indicates a bug
-				// For now, return UNSAT to avoid returning wrong SAT
-				return UNSAT
+				// Model is invalid - this indicates a bug, return UNKNOWN
+				if s.verbose {
+					fmt.Printf("c [SOLVE] Model verification FAILED - returning UNKNOWN\n")
+					s.printStats()
+				}
+				return UNKNOWN
 			}
 			if s.verbose {
 				s.printStats()
