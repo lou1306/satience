@@ -1531,6 +1531,16 @@ func (s *CDCLSolver) restart() {
 		fmt.Printf("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 	}
 
+
+	// CRITICAL: Run inprocessing at restart (not during search)
+	// At restart, we're about to clear the trail anyway, so clause modifications
+	// won't cause trail/watch inconsistencies. This gives us inprocessing benefits
+	// without the soundness bugs from running it mid-search.
+	// Only run after 1000 conflicts to avoid overhead on small instances
+	if s.conflicts >= 1000 {
+		s.inprocessing()
+	}
+
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
 	glueCount := 0
