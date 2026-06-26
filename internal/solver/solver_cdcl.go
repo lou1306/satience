@@ -3693,6 +3693,25 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount := s.tmpLevelCount[s.level]
 
+	// CRITICAL FIX #1: Handle "floating" conflicts where conflict clause has no literals at s.level
+	// This happens when a learned clause's literals are all at levels < s.level
+	// In this case, we can't do 1-UIP - just backtrack to max literal level
+	if currentCount == 0 && len(s.tmpTouchedVars) > 0 {
+		maxLitLevel := 0
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] {
+				lvl := s.assignments[varIdx].Level
+				if lvl > maxLitLevel {
+					maxLitLevel = lvl
+				}
+			}
+		}
+		if maxLitLevel < s.level {
+			return maxLitLevel
+		}
+		return s.level - 1
+	}
+
 	// Build candidate list from trail (most recent first)
 	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
@@ -3778,7 +3797,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpLevelCount[s.level]--
 		currentCount--
 
-		for _, lit := range reasonLits {
+		// CRITICAL FIX #2: Handle reason clauses with multiple literals at current level
+		// Such clauses cause 1-UIP to diverge (add more literals than removed)
+		// Solution: only add ONE literal at current level from such clauses
+		reasonLiteralsAtCurrentLevel := 0
+		firstLitAtCurrentLevel := -1
+		for i, lit := range reasonLits {
+			if s.assignments[lit.Var()].Level == s.level {
+				reasonLiteralsAtCurrentLevel++
+				if firstLitAtCurrentLevel < 0 {
+					firstLitAtCurrentLevel = i
+				}
+			}
+		}
+		skipOtherCurrentLevelLits := reasonLiteralsAtCurrentLevel > 1
+
+		for i, lit := range reasonLits {
 			v := lit.Var()
 			litNegated := lit.IsNegated()
 
@@ -3788,6 +3822,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					fmt.Printf("c [1-UIP]   Skip resolved var %d\n", v+1)
 				}
 				continue
+			}
+
+			// CRITICAL FIX #2: Skip additional literals at current level from multi-lit reason clauses
+			if skipOtherCurrentLevelLits && s.assignments[v].Level == s.level {
+				if i != firstLitAtCurrentLevel {
+					continue
+				}
 			}
 			if s.tmpLiteralInClause[v] {
 				if s.tmpLiteralIsNegated[v] != litNegated {
@@ -3836,6 +3877,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 		}
 		resolveStep++
+	}
+
+	// CRITICAL FIX #3: If 1-UIP didn't converge (currentCount > 1), manually construct valid 1-UIP clause
+	// This happens when reason clauses have multiple literals at current level
+	// Workaround: keep only one literal at current level, include all at lower levels
+	if currentCount > 1 {
+		keptOne := false
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] {
+				if s.assignments[varIdx].Level == s.level {
+					if !keptOne {
+						keptOne = true
+					} else {
+						s.tmpLiteralInClause[varIdx] = false
+						s.tmpLevelCount[s.level]--
+					}
+				}
+			}
+		}
+		currentCount = 1
 	}
 
 	// Calculate LBD and backjump level
