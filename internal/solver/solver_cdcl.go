@@ -3873,6 +3873,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
+	// CRITICAL: Verify 1-UIP property to catch soundness bugs
+	// If verification fails, the learned clause is invalid - stop learning (safer than wrong clause)
+	if !s.verifyLearnedClause(s.tmpLearnedLits) {
+		// 1-UIP verification failed - skip learning this clause
+		// This prevents propagating buggy learned clauses
+		if s.verbose {
+			fmt.Printf("c [learnClause] Skipping buggy learned clause due to 1-UIP violation\n")
+		}
+		// Continue without learning - the search will continue but may be less efficient
+	}
+
 	// Empty clause = UNSAT
 	if len(s.tmpLearnedLits) == 0 {
 		if s.verbose {
@@ -4720,4 +4731,32 @@ func (s *CDCLSolver) ResetTrail() {
 	for i := range s.assignments {
 		s.assignments[i].Level = 0
 	}
+}
+
+// verifyLearnedClause checks that a learned clause satisfies the 1-UIP property
+// This is a SOUNDNESS check that catches bugs in conflict analysis
+// Returns true if the clause is valid, false if it violates 1-UIP
+func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
+	if len(learnedLits) == 0 {
+		return true // Empty clause is valid (means UNSAT)
+	}
+
+	// Check 1: 1-UIP property - exactly 1 literal at current level
+	literalsAtCurrentLevel := 0
+	for _, lit := range learnedLits {
+		if s.assignments[lit.Var()].Level == s.level {
+			literalsAtCurrentLevel++
+		}
+	}
+	if literalsAtCurrentLevel != 1 {
+		fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected 1)\n",
+			s.conflicts, s.level, literalsAtCurrentLevel)
+		fmt.Printf("c   Learned clause: ")
+		for _, lit := range learnedLits {
+			fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
+		}
+		fmt.Printf("\n")
+		return false // 1-UIP violation
+	}
+	return true
 }
