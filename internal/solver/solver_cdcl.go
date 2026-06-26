@@ -185,6 +185,8 @@ type CDCLSolver struct {
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
 	tmpMinimizedLits     []cnf.Literal // Reusable buffer for clause minimization (avoids allocation)
 	tmpIsGlue            []bool        // Bitmap for glue clause selection during restart (avoids allocation)
+	tmpHasPositive       []bool        // Reusable buffer for pure literal detection in inprocessing
+	tmpHasNegative       []bool        // Reusable buffer for pure literal detection in inprocessing
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpClauseInfo         []clauseInfo         // Buffer for clause scoring
@@ -372,6 +374,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpSortedLits:        make([]cnf.Literal, 0, 64),
 		tmpMinimizedLits:     make([]cnf.Literal, 0, 64),
 		tmpIsGlue:            make([]bool, maxLearned),
+		tmpHasPositive:       make([]bool, formula.NumVars),
+		tmpHasNegative:       make([]bool, formula.NumVars),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
 		tmpDeleted:            make([]bool, maxLearned),
@@ -1840,9 +1844,15 @@ func (s *CDCLSolver) inprocessPureLiteralElimination() {
 
 		changed = false
 
-		// Scan for pure literals
-		hasPositive := make([]bool, s.cnf.NumVars)
-		hasNegative := make([]bool, s.cnf.NumVars)
+		// Scan for pure literals (use pre-allocated buffers)
+		hasPositive := s.tmpHasPositive[:s.cnf.NumVars]
+		hasNegative := s.tmpHasNegative[:s.cnf.NumVars]
+		
+		// Clear buffers
+		for i := range hasPositive {
+			hasPositive[i] = false
+			hasNegative[i] = false
+		}
 
 		for _, clause := range s.cnf.Clauses {
 			for _, lit := range clause.Literals {
