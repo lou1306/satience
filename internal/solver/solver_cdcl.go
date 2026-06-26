@@ -2454,7 +2454,7 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
-				// s.inprocessing() // DISABLED: modifying clause database during search causes soundness bugs (trail/watch inconsistency)
+				// s.inprocessing() // DISABLED: soundness bugs in clause deletion swap-remove and inprocessing
 			}
 
 			if s.shouldRestart() {
@@ -2601,7 +2601,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				if s.verbose {
 					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
 				}
-				// s.inprocessing() // DISABLED: modifying clause database during search causes soundness bugs (trail/watch inconsistency)
+				// s.inprocessing() // DISABLED: soundness bugs in clause deletion swap-remove and inprocessing
 			}
 
 			if s.shouldRestart() {
@@ -4400,6 +4400,13 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 		for i := range watchList {
 			if watchList[i].ClauseIdx == oldClauseIdx {
 				watchList[i].ClauseIdx = newClauseIdx
+			}
+		}
+		// FIX: Also update binary watch lists (was missing, causing soundness bugs during clause deletion)
+		binaryWatchList := s.watchListsBinary[litIdx]
+		for i := range binaryWatchList {
+			if binaryWatchList[i].ClauseIdx == oldClauseIdx {
+				binaryWatchList[i].ClauseIdx = newClauseIdx
 			}
 		}
 	}
