@@ -1240,6 +1240,11 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 	binaryUnits := make(map[uint32]bool)
 
 	for _, clause := range s.cnf.Clauses {
+		// CRITICAL: Only consider ORIGINAL clauses for hyper-binary resolution
+		// Learned clauses are context-dependent and cannot be used for permanent simplification
+		if clause.Learned {
+			continue
+		}
 		if len(clause.Literals) == 2 {
 			lit1, lit2 := clause.Literals[0], clause.Literals[1]
 			if s.isUnitLiteral(lit1) {
@@ -1257,6 +1262,10 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 
 	for i := 0; i < len(s.cnf.Clauses); i++ {
 		clause := s.cnf.Clauses[i]
+		// CRITICAL: Only simplify ORIGINAL clauses
+		if clause.Learned {
+			continue
+		}
 		if len(clause.Literals) < 3 {
 			continue
 		}
@@ -1286,6 +1295,11 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 
 	newClauses := make([]cnf.Clause, 0)
 	for _, clause := range s.cnf.Clauses {
+		// CRITICAL: Keep all learned clauses, only simplify original clauses
+		if clause.Learned {
+			newClauses = append(newClauses, clause)
+			continue
+		}
 		satisfied := false
 		for _, lit := range clause.Literals {
 			if assigned, exists := binaryUnits[lit.Var()]; exists {
@@ -1384,6 +1398,11 @@ func (s *CDCLSolver) negateLiteral(lit cnf.Literal) cnf.Literal {
 func (s *CDCLSolver) isUnitLiteral(lit cnf.Literal) bool {
 	varIdx := lit.Var()
 	for _, clause := range s.cnf.Clauses {
+		// CRITICAL: Only consider ORIGINAL clauses as units
+		// Learned unit clauses are context-dependent and cannot be used for simplification
+		if clause.Learned {
+			continue
+		}
 		if len(clause.Literals) == 1 && clause.Literals[0].Var() == varIdx {
 			return true
 		}
@@ -2018,8 +2037,13 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 	units := make([]unitClause, 0, 16)
 
 	// Phase 1: Scan for unit clauses
+	// CRITICAL: Only consider ORIGINAL clauses as permanent units
+	// Learned unit clauses are context-dependent and cannot be propagated at level 0
 	for i := 0; i < s.cnf.NumClauses && i < len(s.cnf.Clauses); i++ {
 		clause := &s.cnf.Clauses[i]
+		if clause.Learned {
+			continue
+		}
 		if len(clause.Literals) != 1 {
 			continue
 		}
