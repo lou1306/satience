@@ -217,9 +217,7 @@ type CDCLSolver struct {
 	qhead int // Watched literals: next trail index to process
 
 	// Configurable parameters (exposed for tuning)
-	inprocessingInterval     int     // Run inprocessing every N conflicts (default 500)
-	inprocessingMaxClauses   int     // Skip inprocessing if > N clauses (default 5000)
-	inprocessingTimeLimitMs  int     // Time limit for inprocessing in ms (default 200)
+	inprocessingMinConflicts int     // Run inprocessing at restart only after N conflicts (default 1000)
 	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
 	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
 	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
@@ -393,10 +391,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		minimizationMaxReasonSize: 15,
 		// Variable elimination tracking
 		// Configurable parameters with defaults
-		inprocessingInterval:     500,
-		inprocessingMaxClauses:   5000,
-		inprocessingTimeLimitMs:  200,
-		preprocessingMinClauses:  10, // Lowered to enable inprocessing after aggressive VE
+		inprocessingMinConflicts: 1000, // Run inprocessing at restart only after 1000 conflicts
+		preprocessingMinClauses:  10,   // Lowered to enable inprocessing after aggressive VE
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
 		clauseDeletionMinLBD:     3,
@@ -499,14 +495,14 @@ func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 }
 
 // SetInprocessingInterval sets how often to run inprocessing (default 500 conflicts)
-func (s *CDCLSolver) SetInprocessingInterval(interval int) {
-	if interval < 100 {
-		interval = 100
+// SetInprocessingMinConflicts sets the minimum conflicts before inprocessing runs at restart
+// Default is 1000 conflicts to avoid overhead on small instances
+func (s *CDCLSolver) SetInprocessingMinConflicts(minConflicts int) {
+	if minConflicts < 0 {
+		minConflicts = 0
 	}
-	s.inprocessingInterval = interval
+	s.inprocessingMinConflicts = minConflicts
 }
-
-
 
 // SetPreprocessingThresholds sets the preprocessing size thresholds
 // minClauses: skip if < N clauses (default 50)
@@ -1556,8 +1552,8 @@ func (s *CDCLSolver) restart() {
 	// At restart, we're about to clear the trail anyway, so clause modifications
 	// won't cause trail/watch inconsistencies. This gives us inprocessing benefits
 	// without the soundness bugs from running it mid-search.
-	// Only run after 1000 conflicts to avoid overhead on small instances
-	if s.conflicts >= 1000 {
+	// Only run after inprocessingMinConflicts to avoid overhead on small instances
+	if s.conflicts >= s.inprocessingMinConflicts {
 		s.inprocessing()
 	}
 
@@ -2491,19 +2487,6 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			}
 			s.backjumpLevel = 0
 
-			// Trigger inprocessing at configured interval
-			// For small instances (< 100 vars), trigger earlier but not too frequently
-			inprocessingInterval := s.inprocessingInterval
-			if s.cnf.NumVars < 100 {
-				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
-			}
-			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 {
-				if s.verbose {
-					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
-				}
-				// s.inprocessing() // DISABLED: soundness bugs in clause deletion swap-remove and inprocessing
-			}
-
 			if s.shouldRestart() {
 				s.restart()
 			}
@@ -2637,19 +2620,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 				return UNSAT
 			}
 			s.backjumpLevel = 0
-
-			// Trigger inprocessing at configured interval
-			// For small instances (< 100 vars), trigger earlier but not too frequently
-			inprocessingInterval := s.inprocessingInterval
-			if s.cnf.NumVars < 100 {
-				inprocessingInterval = 50 // Trigger every 50 conflicts on small instances
-			}
-			if s.conflicts > 0 && s.conflicts%inprocessingInterval == 0 {
-				if s.verbose {
-					fmt.Printf("c [inprocess] Triggering inprocessing at conflict %d (interval=%d, vars=%d, clauses=%d)\n", s.conflicts, inprocessingInterval, s.cnf.NumVars, s.cnf.NumClauses)
-				}
-				// s.inprocessing() // DISABLED: soundness bugs in clause deletion swap-remove and inprocessing
-			}
 
 			if s.shouldRestart() {
 				s.restart()
@@ -3594,8 +3564,8 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 		}
 	}
 
-	// Inprocessing runs every 2000 conflicts on large instances (>500 clauses)
-	// See inprocessing() method and solve loop integration
+	// Inprocessing runs at restart after inprocessingMinConflicts conflicts (default 1000)
+	// See inprocessing() method and restart() integration
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause

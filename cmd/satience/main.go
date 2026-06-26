@@ -49,7 +49,7 @@ func run() int {
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
 	// Inprocessing parameters
-	inprocessingInterval := flag.Int("inprocessing-interval", 500, "Run inprocessing every N conflicts (default=500, 0=disabled)")
+	inprocessingMinConflicts := flag.Int("inprocessing-min-conflicts", 1000, "Run inprocessing at restart only after N conflicts (default=1000, 0=always)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -119,9 +119,7 @@ func run() int {
 	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
 
 	// Configure inprocessing
-	if *inprocessingInterval > 0 {
-		s.SetInprocessingInterval(*inprocessingInterval)
-	}
+	s.SetInprocessingMinConflicts(*inprocessingMinConflicts)
 
 	// Configure clause minimization
 	switch *minimize {
