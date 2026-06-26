@@ -185,9 +185,15 @@ type CDCLSolver struct {
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
-	tmpClauseInfo         []clauseInfo  // Buffer for clause scoring
-	tmpDeleted            []bool        // Bitmap for deleted clauses
-	tmpClauseUsedAsReason []bool        // Track clauses used as implications
+	tmpClauseInfo         []clauseInfo         // Buffer for clause scoring
+	tmpDeleted            []bool               // Bitmap for deleted clauses
+	tmpClauseUsedAsReason []bool               // Track clauses used as implications
+	tmpDeletionOffsets    []int                // Pre-allocated buffer for new offsets during deletion
+	tmpDeletionSizes      []int                // Pre-allocated buffer for new sizes during deletion
+	tmpDeletionMetadata   []cnf.ClauseMetadata // Pre-allocated buffer for new metadata during deletion
+	tmpDeletionLiterals   []cnf.Literal        // Pre-allocated buffer for new literals during deletion
+	tmpClauseIndexMap     []int                // Pre-allocated buffer for old->new clause index mapping
+	tmpKeepIndices        []int                // Pre-allocated buffer for indices of clauses to keep
 
 	// Watched literals infrastructure
 	watchLists        [][]cnf.Watch // watchLists[lit] = clauses watching lit
@@ -366,6 +372,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseInfo:         make([]clauseInfo, 0, maxLearned),
 		tmpDeleted:            make([]bool, maxLearned),
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
+		tmpDeletionOffsets:    make([]int, 0, maxLearned),
+		tmpDeletionSizes:      make([]int, 0, maxLearned),
+		tmpDeletionMetadata:   make([]cnf.ClauseMetadata, 0, maxLearned),
+		tmpDeletionLiterals:   make([]cnf.Literal, 0, maxLearned*4),
+		tmpClauseIndexMap:     make([]int, maxLearned),
+		tmpKeepIndices:        make([]int, 0, maxLearned),
 		learnedClauseBase:     int(formula.NumClauses),
 		// Minimization thresholds
 		minimizationMaxSize:       30,
@@ -4201,13 +4213,13 @@ func (s *CDCLSolver) updateScoresIncrementally() {
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// LBD-based clause deletion using FULL REBUILD approach
-	// Simpler and more reliable than swap-remove, guarantees correctness
+	// LBD-based clause deletion using FULL REBUILD approach with ZERO ALLOCATIONS
+	// Uses pre-allocated buffers to eliminate GC pressure
 
 	// Incremental scoring - only recompute dirty scores
 	s.updateScoresIncrementally()
 
-	// Build clause info for all active learned clauses
+	// Build clause info for all active learned clauses (reuse tmpClauseInfo buffer)
 	if cap(s.tmpClauseInfo) < s.learnedActiveCount {
 		s.tmpClauseInfo = make([]clauseInfo, s.learnedActiveCount)
 	}
@@ -4276,9 +4288,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [deleteLearnedClauses] Protected %d clauses used as implications\n", protectedCount)
 	}
 
-	// Collect indices of clauses to keep
-	// We need to keep: (1) protected clauses, (2) best clauses up to toKeep
-	keepIndices := make([]int, 0, toKeep)
+	// Collect indices of clauses to keep (reuse tmpKeepIndices buffer)
+	keepIndices := s.tmpKeepIndices[:0]
 	deletedCount := 0
 	
 	for i := 0; i < len(clauses); i++ {
@@ -4308,8 +4319,11 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		}
 	}
 
-	// Build clause index mapping (old -> new) for implication updates
-	clauseIndexMap := make([]int, s.learnedActiveCount)
+	// Build clause index mapping (old -> new) for implication updates (reuse tmpClauseIndexMap buffer)
+	if cap(s.tmpClauseIndexMap) < s.learnedActiveCount {
+		s.tmpClauseIndexMap = make([]int, s.learnedActiveCount)
+	}
+	clauseIndexMap := s.tmpClauseIndexMap[:s.learnedActiveCount]
 	for i := range clauseIndexMap {
 		clauseIndexMap[i] = -1
 	}
@@ -4317,31 +4331,46 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		clauseIndexMap[oldIdx] = newIdx
 	}
 
-	// FULL REBUILD: Rebuild all arrays from scratch
-	// This is simpler and more reliable than swap-remove
+	// FULL REBUILD: Rebuild all arrays using pre-allocated buffers (ZERO ALLOCATION)
 	newCapacity := len(keepIndices)
-	newOffsets := make([]int, newCapacity)
-	newSizes := make([]int, newCapacity)
-	newMetadata := make([]cnf.ClauseMetadata, newCapacity)
 	
-	// Collect literals for kept clauses
+	// Ensure pre-allocated buffers are large enough
+	if cap(s.tmpDeletionOffsets) < newCapacity {
+		s.tmpDeletionOffsets = make([]int, 0, newCapacity)
+	}
+	if cap(s.tmpDeletionSizes) < newCapacity {
+		s.tmpDeletionSizes = make([]int, 0, newCapacity)
+	}
+	if cap(s.tmpDeletionMetadata) < newCapacity {
+		s.tmpDeletionMetadata = make([]cnf.ClauseMetadata, 0, newCapacity)
+	}
+	
+	// Calculate total literals needed
 	var newLiteralCount int
 	for _, idx := range keepIndices {
 		newLiteralCount += s.learnedSizes[idx]
 	}
-	newLiterals := make([]cnf.Literal, newLiteralCount)
+	if cap(s.tmpDeletionLiterals) < newLiteralCount {
+		s.tmpDeletionLiterals = make([]cnf.Literal, 0, newLiteralCount)
+	}
 	
-	// Copy kept clauses to new arrays
+	// Clear buffers for reuse
+	offsets := s.tmpDeletionOffsets[:0]
+	sizes := s.tmpDeletionSizes[:0]
+	metadata := s.tmpDeletionMetadata[:0]
+	literals := s.tmpDeletionLiterals[:0]
+	
+	// Copy kept clauses to buffers
 	litOffset := 0
-	for newIdx, oldIdx := range keepIndices {
-		newOffsets[newIdx] = litOffset
-		newSizes[newIdx] = s.learnedSizes[oldIdx]
-		newMetadata[newIdx] = s.learnedMetadata[oldIdx]
+	for _, oldIdx := range keepIndices {
+		offsets = append(offsets, litOffset)
+		sizes = append(sizes, s.learnedSizes[oldIdx])
+		metadata = append(metadata, s.learnedMetadata[oldIdx])
 		
 		// Copy literals
 		oldStart := s.learnedOffsets[oldIdx]
 		oldSize := s.learnedSizes[oldIdx]
-		copy(newLiterals[litOffset:litOffset+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
+		literals = append(literals, s.learnedLiterals[oldStart:oldStart+oldSize]...)
 		litOffset += oldSize
 	}
 
@@ -4363,11 +4392,26 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [deleteLearnedClauses] Updated %d implications\n", implicationUpdates)
 	}
 
-	// Replace old arrays with new ones
-	s.learnedOffsets = newOffsets
-	s.learnedSizes = newSizes
-	s.learnedMetadata = newMetadata
-	s.learnedLiterals = newLiterals
+	// Replace old arrays with new ones (copy from buffers)
+	// Ensure main arrays have sufficient capacity
+	if cap(s.learnedOffsets) < newCapacity {
+		s.learnedOffsets = make([]int, 0, newCapacity)
+	}
+	if cap(s.learnedSizes) < newCapacity {
+		s.learnedSizes = make([]int, 0, newCapacity)
+	}
+	if cap(s.learnedMetadata) < newCapacity {
+		s.learnedMetadata = make([]cnf.ClauseMetadata, 0, newCapacity)
+	}
+	if cap(s.learnedLiterals) < newLiteralCount {
+		s.learnedLiterals = make([]cnf.Literal, 0, newLiteralCount)
+	}
+	
+	// Copy data from buffers to main arrays
+	s.learnedOffsets = append(s.learnedOffsets[:0], offsets...)
+	s.learnedSizes = append(s.learnedSizes[:0], sizes...)
+	s.learnedMetadata = append(s.learnedMetadata[:0], metadata...)
+	s.learnedLiterals = append(s.learnedLiterals[:0], literals...)
 	s.learnedActiveCount = newCapacity
 	s.learnedCapacity = newCapacity
 
@@ -4386,8 +4430,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via full rebuild, kept %d\n", toDelete, s.learnedActiveCount)
 	}
 
-	// Reset buffers for next use
+	// Reset buffers for next use (keep capacity)
 	s.tmpClauseInfo = clauses[:0]
+	s.tmpKeepIndices = keepIndices[:0]
 }
 
 // updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx
