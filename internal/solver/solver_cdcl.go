@@ -3046,6 +3046,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if blitLitTrue {
 					continue
 				}
+			} else {
+				// CRITICAL FIX: If blit is unassigned, it's already a valid watch
+				// Don't search for replacement - the unassigned blit prevents conflict
+				// This bug caused conflicts to be detected on clauses with unassigned literals
+				continue
 			}
 
 			// Look for replacement watch
