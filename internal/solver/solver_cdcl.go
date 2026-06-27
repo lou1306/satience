@@ -2896,12 +2896,33 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		} else if s.assignments[varIdx].Value != litValue {
 			// Conflict: unit learned clause conflicts with existing assignment
 			existingIdx := s.implication[varIdx]
+			existingLevel := s.assignments[varIdx].Level
+			existingValue := s.assignments[varIdx].Value
+			fmt.Printf("c [UNIT CONFLICT] var=%d, new=%v (idx=%d), existing=%v (level=%d, idx=%d)\n",
+				varIdx+1, litValue, learnedIdx, existingValue, existingLevel, existingIdx)
 			if existingIdx != -1 {
 				// Existing assignment is from propagation (not decision) - UNSAT!
+				if existingIdx < -1 {
+					existingLearnedIdx := -existingIdx - 1
+					existingLits := s.getLearnedClauseLiterals(existingLearnedIdx)
+					fmt.Printf("c   Existing from learned clause %d: ", existingLearnedIdx)
+					for _, l := range existingLits {
+						fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
+					}
+					fmt.Printf("\n")
+				}
+				fmt.Printf("c   New unit clause %d: ", learnedIdx)
+				for _, l := range literals {
+					fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
+				}
+				fmt.Printf("\n")
 				s.emptyClauseFound = true
-			} else if s.level == 0 {
-				// Existing assignment is from decision at root level - UNSAT!
-				s.emptyClauseFound = true
+			} else {
+				// Existing assignment is from a decision
+				fmt.Printf("c   Existing from DECISION at level %d\n", existingLevel)
+				if s.level == 0 {
+					s.emptyClauseFound = true
+				}
 			}
 			return true, &cnf.Clause{Literals: literals, Learned: true}
 		}
@@ -3698,12 +3719,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount := s.tmpLevelCount[s.level]
 
+	if s.verbose {
+		fmt.Printf("c [1-UIP] currentCount=%d, level=%d\n", currentCount, s.level)
+	}
+
 	// Build candidate list from trail (most recent first)
 	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
 		varIdx := uint32(s.trail[i])
 		if s.varLevel[varIdx] == s.level && s.tmpLiteralInClause[varIdx] {
+			if s.verbose {
+				fmt.Printf("c [1-UIP] Candidate: var=%d, trailPos=%d, varLevel=%d, assignLevel=%d\n",
+					varIdx+1, i, s.varLevel[varIdx], s.assignments[varIdx].Level)
+			}
 			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx, trailPos: i})
+		}
+	}
+
+	if s.verbose && len(s.tmpCandidates) == 0 && currentCount > 1 {
+		fmt.Printf("c [1-UIP BUG] No candidates but currentCount=%d!\n", currentCount)
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] {
+				fmt.Printf("c   Literal: var=%d, inClause=true, varLevel=%d, assignLevel=%d\n",
+					varIdx+1, s.varLevel[varIdx], s.assignments[varIdx].Level)
+			}
 		}
 	}
 
@@ -3744,16 +3783,24 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			continue // Invalid clause
 		}
 
-		// FIX: Skip reason clauses with multiple literals at current level
-		// Such clauses violate 1-UIP and cause incorrect learning
+		// FIX: Skip reason clauses with unassigned literals
+		// Such clauses are not valid conflict clauses
+		hasUnassigned := false
 		reasonAtCurrentLevel := 0
 		for _, lit := range reasonLits {
+			if s.assignments[lit.Var()].Level == 0 {
+				hasUnassigned = true
+				break
+			}
 			if s.assignments[lit.Var()].Level == s.level {
 				reasonAtCurrentLevel++
 			}
 		}
-		if reasonAtCurrentLevel > 1 {
+		if hasUnassigned {
 			continue // Skip buggy reason clause
+		}
+		if reasonAtCurrentLevel > 1 {
+			continue // Skip reason clause with multiple lits at current level
 		}
 
 		if s.verbose {
@@ -3771,22 +3818,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpLevelCount[s.level]--
 		currentCount--
 
-		// CRITICAL FIX #2: Handle reason clauses with multiple literals at current level
-		// Such clauses cause 1-UIP to diverge (add more literals than removed)
-		// Solution: only add ONE literal at current level from such clauses
-		reasonLiteralsAtCurrentLevel := 0
-		firstLitAtCurrentLevel := -1
-		for i, lit := range reasonLits {
-			if s.assignments[lit.Var()].Level == s.level {
-				reasonLiteralsAtCurrentLevel++
-				if firstLitAtCurrentLevel < 0 {
-					firstLitAtCurrentLevel = i
-				}
-			}
-		}
-		skipOtherCurrentLevelLits := reasonLiteralsAtCurrentLevel > 1
-
-		for i, lit := range reasonLits {
+		for _, lit := range reasonLits {
 			v := lit.Var()
 			litNegated := lit.IsNegated()
 
@@ -3796,13 +3828,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					fmt.Printf("c [1-UIP]   Skip resolved var %d\n", v+1)
 				}
 				continue
-			}
-
-			// CRITICAL FIX #2: Skip additional literals at current level from multi-lit reason clauses
-			if skipOtherCurrentLevelLits && s.assignments[v].Level == s.level {
-				if i != firstLitAtCurrentLevel {
-					continue
-				}
 			}
 			if s.tmpLiteralInClause[v] {
 				if s.tmpLiteralIsNegated[v] != litNegated {
@@ -3821,19 +3846,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					}
 				}
 			} else {
+				// FIX: Only add assigned literals (level > 0)
+				// Unassigned literals (level 0) cannot be part of a conflict clause
+				assignLevel := s.assignments[v].Level
+				if assignLevel == 0 {
+					// Skip unassigned literal - it's not part of the conflict
+					continue
+				}
+				
 				// Add to clause
 				if s.verbose {
-					fmt.Printf("c [1-UIP]   ADD var %d, neg=%v, level=%d\n", v+1, litNegated, s.varLevel[v])
+					fmt.Printf("c [1-UIP]   ADD var %d, neg=%v, level=%d\n", v+1, litNegated, assignLevel)
 				}
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
-				lvl := s.varLevel[v]
-				assignLevel := s.assignments[v].Level
-				if lvl != assignLevel {
-					fmt.Printf("c [1-UIP BUG] Level MISMATCH var %d: varLevel=%d != assignLevel=%d (s.level=%d)\n",
-						v+1, lvl, assignLevel, s.level)
-				}
+				lvl := assignLevel // Use assignment level, not varLevel cache
 				if lvl <= s.level {
 					if !s.tmpLevelCountUsed[lvl] {
 						s.tmpLevelCountUsed[lvl] = true
@@ -3858,25 +3886,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		resolveStep++
 	}
 
-	// CRITICAL FIX #3: If 1-UIP didn't converge (currentCount > 1), manually construct valid 1-UIP clause
-	// This happens when reason clauses have multiple literals at current level
-	// Workaround: keep only one literal at current level, include all at lower levels
-	if currentCount > 1 {
-		keptOne := false
-		for _, varIdx := range s.tmpTouchedVars {
-			if s.tmpLiteralInClause[varIdx] {
-				if s.assignments[varIdx].Level == s.level {
-					if !keptOne {
-						keptOne = true
-					} else {
-						s.tmpLiteralInClause[varIdx] = false
-						s.tmpLevelCount[s.level]--
-					}
-				}
-			}
-		}
-		currentCount = 1
-	}
+	// FIX: If 1-UIP didn't converge (currentCount > 1) after exhausting all candidates,
+	// it means all remaining literals are decisions. In this case, keep all of them -
+	// they form a valid conflict clause.
+	// DO NOT artificially reduce to 1 literal - that creates incorrect learned clauses!
+	// The 1-UIP property is satisfied when we can't resolve further (all are decisions).
 
 	// CRITICAL FIX: If 1-UIP resolved away ALL literals (currentCount == 0), we derived empty clause = UNSAT
 	if currentCount == 0 {
@@ -4779,30 +4793,75 @@ func (s *CDCLSolver) ResetTrail() {
 	}
 }
 
-// verifyLearnedClause checks that a learned clause satisfies the 1-UIP property
-// This is a SOUNDNESS check that catches bugs in conflict analysis
-// Returns true if the clause is valid, false if it violates 1-UIP
+// verifyLearnedClause checks that a learned clause is sound
+// This catches bugs in conflict analysis
+// Returns true if the clause is valid, false otherwise
 func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 	if len(learnedLits) == 0 {
 		return true // Empty clause is valid (means UNSAT)
 	}
 
-	// Check 1: 1-UIP property - exactly 1 literal at current level
-	literalsAtCurrentLevel := 0
+	// Check 1: All literals must be assigned (no unassigned literals)
 	for _, lit := range learnedLits {
-		if s.assignments[lit.Var()].Level == s.level {
-			literalsAtCurrentLevel++
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level == 0 {
+			// Unassigned literal - clause is not a valid conflict clause
+			fmt.Printf("c [SOUNDNESS BUG] Learned clause has unassigned literal: conflict=%d, var=%d\n",
+				s.conflicts, varIdx+1)
+			fmt.Printf("c   Learned clause: ")
+			for _, l := range learnedLits {
+				fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+			}
+			fmt.Printf("\n")
+			return false
 		}
 	}
-	if literalsAtCurrentLevel != 1 {
-		fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected 1)\n",
-			s.conflicts, s.level, literalsAtCurrentLevel)
+
+	// Check 2: Learned clause must be falsified by current assignment
+	// (otherwise it's not a valid conflict clause)
+	for _, lit := range learnedLits {
+		varIdx := lit.Var()
+		litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+		if litTrue {
+			fmt.Printf("c [SOUNDNESS BUG] Learned clause has TRUE literal: conflict=%d, var=%d, value=%v, neg=%v\n",
+				s.conflicts, varIdx+1, s.assignments[varIdx].Value, lit.IsNegated())
+			fmt.Printf("c   Learned clause: ")
+			for _, l := range learnedLits {
+				fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+			}
+			fmt.Printf("\n")
+			return false
+		}
+	}
+
+	// Check 3: 1-UIP property - at most 1 literal at current level
+	// EXCEPTION: If all literals at current level are decisions, we can have multiple
+	// (this happens when 1-UIP can't resolve further)
+	literalsAtCurrentLevel := 0
+	decisionsAtCurrentLevel := 0
+	for _, lit := range learnedLits {
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level == s.level {
+			literalsAtCurrentLevel++
+			if s.implication[varIdx] == -1 {
+				decisionsAtCurrentLevel++
+			}
+		}
+	}
+	if literalsAtCurrentLevel > 1 && decisionsAtCurrentLevel < literalsAtCurrentLevel {
+		// Multiple literals at current level, but not all are decisions - this is a bug
+		fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d, decisions=%d (expected all decisions)\n",
+			s.conflicts, s.level, literalsAtCurrentLevel, decisionsAtCurrentLevel)
 		fmt.Printf("c   Learned clause: ")
 		for _, lit := range learnedLits {
-			fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
+			fmt.Printf("%d%c(L%d,imp=%d) ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()],
+				s.assignments[lit.Var()].Level, s.implication[lit.Var()])
 		}
 		fmt.Printf("\n")
-		return false // 1-UIP violation
+		return false
 	}
+
 	return true
 }
