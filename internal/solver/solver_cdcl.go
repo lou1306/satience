@@ -3923,24 +3923,92 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 	
-	if currentCount > 1 && propagationsAtCurrentLevel > 0 {
-		// 1-UIP didn't converge and we have propagations remaining
-		// This means reason clauses were skipped (buggy reasons)
-		// FALLBACK: Rebuild learned clause from conflictLits (the original conflict)
+	if currentCount > 1 {
+		// 1-UIP didn't converge - either all decisions or some propagations with buggy reasons
+		// FALLBACK: Build a proper 1-UIP clause by keeping exactly 1 literal at current level
+		// IMPORTANT: Keep ALL literals at lower levels - they explain WHY the conflict occurred
 		if s.verbose {
-			fmt.Printf("c [1-UIP] FALLBACK: %d decisions + %d propagations at level %d - learning conflict clause\n",
+			fmt.Printf("c [1-UIP] FALLBACK: %d decisions + %d propagations at level %d\n",
 				decisionsAtCurrentLevel, propagationsAtCurrentLevel, s.level)
 		}
-		// Rebuild learned clause from conflictLits (the original conflict)
-		s.tmpLearnedLits = s.tmpLearnedLits[:0]
-		for _, lit := range conflictLits {
-			s.tmpLearnedLits = append(s.tmpLearnedLits, lit)
+		
+		// Find the most recent decision at current level (this will be the UIP)
+		var uipVar uint32 = 0
+		var uipTrailPos int = -1
+		
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] && 
+			   s.assignments[varIdx].Level == s.level && 
+			   s.implication[varIdx] == -1 {
+				for ti := len(s.trail) - 1; ti >= 0; ti-- {
+					if uint32(s.trail[ti]) == varIdx {
+						if uipTrailPos < 0 || ti > uipTrailPos {
+							uipTrailPos = ti
+							uipVar = varIdx
+						}
+						break
+					}
+				}
+			}
 		}
-		// Reset level tracking for LBD calculation below
-		for i := range s.tmpLevelSetUsed {
-			s.tmpLevelSetUsed[i] = false
+		
+		// If no decision at current level, we can't learn a valid 1-UIP clause
+		// Just backjump without learning (less efficient but sound)
+		if uipVar == 0 {
+			if s.verbose {
+				fmt.Printf("c [1-UIP] No decision at level %d - skipping learn\n", s.level)
+			}
+			// Clear the learned clause - don't learn anything
+			s.tmpLearnedLits = s.tmpLearnedLits[:0]
+			// Reset level tracking
+			for i := range s.tmpLevelSetUsed {
+				s.tmpLevelSetUsed[i] = false
+			}
+			// Continue - will skip storage since tmpLearnedLits is empty
+		} else {
+			// Count how many literals will remain after removing others at current level
+			remainingLits := 0
+			hasLowerLevelLits := false
+			for _, varIdx := range s.tmpTouchedVars {
+				if s.tmpLiteralInClause[varIdx] {
+					if s.assignments[varIdx].Level < s.level {
+						remainingLits++
+						hasLowerLevelLits = true
+					} else if varIdx == uipVar {
+						remainingLits++
+					}
+				}
+			}
+			
+			// If we'd learn a unit at current level (no lower-level lits), don't learn
+			// Learning a unit causes backjump to 0, which resets and re-learns the same unit
+			if !hasLowerLevelLits {
+				if s.verbose {
+					fmt.Printf("c [1-UIP] Would learn unit at level %d - skipping learn\n", s.level)
+				}
+				s.tmpLearnedLits = s.tmpLearnedLits[:0]
+				for i := range s.tmpLevelSetUsed {
+					s.tmpLevelSetUsed[i] = false
+				}
+			} else {
+				// Remove all other literals at current level (keep only the UIP decision)
+				for _, varIdx := range s.tmpTouchedVars {
+					if s.tmpLiteralInClause[varIdx] && 
+					   s.assignments[varIdx].Level == s.level && 
+					   varIdx != uipVar {
+						s.tmpLiteralInClause[varIdx] = false
+						s.tmpLevelCount[s.level]--
+					}
+				}
+				currentCount = 1
+				
+				// Reset level tracking for LBD calculation
+				for i := range s.tmpLevelSetUsed {
+					s.tmpLevelSetUsed[i] = false
+				}
+				// Continue to normal LBD calculation and storage
+			}
 		}
-		// Continue to normal LBD calculation and storage
 	}
 
 	// CRITICAL FIX: If 1-UIP resolved away ALL literals (currentCount == 0), we derived empty clause = UNSAT
