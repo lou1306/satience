@@ -138,6 +138,8 @@ type CDCLSolver struct {
 	normalClauseCount    int                   // Track number of non-glue clauses (LBD > 3)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
+	literalFreeSlots     []literalFreeSlot     // Free literal regions for reuse (reduces GC pressure)
+	literalPoolSize      int                   // Total size of literal pool (for compaction threshold)
 	currentAge           int
 	verbose              bool
 	decisions            int
@@ -251,6 +253,13 @@ type CDCLSolver struct {
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
+// literalFreeSlot tracks freed literal regions in the learned clause pool
+// Used for memory reuse to avoid GC pressure from growing literal pool
+type literalFreeSlot struct {
+	offset int // Start offset in learnedLiterals
+	size   int // Number of literals (capacity)
+}
+
 type resolveCandidate struct {
 	varIdx     uint32
 	trailPos   int // Trail position (for preserving trail order after sorting)
@@ -330,6 +339,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
+		literalFreeSlots:     make([]literalFreeSlot, 0, 256), // Pre-allocate for free slot tracking
+		literalPoolSize:      0,
 		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
 		currentAge:           0,
 		verbose:              false,
@@ -4233,13 +4244,47 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			return 0
 		}
 
-		// Store literals in contiguous pool
-		// NOTE: Slot reuse disabled - swap-remove moves clauses but literals stay in place,
-		// causing corruption when freed slots are reused
-		offset := len(s.learnedLiterals)
-		s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
-
-		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
+		// Store literals in contiguous pool with FREE SLOT REUSE
+		// Find a free slot that fits, or append to end of pool
+		offset := -1
+		requiredSize := len(s.tmpLearnedLits)
+		
+		// Search for a free slot that fits (best-fit strategy)
+		bestFitIdx := -1
+		bestFitSize := int(1e9)
+		for i, slot := range s.literalFreeSlots {
+			if slot.size >= requiredSize && slot.size < bestFitSize {
+				bestFitIdx = i
+				bestFitSize = slot.size
+			}
+		}
+		
+		if bestFitIdx >= 0 {
+			// Reuse free slot
+			slot := s.literalFreeSlots[bestFitIdx]
+			offset = slot.offset
+			
+			// Remove or split free slot
+			if slot.size == requiredSize {
+				// Exact fit - remove slot
+				s.literalFreeSlots[bestFitIdx] = s.literalFreeSlots[len(s.literalFreeSlots)-1]
+				s.literalFreeSlots = s.literalFreeSlots[:len(s.literalFreeSlots)-1]
+			} else {
+				// Larger slot - split it
+				s.literalFreeSlots[bestFitIdx] = literalFreeSlot{
+					offset: slot.offset + requiredSize,
+					size:   slot.size - requiredSize,
+				}
+			}
+			
+			// Copy literals to reused slot
+			copy(s.learnedLiterals[offset:offset+requiredSize], s.tmpLearnedLits)
+		} else {
+			// No suitable free slot - append to pool
+			offset = len(s.learnedLiterals)
+			s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, requiredSize)...)
+			copy(s.learnedLiterals[offset:offset+requiredSize], s.tmpLearnedLits)
+		}
 
 		// Append metadata (packed struct for cache efficiency)
 		s.learnedOffsets = append(s.learnedOffsets, offset)
@@ -4591,13 +4636,24 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		clauseIndexMap[i] = -1
 	}
 
-	// SWAP-REMOVE: Move active clauses into deleted slots
-	// This avoids rebuilding arrays and preserves memory pool benefits
+	// SWAP-REMOVE with LITERAL POOL COMPACTION
+	// Move active clauses into deleted slots AND compact literal pool
+	// This eliminates fragmentation and enables safe slot reuse
 	writeIdx := 0
 	watchUpdates := 0
+	freeSlotsCreated := 0
+	compactOffset := 0 // Next offset for compacted literals
 	
 	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
 		if deleted[readIdx] {
+			// Track freed literal slot for reuse
+			if s.learnedSizes[readIdx] > 0 {
+				s.literalFreeSlots = append(s.literalFreeSlots, literalFreeSlot{
+					offset: s.learnedOffsets[readIdx],
+					size:   s.learnedSizes[readIdx],
+				})
+				freeSlotsCreated++
+			}
 			// Mark as tombstone (size=0) for future reuse
 			s.learnedSizes[readIdx] = 0
 			continue
@@ -4606,26 +4662,33 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Record mapping for this clause
 		clauseIndexMap[readIdx] = writeIdx
 
+		// Move clause metadata
+		oldSize := s.learnedSizes[readIdx]
+		s.learnedOffsets[writeIdx] = compactOffset
+		s.learnedSizes[writeIdx] = oldSize
+		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+
+		// Copy literals to compacted location
+		oldStart := s.learnedOffsets[readIdx]
 		if writeIdx != readIdx {
-			// Move clause metadata from readIdx to writeIdx
-			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
-			s.learnedSizes[writeIdx] = s.learnedSizes[readIdx]
-			s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
-
-			// Copy literals to new location
-			oldStart := s.learnedOffsets[readIdx]
-			oldSize := s.learnedSizes[readIdx]
-			newStart := s.learnedOffsets[writeIdx]
+			// Copy literals to new compacted location
+			copy(s.learnedLiterals[compactOffset:compactOffset+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
 			
-			// Copy literals (handle overlap with copy)
-			copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
-
 			// CRITICAL: Update watch lists inline - both regular and binary
 			s.updateWatchClauseIndices(writeIdx, readIdx)
 			watchUpdates++
 		}
+		
+		// Advance compact offset for next clause
+		compactOffset += oldSize
 		writeIdx++
 	}
+	
+	// Update literal pool size to compacted size
+	if compactOffset < len(s.learnedLiterals) {
+		s.learnedLiterals = s.learnedLiterals[:compactOffset]
+	}
+	s.literalPoolSize = compactOffset
 
 	// Update implication array using the mapping (MUST be after all swaps)
 	// This ensures variables point to their reason clauses at the new locations
@@ -4667,8 +4730,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
-		fmt.Printf("c [verbose] Watch updates: %d, implication updates: %d, stale: %d\n",
-			watchUpdates, implicationUpdates, implicationStale)
+		fmt.Printf("c [verbose] Watch updates: %d, implication updates: %d, stale: %d, free slots: %d\n",
+			watchUpdates, implicationUpdates, implicationStale, freeSlotsCreated)
+		fmt.Printf("c [verbose] Literal pool: size=%d, free slots=%d\n", len(s.learnedLiterals), len(s.literalFreeSlots))
 	}
 
 	// DEBUG: Verify clause indices are consistent after deletion
