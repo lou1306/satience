@@ -1561,7 +1561,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 	return false
 }
 
-func (s *CDCLSolver) restart() {
+func (s *CDCLSolver) restart() bool {
 	if s.verbose {
 		fmt.Printf("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 	}
@@ -1573,7 +1573,10 @@ func (s *CDCLSolver) restart() {
 	// without the soundness bugs from running it mid-search.
 	// Only run after inprocessingMinConflicts to avoid overhead on small instances
 	if s.conflicts >= s.inprocessingMinConflicts {
-		s.inprocessing()
+		if s.inprocessing() {
+			// UNSAT detected during inprocessing
+			return true
+		}
 	}
 
 	// Use stored LBD values (calculated at learning time) instead of recalculating
@@ -1704,6 +1707,7 @@ func (s *CDCLSolver) restart() {
 	// Otherwise propagateWatched() will re-process them, causing massive slowdown
 	s.qhead = len(s.trail)
 
+	return false // No UNSAT detected
 }
 
 func (s *CDCLSolver) isTautology(clause *cnf.Clause) bool {
@@ -1780,7 +1784,7 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 	return UNKNOWN
 }
 
-func (s *CDCLSolver) inprocessing() {
+func (s *CDCLSolver) inprocessing() bool {
 	if s.verbose {
 		fmt.Printf("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
 	}
@@ -1791,14 +1795,17 @@ func (s *CDCLSolver) inprocessing() {
 
 	// 1. Unit propagation (cheap, can find new units from learned clauses)
 	s.inprocessUnitPropagation()
+	if s.emptyClauseFound {
+		return true // UNSAT detected
+	}
 	if time.Since(startTime) > timeLimit {
-		return
+		return false
 	}
 
 	// 2. Variable elimination DISABLED - soundness bug with variable tracking
 	// Preprocessing VE eliminates most vars, search handles the rest
 	if time.Since(startTime) > timeLimit {
-		return
+		return false
 	}
 
 	// 3. Blocked clause elimination (sound, removes redundant clauses)
@@ -1807,7 +1814,7 @@ func (s *CDCLSolver) inprocessing() {
 		s.inprocessBlockedClauseElimination()
 	}
 	if time.Since(startTime) > timeLimit {
-		return
+		return false
 	}
 
 	// 5. Self-subsumption (every 1000 conflicts, more expensive)
@@ -1816,7 +1823,7 @@ func (s *CDCLSolver) inprocessing() {
 		s.selfSubsumption()
 	}
 	if time.Since(startTime) > timeLimit {
-		return
+		return false
 	}
 
 	removed := initialClauses - s.cnf.NumClauses
@@ -1829,12 +1836,15 @@ func (s *CDCLSolver) inprocessing() {
 	// Watch lists must reflect current clause database to avoid stale references
 	if s.watchInitialized {
 		s.watchLists = make([][]cnf.Watch, 2*s.cnf.NumVars)
+		s.watchListsBinary = make([][]cnf.Watch, 2*s.cnf.NumVars)
 		s.watchInitialized = false
 	}
 	s.initWatches()
 
 	// Clear qhead to re-process all trail elements with updated watches
 	s.qhead = 0
+	
+	return false // No UNSAT detected
 }
 
 // inprocessVariableElimination performs lightweight variable elimination during search
@@ -2069,9 +2079,28 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 			Level: 0, // CRITICAL: Level 0, not current level
 		}
 		s.varLevel[unit.varIdx] = 0
+		s.trail = append(s.trail, int(unit.varIdx))
+		s.implication[unit.varIdx] = -1 // Mark as decision (no clause reason)
 
 		if s.verbose {
 			fmt.Printf("c [inprocess] Unit propagation: var %d = %v (level 0)\n", unit.varIdx, unit.value)
+		}
+	}
+	
+	// CRITICAL: Propagate the level-0 assignments through watch lists
+	// Without this, clauses that should be satisfied by these assignments are not processed
+	if len(units) > 0 {
+		s.qhead = 0
+		s.level = 0
+		s.trailHead = []int{0, len(s.trail)}
+		// Run propagation to process the level-0 assignments
+		if conflict, _ := s.propagate(); conflict {
+			if s.verbose {
+				fmt.Printf("c [inprocess] Conflict during level-0 propagation - UNSAT\n")
+			}
+			// Conflict at level 0 means UNSAT - but we can't return here
+			// Just mark the solver for UNSAT detection
+			s.emptyClauseFound = true
 		}
 	}
 }
@@ -2512,7 +2541,13 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 			s.backjumpLevel = 0
 
 			if s.shouldRestart() {
-				s.restart()
+				if s.restart() {
+					// UNSAT detected during restart/inprocessing
+					if s.verbose {
+						s.printStats()
+					}
+					return UNSAT
+				}
 			}
 
 			continue
@@ -2646,7 +2681,13 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			s.backjumpLevel = 0
 
 			if s.shouldRestart() {
-				s.restart()
+				if s.restart() {
+					// UNSAT detected during restart/inprocessing
+					if s.verbose {
+						s.printStats()
+					}
+					return UNSAT
+				}
 			}
 			continue
 		}
@@ -4037,6 +4078,26 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// Store learned clause in database
 	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
+		// Check for duplicate literals (SOUNDNESS CHECK)
+		seenVars := make(map[uint32]bool)
+		hasDup := false
+		for _, lit := range s.tmpLearnedLits {
+			if seenVars[lit.Var()] {
+				hasDup = true
+				break
+			}
+			seenVars[lit.Var()] = true
+		}
+		if hasDup {
+			fmt.Printf("c [SOUNDNESS BUG] Learned clause has duplicate literals: conflict=%d, clause: ", s.conflicts)
+			for _, lit := range s.tmpLearnedLits {
+				fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
+			}
+			fmt.Printf("\n")
+			// Skip storing this buggy clause
+			return 0
+		}
+
 		// Store literals in contiguous pool
 		// NOTE: Slot reuse disabled - swap-remove moves clauses but literals stay in place,
 		// causing corruption when freed slots are reused
@@ -4495,6 +4556,40 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
+
+	// CRITICAL FIX: Rebuild watch lists with new clause indices
+	// After full rebuild, clause indices have changed but watches still reference old indices
+	// Solution: Create new watch lists with only original clauses, then re-add learned clauses
+	newWatchLists := make([][]cnf.Watch, len(s.watchLists))
+	newWatchListsBinary := make([][]cnf.Watch, len(s.watchListsBinary))
+	
+	for i := range s.watchLists {
+		// Keep only original clause watches (ClauseIdx >= 0)
+		for _, watch := range s.watchLists[i] {
+			if watch.ClauseIdx >= 0 {
+				newWatchLists[i] = append(newWatchLists[i], watch)
+			}
+		}
+	}
+	for i := range s.watchListsBinary {
+		// Keep only original clause watches
+		for _, watch := range s.watchListsBinary[i] {
+			if watch.ClauseIdx >= 0 {
+				newWatchListsBinary[i] = append(newWatchListsBinary[i], watch)
+			}
+		}
+	}
+	s.watchLists = newWatchLists
+	s.watchListsBinary = newWatchListsBinary
+	
+	// Re-add all learned clause watches with new indices
+	for i := 0; i < s.learnedActiveCount; i++ {
+		if s.learnedSizes[i] >= 2 {
+			literals := s.getLearnedClauseLiterals(i)
+			clause := &cnf.Clause{Literals: literals, Learned: true}
+			s.addLearnedClauseToWatches(i, clause, literals)
+		}
+	}
 
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via full rebuild, kept %d\n", toDelete, s.learnedActiveCount)
