@@ -2921,10 +2921,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			if propLevel == 0 {
 				propLevel = 1
 			}
-			// Update trailHead if propagating at a new highest level
-			if propLevel >= len(s.trailHead) {
-				s.trailHead = append(s.trailHead, len(s.trail))
-			}
+			// FIX: Do NOT update trailHead during unit propagation when s.level=0.
+			// trailHead should only track decisions, not propagated variables.
+			// If we append trailHead here, backtracking will incorrectly clear unit-propagated variables.
 			if s.verbose {
 				fmt.Printf("c [UNIT PROP] var=%d, value=%v, level=%d (s.level=%d)\n", varIdx+1, litValue, propLevel, s.level)
 			}
@@ -2993,7 +2992,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		varIdx := uint32(lit)
 		// CRITICAL FIX: Skip unassigned variables (level 0 with no implication)
 		// Unassigned variables have Value=false by default, which incorrectly triggers watches
-		if false { // TEMP DISABLE
+		if s.assignments[varIdx].Level == 0 {
 			continue // Unassigned - skip watch processing
 		}
 		value := s.assignments[varIdx].Value
@@ -3471,9 +3470,19 @@ func (s *CDCLSolver) decide() bool {
 		s.lastDecisionVar = varIdx
 	}
 
+	// SAFETY CHECK: Ensure variable is unassigned before deciding
+	if s.assignments[varIdx].Level != 0 {
+		if s.verbose {
+			fmt.Printf("c [DECIDE BUG] var %d already assigned at level %d, skipping\n", varIdx+1, s.assignments[varIdx].Level)
+		}
+		s.level-- // Undo level increment
+		return s.decide() // Try again with next variable
+	}
+
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1) // -1 = decision
+	s.savedPhase[varIdx] = phase                                // Save phase for decisions only
 	s.decisions++
 	// SYMMETRY BREAKING: Track this decision to apply recency penalty
 	s.vsids.TrackDecision(varIdx, s.conflicts)
@@ -3507,9 +3516,6 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
-
-	// Save the phase (polarity) for ALL assignments (phase saving heuristic)
-	s.savedPhase[varIdx] = value
 
 	if s.verbose && level > 0 {
 		reasonStr := "propagation"
@@ -3550,9 +3556,6 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 
 	// Store clause index
 	s.implication[varIdx] = clauseIdx
-
-	// Save phase for ALL assignments (consistent with assignLiteral)
-	s.savedPhase[varIdx] = value
 }
 
 func (s *CDCLSolver) literalIsTrue(lit cnf.Literal) bool {
@@ -3832,12 +3835,20 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			continue
 		}
-		// CRITICAL FIX: Only skip LEARNED clauses with multiple lits at current level
-		// Original clauses can have multiple lits at current level - they're always valid to resolve
-		if reasonClauseIdx < 0 && reasonAtCurrentLevel > 1 {
+		// CRITICAL FIX: Skip learned clauses with unassigned literals (soundness bug)
+		// Original clauses can have multiple lits at current level - always valid to resolve
+		// Learned clauses with unassigned lits indicate corruption - skip them
+		hasUnassignedInReason := false
+		for _, rl := range reasonLits {
+			if s.assignments[rl.Var()].Level == 0 {
+				hasUnassignedInReason = true
+				break
+			}
+		}
+		if reasonClauseIdx < 0 && hasUnassignedInReason {
 			if s.verbose {
-				fmt.Printf("c [1-UIP] SKIP var %d: learned clause %d has %d lits at level %d: ", 
-					varIdx+1, -reasonClauseIdx-1, reasonAtCurrentLevel, s.level)
+				fmt.Printf("c [1-UIP] SKIP var %d: learned clause %d has unassigned literal: ", 
+					varIdx+1, -reasonClauseIdx-1)
 				for _, rl := range reasonLits {
 					fmt.Printf("%d%c(L%d) ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()], 
 						s.assignments[rl.Var()].Level)
