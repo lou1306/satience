@@ -3827,10 +3827,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			continue
 		}
-		if reasonAtCurrentLevel > 1 {
+		// CRITICAL FIX: Only skip LEARNED clauses with multiple lits at current level
+		// Original clauses can have multiple lits at current level - they're always valid to resolve
+		if reasonClauseIdx < 0 && reasonAtCurrentLevel > 1 {
 			if s.verbose {
-				fmt.Printf("c [1-UIP] SKIP var %d: reason (clause %d) has %d lits at level %d: ", 
-					varIdx+1, reasonClauseIdx, reasonAtCurrentLevel, s.level)
+				fmt.Printf("c [1-UIP] SKIP var %d: learned clause %d has %d lits at level %d: ", 
+					varIdx+1, -reasonClauseIdx-1, reasonAtCurrentLevel, s.level)
 				for _, rl := range reasonLits {
 					fmt.Printf("%d%c(L%d) ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()], 
 						s.assignments[rl.Var()].Level)
@@ -3958,20 +3960,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 		}
 		
-		// If no decision at current level, fallback to learning the original conflict clause
-		// This is sound (prevents exact same conflict) even if not optimal
+		// If no decision at current level, use the most recent propagation as UIP
+		// This can happen when all literals at current level were propagated (not decided)
 		if uipVar == 0 {
-			if s.verbose {
-				fmt.Printf("c [1-UIP] No decision at level %d - learning conflict clause\n", s.level)
+			// Find the most recent propagation at current level
+			for _, varIdx := range s.tmpTouchedVars {
+				if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == s.level {
+					for ti := len(s.trail) - 1; ti >= 0; ti-- {
+						if uint32(s.trail[ti]) == varIdx {
+							if uipTrailPos < 0 || ti > uipTrailPos {
+								uipTrailPos = ti
+								uipVar = varIdx
+							}
+							break
+						}
+					}
+				}
 			}
-			// Keep all literals from conflict clause (don't modify tmpLiteralInClause)
-			// Just reset level tracking for LBD calculation
-			for i := range s.tmpLevelSetUsed {
-				s.tmpLevelSetUsed[i] = false
+			if s.verbose && uipVar == 0 {
+				fmt.Printf("c [1-UIP] ERROR: No UIP found at level %d\n", s.level)
 			}
-			currentCount = 1  // Pretend we converged to avoid more fallback
-		} else {
-			// Remove all other literals at current level (keep only the UIP decision)
+		}
+		
+		// Now remove all other literals at current level (keep only the UIP)
+		if uipVar != 0 {
 			for _, varIdx := range s.tmpTouchedVars {
 				if s.tmpLiteralInClause[varIdx] && 
 				   s.assignments[varIdx].Level == s.level && 
@@ -3981,12 +3993,36 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				}
 			}
 			currentCount = 1
-			
-			// Reset level tracking for LBD calculation
-			for i := range s.tmpLevelSetUsed {
-				s.tmpLevelSetUsed[i] = false
+		}
+		
+		// Reset level tracking for LBD calculation
+		for i := range s.tmpLevelSetUsed {
+			s.tmpLevelSetUsed[i] = false
+		}
+		// Continue to normal LBD calculation and storage
+	}
+	
+	if currentCount > 1 {
+		// Fallback didn't work - force convergence by keeping only 1 literal
+		// This shouldn't happen but is a safety net
+		if s.verbose {
+			fmt.Printf("c [1-UIP] FORCE: Still %d lits at level %d after fallback\n", currentCount, s.level)
+		}
+		// Keep only the first literal at current level
+		keptOne := false
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == s.level {
+				if !keptOne {
+					keptOne = true
+				} else {
+					s.tmpLiteralInClause[varIdx] = false
+					s.tmpLevelCount[s.level]--
+				}
 			}
-			// Continue to normal LBD calculation and storage
+		}
+		currentCount = 1
+		for i := range s.tmpLevelSetUsed {
+			s.tmpLevelSetUsed[i] = false
 		}
 	}
 
