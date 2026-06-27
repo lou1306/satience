@@ -1,0 +1,110 @@
+//go:build debug
+// +build debug
+
+package solver
+
+import "fmt"
+
+// ClauseDeletionTelemetry tracks clause movements during deletion for debugging
+type ClauseDeletionTelemetry struct {
+	ImplicationUpdates int
+	ImplicationStale   int
+	WatchUpdates       int
+	FreeSlotsCreated   int
+	FreeSlotsReused    int
+}
+
+// logClauseDeletionTelemetry prints telemetry data for debugging swap-remove
+func logClauseDeletionTelemetry(s *CDCLSolver, telemetry *ClauseDeletionTelemetry) {
+	fmt.Printf("c [TELEMETRY] Clause deletion: implications_updated=%d, implications_stale=%d, watch_updates=%d, free_slots_created=%d, free_slots_reused=%d\n",
+		telemetry.ImplicationUpdates,
+		telemetry.ImplicationStale,
+		telemetry.WatchUpdates,
+		telemetry.FreeSlotsCreated,
+		telemetry.FreeSlotsReused)
+	fmt.Printf("c [TELEMETRY] Learned clauses: active=%d, capacity=%d, literals=%d\n",
+		s.learnedActiveCount, s.learnedCapacity, len(s.learnedLiterals))
+}
+
+// verifyClauseIndices validates that all clause references are consistent after deletion
+// This is a DEBUG-ONLY verification function for validating swap-remove correctness
+// Enabled with: go build -tags debug
+func verifyClauseIndices(s *CDCLSolver) bool {
+	errors := 0
+
+	// Check 1: All implications point to valid, non-deleted clauses
+	for varIdx, impIdx := range s.implication {
+		if impIdx < -1 {
+			learnedIdx := -impIdx - 1
+			if learnedIdx >= s.learnedCapacity {
+				fmt.Printf("c [VERIFY ERROR] Implication var %d -> clause %d (>= learnedCapacity %d)\n",
+					varIdx+1, learnedIdx, s.learnedCapacity)
+				errors++
+			} else if s.learnedSizes[learnedIdx] == 0 {
+				fmt.Printf("c [VERIFY ERROR] Implication var %d -> deleted clause %d (size=0)\n",
+					varIdx+1, learnedIdx)
+				errors++
+			}
+		}
+	}
+
+	// Check 2: All watch lists reference existing clauses
+	for litIdx := range s.watchLists {
+		for i, watch := range s.watchLists[litIdx] {
+			if watch.ClauseIdx < 0 {
+				learnedIdx := -watch.ClauseIdx - 1
+				if learnedIdx >= s.learnedCapacity {
+					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
+						litIdx, i, learnedIdx, s.learnedCapacity)
+					errors++
+				} else if s.learnedSizes[learnedIdx] == 0 {
+					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> deleted clause %d (size=0)\n",
+						litIdx, i, learnedIdx)
+					errors++
+				}
+			}
+		}
+	}
+
+	// Check 3: Binary watch lists reference existing clauses
+	for litIdx := range s.watchListsBinary {
+		for i, watch := range s.watchListsBinary[litIdx] {
+			if watch.ClauseIdx < 0 {
+				learnedIdx := -watch.ClauseIdx - 1
+				if learnedIdx >= s.learnedCapacity {
+					fmt.Printf("c [VERIFY ERROR] BinaryWatch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
+						litIdx, i, learnedIdx, s.learnedCapacity)
+					errors++
+				} else if s.learnedSizes[learnedIdx] == 0 {
+					fmt.Printf("c [VERIFY ERROR] BinaryWatch[%d][%d] -> deleted clause %d (size=0)\n",
+						litIdx, i, learnedIdx)
+					errors++
+				}
+			}
+		}
+	}
+
+	// Check 4: unitLearnedList only contains size=1 clauses
+	for i, learnedIdx := range s.unitLearnedList {
+		if learnedIdx >= s.learnedCapacity {
+			fmt.Printf("c [VERIFY ERROR] unitLearnedList[%d] -> clause %d (>= learnedCapacity %d)\n",
+				i, learnedIdx, s.learnedCapacity)
+			errors++
+		} else if s.learnedSizes[learnedIdx] != 1 {
+			fmt.Printf("c [VERIFY ERROR] unitLearnedList[%d] -> clause %d (size=%d, expected 1)\n",
+				i, learnedIdx, s.learnedSizes[learnedIdx])
+			errors++
+		}
+	}
+
+	if errors > 0 {
+		fmt.Printf("c [VERIFY FAILED] %d errors found in clause index verification\n", errors)
+		return false
+	}
+
+	if s.verbose {
+		fmt.Printf("c [VERIFY OK] Clause indices verified: learned=%d, capacity=%d\n",
+			s.learnedActiveCount, s.learnedCapacity)
+	}
+	return true
+}

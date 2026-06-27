@@ -4730,6 +4730,11 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via full rebuild, kept %d\n", toDelete, s.learnedActiveCount)
 	}
 
+	// DEBUG: Verify clause indices are consistent after deletion
+	if !verifyClauseIndices(s) {
+		panic("Clause index verification failed after deleteLearnedClauses")
+	}
+
 	// Reset buffers for next use (keep capacity)
 	s.tmpClauseInfo = clauses[:0]
 	s.tmpKeepIndices = keepIndices[:0]
