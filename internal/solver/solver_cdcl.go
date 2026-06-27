@@ -4479,8 +4479,9 @@ func (s *CDCLSolver) updateScoresIncrementally() {
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// LBD-based clause deletion using FULL REBUILD approach with ZERO ALLOCATIONS
-	// Uses pre-allocated buffers to eliminate GC pressure
+	// SWAP-REMOVE clause deletion - avoids array rebuilding for better performance
+	// Moves active clauses into deleted slots instead of copying to new arrays
+	// Uses inline watch list updates to maintain clause index consistency
 
 	// Incremental scoring - only recompute dirty scores
 	s.updateScoresIncrementally()
@@ -4540,11 +4541,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 	
 	// Mark clauses used as implications (protected from deletion)
+	// CRITICAL: Check learnedCapacity, not learnedActiveCount
 	protectedCount := 0
 	for _, impIdx := range s.implication {
 		if impIdx < -1 {
 			learnedIdx := -impIdx - 1
-			if learnedIdx < s.learnedActiveCount && s.learnedSizes[learnedIdx] > 0 {
+			if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
 				clauseUsedAsReason[learnedIdx] = true
 				protectedCount++
 			}
@@ -4554,8 +4556,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [deleteLearnedClauses] Protected %d clauses used as implications\n", protectedCount)
 	}
 
-	// Collect indices of clauses to keep (reuse tmpKeepIndices buffer)
-	keepIndices := s.tmpKeepIndices[:0]
+	// Mark clauses for deletion
 	deletedCount := 0
 	
 	for i := 0; i < len(clauses); i++ {
@@ -4563,13 +4564,11 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		
 		// Always keep protected clauses (score < 0 means protected)
 		if clauses[i].score < 0 {
-			keepIndices = append(keepIndices, idx)
 			continue
 		}
 		
 		// Also keep clauses used as implications
 		if clauseUsedAsReason[idx] {
-			keepIndices = append(keepIndices, idx)
 			continue
 		}
 		
@@ -4579,69 +4578,59 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			// Remove watches before deleting
 			s.removeLearnedClauseWatches(idx)
 			deletedCount++
-		} else {
-			// Keep this clause
-			keepIndices = append(keepIndices, idx)
 		}
 	}
 
-	// Build clause index mapping (old -> new) for implication updates (reuse tmpClauseIndexMap buffer)
-	if cap(s.tmpClauseIndexMap) < s.learnedActiveCount {
-		s.tmpClauseIndexMap = make([]int, s.learnedActiveCount)
+	// Build clause index mapping (old -> new) for implication updates
+	// Track where each clause moves to, or -1 if deleted
+	if cap(s.tmpClauseIndexMap) < s.learnedCapacity {
+		s.tmpClauseIndexMap = make([]int, s.learnedCapacity)
 	}
-	clauseIndexMap := s.tmpClauseIndexMap[:s.learnedActiveCount]
+	clauseIndexMap := s.tmpClauseIndexMap[:s.learnedCapacity]
 	for i := range clauseIndexMap {
 		clauseIndexMap[i] = -1
 	}
-	for newIdx, oldIdx := range keepIndices {
-		clauseIndexMap[oldIdx] = newIdx
+
+	// SWAP-REMOVE: Move active clauses into deleted slots
+	// This avoids rebuilding arrays and preserves memory pool benefits
+	writeIdx := 0
+	watchUpdates := 0
+	
+	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
+		if deleted[readIdx] {
+			// Mark as tombstone (size=0) for future reuse
+			s.learnedSizes[readIdx] = 0
+			continue
+		}
+
+		// Record mapping for this clause
+		clauseIndexMap[readIdx] = writeIdx
+
+		if writeIdx != readIdx {
+			// Move clause metadata from readIdx to writeIdx
+			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
+			s.learnedSizes[writeIdx] = s.learnedSizes[readIdx]
+			s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+
+			// Copy literals to new location
+			oldStart := s.learnedOffsets[readIdx]
+			oldSize := s.learnedSizes[readIdx]
+			newStart := s.learnedOffsets[writeIdx]
+			
+			// Copy literals (handle overlap with copy)
+			copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
+
+			// CRITICAL: Update watch lists inline - both regular and binary
+			s.updateWatchClauseIndices(writeIdx, readIdx)
+			watchUpdates++
+		}
+		writeIdx++
 	}
 
-	// FULL REBUILD: Rebuild all arrays using pre-allocated buffers (ZERO ALLOCATION)
-	newCapacity := len(keepIndices)
-	
-	// Ensure pre-allocated buffers are large enough
-	if cap(s.tmpDeletionOffsets) < newCapacity {
-		s.tmpDeletionOffsets = make([]int, 0, newCapacity)
-	}
-	if cap(s.tmpDeletionSizes) < newCapacity {
-		s.tmpDeletionSizes = make([]int, 0, newCapacity)
-	}
-	if cap(s.tmpDeletionMetadata) < newCapacity {
-		s.tmpDeletionMetadata = make([]cnf.ClauseMetadata, 0, newCapacity)
-	}
-	
-	// Calculate total literals needed
-	var newLiteralCount int
-	for _, idx := range keepIndices {
-		newLiteralCount += s.learnedSizes[idx]
-	}
-	if cap(s.tmpDeletionLiterals) < newLiteralCount {
-		s.tmpDeletionLiterals = make([]cnf.Literal, 0, newLiteralCount)
-	}
-	
-	// Clear buffers for reuse
-	offsets := s.tmpDeletionOffsets[:0]
-	sizes := s.tmpDeletionSizes[:0]
-	metadata := s.tmpDeletionMetadata[:0]
-	literals := s.tmpDeletionLiterals[:0]
-	
-	// Copy kept clauses to buffers
-	litOffset := 0
-	for _, oldIdx := range keepIndices {
-		offsets = append(offsets, litOffset)
-		sizes = append(sizes, s.learnedSizes[oldIdx])
-		metadata = append(metadata, s.learnedMetadata[oldIdx])
-		
-		// Copy literals
-		oldStart := s.learnedOffsets[oldIdx]
-		oldSize := s.learnedSizes[oldIdx]
-		literals = append(literals, s.learnedLiterals[oldStart:oldStart+oldSize]...)
-		litOffset += oldSize
-	}
-
-	// Update implication array to reflect new clause indices
+	// Update implication array using the mapping (MUST be after all swaps)
+	// This ensures variables point to their reason clauses at the new locations
 	implicationUpdates := 0
+	implicationStale := 0
 	for varIdx := range s.implication {
 		if s.implication[varIdx] < -1 {
 			learnedIdx := -s.implication[varIdx] - 1
@@ -4649,39 +4638,23 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 				s.implication[varIdx] = -clauseIndexMap[learnedIdx] - 1
 				implicationUpdates++
 			} else if learnedIdx < len(clauseIndexMap) {
-				// Clause was deleted, reset to decision
+				// Clause was deleted but wasn't protected - this is a bug
+				implicationStale++
+				if s.verbose && implicationStale <= 10 {
+					fmt.Printf("c [BUG] Stale implication: var %d -> clause %d (deleted, not protected)\n",
+						varIdx+1, learnedIdx)
+				}
+				// Reset to decision (variable will be re-propagated)
 				s.implication[varIdx] = -1
 			}
 		}
 	}
-	if s.verbose && implicationUpdates > 0 {
-		fmt.Printf("c [deleteLearnedClauses] Updated %d implications\n", implicationUpdates)
-	}
 
-	// Replace old arrays with new ones (copy from buffers)
-	// Ensure main arrays have sufficient capacity
-	if cap(s.learnedOffsets) < newCapacity {
-		s.learnedOffsets = make([]int, 0, newCapacity)
-	}
-	if cap(s.learnedSizes) < newCapacity {
-		s.learnedSizes = make([]int, 0, newCapacity)
-	}
-	if cap(s.learnedMetadata) < newCapacity {
-		s.learnedMetadata = make([]cnf.ClauseMetadata, 0, newCapacity)
-	}
-	if cap(s.learnedLiterals) < newLiteralCount {
-		s.learnedLiterals = make([]cnf.Literal, 0, newLiteralCount)
-	}
-	
-	// Copy data from buffers to main arrays
-	s.learnedOffsets = append(s.learnedOffsets[:0], offsets...)
-	s.learnedSizes = append(s.learnedSizes[:0], sizes...)
-	s.learnedMetadata = append(s.learnedMetadata[:0], metadata...)
-	s.learnedLiterals = append(s.learnedLiterals[:0], literals...)
-	s.learnedActiveCount = newCapacity
-	s.learnedCapacity = newCapacity
+	// Update active count and capacity
+	s.learnedActiveCount = writeIdx
+	s.learnedCapacity = writeIdx
 
-	// Rebuild unit clause list
+	// Rebuild unit clause list from scratch
 	s.unitLearnedList = s.unitLearnedList[:0]
 	for i := 0; i < s.learnedActiveCount; i++ {
 		if s.learnedSizes[i] == 1 {
@@ -4692,42 +4665,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
 
-	// CRITICAL FIX: Rebuild watch lists with new clause indices
-	// After full rebuild, clause indices have changed but watches still reference old indices
-	// Solution: Create new watch lists with only original clauses, then re-add learned clauses
-	newWatchLists := make([][]cnf.Watch, len(s.watchLists))
-	newWatchListsBinary := make([][]cnf.Watch, len(s.watchListsBinary))
-	
-	for i := range s.watchLists {
-		// Keep only original clause watches (ClauseIdx >= 0)
-		for _, watch := range s.watchLists[i] {
-			if watch.ClauseIdx >= 0 {
-				newWatchLists[i] = append(newWatchLists[i], watch)
-			}
-		}
-	}
-	for i := range s.watchListsBinary {
-		// Keep only original clause watches
-		for _, watch := range s.watchListsBinary[i] {
-			if watch.ClauseIdx >= 0 {
-				newWatchListsBinary[i] = append(newWatchListsBinary[i], watch)
-			}
-		}
-	}
-	s.watchLists = newWatchLists
-	s.watchListsBinary = newWatchListsBinary
-	
-	// Re-add all learned clause watches with new indices
-	for i := 0; i < s.learnedActiveCount; i++ {
-		if s.learnedSizes[i] >= 2 {
-			literals := s.getLearnedClauseLiterals(i)
-			clause := &cnf.Clause{Literals: literals, Learned: true}
-			s.addLearnedClauseToWatches(i, clause, literals)
-		}
-	}
-
 	if s.verbose {
-		fmt.Printf("c [verbose] Deleted %d learned clauses via full rebuild, kept %d\n", toDelete, s.learnedActiveCount)
+		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
+		fmt.Printf("c [verbose] Watch updates: %d, implication updates: %d, stale: %d\n",
+			watchUpdates, implicationUpdates, implicationStale)
 	}
 
 	// DEBUG: Verify clause indices are consistent after deletion
@@ -4737,7 +4678,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 	// Reset buffers for next use (keep capacity)
 	s.tmpClauseInfo = clauses[:0]
-	s.tmpKeepIndices = keepIndices[:0]
 }
 
 // updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx
