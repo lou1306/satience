@@ -1808,11 +1808,11 @@ func (s *CDCLSolver) inprocessing() bool {
 		return false
 	}
 
-	// 3. Blocked clause elimination (sound, removes redundant clauses)
+	// 3. Blocked clause elimination DISABLED - soundness bug removing non-redundant clauses
 	// Run every 200 conflicts (more expensive than subsumption)
-	if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
-		s.inprocessBlockedClauseElimination()
-	}
+	// if s.conflicts%200 == 0 && s.cnf.NumClauses < 2000 {
+	// 	s.inprocessBlockedClauseElimination()
+	// }
 	if time.Since(startTime) > timeLimit {
 		return false
 	}
@@ -3605,12 +3605,14 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 					}
 				}
 				// Existing assignment was a decision - not UNSAT, just a conflict
+				// Continue to conflict analysis below (don't return here!)
+			} else {
+				// Variable already assigned with same value - redundant unit, skip
+				if s.verbose {
+					fmt.Printf("c [handleConflict] Redundant unit on var %d - skipping\n", varIdx+1)
+				}
+				return
 			}
-			// Variable already assigned with same value - redundant unit, skip
-			if s.verbose {
-				fmt.Printf("c [handleConflict] Redundant unit on var %d - skipping\n", varIdx+1)
-			}
-			return
 		}
 	}
 
@@ -3820,9 +3822,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 		}
 		if hasUnassigned {
+			if s.verbose && s.conflicts < 100 {
+				fmt.Printf("c [1-UIP] SKIP var %d: reason has unassigned literal\n", varIdx+1)
+			}
 			continue
 		}
 		if reasonAtCurrentLevel > 1 {
+			if s.verbose && s.conflicts < 100 {
+				fmt.Printf("c [1-UIP] SKIP var %d: reason has %d lits at current level\n", varIdx+1, reasonAtCurrentLevel)
+			}
 			continue
 		}
 
@@ -3902,10 +3910,38 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 
 	// FIX: If 1-UIP didn't converge (currentCount > 1) after exhausting all candidates,
-	// it means all remaining literals are decisions. In this case, keep all of them -
-	// they form a valid conflict clause.
-	// DO NOT artificially reduce to 1 literal - that creates incorrect learned clauses!
-	// The 1-UIP property is satisfied when we can't resolve further (all are decisions).
+	// check if remaining literals are all decisions or if some are propagations with buggy reasons
+	decisionsAtCurrentLevel := 0
+	propagationsAtCurrentLevel := 0
+	for _, varIdx := range s.tmpTouchedVars {
+		if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == s.level {
+			if s.implication[varIdx] == -1 {
+				decisionsAtCurrentLevel++
+			} else {
+				propagationsAtCurrentLevel++
+			}
+		}
+	}
+	
+	if currentCount > 1 && propagationsAtCurrentLevel > 0 {
+		// 1-UIP didn't converge and we have propagations remaining
+		// This means reason clauses were skipped (buggy reasons)
+		// FALLBACK: Rebuild learned clause from conflictLits (the original conflict)
+		if s.verbose {
+			fmt.Printf("c [1-UIP] FALLBACK: %d decisions + %d propagations at level %d - learning conflict clause\n",
+				decisionsAtCurrentLevel, propagationsAtCurrentLevel, s.level)
+		}
+		// Rebuild learned clause from conflictLits (the original conflict)
+		s.tmpLearnedLits = s.tmpLearnedLits[:0]
+		for _, lit := range conflictLits {
+			s.tmpLearnedLits = append(s.tmpLearnedLits, lit)
+		}
+		// Reset level tracking for LBD calculation below
+		for i := range s.tmpLevelSetUsed {
+			s.tmpLevelSetUsed[i] = false
+		}
+		// Continue to normal LBD calculation and storage
+	}
 
 	// CRITICAL FIX: If 1-UIP resolved away ALL literals (currentCount == 0), we derived empty clause = UNSAT
 	if currentCount == 0 {
