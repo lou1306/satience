@@ -3748,10 +3748,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		reasonClauseIdx := s.implication[varIdx]
 		if reasonClauseIdx == -1 {
-			if s.verbose {
-				// fmt.Printf("c [1-UIP] Step %d: var %d is decision (no reason), skip\n", resolveStep, varIdx+1)
-			}
-			continue // Decision, skip
+			// Decision literal encountered - skip it (can't resolve on decisions)
+			// The decision will remain in the clause as the UIP
+			continue
 		}
 
 		// Get reason clause literals
