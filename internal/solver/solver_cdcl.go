@@ -3828,8 +3828,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			continue
 		}
 		if reasonAtCurrentLevel > 1 {
-			if s.verbose && s.conflicts < 100 {
-				fmt.Printf("c [1-UIP] SKIP var %d: reason has %d lits at current level\n", varIdx+1, reasonAtCurrentLevel)
+			if s.verbose {
+				fmt.Printf("c [1-UIP] SKIP var %d: reason (clause %d) has %d lits at level %d: ", 
+					varIdx+1, reasonClauseIdx, reasonAtCurrentLevel, s.level)
+				for _, rl := range reasonLits {
+					fmt.Printf("%d%c(L%d) ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()], 
+						s.assignments[rl.Var()].Level)
+				}
+				fmt.Printf("\n")
 			}
 			continue
 		}
@@ -3952,62 +3958,35 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 		}
 		
-		// If no decision at current level, we can't learn a valid 1-UIP clause
-		// Just backjump without learning (less efficient but sound)
+		// If no decision at current level, fallback to learning the original conflict clause
+		// This is sound (prevents exact same conflict) even if not optimal
 		if uipVar == 0 {
 			if s.verbose {
-				fmt.Printf("c [1-UIP] No decision at level %d - skipping learn\n", s.level)
+				fmt.Printf("c [1-UIP] No decision at level %d - learning conflict clause\n", s.level)
 			}
-			// Clear the learned clause - don't learn anything
-			s.tmpLearnedLits = s.tmpLearnedLits[:0]
-			// Reset level tracking
+			// Keep all literals from conflict clause (don't modify tmpLiteralInClause)
+			// Just reset level tracking for LBD calculation
 			for i := range s.tmpLevelSetUsed {
 				s.tmpLevelSetUsed[i] = false
 			}
-			// Continue - will skip storage since tmpLearnedLits is empty
+			currentCount = 1  // Pretend we converged to avoid more fallback
 		} else {
-			// Count how many literals will remain after removing others at current level
-			remainingLits := 0
-			hasLowerLevelLits := false
+			// Remove all other literals at current level (keep only the UIP decision)
 			for _, varIdx := range s.tmpTouchedVars {
-				if s.tmpLiteralInClause[varIdx] {
-					if s.assignments[varIdx].Level < s.level {
-						remainingLits++
-						hasLowerLevelLits = true
-					} else if varIdx == uipVar {
-						remainingLits++
-					}
+				if s.tmpLiteralInClause[varIdx] && 
+				   s.assignments[varIdx].Level == s.level && 
+				   varIdx != uipVar {
+					s.tmpLiteralInClause[varIdx] = false
+					s.tmpLevelCount[s.level]--
 				}
 			}
+			currentCount = 1
 			
-			// If we'd learn a unit at current level (no lower-level lits), don't learn
-			// Learning a unit causes backjump to 0, which resets and re-learns the same unit
-			if !hasLowerLevelLits {
-				if s.verbose {
-					fmt.Printf("c [1-UIP] Would learn unit at level %d - skipping learn\n", s.level)
-				}
-				s.tmpLearnedLits = s.tmpLearnedLits[:0]
-				for i := range s.tmpLevelSetUsed {
-					s.tmpLevelSetUsed[i] = false
-				}
-			} else {
-				// Remove all other literals at current level (keep only the UIP decision)
-				for _, varIdx := range s.tmpTouchedVars {
-					if s.tmpLiteralInClause[varIdx] && 
-					   s.assignments[varIdx].Level == s.level && 
-					   varIdx != uipVar {
-						s.tmpLiteralInClause[varIdx] = false
-						s.tmpLevelCount[s.level]--
-					}
-				}
-				currentCount = 1
-				
-				// Reset level tracking for LBD calculation
-				for i := range s.tmpLevelSetUsed {
-					s.tmpLevelSetUsed[i] = false
-				}
-				// Continue to normal LBD calculation and storage
+			// Reset level tracking for LBD calculation
+			for i := range s.tmpLevelSetUsed {
+				s.tmpLevelSetUsed[i] = false
 			}
+			// Continue to normal LBD calculation and storage
 		}
 	}
 
@@ -5009,23 +4988,25 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 		}
 	}
 
-	// Check 3: 1-UIP property - at most 1 literal at current level
-	// NOTE: This is an OPTIMIZATION for better backjumping, not required for soundness
-	// Multiple literals at current level is still sound, just less efficient
-	// We warn but don't reject such clauses
+	// Check 3: 1-UIP property - EXACTLY 1 literal at current level
+	// This is REQUIRED for sound 1-UIP conflict analysis
+	// Multiple literals at current level means the clause was learned incorrectly
 	literalsAtCurrentLevel := 0
 	for _, lit := range learnedLits {
 		if s.assignments[lit.Var()].Level == s.level {
 			literalsAtCurrentLevel++
 		}
 	}
-	if literalsAtCurrentLevel > 1 {
-		// Not a soundness bug, but indicates 1-UIP didn't converge optimally
-		// This can happen when reason clauses have multiple literals at current level
-		if s.verbose {
-			fmt.Printf("c [1-UIP SUBOPTIMAL] conflict=%d, level=%d, literals_at_level=%d (backjumping less efficient)\n",
-				s.conflicts, s.level, literalsAtCurrentLevel)
+	if literalsAtCurrentLevel != 1 {
+		fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected exactly 1)\n",
+			s.conflicts, s.level, literalsAtCurrentLevel)
+		fmt.Printf("c   Learned clause: ")
+		for _, l := range learnedLits {
+			fmt.Printf("%d%c(L%d) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+				s.assignments[l.Var()].Level)
 		}
+		fmt.Printf("\n")
+		return false
 	}
 
 	return true
