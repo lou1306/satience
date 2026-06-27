@@ -3698,33 +3698,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount := s.tmpLevelCount[s.level]
 
-	// CRITICAL FIX #1: Handle "floating" conflicts where conflict clause has no literals at s.level
-	// This happens when a learned clause's literals are all at levels < s.level
-	// In this case, we can't do 1-UIP - just backtrack to max literal level
-	if currentCount == 0 && len(s.tmpTouchedVars) > 0 {
-		maxLitLevel := 0
-		for _, varIdx := range s.tmpTouchedVars {
-			if s.tmpLiteralInClause[varIdx] {
-				lvl := s.assignments[varIdx].Level
-				if lvl > maxLitLevel {
-					maxLitLevel = lvl
-				}
-			}
-		}
-		// fmt.Printf("c [FLOATING CONFLICT] conflict=%d, s.level=%d, maxLitLevel=%d\n", s.conflicts, s.level, maxLitLevel)
-		fmt.Printf("c   Conflict literals: ")
-		for _, varIdx := range s.tmpTouchedVars {
-			if s.tmpLiteralInClause[varIdx] {
-				fmt.Printf("%d%c(L%d) ", varIdx+1, map[bool]byte{true: '-', false: '+'}[s.tmpLiteralIsNegated[varIdx]], s.assignments[varIdx].Level)
-			}
-		}
-		fmt.Printf("\n")
-		if maxLitLevel < s.level {
-			return maxLitLevel
-		}
-		return s.level - 1
-	}
-
 	// Build candidate list from trail (most recent first)
 	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
@@ -3771,27 +3744,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			continue // Invalid clause
 		}
 
-		// Check for tautologies in reason clause (verbose mode only)
-		if s.verbose {
-			reasonIsTaut := false
-			for i := 0; i < len(reasonLits); i++ {
-				for j := i + 1; j < len(reasonLits); j++ {
-					if reasonLits[i].Var() == reasonLits[j].Var() {
-						reasonIsTaut = true
-						break
-					}
-				}
-				if reasonIsTaut {
-					break
-				}
+		// FIX: Skip reason clauses with multiple literals at current level
+		// Such clauses violate 1-UIP and cause incorrect learning
+		reasonAtCurrentLevel := 0
+		for _, lit := range reasonLits {
+			if s.assignments[lit.Var()].Level == s.level {
+				reasonAtCurrentLevel++
 			}
-			if reasonIsTaut {
-				// fmt.Printf("c [1-UIP] Step %d: WARNING - reason clause for var %d is TAUTOLOGY: ", resolveStep, varIdx+1)
-				for _, rl := range reasonLits {
-					fmt.Printf("%d%c ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()])
-				}
-				fmt.Printf("\n")
-			}
+		}
+		if reasonAtCurrentLevel > 1 {
+			continue // Skip buggy reason clause
 		}
 
 		if s.verbose {
