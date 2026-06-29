@@ -803,6 +803,15 @@ func (s *CDCLSolver) printStats() {
 	fmt.Printf("c \n")
 }
 
+// InstanceStructure captures metrics about CNF structure for adaptive preprocessing
+type InstanceStructure struct {
+	Density          float64 // clauses / vars
+	BinaryRatio      float64 // binary clauses / total
+	TernaryRatio     float64 // 3-literal clauses / total
+	SmallClauseRatio float64 // (binary + ternary) / total
+	StructuredScore  float64 // 0.0 = random, 1.0 = highly structured
+}
+
 // PreprocessingConfig controls which preprocessing techniques are enabled
 // Used for debugging soundness issues
 type PreprocessingConfig struct {
@@ -812,6 +821,7 @@ type PreprocessingConfig struct {
 	EnableSubsumption     bool
 	EnableSelfSubsumption bool
 	EnableHyperBinary     bool
+	MaxPasses             int
 }
 
 // DefaultPreprocessingConfig returns the default (all enabled) configuration
@@ -823,6 +833,7 @@ func DefaultPreprocessingConfig() PreprocessingConfig {
 		EnableSubsumption:     true,  // FIXED: Subsumption elimination is now sound
 		EnableSelfSubsumption: false, // DISABLED: Soundness bug - incorrect clause removal
 		EnableHyperBinary:     false, // DISABLED: Soundness bug - derives false empty clauses
+		MaxPasses:             3,
 	}
 }
 
@@ -838,6 +849,135 @@ func SetPreprocessingConfig(config PreprocessingConfig) {
 // GetPreprocessingConfig returns the current preprocessing configuration
 func GetPreprocessingConfig() PreprocessingConfig {
 	return preprocessConfig
+}
+
+// analyzeInstanceStructure computes metrics to detect structured vs random instances
+// Structured instances (Tseitin, hardware, combinatorial) benefit from aggressive preprocessing
+// Random instances benefit from lightweight preprocessing only
+func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
+	structure := InstanceStructure{}
+
+	// Density: clauses / vars
+	if s.cnf.NumVars > 0 {
+		structure.Density = float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
+	}
+
+	// Clause size distribution
+	binaryCount := 0
+	ternaryCount := 0
+	smallCount := 0
+
+	for i := 0; i < s.cnf.NumClauses; i++ {
+		_, size := s.cnf.GetOriginalClauseInfo(i)
+		if size == 2 {
+			binaryCount++
+			smallCount++
+		} else if size == 3 {
+			ternaryCount++
+			smallCount++
+		}
+	}
+
+	if s.cnf.NumClauses > 0 {
+		structure.BinaryRatio = float64(binaryCount) / float64(s.cnf.NumClauses)
+		structure.TernaryRatio = float64(ternaryCount) / float64(s.cnf.NumClauses)
+		structure.SmallClauseRatio = float64(smallCount) / float64(s.cnf.NumClauses)
+	}
+
+	// Structured score: weighted combination of metrics
+	// Key insight: structured instances have HIGH BINARY ratio + mixed clause sizes
+	// Random k-SAT has uniform clause sizes (all 3-literal), low binary ratio
+	// 
+	// Components:
+	// 1. Binary ratio (weight 0.6): structured instances often have many binary clauses
+	// 2. Density (weight 0.2): moderate contribution
+	// 3. Mixed sizes (weight 0.2): structured instances have varied clause sizes
+	
+	binaryScore := structure.BinaryRatio
+	
+	densityScore := 0.0
+	if structure.Density > 0 {
+		// Normalize: density of 5+ gets full score
+		densityScore = structure.Density / 5.0
+		if densityScore > 1.0 {
+			densityScore = 1.0
+		}
+	}
+	
+	// Mixed size score: penalize uniform distributions
+	// If all clauses are same size (e.g., all ternary), this is 0
+	// If mixed (binary + ternary + larger), this approaches 1.0
+	mixedSizeScore := 0.0
+	if structure.BinaryRatio > 0 && structure.TernaryRatio > 0 {
+		// Has both binary and ternary - good mix
+		mixedSizeScore = 1.0
+	} else if structure.BinaryRatio > 0 || structure.TernaryRatio > 0 {
+		// Has some small clauses but not mixed
+		mixedSizeScore = 0.3
+	}
+	
+	structure.StructuredScore = binaryScore*0.6 + densityScore*0.2 + mixedSizeScore*0.2
+
+	return structure
+}
+
+// getAdaptivePreprocessingConfig returns preprocessing config based on instance structure
+func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
+	structure := s.analyzeInstanceStructure()
+
+	if s.verbose {
+		fmt.Printf("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Structured=%.2f\n",
+			structure.Density,
+			structure.BinaryRatio*100,
+			structure.TernaryRatio*100,
+			structure.StructuredScore)
+	}
+
+	// Highly structured: density > 3 OR small clause ratio > 0.7
+	if structure.StructuredScore > 0.6 {
+		if s.verbose {
+			fmt.Printf("c [preprocessing] Structured instance detected - enabling aggressive preprocessing\n")
+		}
+		return PreprocessingConfig{
+			EnableUnitProp:        true,
+			EnableEquivalence:     false,
+			EnablePureLiteral:     true,
+			EnableSubsumption:     true,
+			EnableSelfSubsumption: true,
+			EnableHyperBinary:     true,
+			MaxPasses:             5,
+		}
+	}
+
+	// Moderately structured: density > 1.5 OR small clause ratio > 0.4
+	if structure.StructuredScore > 0.3 {
+		if s.verbose {
+			fmt.Printf("c [preprocessing] Mixed instance detected - enabling moderate preprocessing\n")
+		}
+		return PreprocessingConfig{
+			EnableUnitProp:        true,
+			EnableEquivalence:     false,
+			EnablePureLiteral:     true,
+			EnableSubsumption:     true,
+			EnableSelfSubsumption: false,
+			EnableHyperBinary:     false,
+			MaxPasses:             3,
+		}
+	}
+
+	// Random-like instance: lightweight preprocessing only
+	if s.verbose {
+		fmt.Printf("c [preprocessing] Random-like instance detected - using lightweight preprocessing\n")
+	}
+	return PreprocessingConfig{
+		EnableUnitProp:        true,
+		EnableEquivalence:     false,
+		EnablePureLiteral:     false,
+		EnableSubsumption:     false,
+		EnableSelfSubsumption: false,
+		EnableHyperBinary:     false,
+		MaxPasses:             1,
+	}
 }
 
 func (s *CDCLSolver) preprocessAggressive() SolveResult {
@@ -866,23 +1006,10 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNKNOWN
 	}
 
-	// For large instances, use lightweight preprocessing
-	isLargeInstance := s.cnf.NumVars > 10000 || s.cnf.NumClauses > 50000
-	if isLargeInstance && s.verbose {
-		fmt.Printf("c [verbose] Running lightweight preprocessing on large instance (%d vars, %d clauses)\n",
-			s.cnf.NumVars, s.cnf.NumClauses)
-	}
-
+	// Get adaptive preprocessing config based on instance structure
+	config := s.getAdaptivePreprocessingConfig()
 	initialClauses := s.cnf.NumClauses
-
-	// For large instances, use fewer passes and skip expensive techniques
-	maxPasses := 3
-	if isLargeInstance {
-		maxPasses = 2
-	}
-	if s.cnf.NumVars < 50 {
-		maxPasses = 10 // More passes for small instances to eliminate variable chains
-	}
+	maxPasses := config.MaxPasses
 
 	// Increase to 5 passes for more thorough preprocessing
 	// Modern solvers (CaDiCaL) use 10+ passes
@@ -893,55 +1020,45 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 
 		// Run unit propagation first to catch any existing units
-		if preprocessConfig.EnableUnitProp {
+		if config.EnableUnitProp {
 			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
 				return unitResult
 			}
 		}
 
 		// Equivalence detection: find a↔b patterns and substitute
-		// Skip on very large instances (>20K vars) - O(n^2) complexity
-		if preprocessConfig.EnableEquivalence && !isLargeInstance {
+		if config.EnableEquivalence {
 			if equivResult := s.equivalenceDetection(); equivResult != UNKNOWN {
 				return equivResult
 			}
 		}
 
-		// Single-pass VE with pos=1 restriction is sound in theory, but implementation has bugs
-		// TODO: Fix variableEliminationSinglePass() to properly handle clause index changes
-		// For now, use original variableElimination() which is also disabled due to soundness bugs
-		// clauseDensity := float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
-		// if !isLargeInstance && s.cnf.NumVars < 500 && s.cnf.NumClauses < 5000 && clauseDensity > 2.0 {
-		// 		return UNSAT
-		// 	}
-		// }
-
 		// Run unit propagation to catch new units from equivalence substitution
-		if preprocessConfig.EnableUnitProp {
+		if config.EnableUnitProp {
 			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
 				return unitResult
 			}
 		}
 
 		// Pure literal elimination - cheap, run on all instances
-		if preprocessConfig.EnablePureLiteral {
+		if config.EnablePureLiteral {
 			if pureResult := s.pureLiteralElimination(); pureResult != UNKNOWN {
 				return pureResult
 			}
 		}
 
-		// Self-subsumption - skip on large instances (expensive)
-		if preprocessConfig.EnableSelfSubsumption && !isLargeInstance {
+		// Self-subsumption
+		if config.EnableSelfSubsumption {
 			s.selfSubsumption()
 		}
 
-		// Hyper-binary resolution - skip on large instances (expensive)
-		if preprocessConfig.EnableHyperBinary && !isLargeInstance {
+		// Hyper-binary resolution
+		if config.EnableHyperBinary {
 			s.hyperBinaryResolution()
 		}
 
 		// Run unit propagation after hyper-binary resolution
-		if preprocessConfig.EnableUnitProp {
+		if config.EnableUnitProp {
 			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
 				return unitResult
 			}

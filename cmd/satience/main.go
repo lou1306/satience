@@ -19,6 +19,7 @@ func run() int {
 	model := flag.Bool("model", false, "Print satisfying assignment")
 	verify := flag.Bool("verify", false, "Verify model is correct (implies -model)")
 	dpll := flag.Bool("dpll", false, "Use plain DPLL algorithm (no clause learning)")
+	noPreprocess := flag.Bool("no-preprocess", false, "Disable adaptive preprocessing (use lightweight preprocessing only)")
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
@@ -139,8 +140,12 @@ func run() int {
 	var result solver.SolveResult
 	if *dpll {
 		result = s.SolveDPLL()
-	} else {
+	} else if *noPreprocess {
+		// Skip adaptive preprocessing, use lightweight preprocessing only
 		result = s.SolveWithResult()
+	} else {
+		// Use adaptive preprocessing based on instance structure analysis
+		result = s.SolveWithPreprocessing()
 	}
 	elapsed := time.Since(start)
 
