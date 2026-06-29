@@ -24,7 +24,6 @@ func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
-	noPreprocess := flag.Bool("no-preprocess", false, "Disable aggressive preprocessing (default: enabled for structured instances)")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
@@ -138,13 +137,9 @@ func run() int {
 
 	start := time.Now()
 	var result solver.SolveResult
-	if *noPreprocess {
-		// Force no preprocessing - use basic solver
-		result = s.SolveWithResultBasic()
-	} else if *dpll {
+	if *dpll {
 		result = s.SolveDPLL()
 	} else {
-		// Default: automatic preprocessing for structured instances
 		result = s.SolveWithResult()
 	}
 	elapsed := time.Since(start)

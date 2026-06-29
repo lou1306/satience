@@ -1683,7 +1683,7 @@ func (s *CDCLSolver) restart() bool {
 	// CRITICAL FIX: Re-propagate unit clauses after restart
 	// Unit clauses (length 1) are NOT watched, so they won't be re-propagated
 	// by the watched literals scheme. We must re-assign them manually.
-	s.level = 1
+	s.level = 0  // FIX: Start at level 0, decisions will be at level 1+
 	s.trailHead = []int{0}
 	for i := 0; i < s.cnf.NumClauses; i++ {
 		clause := &s.cnf.Clauses[i]
@@ -1694,15 +1694,15 @@ func (s *CDCLSolver) restart() bool {
 				value := !lit.IsNegated()
 				s.assignments[varIdx] = Assignment{
 					Value: value,
-					Level: 1,
+					Level: 0,  // FIX: Unit propagations at level 0, not level 1
 				}
-				s.varLevel[varIdx] = 1
+				s.varLevel[varIdx] = 0
 				s.trail = append(s.trail, int(varIdx))
 				s.implication[varIdx] = i // Original clause index
 			}
 		}
 	}
-	s.trailHead = append(s.trailHead, len(s.trail))
+	// FIX: Don't add spurious trailHead entry for unit propagations
 	// CRITICAL: Update qhead to skip the unit propagations we just added
 	// Otherwise propagateWatched() will re-process them, causing massive slowdown
 	s.qhead = len(s.trail)
@@ -1966,7 +1966,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	s.trail = s.trail[:0]
 	s.trailHead = s.trailHead[:1]
 	s.trailHead[0] = 0
-	s.level = 1
+	s.level = 0  // FIX: Unit propagations at level 0, decisions start at level 1
 
 	changed := true
 	for changed {
@@ -2013,9 +2013,9 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				value := !unassignedLit.IsNegated()
 				s.assignments[varIdx] = Assignment{
 					Value: value,
-					Level: 1,
+					Level: 0,  // FIX: Unit propagations at level 0
 				}
-				s.varLevel[varIdx] = 1
+				s.varLevel[varIdx] = 0
 				s.trail = append(s.trail, int(varIdx))
 				changed = true
 				// Don't modify clauses - just track assignments in trail
@@ -2023,9 +2023,9 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 		}
 	}
 
-	// Set up trail for search
-	s.trailHead = []int{0, len(s.trail)}
-	s.level = 1
+	// Set up trail for search - FIX: reset to initial state, units are at level 0
+	s.trailHead = []int{0}
+	s.level = 0
 
 	return UNKNOWN
 }
@@ -2092,7 +2092,7 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 	if len(units) > 0 {
 		s.qhead = 0
 		s.level = 0
-		s.trailHead = []int{0, len(s.trail)}
+		s.trailHead = []int{0}  // FIX: Unit propagations are not decisions, don't add spurious trailHead entry
 		// Run propagation to process the level-0 assignments
 		if conflict, _ := s.propagate(); conflict {
 			if s.verbose {
