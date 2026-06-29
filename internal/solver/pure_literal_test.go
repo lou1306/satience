@@ -223,7 +223,7 @@ func TestPureLiteralRealBug(t *testing.T) {
 
 	// No variables should be assigned
 	for i := uint32(0); i < 3; i++ {
-		if s.assignments[i].Level != 0 {
+		if s.assignments[i].Level >= 0 {
 			t.Errorf("Var %d should not be assigned, got level %d", i+1, s.assignments[i].Level)
 		}
 	}

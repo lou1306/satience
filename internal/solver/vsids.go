@@ -558,7 +558,7 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 		item := v.heap.pop()
 		varIdx := int(item.varIdx)
 
-		if varIdx >= len(assignments) || assignments[varIdx].Level != 0 {
+		if varIdx >= len(assignments) || assignments[varIdx].Level >= 0 {
 			continue
 		}
 
@@ -591,7 +591,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 	bestEffectiveActivity := -1.0
 
 	for i := range v.activity {
-		if assignments[i].Level == 0 {
+		if assignments[i].Level < 0 {
 			v.randomSeed ^= v.randomSeed << 13
 			v.randomSeed ^= v.randomSeed >> 7
 			v.randomSeed ^= v.randomSeed << 17
@@ -643,7 +643,7 @@ func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []b
 // hasUnassigned checks if there are unassigned variables
 func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
 	for i := uint32(0); i < numVars; i++ {
-		if assignments[i].Level == 0 {
+		if assignments[i].Level < 0 {
 			return true
 		}
 	}
