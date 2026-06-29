@@ -24,7 +24,7 @@ func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
-	preprocess := flag.Bool("preprocess", false, "Enable aggressive preprocessing (unit prop, pure lit, subsumption, equivalence, VE)")
+	noPreprocess := flag.Bool("no-preprocess", false, "Disable aggressive preprocessing (default: enabled for structured instances)")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
@@ -41,11 +41,11 @@ func run() int {
 	clauseDelKeepRatio := flag.Float64("clause-del-keep-ratio", 0.5, "Ratio of clauses to keep during deletion (default=0.5)")
 	// VSIDS parameters
 	decayInterval := flag.Int("decay-interval", 10, "VSIDS decay interval - conflicts between activity decays (default=10)")
-	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95)")
+	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
 	maxDecay := flag.Float64("max-decay", 0.999, "VSIDS maximum decay factor (default=0.999)")
-	decayRampup := flag.Int("decay-rampup", 10000, "Conflicts to reach max decay (default=10000)")
+	decayRampup := flag.Int("decay-rampup", 5000, "Conflicts to reach max decay (default=5000)")
 	lbdScale := flag.Float64("lbd-scale", 2000.0, "LBD bonus scale for VSIDS (default=2000.0)")
-	bumpAmount := flag.Float64("bump-amount", 50.0, "Base bump amount for conflicts (default=50.0)")
+	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
 	// Inprocessing parameters
@@ -138,11 +138,13 @@ func run() int {
 
 	start := time.Now()
 	var result solver.SolveResult
-	if *preprocess {
-		result = s.SolveWithPreprocessing()
+	if *noPreprocess {
+		// Force no preprocessing - use basic solver
+		result = s.SolveWithResultBasic()
 	} else if *dpll {
 		result = s.SolveDPLL()
 	} else {
+		// Default: automatic preprocessing for structured instances
 		result = s.SolveWithResult()
 	}
 	elapsed := time.Since(start)

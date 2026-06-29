@@ -134,6 +134,7 @@ func TestCDCLSolveUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	if s.Solve() {
 		t.Error("Expected UNSAT")
 	}
@@ -150,6 +151,7 @@ func TestCDCLSolveSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	if !s.Solve() {
 		t.Error("Expected SAT")
 	}
@@ -168,6 +170,7 @@ func TestCDCLSolve3SAT(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	if !s.Solve() {
 		t.Error("Expected SAT")
 	}
@@ -190,6 +193,7 @@ func TestCDCLSolveUnsat3SAT(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT && result != UNKNOWN {
@@ -280,6 +284,7 @@ func TestCDCLTseitin4x4Unsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT {
@@ -301,6 +306,7 @@ func TestCDCLAlgebra20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (simple 20 unit clauses)")
@@ -331,6 +337,7 @@ func TestCDCLPhp3p4hSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (pigeonhole 3 pigeons 4 holes)")
@@ -377,6 +384,7 @@ func TestCDCLPhp4p3hUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if result {
 		t.Error("Expected UNSAT (pigeonhole 4 pigeons 3 holes)")
@@ -399,6 +407,7 @@ func TestCDCLSimple50vSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (simple 50v)")
@@ -420,6 +429,7 @@ func TestCDCLArgChain20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (argumentation chain 20)")
@@ -444,6 +454,7 @@ func TestCDCLAlgebraXor20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (algebra XOR 20)")
@@ -533,6 +544,7 @@ func TestCDCLTseitin5x5Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (tseitin grid 5x5)")
@@ -624,6 +636,7 @@ func TestCDCLTseitin5x5Unsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (tseitin grid 5x5), got %v", result)
@@ -645,6 +658,7 @@ func TestCDCLArgChain50Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (argumentation chain 50)")
@@ -666,6 +680,7 @@ func TestCDCLEquivalenceRich50vUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (equivalence-rich 50v), got %v", result)
@@ -759,6 +774,7 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
+	
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT {
@@ -791,6 +807,7 @@ func TestCDCLRandomK3Sat(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	// Don't check SAT/UNSAT - just ensure it terminates quickly
 	if result == UNKNOWN {
@@ -885,6 +902,7 @@ func TestCDCLSudoku2x2(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	if result != SAT {
 		t.Errorf("Expected SAT (2x2 Sudoku), got %v", result)
@@ -967,6 +985,7 @@ func TestCDCLPhp5p6hSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	if result != SAT {
 		t.Errorf("Expected SAT (pigeonhole 5 pigeons 6 holes), got %v", result)
@@ -998,6 +1017,7 @@ func TestCDCLTseitinCycleUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
+	
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (odd cycle), got %v", result)
