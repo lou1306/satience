@@ -180,7 +180,7 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 		allFalse := true
 		for _, lit := range clause.Literals {
 			varIdx := lit.Var()
-			if s.assignments[varIdx].Level == 0 {
+			if s.assignments[varIdx].Level < 0 {
 				allFalse = false
 				break
 			}
@@ -203,7 +203,7 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 		allFalse := true
 		for _, lit := range clause.Literals {
 			varIdx := lit.Var()
-			if s.assignments[varIdx].Level == 0 {
+			if s.assignments[varIdx].Level < 0 {
 				allFalse = false
 				break
 			}
@@ -224,7 +224,7 @@ func (s *CDCLSolver) VerifyNoContradictions(reason string) error {
 // VerifyModel checks that a complete assignment satisfies all clauses
 func (s *CDCLSolver) VerifyModel(reason string) error {
 	for varIdx := uint32(0); varIdx < s.cnf.NumVars; varIdx++ {
-		if s.assignments[varIdx].Level == 0 {
+		if s.assignments[varIdx].Level < 0 {
 			return fmt.Errorf("variable %d is unassigned in model (%s)", varIdx, reason)
 		}
 	}
@@ -284,7 +284,7 @@ func (s *CDCLSolver) RunAllVerifications(config VerificationConfig, context stri
 // VerifySolution verifies a SAT solution
 func VerifySolution(cnfFormula *cnf.CNF, assignments []Assignment, verbose bool) error {
 	for varIdx := uint32(0); varIdx < cnfFormula.NumVars; varIdx++ {
-		if assignments[varIdx].Level == 0 {
+		if assignments[varIdx].Level < 0 {
 			return fmt.Errorf("variable %d is unassigned", varIdx)
 		}
 	}

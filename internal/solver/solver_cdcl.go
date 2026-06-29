@@ -2207,8 +2207,8 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 		lit := clause.Literals[0]
 		varIdx := lit.Var()
 
-		// Check if already assigned
-		if s.assignments[varIdx].Level != 0 {
+		// Check if already assigned (Level >= 0 means assigned)
+		if s.assignments[varIdx].Level >= 0 {
 			continue
 		}
 
@@ -2226,7 +2226,7 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 		}
 		s.varLevel[unit.varIdx] = 0
 		s.trail = append(s.trail, int(unit.varIdx))
-		s.implication[unit.varIdx] = -1 // Mark as decision (no clause reason)
+		s.implication[unit.varIdx] = -2 // Mark as unit propagation (not decision)
 
 		if s.verbose {
 			fmt.Printf("c [inprocess] Unit propagation: var %d = %v (level 0)\n", unit.varIdx, unit.value)

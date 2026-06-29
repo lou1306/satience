@@ -208,7 +208,7 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heap = make(vsidsHeap, 0, len(v.activity))
 
 	for i, act := range v.activity {
-		if assignments[i].Level == 0 {
+		if assignments[i].Level < 0 {
 			// Add LBD bonus to activity for selection
 			effectiveActivity := act + v.lbdBonus[i]
 			v.heap = append(v.heap, vsidsHeapItem{
