@@ -3640,6 +3640,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
+	if s.verbose && s.conflicts <= 10 {
+		fmt.Printf("c [DEBUG] learnClause returned backjumpLevel=%d, s.level=%d\n", bjLevel, s.level)
+	}
 
 	// Delete learned clauses when database exceeds dynamic limit
 	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
@@ -4755,6 +4758,9 @@ func (s *CDCLSolver) backtrack() bool {
 
 	// Use backjump level if available, otherwise backtrack one level
 	bjLevel := s.backjumpLevel
+	if s.verbose && s.conflicts <= 10 {
+		fmt.Printf("c [BACKTRACK DEBUG] s.backjumpLevel=%d, s.level=%d, using bjLevel=%d\n", s.backjumpLevel, s.level, bjLevel)
+	}
 	if bjLevel < 0 {
 		bjLevel = s.level - 1
 	}
@@ -4794,6 +4800,11 @@ func (s *CDCLSolver) backtrack() bool {
 
 	decisionVar := uint32(s.trail[decisionPoint])
 	decisionValue := s.assignments[decisionVar].Value
+
+	if s.verbose && s.conflicts <= 10 {
+		fmt.Printf("c [BACKTRACK] Flipping var %d (decision at trail pos %d, level %d) from %v to %v\n",
+			decisionVar+1, decisionPoint, s.assignments[decisionVar].Level, decisionValue, !decisionValue)
+	}
 
 	// Clear all assignments from decisionPoint onwards
 	for i := decisionPoint; i < len(s.trail); i++ {
