@@ -185,13 +185,14 @@ func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 	assignments := s.GetAssignments()
 
 	// Print model - only output variables up to cnf.NumVars
+	// Include ALL assigned variables (Level >= 0), not just decisions
 	numVars := int(cnf.NumVars)
 	if len(assignments) < numVars {
 		numVars = len(assignments)
 	}
 	for i := 0; i < numVars; i++ {
 		assign := assignments[i]
-		if assign.Level > 0 {
+		if assign.Level >= 0 {
 			val := int32(i + 1)
 			if !assign.Value {
 				val = -val

@@ -389,7 +389,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		minimizationMaxReasonSize: 15,
 		// Variable elimination tracking
 		// Configurable parameters with defaults
-		inprocessingMinConflicts: 1000, // Run inprocessing at restart only after 1000 conflicts
+		inprocessingMinConflicts: 1000000000, // DISABLED: Inprocessing has soundness bugs with level-0 propagation
 		preprocessingMinClauses:  10,   // Lowered to enable inprocessing after aggressive VE
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
@@ -1075,17 +1075,32 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 	}
 
-	// Clear assignments made during preprocessing passes
+	// FIX: Do NOT clear preprocessing assignments (e.g., from pure literal elimination)
+	// These are permanent assignments that must be part of the final model.
+	// Only clear the trail and reset search state.
+	// Count preprocessing assignments for statistics
+	preprocAssignments := 0
 	for i := range s.assignments {
-		s.assignments[i] = Assignment{Level: -1}
-		s.varLevel[i] = -1
+		if s.assignments[i].Level >= 0 {
+			preprocAssignments++
+		}
 	}
+	
 	s.trail = s.trail[:0]
 	s.trailHead = []int{0}
 	s.level = 0
 	s.qhead = 0
+	// FIX: Only clear implication for unassigned variables
+	// Preprocessing assignments (Level >= 0) must keep their implication to prevent re-propagation
 	for i := range s.implication {
-		s.implication[i] = -1
+		if s.assignments[i].Level < 0 {
+			s.implication[i] = -1
+		}
+		// For assigned variables, implication stays as-is (set by unit propagation or pure literal elimination)
+	}
+	
+	if s.verbose && preprocAssignments > 0 {
+		fmt.Printf("c [verbose] Preserving %d preprocessing assignments for final model\n", preprocAssignments)
 	}
 
 	// CRITICAL: Run unit propagation to handle unit clauses before search
@@ -1711,14 +1726,23 @@ func (s *CDCLSolver) restart() bool {
 	// Deleting clauses on restart throws away potentially useful learned information
 
 	// Clear trail and assignments
+	// FIX: Preserve preprocessing assignments (implication < -1)
 	s.trail = s.trail[:0]
 	s.trailHead = s.trailHead[:1]
 	s.qhead = 0 // Reset qhead since trail is empty
 	s.level = 0
 	for i := range s.implication {
+		// Skip preprocessing assignments
+		if s.implication[i] < -1 {
+			continue
+		}
 		s.implication[i] = -1
 	}
 	for i := range s.assignments {
+		// Skip preprocessing assignments
+		if s.implication[i] < -1 {
+			continue
+		}
 		s.assignments[i] = Assignment{Level: -1}
 		s.varLevel[i] = -1
 	}
@@ -2050,18 +2074,24 @@ func (s *CDCLSolver) clauseHash(clause *cnf.Clause) uint64 {
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
-	// Clear any previous assignments before starting unit propagation
-	// This is critical when called multiple times in preprocessing loop
-	// FIX: Use Level=-1 to mark unassigned (distinguishes from unit propagations at level 0)
-	for i := range s.assignments {
-		s.assignments[i] = Assignment{Level: -1}
-	}
-
+	// FIX: Do NOT clear existing assignments (from pure literal elimination, etc.)
+	// Only reset trail and propagate NEW unit clauses from current state
 	// Initialize trail for preprocessing (reuse capacity)
 	s.trail = s.trail[:0]
 	s.trailHead = s.trailHead[:1]
 	s.trailHead[0] = 0
-	s.level = 0  // FIX: Unit propagations at level 0, decisions start at level 1
+	s.level = 0  // Unit propagations at level 0, decisions start at level 1
+
+	if s.verbose {
+		// Count unit clauses for debugging
+		unitCount := 0
+		for _, clause := range s.cnf.Clauses {
+			if len(clause.Literals) == 1 {
+				unitCount++
+			}
+		}
+		fmt.Printf("c [unit prop] Starting with %d unit clauses, %d existing assignments\n", unitCount, s.countAssignedVariables())
+	}
 
 	changed := true
 	for changed {
@@ -2108,21 +2138,42 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				value := !unassignedLit.IsNegated()
 				s.assignments[varIdx] = Assignment{
 					Value: value,
-					Level: 0,  // FIX: Unit propagations at level 0
+					Level: 0,  // Unit propagations at level 0
 				}
 				s.varLevel[varIdx] = 0
 				s.trail = append(s.trail, int(varIdx))
+				// FIX: Set implication to prevent re-propagation during search
+				// Use -2 to indicate "assigned by preprocessing unit propagation"
+				s.implication[varIdx] = -2
 				changed = true
+				if s.verbose && len(clause.Literals) == 1 {
+					fmt.Printf("c [unit prop] Propagated unit clause: var %d = %v, implication=%d\n", varIdx, value, s.implication[varIdx])
+				}
 				// Don't modify clauses - just track assignments in trail
 			}
 		}
 	}
 
-	// Set up trail for search - FIX: reset to initial state, units are at level 0
+	if s.verbose {
+		fmt.Printf("c [unit prop] Finished, trail has %d units\n", len(s.trail))
+	}
+
+	// Set up trail for search - reset to initial state, units are at level 0
 	s.trailHead = []int{0}
 	s.level = 0
 
 	return UNKNOWN
+}
+
+// countAssignedVariables counts variables with Level >= 0
+func (s *CDCLSolver) countAssignedVariables() int {
+	count := 0
+	for _, assign := range s.assignments {
+		if assign.Level >= 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // inprocessUnitPropagation performs unit propagation during search
@@ -2464,6 +2515,10 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 					Value: pureValue,
 					Level: 1,
 				}
+				s.varLevel[varIdx] = 1
+				// FIX: Set implication to prevent re-propagation during search
+				// Use -3 to indicate "assigned by pure literal elimination"
+				s.implication[varIdx] = -3
 				changed = true
 
 				conflict := s.simplifyAfterAssignment(varIdx, pureValue)
@@ -2854,6 +2909,11 @@ func (s *CDCLSolver) verifyModel() bool {
 		clauseSat := false
 		for _, lit := range clause.Literals {
 			assign := s.assignments[lit.Var()]
+			// FIX: Check if variable is actually assigned (level >= 0)
+			// Unassigned variables (level < 0) cannot satisfy clauses
+			if assign.Level < 0 {
+				continue // Unassigned - clause not satisfied by this literal
+			}
 			litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
 			if litTrue {
 				clauseSat = true
@@ -3147,13 +3207,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				continue
 			}
 
-			if blitLevel == 0 {
-				blitLit := cnf.IndexToLit(int(blitIdx))
-				s.assignLiteralByClause(blitLit, s.level, watch.ClauseIdx)
-				propagationCount++
-				s.propagations++
-				continue
-			}
+			// FIX: blitLevel == 0 means assigned by unit propagation - do NOT re-propagate
+			// Previously this case propagated again, causing unit assignments to be overwritten
 
 			// Re-check blit value - may have been assigned TRUE during replacement search
 			blitValue := s.assignments[blitVarIdx].Value
@@ -3371,6 +3426,11 @@ func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 func (s *CDCLSolver) decide() bool {
 	if !s.vsids.hasUnassigned(s.assignments, s.cnf.NumVars) {
 		return false
+	}
+
+	// DEBUG: Check if var 180 (unit clause [181]) is still assigned
+	if s.verbose {
+		fmt.Printf("c [DECIDE DEBUG] var 180 (unit) Level=%d, implication=%d\n", s.assignments[180].Level, s.implication[180])
 	}
 
 	// Track conflicts at current level
@@ -4845,8 +4905,14 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 
 	// Clear all assignments from decisionPoint onwards
+	// FIX: Skip preprocessing assignments (Level=0 from unit prop, Level=1 from pure literal)
+	// These are permanent and should not be cleared during backtracking
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
+		// Skip if this is a preprocessing assignment (implication < -1)
+		if s.implication[varIdx] < -1 {
+			continue
+		}
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
