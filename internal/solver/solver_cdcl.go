@@ -4184,20 +4184,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// FIX: If no resolution happened (all conflict literals were decisions),
-	// the learned clause is identical to the conflict clause and provides no new information.
-	// Skip learning to avoid infinite loops.
-	if resolvedCount == 0 && len(s.tmpLearnedLits) > 1 {
-		if s.verbose {
-			fmt.Printf("c [learnClause] No resolution performed (all decisions) - skipping learned clause to avoid loop\n")
-		}
-		// Don't learn the clause, just backjump
-		// Backjump to maxLevel (second-highest level in conflict clause)
-		if maxLevel == 0 {
-			return 1
-		}
-		return maxLevel
-	}
+	// NOTE: resolvedCount == 0 is normal when all conflict literals are decisions.
+	// The learned clause IS useful - it prevents this exact combination of decisions.
+	// Do NOT skip learning in this case - that would cripple the solver.
 
 	// CRITICAL: Verify 1-UIP property to catch soundness bugs
 	// If verification fails, the learned clause is invalid - stop learning (safer than wrong clause)
