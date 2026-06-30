@@ -3119,8 +3119,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if learnedIdx >= len(s.learnedSizes) || s.learnedSizes[learnedIdx] == 0 {
 					continue
 				}
-				// ZERO ALLOCATION: Use slice view directly from learnedLiterals pool
-				clauseLits = s.getLearnedClauseLiterals(learnedIdx)
+				// OPTIMIZATION: Inline getLearnedClauseLiterals to eliminate function call overhead
+				offset := s.learnedOffsets[learnedIdx]
+				size := s.learnedSizes[learnedIdx]
+				clauseLits = s.learnedLiterals[offset : offset+size]
 			}
 			blitIdx := watch.Blit
 			if s.verbose && s.conflicts <= 10 && watch.ClauseIdx < 0 {
