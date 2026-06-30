@@ -135,6 +135,8 @@ type CDCLSolver struct {
 	learnedOffsets       []int                 // Start offset in learnedLiterals for each clause
 	learnedSizes         []int                 // Number of literals in each clause (0 = deleted/tombstone)
 	learnedMetadata      []cnf.ClauseMetadata  // OPTIMIZATION: Packed metadata (LBD, age, activity, useCount, propCount, score)
+	learnedWatchIdx0     []int                 // First watched literal index (for fast watch removal)
+	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
 	normalClauseCount    int                   // Track number of non-glue clauses (LBD > 3)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
@@ -326,6 +328,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedOffsets:       make([]int, 0, maxLearned),
 		learnedSizes:         make([]int, 0, maxLearned),
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
+		learnedWatchIdx0:     make([]int, 0, maxLearned), // Watched literal indices
+		learnedWatchIdx1:     make([]int, 0, maxLearned),
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
@@ -1237,30 +1241,28 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx0),
 	})
+
+	// Store watched literal indices for fast removal
+	s.learnedWatchIdx0 = append(s.learnedWatchIdx0, idx0)
+	s.learnedWatchIdx1 = append(s.learnedWatchIdx1, idx1)
 }
 
 // removeLearnedClauseWatches removes all watches for a deleted learned clause
-// P1 OPTIMIZATION: Remove watches immediately when clause is deleted (not during propagation)
+// FIX: Use stored watched literal indices instead of reading from potentially corrupted literals
 func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
 		return
 	}
 
-	// Get clause literals to find watched literals
 	if s.learnedSizes[learnedIdx] < 2 {
 		return // Clause too short to have watches
 	}
 
-	literals := s.getLearnedClauseLiterals(learnedIdx)
-	if len(literals) < 2 {
-		return
-	}
-
-	lit0 := literals[0]
-	lit1 := literals[1]
-	idx0 := cnf.LitToIndex(lit0)
-	idx1 := cnf.LitToIndex(lit1)
 	clauseIdx := -learnedIdx - 1
+
+	// Use stored watched literal indices (not from potentially corrupted literals)
+	idx0 := s.learnedWatchIdx0[learnedIdx]
+	idx1 := s.learnedWatchIdx1[learnedIdx]
 
 	// Remove watch from lit0's watch list
 	watchList0 := s.watchLists[idx0]
@@ -3010,32 +3012,28 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			existingIdx := s.implication[varIdx]
 			existingLevel := s.assignments[varIdx].Level
 			existingValue := s.assignments[varIdx].Value
-			fmt.Printf("c [UNIT CONFLICT] var=%d, new=%v (idx=%d), existing=%v (level=%d, idx=%d)\n",
-				varIdx+1, litValue, learnedIdx, existingValue, existingLevel, existingIdx)
-			if existingIdx != -1 {
-				// Existing assignment is from propagation (not decision) - UNSAT!
-				if existingIdx < -1 {
-					existingLearnedIdx := -existingIdx - 1
-					existingLits := s.getLearnedClauseLiterals(existingLearnedIdx)
-					fmt.Printf("c   Existing from learned clause %d: ", existingLearnedIdx)
-					for _, l := range existingLits {
+			if s.verbose {
+				fmt.Printf("c [UNIT CONFLICT] var=%d, new=%v (idx=%d), existing=%v (level=%d, idx=%d)\n",
+					varIdx+1, litValue, learnedIdx, existingValue, existingLevel, existingIdx)
+				if existingIdx != -1 {
+					// Existing assignment is from propagation (not decision) - UNSAT!
+					if existingIdx < -1 {
+						existingLearnedIdx := -existingIdx - 1
+						existingLits := s.getLearnedClauseLiterals(existingLearnedIdx)
+						fmt.Printf("c   Existing from learned clause %d: ", existingLearnedIdx)
+						for _, l := range existingLits {
+							fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
+						}
+						fmt.Printf("\n")
+					}
+					fmt.Printf("c   New unit clause %d: ", learnedIdx)
+					for _, l := range literals {
 						fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
 					}
 					fmt.Printf("\n")
 				}
-				fmt.Printf("c   New unit clause %d: ", learnedIdx)
-				for _, l := range literals {
-					fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
-				}
-				fmt.Printf("\n")
-				s.emptyClauseFound = true
-			} else {
-				// Existing assignment is from a decision
-				fmt.Printf("c   Existing from DECISION at level %d\n", existingLevel)
-				if s.level == 0 {
-					s.emptyClauseFound = true
-				}
 			}
+			s.emptyClauseFound = true
 			return true, &cnf.Clause{Literals: literals, Learned: true}
 		}
 	}
@@ -4318,11 +4316,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			seenVars[lit.Var()] = true
 		}
 		if hasDup {
-			fmt.Printf("c [SOUNDNESS BUG] Learned clause has duplicate literals: conflict=%d, clause: ", s.conflicts)
-			for _, lit := range s.tmpLearnedLits {
-				fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
+			if s.verbose {
+				fmt.Printf("c [SOUNDNESS BUG] Learned clause has duplicate literals: conflict=%d, clause: ", s.conflicts)
+				for _, lit := range s.tmpLearnedLits {
+					fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
+				}
+				fmt.Printf("\n")
 			}
-			fmt.Printf("\n")
 			// Skip storing this buggy clause
 			return 0
 		}
@@ -4714,6 +4714,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
 			s.learnedSizes[writeIdx] = s.learnedSizes[readIdx]
 			s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+			s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
+			s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
 
 			// Copy literals to new location
 			oldStart := s.learnedOffsets[readIdx]
@@ -4768,13 +4770,19 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
 
+	// Truncate arrays to new capacity (CRITICAL for append() to work correctly)
+	s.learnedLiterals = s.learnedLiterals[:s.learnedOffsets[writeIdx-1]+s.learnedSizes[writeIdx-1]]
+	s.learnedOffsets = s.learnedOffsets[:writeIdx]
+	s.learnedSizes = s.learnedSizes[:writeIdx]
+	s.learnedMetadata = s.learnedMetadata[:writeIdx]
+	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
+	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]
+
 	if s.verbose {
 		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
 		fmt.Printf("c [verbose] Watch updates: %d, implication updates: %d, stale: %d\n",
 			watchUpdates, implicationUpdates, implicationStale)
 	}
-
-
 
 	// Reset buffers for next use (keep capacity)
 	s.tmpClauseInfo = clauses[:0]
@@ -5086,14 +5094,16 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level < 0 {
 			// Unassigned literal - clause is not a valid conflict clause
-			fmt.Printf("c [SOUNDNESS BUG] Learned clause has unassigned literal: conflict=%d, var=%d\n",
-				s.conflicts, varIdx+1)
-			fmt.Printf("c   Learned clause: ")
-			for _, l := range learnedLits {
-				fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+			if s.verbose {
+				fmt.Printf("c [SOUNDNESS BUG] Learned clause has unassigned literal: conflict=%d, var=%d\n",
+					s.conflicts, varIdx+1)
+				fmt.Printf("c   Learned clause: ")
+				for _, l := range learnedLits {
+					fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+						s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+				}
+				fmt.Printf("\n")
 			}
-			fmt.Printf("\n")
 			return false
 		}
 	}
@@ -5104,14 +5114,16 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 		varIdx := lit.Var()
 		litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
 		if litTrue {
-			fmt.Printf("c [SOUNDNESS BUG] Learned clause has TRUE literal: conflict=%d, var=%d, value=%v, neg=%v\n",
-				s.conflicts, varIdx+1, s.assignments[varIdx].Value, lit.IsNegated())
-			fmt.Printf("c   Learned clause: ")
-			for _, l := range learnedLits {
-				fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+			if s.verbose {
+				fmt.Printf("c [SOUNDNESS BUG] Learned clause has TRUE literal: conflict=%d, var=%d, value=%v, neg=%v\n",
+					s.conflicts, varIdx+1, s.assignments[varIdx].Value, lit.IsNegated())
+				fmt.Printf("c   Learned clause: ")
+				for _, l := range learnedLits {
+					fmt.Printf("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+						s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
+				}
+				fmt.Printf("\n")
 			}
-			fmt.Printf("\n")
 			return false
 		}
 	}
@@ -5126,14 +5138,16 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 		}
 	}
 	if literalsAtCurrentLevel != 1 {
-		fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected exactly 1)\n",
-			s.conflicts, s.level, literalsAtCurrentLevel)
-		fmt.Printf("c   Learned clause: ")
-		for _, l := range learnedLits {
-			fmt.Printf("%d%c(L%d) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-				s.assignments[l.Var()].Level)
+		if s.verbose {
+			fmt.Printf("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected exactly 1)\n",
+				s.conflicts, s.level, literalsAtCurrentLevel)
+			fmt.Printf("c   Learned clause: ")
+			for _, l := range learnedLits {
+				fmt.Printf("%d%c(L%d) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
+					s.assignments[l.Var()].Level)
+			}
+			fmt.Printf("\n")
 		}
-		fmt.Printf("\n")
 		return false
 	}
 
