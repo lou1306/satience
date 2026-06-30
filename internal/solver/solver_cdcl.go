@@ -1727,21 +1727,22 @@ func (s *CDCLSolver) restart() bool {
 	// Deleting clauses on restart throws away potentially useful learned information
 
 	// Clear trail and assignments
-	// FIX: Preserve preprocessing assignments (implication < -1)
+	// FIX: Preserve ONLY preprocessing assignments (Level <= 1 AND implication <= -2)
+	// Learned clause propagations have Level > 1 and implication < -1, must be cleared
 	s.trail = s.trail[:0]
 	s.trailHead = s.trailHead[:1]
 	s.qhead = 0 // Reset qhead since trail is empty
 	s.level = 0
 	for i := range s.implication {
-		// Skip preprocessing assignments
-		if s.implication[i] < -1 {
+		// Skip preprocessing: Level <= 1 (unit prop at level 0, pure literal at level 1)
+		if s.assignments[i].Level <= 1 && s.implication[i] <= -2 {
 			continue
 		}
 		s.implication[i] = -1
 	}
 	for i := range s.assignments {
-		// Skip preprocessing assignments
-		if s.implication[i] < -1 {
+		// Skip preprocessing: Level <= 1 (unit prop at level 0, pure literal at level 1)
+		if s.assignments[i].Level <= 1 && s.implication[i] <= -2 {
 			continue
 		}
 		s.assignments[i] = Assignment{Level: -1}
@@ -2931,7 +2932,12 @@ func (s *CDCLSolver) verifyModel() bool {
 						fmt.Printf("%d ", lit.Var()+1)
 					}
 				}
-				fmt.Println()
+				fmt.Printf("(assignments: ")
+				for _, lit := range clause.Literals {
+					v := lit.Var()
+					fmt.Printf("var%d={V=%v,L=%d,I=%d} ", v+1, s.assignments[v].Value, s.assignments[v].Level, s.implication[v])
+				}
+				fmt.Printf(")\n")
 			}
 			return false
 		}
