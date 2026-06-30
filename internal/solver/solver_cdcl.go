@@ -71,10 +71,10 @@ const (
 // MiniSat-style: base limit proportional to variables, grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
 	// Base limit: proportional to number of variables (MiniSat uses ~6*vars initially)
-	// This gives small instances room to learn, large instances don't explode
+	// Improved scaling for small instances that need more learned clauses
 	baseLimit := int(numVars) * 6
 
-	// Scale with instance size
+	// Scale with instance size - more aggressive for small instances
 	if numVars >= 50000 {
 		baseLimit = 16000
 	} else if numVars >= 10000 {
@@ -83,20 +83,32 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 		baseLimit = 4000
 	} else if numVars >= 1000 {
 		baseLimit = 2000
-	}
-
-	if numVars > 0 {
-		density := float64(numClauses) / float64(numVars)
-		if density > 10.0 {
-			baseLimit = int(float64(baseLimit) * 1.5)
-		} else if density < 3.0 {
-			baseLimit = int(float64(baseLimit) * 0.75)
+	} else if numVars >= 100 {
+		// Small instances (100-1000 vars): scale with vars
+		baseLimit = int(numVars) * 12
+	} else {
+		// Tiny instances (< 100 vars): use clause-based scaling
+		// Small instances often need more learned clauses to find conflicts
+		clauseBased := int(numClauses) * 8
+		if clauseBased > baseLimit {
+			baseLimit = clauseBased
 		}
 	}
 
-	// Minimum 300 for tiny instances (enough to learn useful clauses)
-	if baseLimit < 300 {
-		baseLimit = 300
+	// Density adjustment: sparse instances (density < 3) need fewer learned clauses
+	// Dense instances (density > 10) can benefit from more learned clauses
+	if numVars > 0 {
+		density := float64(numClauses) / float64(numVars)
+		if density > 10.0 {
+			baseLimit = int(float64(baseLimit) * 1.3)
+		} else if density < 3.0 {
+			baseLimit = int(float64(baseLimit) * 0.8)
+		}
+	}
+
+	// Minimum 400 for tiny instances (enough to learn useful clauses)
+	if baseLimit < 400 {
+		baseLimit = 400
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
