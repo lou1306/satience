@@ -439,22 +439,22 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	// Variables in low-LBD clauses get higher priority
 	solver.vsids.EnableLBD()
 
-	// CRITICAL FIX: Tune VSIDS parameters for small instances
-	// Problem: 50-variable instances timing out while MiniSat solves in 0.027s
-	// Root cause: VSIDS decay too slow (0.95), bump too small (50.0)
-	// Solution: More aggressive parameters for instances < 1000 variables
+	// TUNE VSIDS parameters based on instance size
+	// Small instances need faster decay to quickly identify important variables
 	if formula.NumVars < 1000 {
-		// Faster decay = quicker adaptation to search progress
-		solver.vsids.SetInitialDecayFactor(0.99)
-		// Slower ramp-up = stay aggressive longer
-		solver.vsids.SetDecayRampUpConflicts(50000)
-		// Larger bump = more activity for conflict variables
-		solver.vsids.SetBaseBumpAmount(150.0)
-		// More aggressive LBD bonus
-		solver.vsids.SetLBDBonusScale(10000.0)
+		// Faster decay (0.90 vs 0.95) = quicker adaptation to search progress
+		// Lower initial decay means activity drops faster, focusing on recent conflicts
+		solver.vsids.SetInitialDecayFactor(0.90)
+		// Faster ramp-up to max decay (5000 vs 10000 conflicts)
+		// Stay in aggressive exploration phase longer
+		solver.vsids.SetDecayRampUpConflicts(5000)
+		// Moderate bump amount - large bumps can cause activity inflation
+		solver.vsids.SetBaseBumpAmount(25.0)
+		// Moderate LBD bonus - too high causes over-prioritization of glue clauses
+		solver.vsids.SetLBDBonusScale(2000.0)
 		// More aggressive clause minimization for small instances
 		solver.minimizationMaxReasonSize = 50 // Allow larger reason clauses for more minimization
-		// Much more aggressive restarts for small instances
+		// More aggressive restarts for small instances
 		// Luby base: 100 → 10 (restart 10× more frequently)
 		solver.restartBase = 10
 		// Glucose restart: start earlier and more aggressive
