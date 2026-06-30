@@ -1120,14 +1120,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		fmt.Printf("c [verbose] Preserving %d preprocessing assignments for final model\n", preprocAssignments)
 	}
 
-	// CRITICAL: Run unit propagation to handle unit clauses before search
-	// Unit clauses are not watched by watched literals, so they must be propagated
-	// before search starts. This is especially important when preprocessing techniques
-	// are disabled or don't run unit propagation.
-	if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
-		return unitResult
-	}
-
 	// CRITICAL FIX: Rebuild trail from all preprocessing assignments
 	// Pure literal elimination and other techniques assign variables but may not
 	// add them to the trail. The watch system needs all assignments in the trail
@@ -1212,14 +1204,49 @@ func (s *CDCLSolver) initWatches() {
 }
 
 // addOriginalClauseToWatches adds an original clause to the watch lists
-// Watches the first two literals in the clause
+// Watches the first two literals that are not both false
 func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Clause, literals []cnf.Literal) {
 	if len(literals) < 2 {
 		return
 	}
 
-	lit0 := literals[0]
-	lit1 := literals[1]
+	// CRITICAL FIX: Choose watched literals that are not both false
+	// After preprocessing, some literals may be assigned. We need to watch
+	// literals that are either unassigned or assigned true.
+	watch0 := -1
+	watch1 := -1
+
+	for i, lit := range literals {
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level >= 0 {
+			// Assigned - check if true
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if !litTrue {
+				// False - skip unless we have no other choice
+				if watch0 < 0 {
+					watch0 = i
+				} else if watch1 < 0 {
+					watch1 = i
+				}
+				continue
+			}
+		}
+		// Unassigned or true - prefer this
+		if watch0 < 0 {
+			watch0 = i
+		} else if watch1 < 0 {
+			watch1 = i
+			break
+		}
+	}
+
+	if watch0 < 0 || watch1 < 0 {
+		// Clause has < 2 literals - shouldn't happen after preprocessing
+		return
+	}
+
+	lit0 := literals[watch0]
+	lit1 := literals[watch1]
 
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
@@ -1238,15 +1265,48 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 }
 
 // addLearnedClauseToWatches adds a learned clause to the watch lists
-// Watches the first two literals in the clause
+// Watches the first two literals that are not both false
 // BINARY CLAUSE OPTIMIZATION: Binary clauses use separate watch lists for optimized propagation
 func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Clause, literals []cnf.Literal) {
 	if len(literals) < 2 {
 		return
 	}
 
-	lit0 := literals[0]
-	lit1 := literals[1]
+	// CRITICAL FIX: Choose watched literals that are not both false
+	// After preprocessing/backjumping, some literals may be assigned.
+	watch0 := -1
+	watch1 := -1
+
+	for i, lit := range literals {
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level >= 0 {
+			// Assigned - check if true
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if !litTrue {
+				// False - skip unless we have no other choice
+				if watch0 < 0 {
+					watch0 = i
+				} else if watch1 < 0 {
+					watch1 = i
+				}
+				continue
+			}
+		}
+		// Unassigned or true - prefer this
+		if watch0 < 0 {
+			watch0 = i
+		} else if watch1 < 0 {
+			watch1 = i
+			break
+		}
+	}
+
+	if watch0 < 0 || watch1 < 0 {
+		return
+	}
+
+	lit0 := literals[watch0]
+	lit1 := literals[watch1]
 
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
@@ -3408,7 +3468,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				lit := cnf.Literal(pool[offset+i])
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
+				if litLevel < 0 {
+					// Unassigned
 					unassignedCount++
 					unassignedLit = lit
 				} else {
@@ -3468,7 +3529,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 			for _, lit := range literals {
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
-				if litLevel == 0 {
+				if litLevel < 0 {
+					// Unassigned
 					unassignedCount++
 					unassignedLit = lit
 				} else {
@@ -4114,10 +4176,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 					}
 				}
 			} else {
-				// FIX: Only add assigned literals (level > 0)
-				// Unassigned literals (level 0) cannot be part of a conflict clause
+				// FIX: Only add assigned literals (level >= 0)
+				// Unassigned literals (level < 0) cannot be part of a conflict clause
 				assignLevel := s.assignments[v].Level
-				if assignLevel == 0 {
+				if assignLevel < 0 {
 					// Skip unassigned literal - it's not part of the conflict
 					continue
 				}
@@ -4270,12 +4332,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 
 	// Calculate LBD and backjump level
+	// CRITICAL FIX: Level 0 is preprocessing - not a decision level for LBD
 	lbd := 0
 	maxLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := s.assignments[varIdx].Level
-			if lvl >= 0 {
+			if lvl > 0 {
 				// Ensure arrays are large enough for this level
 				if lvl >= len(s.tmpLevelSetUsed) {
 					newSize := lvl + 1
@@ -5158,12 +5221,12 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 
 	// Clear all assignments from decisionPoint onwards
-	// FIX: Skip ONLY preprocessing assignments (Level <= 1 AND implication <= -2)
-	// Learned clause propagations have Level > 1 even though implication < -1, and MUST be cleared
+	// FIX: Skip ONLY preprocessing assignments (Level == 0 AND implication <= -2)
+	// Search propagations have Level >= 1 even though implication < -1, and MUST be cleared
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
-		// Skip preprocessing: Level <= 1 (unit prop at level 0, pure literal at level 1)
-		if s.assignments[varIdx].Level <= 1 && s.implication[varIdx] <= -2 {
+		// Skip preprocessing: Level == 0 (unit prop or pure literal)
+		if s.assignments[varIdx].Level == 0 && s.implication[varIdx] <= -2 {
 			continue
 		}
 		s.assignments[varIdx] = Assignment{Level: -1}
