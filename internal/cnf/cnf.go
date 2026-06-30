@@ -68,6 +68,7 @@ type ClauseMetadata struct {
 	Activity   float64 // Clause activity
 	Score      float64 // Cached deletion score
 	ScoreDirty bool    // True if score needs recomputation
+	ID         uint32  // Unique clause ID for tracking through swap-remove (debug)
 }
 
 // CNF represents a CNF formula

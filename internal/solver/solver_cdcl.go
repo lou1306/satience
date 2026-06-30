@@ -142,6 +142,7 @@ type CDCLSolver struct {
 	learnedCapacity      int                   // Total capacity including tombstones
 	currentAge           int
 	verbose              bool
+	debugVerify          bool      // Enable expensive clause verification (debug builds)
 	decisions            int
 	backjumpLevel        int
 	maxLearned           int
@@ -3257,6 +3258,30 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				} else {
 					learnedIdx := -watch.ClauseIdx - 1
 					literals := s.getLearnedClauseLiterals(learnedIdx)
+					
+					// VERIFY: Check that watched literals are actually in the clause
+					watchLit := cnf.IndexToLit(int(watchIdx))
+					blitLit := cnf.IndexToLit(int(blitIdx))
+					hasWatch := false
+					hasBlit := false
+					for _, l := range literals {
+						if l == watchLit {
+							hasWatch = true
+						}
+						if l == blitLit {
+							hasBlit = true
+						}
+					}
+					if !hasWatch || !hasBlit {
+						fmt.Printf("c [WATCH CORRUPTION] learnedIdx=%d: watch=%d%c blit=%d%c, clause=[",
+							learnedIdx, watchLit.Var()+1, map[bool]byte{true: '-', false: '+'}[watchLit.IsNegated()],
+							blitLit.Var()+1, map[bool]byte{true: '-', false: '+'}[blitLit.IsNegated()])
+						for _, l := range literals {
+							fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
+						}
+						fmt.Printf("]\n")
+					}
+					
 					// Allocate only for conflict return (rare path)
 					litsCopy := make([]cnf.Literal, len(literals))
 					copy(litsCopy, literals)
@@ -3278,12 +3303,20 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 							fmt.Printf("c   Clause size=%d, LBD=%d\n", s.learnedSizes[learnedIdx], s.learnedMetadata[learnedIdx].LBD)
 						}
 					}
-					// Print conflict clause literals
-					fmt.Printf("c   Conflict clause: ")
+					// Print conflict clause literals with levels
+					fmt.Printf("c   Conflict clause (s.level=%d): ", s.level)
 					for _, cl := range conflictClause.Literals {
-						fmt.Printf("%d%c ", cl.Var()+1, map[bool]byte{true: '-', false: '+'}[cl.IsNegated()])
+						fmt.Printf("%d%c(L%d) ", cl.Var()+1, map[bool]byte{true: '-', false: '+'}[cl.IsNegated()], s.assignments[cl.Var()].Level)
 					}
 					fmt.Printf("\n")
+					// Count literals at current level
+					atCurrentLevel := 0
+					for _, cl := range conflictClause.Literals {
+						if s.assignments[cl.Var()].Level == s.level {
+							atCurrentLevel++
+						}
+					}
+					fmt.Printf("c   Literals at current level %d: %d (should be >= 1)\n", s.level, atCurrentLevel)
 				}
 				s.watchLists[watchIdx] = watchList
 				return true, conflictClause
@@ -3925,6 +3958,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		if reasonLits == nil {
 			continue // Invalid clause
+		}
+
+		// DEBUG: Trace resolution step
+		if s.verbose && s.conflicts >= 4990 {
+			fmt.Printf("c [1-UIP TRACE] Resolving on var %d (level %d)\n", varIdx+1, s.assignments[varIdx].Level)
+			fmt.Printf("c   Current clause: ")
+			for v := range s.tmpLiteralInClause {
+				if s.tmpLiteralInClause[v] {
+					fmt.Printf("%d%c ", v+1, map[bool]byte{true: '-', false: '+'}[s.tmpLiteralIsNegated[v]])
+				}
+			}
+			fmt.Printf("0\n")
+			fmt.Printf("c   Reason clause (idx=%d): ", reasonClauseIdx)
+			for _, rl := range reasonLits {
+				fmt.Printf("%d%c ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()])
+			}
+			fmt.Printf("0\n")
 		}
 
 		// FIX: Skip reason clauses with unassigned literals
