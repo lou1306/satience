@@ -2962,9 +2962,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	if s.verbose && s.conflicts <= 10 {
 		fmt.Printf("c [PROPAGATE] qhead=%d, trail len=%d, level=%d\n", s.qhead, len(s.trail), s.level)
-		if s.qhead < len(s.trail) {
-			fmt.Printf("c [PROPAGATE DEBUG] Processing trail[%d]=var%d (level %d)\n", s.qhead, s.trail[s.qhead]+1, s.assignments[uint32(s.trail[s.qhead])].Level)
-		}
 	}
 
 	// OPTIMIZATION #1: Use unitLearnedList for O(1) unit propagation
@@ -3076,11 +3073,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		// Process watches for this literal using swap-with-last deletion
 		watchList := s.watchLists[watchIdx]
-
-		if s.verbose && s.conflicts <= 10 && len(watchList) > 0 {
-			fmt.Printf("c [WATCH PROCESS] trail[%d]=var%d (val=%v, lvl=%d), watchIdx=%d, watches=%d\n", 
-				trailIndex, varIdx+1, value, s.assignments[varIdx].Level, watchIdx, len(watchList))
-		}
 
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
@@ -3722,9 +3714,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
-	if s.verbose && s.conflicts <= 10 {
-		fmt.Printf("c [DEBUG] learnClause returned backjumpLevel=%d, s.level=%d\n", bjLevel, s.level)
-	}
 
 	// Delete learned clauses when database exceeds dynamic limit
 	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
@@ -4859,9 +4848,6 @@ func (s *CDCLSolver) backtrack() bool {
 
 	// Use backjump level if available, otherwise backtrack one level
 	bjLevel := s.backjumpLevel
-	if s.verbose && s.conflicts <= 10 {
-		fmt.Printf("c [BACKTRACK DEBUG] s.backjumpLevel=%d, s.level=%d, using bjLevel=%d\n", s.backjumpLevel, s.level, bjLevel)
-	}
 	if bjLevel < 0 {
 		bjLevel = s.level - 1
 	}
