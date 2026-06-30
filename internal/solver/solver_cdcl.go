@@ -218,6 +218,11 @@ type CDCLSolver struct {
 	watchInitialized  bool          // True if watches have been initialized
 	learnedClauseBase int           // Base ID for learned clause watches (fixed at initialization)
 
+	// Conflict loop detection - detect when same conflict repeats and force diversification
+	lastConflictClause uint64 // Hash of last conflict clause (for loop detection)
+	sameConflictCount  int    // Number of times same conflict repeated
+	maxSameConflict    int    // Max repetitions before forcing diversification (default 10)
+
 	// LBD-based learned clause ordering for propagation prioritization
 	learnedClauseOrder []int // Indices into learnedClauses/clauseLBD sorted by LBD
 
@@ -362,6 +367,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		randomSeed:           0,
 		learnedClauseOrder:   make([]int, 0),
 		lbdOrderDirty:        true,
+		maxSameConflict:      10, // Force diversification after 10 repetitions of same conflict
 		lbdOrderLastRebuild:  0,
 		lastConflictLBD:      0,
 		conflictsAtLevel:     make([]int, formula.NumVars+1),
@@ -4423,6 +4429,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		// VSIDS bump
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
+
+		// FIX: Flip saved phase for UIP variable to avoid repeating same conflict
+		// After backtracking, the UIP will be propagated, but next decision at this level
+		// should try the opposite phase to escape conflict loops
+		for _, lit := range s.tmpLearnedLits {
+			if s.assignments[lit.Var()].Level == backjumpLevel {
+				// This is the UIP literal - flip its saved phase
+				s.savedPhase[lit.Var()] = !s.savedPhase[lit.Var()]
+				break
+			}
+		}
 	}
 
 	return backjumpLevel
