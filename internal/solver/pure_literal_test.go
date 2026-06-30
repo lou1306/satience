@@ -136,12 +136,12 @@ func TestPureLiteralBug1(t *testing.T) {
 		t.Errorf("Expected SAT (all clauses satisfied), got %v", result)
 	}
 
-	// x2 and x3 should be assigned (pure positive)
-	if s.assignments[1].Level == 0 {
-		t.Errorf("x2 should be assigned (pure positive)")
+	// x2 and x3 should be assigned at level 0 (pure positive, soundness fix)
+	if s.assignments[1].Level != 0 {
+		t.Errorf("x2 should be assigned at level 0 (pure positive), got level %d", s.assignments[1].Level)
 	}
-	if s.assignments[2].Level == 0 {
-		t.Errorf("x3 should be assigned (pure positive)")
+	if s.assignments[2].Level != 0 {
+		t.Errorf("x3 should be assigned at level 0 (pure positive), got level %d", s.assignments[2].Level)
 	}
 
 	// x1 is assigned arbitrarily to complete the model (this is OK for preprocessing)

@@ -4647,7 +4647,10 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// Determine how many clauses to keep
-	toKeep := int(float64(s.learnedActiveCount) * s.clauseDeletionKeepRatio)
+	// Target: 50% of dynamicLimit (not 50% of current count)
+	// This ensures single deletion pass removes enough clauses even if we massively overshoot
+	dynamicLimit := s.maxLearned + s.conflicts/50
+	toKeep := int(float64(dynamicLimit) * s.clauseDeletionKeepRatio)
 	if toKeep < s.minLearned {
 		toKeep = s.minLearned
 	}
