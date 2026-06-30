@@ -3897,7 +3897,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 		// Find matching clause by comparing literals (expensive, so skip for now)
 	}
 
-	s.vsids.bumpClause(conflictLits)
+	s.vsids.bumpClause(conflictLits, s.assignments)
 
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
@@ -3913,7 +3913,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	}
 
 	// Decay VSIDS activity every conflict (standard)
-	s.vsids.decay()
+	s.vsids.decay(s.assignments)
 	s.vsids.decayLBD()
 
 	// OPTIMIZATION 2A: Lazy clause activity decay

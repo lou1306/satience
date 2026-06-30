@@ -455,7 +455,7 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 // bumpClause increases activity for all variables in a clause
 // Also tracks conflict participation for LRB heuristic
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
-func (v *VSIDS) bumpClause(literals []cnf.Literal) {
+func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 	baseBump := v.baseBumpAmount
 	bumpAmount := baseBump / float64(len(literals))
 	minBump := v.baseBumpAmount * 0.04 // 2.0 when baseBump=50.0
@@ -483,26 +483,34 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 
 	// Periodic decay for LRB scores
 	if v.useLRB && v.conflictCount%v.lrbDecayInterval == 0 {
-		v.decayLRB()
+		v.decayLRB(assignments)
 	}
 
 	// CHB: Periodic decay for conflict frequency
 	if v.useCHB && v.conflictCount%v.chbDecayInterval == 0 {
-		v.decayCHB()
+		v.decayCHB(assignments)
 	}
 }
 
 // decayLRB decays LRB conflict participation scores
-func (v *VSIDS) decayLRB() {
+func (v *VSIDS) decayLRB(assignments []Assignment) {
 	for i := range v.conflictParticipation {
+		// Skip pre-assigned variables (level 0) - not selectable
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
 	}
 }
 
 // decayCHB decays CHB conflict frequency scores (aggressive decay)
 // CHB uses much more aggressive decay than VSIDS to focus on recent conflicts
-func (v *VSIDS) decayCHB() {
+func (v *VSIDS) decayCHB(assignments []Assignment) {
 	for i := range v.conflictFrequency {
+		// Skip pre-assigned variables (level 0) - not selectable
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.conflictFrequency[i] *= v.chbDecayFactor
 	}
 }
@@ -511,7 +519,7 @@ func (v *VSIDS) decayCHB() {
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
 // Only decays every v.decayInterval conflicts to reduce heap rebuild overhead
-func (v *VSIDS) decay() {
+func (v *VSIDS) decay(assignments []Assignment) {
 	v.conflictCount++
 
 	// Lazy decay: only decay every decayInterval conflicts
@@ -532,7 +540,12 @@ func (v *VSIDS) decay() {
 	// SYMMETRY BREAKING: Update activity momentum before decaying
 	// Momentum = bump amount (how much activity increased before decay)
 	// This tracks which variables are being bumped in recent conflicts
+	// OPTIMIZATION: Skip pre-assigned variables (level 0) - they're not selectable
 	for i := range v.activity {
+		if assignments[i].Level == 0 {
+			// Pre-assigned variable - skip decay to avoid wasting cycles
+			continue
+		}
 		oldActivity := v.activity[i]
 		v.activity[i] *= v.decayFactor
 		// Momentum = activity lost to decay (represents recent bumping)
@@ -669,20 +682,30 @@ func (v *VSIDS) ConflictParticipationForDebug(varIdx uint32) int {
 // resetActivity resets activity scores to prevent choosing the same variables repeatedly
 // Called on restart. We scale down activity rather than zeroing it completely,
 // which preserves some learned information while allowing exploration of new variables.
-func (v *VSIDS) resetActivity() {
+func (v *VSIDS) resetActivity(assignments []Assignment) {
 	// Scale down activity - preserves important variables but allows others to compete
+	// Skip pre-assigned variables (level 0) - not selectable
 	for i := range v.activity {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.activity[i] *= v.activityResetScale
 	}
 
 	// Reset LBD bonus completely - glue clause importance changes after restart
 	for i := range v.lbdBonus {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.lbdBonus[i] = 0
 	}
 
 	// Keep conflict participation for LRB - it's valuable long-term information
 	// Scale it down too
 	for i := range v.conflictParticipation {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
 	}
 	// Don't reset conflictCount - it's used for decay timing
@@ -690,14 +713,21 @@ func (v *VSIDS) resetActivity() {
 
 // diversify performs aggressive diversification when stuck in local minima
 // Completely resets activity while preserving conflict history
-func (v *VSIDS) diversify() {
+func (v *VSIDS) diversify(assignments []Assignment) {
 	// Reset activity to initial values (small uniform values)
+	// Skip pre-assigned variables (level 0) - not selectable
 	for i := range v.activity {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.activity[i] = 1.0
 	}
 
 	// Reset LBD bonus completely
 	for i := range v.lbdBonus {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.lbdBonus[i] = 0
 	}
 
@@ -713,10 +743,14 @@ func (v *VSIDS) diversify() {
 
 // diversifyAggressive performs very aggressive diversification when completely stuck
 // Resets all scores and adds deterministic noise to break symmetry
-func (v *VSIDS) diversifyAggressive() {
+func (v *VSIDS) diversifyAggressive(assignments []Assignment) {
 	// Reset activity with deterministic values to break symmetry
 	// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
+	// Skip pre-assigned variables (level 0) - not selectable
 	for i := range v.activity {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.randomSeed ^= v.randomSeed << 13
 		v.randomSeed ^= v.randomSeed >> 7
 		v.randomSeed ^= v.randomSeed << 17
@@ -726,11 +760,17 @@ func (v *VSIDS) diversifyAggressive() {
 
 	// Reset LBD bonus completely
 	for i := range v.lbdBonus {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.lbdBonus[i] = 0
 	}
 
 	// Reset conflict participation more aggressively
 	for i := range v.conflictParticipation {
+		if assignments[i].Level == 0 {
+			continue
+		}
 		v.conflictParticipation[i] = v.conflictParticipation[i] / 8
 	}
 
