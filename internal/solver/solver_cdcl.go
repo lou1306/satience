@@ -938,6 +938,17 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 			structure.StructuredScore)
 	}
 
+	// FIX: Only enable unit propagation - other techniques modify clauses and cause soundness bugs
+	return PreprocessingConfig{
+		EnableUnitProp:        true,
+		EnableEquivalence:     false,
+		EnablePureLiteral:     false,
+		EnableSubsumption:     false,
+		EnableSelfSubsumption: false,
+		EnableHyperBinary:     false,
+		MaxPasses:             1,
+	}
+	
 	// Highly structured: density > 3 OR small clause ratio > 0.7
 	if structure.StructuredScore > 0.6 {
 		if s.LogEnabled() {
@@ -2162,6 +2173,20 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 
 			if unassignedCount == 1 && falseCount == len(clause.Literals)-1 {
 				varIdx := unassignedLit.Var()
+				// FIX: Check if variable is already assigned (may have been assigned by pure literal elimination)
+				if s.assignments[varIdx].Level >= 0 {
+					// Already assigned - check if consistent
+					expectedValue := !unassignedLit.IsNegated()
+					if s.assignments[varIdx].Value != expectedValue {
+						// Conflict: variable already assigned opposite value
+						if s.LogEnabled() {
+							fmt.Printf("c [verbose] Preprocessing: conflict - var %d already assigned opposite value\n", varIdx)
+						}
+						return UNSAT
+					}
+					// Already assigned correctly - skip
+					continue
+				}
 				value := !unassignedLit.IsNegated()
 				s.assignments[varIdx] = Assignment{
 					Value: value,
@@ -2279,34 +2304,37 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 }
 
 func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
-	// FIX: Do NOT remove satisfied clauses during preprocessing.
-	// The CNF must remain unchanged for sound model verification.
-	// Only simplify clauses by removing false literals.
-	// Satisfied clauses will be handled by the watch system during search.
+	// DISABLED: Do NOT modify clauses during preprocessing.
+	// Clause modification causes soundness bugs when combined with pure literal elimination.
+	// The watch system will handle clause satisfaction during search.
+	// Just check for conflicts.
 	for i := range s.cnf.Clauses {
 		clause := &s.cnf.Clauses[i]
-		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
-
+		allFalse := true
 		for _, lit := range clause.Literals {
 			if lit.Var() == varIdx {
 				litValue := !lit.IsNegated()
 				if litValue == value {
-					// Clause is satisfied - keep it but don't remove
-					// The watch system will handle it efficiently during search
-					goto nextClause
+					// Clause is satisfied
+					allFalse = false
+					break
+				}
+			} else if s.assignments[lit.Var()].Level >= 0 {
+				// Check if other literals are already satisfied
+				assignValue := s.assignments[lit.Var()].Value
+				litIsTrue := (!lit.IsNegated() && assignValue) || (lit.IsNegated() && !assignValue)
+				if litIsTrue {
+					allFalse = false
+					break
 				}
 			} else {
-				newLiterals = append(newLiterals, lit)
+				// Unassigned literal - clause not yet decided
+				allFalse = false
 			}
 		}
-
-		if len(newLiterals) == 0 {
+		if allFalse {
 			return true // Empty clause - UNSAT
 		}
-
-		// Simplify clause by removing false literals
-		clause.Literals = newLiterals
-	nextClause:
 	}
 	return false
 }
