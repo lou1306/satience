@@ -1116,6 +1116,18 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return unitResult
 	}
 
+	// CRITICAL FIX: Rebuild trail from all preprocessing assignments
+	// Pure literal elimination and other techniques assign variables but may not
+	// add them to the trail. The watch system needs all assignments in the trail
+	// to process watches correctly when search starts.
+	s.trail = s.trail[:0]
+	for i := range s.assignments {
+		if s.assignments[i].Level == 0 {
+			s.trail = append(s.trail, int(i))
+		}
+	}
+	s.trailHead = []int{0}  // Only level 0 exists after preprocessing
+
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
 
@@ -1729,10 +1741,21 @@ func (s *CDCLSolver) restart() bool {
 	// Clear trail and assignments
 	// FIX: Preserve ONLY preprocessing assignments (Level <= 1 AND implication <= -2)
 	// Learned clause propagations have Level > 1 and implication < -1, must be cleared
+	
+	// CRITICAL FIX: Rebuild trail from preserved preprocessing assignments
+	// After inprocessing rebuilds watches, preserved assignments must be in the trail
+	// so propagateWatched() processes them through the new watch lists.
+	// Without this, preserved assignments are invisible to the watch system.
 	s.trail = s.trail[:0]
+	for i := range s.assignments {
+		if s.assignments[i].Level <= 1 && s.implication[i] <= -2 {
+			s.trail = append(s.trail, int(i))
+		}
+	}
 	s.trailHead = s.trailHead[:1]
-	s.qhead = 0 // Reset qhead since trail is empty
+	s.qhead = 0 // Reset qhead to process all trail elements
 	s.level = 0
+	
 	for i := range s.implication {
 		// Skip preprocessing: Level <= 1 (unit prop at level 0, pure literal at level 1)
 		if s.assignments[i].Level <= 1 && s.implication[i] <= -2 {
@@ -2515,12 +2538,14 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 			if isPure {
 				s.assignments[varIdx] = Assignment{
 					Value: pureValue,
-					Level: 1,
+					Level: 0,  // CRITICAL FIX: Level 0 for preprocessing assignments
 				}
-				s.varLevel[varIdx] = 1
+				s.varLevel[varIdx] = 0
 				// FIX: Set implication to prevent re-propagation during search
 				// Use -3 to indicate "assigned by pure literal elimination"
 				s.implication[varIdx] = -3
+				// CRITICAL FIX: Add to trail so watch propagation processes these assignments
+				s.trail = append(s.trail, int(varIdx))
 				changed = true
 
 				conflict := s.simplifyAfterAssignment(varIdx, pureValue)
