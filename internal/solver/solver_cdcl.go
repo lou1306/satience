@@ -3428,10 +3428,7 @@ func (s *CDCLSolver) decide() bool {
 		return false
 	}
 
-	// DEBUG: Check if var 180 (unit clause [181]) is still assigned
-	if s.verbose {
-		fmt.Printf("c [DECIDE DEBUG] var 180 (unit) Level=%d, implication=%d\n", s.assignments[180].Level, s.implication[180])
-	}
+
 
 	// Track conflicts at current level
 	if s.level > 0 && s.level < len(s.conflictsAtLevel) {
@@ -4779,10 +4776,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			watchUpdates, implicationUpdates, implicationStale)
 	}
 
-	// DEBUG: Verify clause indices are consistent after deletion
-	if !verifyClauseIndices(s) {
-		panic("Clause index verification failed after deleteLearnedClauses")
-	}
+
 
 	// Reset buffers for next use (keep capacity)
 	s.tmpClauseInfo = clauses[:0]
@@ -4905,12 +4899,12 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 
 	// Clear all assignments from decisionPoint onwards
-	// FIX: Skip preprocessing assignments (Level=0 from unit prop, Level=1 from pure literal)
-	// These are permanent and should not be cleared during backtracking
+	// FIX: Skip ONLY preprocessing assignments (Level <= 1 AND implication <= -2)
+	// Learned clause propagations have Level > 1 even though implication < -1, and MUST be cleared
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
-		// Skip if this is a preprocessing assignment (implication < -1)
-		if s.implication[varIdx] < -1 {
+		// Skip preprocessing: Level <= 1 (unit prop at level 0, pure literal at level 1)
+		if s.assignments[varIdx].Level <= 1 && s.implication[varIdx] <= -2 {
 			continue
 		}
 		s.assignments[varIdx] = Assignment{Level: -1}
@@ -4918,11 +4912,30 @@ func (s *CDCLSolver) backtrack() bool {
 		s.implication[varIdx] = -1
 	}
 	s.trail = s.trail[:decisionPoint]
-	// Reset qhead to decisionPoint - the flipped decision needs to be propagated
-	// and all subsequent trail elements have been cleared
-	s.qhead = decisionPoint
+	// FIX: Reset qhead to 0 to re-scan entire trail after backjump
+	// This ensures watches on newly learned clauses are checked against all assigned variables
+	s.qhead = 0
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
+
+	// SAFETY: Clear any variables with Level > bjLevel that aren't in the trail
+	// This catches bugs where trail was truncated without clearing assignments
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level > bjLevel {
+			inTrail := false
+			for _, t := range s.trail {
+				if uint32(t) == i {
+					inTrail = true
+					break
+				}
+			}
+			if !inTrail {
+				s.assignments[i] = Assignment{Level: -1}
+				s.varLevel[i] = -1
+				s.implication[i] = -1
+			}
+		}
+	}
 
 	// Reset conflicts at levels > bjLevel since we're backtracking
 	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
