@@ -388,10 +388,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseIndexMap:     make([]int, maxLearned),
 		tmpKeepIndices:        make([]int, 0, maxLearned),
 		learnedClauseBase:     int(formula.NumClauses),
-		// Minimization thresholds
-		minimizationMaxSize:       30,
-		minimizationMaxLBD:        8,
-		minimizationMaxReasonSize: 15,
+		// Minimization thresholds - aggressive for better clause quality
+		minimizationMaxSize:       0, // Always minimize (no size limit)
+		minimizationMaxLBD:        0, // Always minimize (no LBD limit)
+		minimizationMaxReasonSize: 0, // Always try all reason clauses
 		// Variable elimination tracking
 		// Configurable parameters with defaults
 		inprocessingMinConflicts: 1000000000, // DISABLED: Inprocessing has soundness bugs
@@ -4640,16 +4640,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 // Higher score = more likely to delete
 
 // minimizeLearnedClause reduces the size of a learned clause via self-subsumption
-// OPTIMIZATION: Early termination heuristics to skip minimization when unlikely to help
+// Aggressive minimization: always attempt for clauses > 2 literals
 func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Literal {
-	// EARLY TERMINATION #1: Clauses ≤2 literals are already minimal
+	// EARLY TERMINATION: Clauses ≤2 literals are already minimal
 	if len(learnedLits) <= 2 {
-		return learnedLits
-	}
-
-	// EARLY TERMINATION #2: Small clauses (≤4 literals) rarely benefit from minimization
-	// The overhead outweighs the benefit of removing 1 literal
-	if len(learnedLits) <= 4 {
 		return learnedLits
 	}
 
@@ -4661,36 +4655,9 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		s.tmpLiteralInClause[lit.Var()] = true
 	}
 
-	// EARLY TERMINATION #3: Check if any reason clauses are small enough to help
-	// If all reason clauses are large, minimization won't help
-	smallReasonCount := 0
-	for _, lit := range learnedLits {
-		reasonClauseIdx := s.implication[lit.Var()]
-		if reasonClauseIdx != -1 {
-			var reasonSize int
-			if reasonClauseIdx < 0 {
-				learnedIdx := -reasonClauseIdx - 1
-				if learnedIdx < s.learnedCapacity {
-					reasonSize = s.learnedSizes[learnedIdx]
-				}
-			} else if reasonClauseIdx < len(s.cnf.Clauses) {
-				reasonSize = len(s.cnf.Clauses[reasonClauseIdx].Literals)
-			}
-			// Count reason clauses with ≤3 literals (good candidates for subsumption)
-			if reasonSize > 0 && reasonSize <= 3 {
-				smallReasonCount++
-				// Found at least one small reason clause - proceed with minimization
-				break
-			}
-		}
-	}
-	if smallReasonCount == 0 {
-		// No small reason clauses - minimization unlikely to help
-		return learnedLits
-	}
-
-	// Single-pass minimization with early exit
+	// Single-pass minimization: try to remove each literal via self-subsumption
 	reductionAchieved := 0
+	attemptedRemovals := 0
 	for _, lit := range learnedLits {
 		varIdx := lit.Var()
 
@@ -4718,12 +4685,10 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			}
 
 			if reasonLits != nil {
-				// OPTIMIZATION: Skip large reason clauses (diminishing returns)
-				if len(reasonLits) > s.minimizationMaxReasonSize {
-					continue
-				}
-
-				// Check if all reason literals (except varIdx) are in the clause
+				attemptedRemovals++
+				// Check if all reason literals (except varIdx) are in the learned clause
+				// This is self-subsumption: if (A ∨ B ∨ C) and reason for A is (A ∨ D),
+				// and D is in learned clause, we can remove A
 				allCovered := true
 				for _, reasonLit := range reasonLits {
 					if reasonLit.Var() == varIdx {
@@ -4744,12 +4709,6 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		if canRemove {
 			s.tmpLiteralInClause[varIdx] = false
 			reductionAchieved++
-			
-			// EARLY TERMINATION #4: If we've removed ≥2 literals, that's usually enough
-			// Further minimization has diminishing returns
-			if reductionAchieved >= 2 {
-				break
-			}
 		}
 	}
 
@@ -4759,6 +4718,11 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		if s.tmpLiteralInClause[lit.Var()] {
 			s.tmpMinimizedLits = append(s.tmpMinimizedLits, lit)
 		}
+	}
+
+	if s.LogEnabled() && reductionAchieved > 0 {
+		fmt.Printf("c [minimize] Reduced: %d→%d literals (removed %d)\n",
+			len(learnedLits), len(s.tmpMinimizedLits), reductionAchieved)
 	}
 
 	// Return copy to avoid aliasing (caller expects ownership)
