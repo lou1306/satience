@@ -4766,8 +4766,13 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// SWAP-REMOVE: Move active clauses into deleted slots
-	// This avoids rebuilding arrays and preserves memory pool benefits
+	// CRITICAL FIX: Compact literal pool to prevent fragmentation and corruption
+	// Previously, clauses kept their original offsets after moving, leading to:
+	// 1. Fragmented literal pool with gaps
+	// 2. New clauses overwriting old clause literals
+	// 3. Duplicate/corrupted literals in conflict clauses
 	writeIdx := 0
+	nextOffset := 0  // Next available offset in compacted literal pool
 	watchUpdates := 0
 	
 	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
@@ -4780,27 +4785,29 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Record mapping for this clause
 		clauseIndexMap[readIdx] = writeIdx
 
+		// Move clause metadata from readIdx to writeIdx
+		oldStart := s.learnedOffsets[readIdx]
+		oldSize := s.learnedSizes[readIdx]
+		newStart := nextOffset  // Compact literals contiguously
+		
+		s.learnedOffsets[writeIdx] = newStart
+		s.learnedSizes[writeIdx] = oldSize
+		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
+		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
+
+		// Copy literals to compacted location
+		copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
+
+		// Update watch lists if clause moved
 		if writeIdx != readIdx {
-			// Move clause metadata from readIdx to writeIdx
-			s.learnedOffsets[writeIdx] = s.learnedOffsets[readIdx]
-			s.learnedSizes[writeIdx] = s.learnedSizes[readIdx]
-			s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
-			s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
-			s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
-
-			// Copy literals to new location
-			oldStart := s.learnedOffsets[readIdx]
-			oldSize := s.learnedSizes[readIdx]
-			newStart := s.learnedOffsets[writeIdx]
-			
-			// Copy literals (handle overlap with copy)
-			copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
-
 			// CRITICAL: Update watch lists inline - both regular and binary
 			s.updateWatchClauseIndices(writeIdx, readIdx)
 			watchUpdates++
 		}
+		
 		writeIdx++
+		nextOffset += oldSize  // Advance to next available offset
 	}
 
 	// Update implication array using the mapping (MUST be after all swaps)
@@ -4842,7 +4849,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.lbdOrderDirty = true
 
 	// Truncate arrays to new capacity (CRITICAL for append() to work correctly)
-	s.learnedLiterals = s.learnedLiterals[:s.learnedOffsets[writeIdx-1]+s.learnedSizes[writeIdx-1]]
+	s.learnedLiterals = s.learnedLiterals[:nextOffset]  // Use compacted offset
 	s.learnedOffsets = s.learnedOffsets[:writeIdx]
 	s.learnedSizes = s.learnedSizes[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
