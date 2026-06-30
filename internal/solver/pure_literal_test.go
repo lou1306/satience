@@ -150,10 +150,14 @@ func TestPureLiteralBug1(t *testing.T) {
 
 func TestPureLiteralBug2(t *testing.T) {
 	// Bug test: Check simplifyAfterAssignment logic
-	// When we assign x1=true, clauses containing x1 should be satisfied (removed)
-	// Clauses containing ¬x1 should have ¬x1 removed
+	// FIX: Clauses are no longer removed during preprocessing for soundness.
+	// Satisfied clauses are kept (not removed) so verification can check against
+	// the original CNF. Only false literals are removed from clauses.
+	// When we assign x1=true:
+	// - Clause (x1 ∨ x2) is satisfied but KEPT (not removed)
+	// - Clause (¬x1 ∨ x3) becomes (x3) after removing ¬x1
 	clauses := []cnf.Clause{
-		newClause(1, 2),  // x1 ∨ x2 (satisfied by x1=true)
+		newClause(1, 2),  // x1 ∨ x2 (satisfied by x1=true, but kept)
 		newClause(-1, 3), // ¬x1 ∨ x3 (becomes x3 after removing ¬x1)
 	}
 
@@ -179,9 +183,16 @@ func TestPureLiteralBug2(t *testing.T) {
 		t.Errorf("Should not be conflict")
 	}
 
-	// Should have 1 clause remaining: (x3)
-	if len(s.cnf.Clauses) != 1 {
-		t.Errorf("Expected 1 clause, got %d", len(s.cnf.Clauses))
+	// FIX: Should have 2 clauses remaining (satisfied clause is kept, not removed)
+	// Clause 0: (x1 ∨ x2) - satisfied but kept
+	// Clause 1: (x3) - simplified from (¬x1 ∨ x3)
+	if len(s.cnf.Clauses) != 2 {
+		t.Errorf("Expected 2 clauses (satisfied clause kept), got %d", len(s.cnf.Clauses))
+	}
+
+	// Verify the second clause was simplified correctly
+	if len(s.cnf.Clauses[1].Literals) != 1 {
+		t.Errorf("Expected clause 1 to have 1 literal (simplified), got %d", len(s.cnf.Clauses[1].Literals))
 	}
 }
 

@@ -71,10 +71,10 @@ const (
 // MiniSat-style: base limit proportional to variables, grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
 	// Base limit: proportional to number of variables (MiniSat uses ~6*vars initially)
-	// Improved scaling for small instances that need more learned clauses
+	// This gives small instances room to learn, large instances don't explode
 	baseLimit := int(numVars) * 6
 
-	// Scale with instance size - more aggressive for small instances
+	// Scale with instance size
 	if numVars >= 50000 {
 		baseLimit = 16000
 	} else if numVars >= 10000 {
@@ -83,32 +83,20 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 		baseLimit = 4000
 	} else if numVars >= 1000 {
 		baseLimit = 2000
-	} else if numVars >= 100 {
-		// Small instances (100-1000 vars): scale with vars
-		baseLimit = int(numVars) * 12
-	} else {
-		// Tiny instances (< 100 vars): use clause-based scaling
-		// Small instances often need more learned clauses to find conflicts
-		clauseBased := int(numClauses) * 8
-		if clauseBased > baseLimit {
-			baseLimit = clauseBased
-		}
 	}
 
-	// Density adjustment: sparse instances (density < 3) need fewer learned clauses
-	// Dense instances (density > 10) can benefit from more learned clauses
 	if numVars > 0 {
 		density := float64(numClauses) / float64(numVars)
 		if density > 10.0 {
-			baseLimit = int(float64(baseLimit) * 1.3)
+			baseLimit = int(float64(baseLimit) * 1.5)
 		} else if density < 3.0 {
-			baseLimit = int(float64(baseLimit) * 0.8)
+			baseLimit = int(float64(baseLimit) * 0.75)
 		}
 	}
 
-	// Minimum 400 for tiny instances (enough to learn useful clauses)
-	if baseLimit < 400 {
-		baseLimit = 400
+	// Minimum 300 for tiny instances (enough to learn useful clauses)
+	if baseLimit < 300 {
+		baseLimit = 300
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
@@ -1428,29 +1416,11 @@ func (s *CDCLSolver) hyperBinaryResolution() {
 	satisfied:
 	}
 
-	newClauses := make([]cnf.Clause, 0)
-	for _, clause := range s.cnf.Clauses {
-		// CRITICAL: Keep all learned clauses, only simplify original clauses
-		if clause.Learned {
-			newClauses = append(newClauses, clause)
-			continue
-		}
-		satisfied := false
-		for _, lit := range clause.Literals {
-			if assigned, exists := binaryUnits[lit.Var()]; exists {
-				litTrue := !lit.IsNegated()
-				if litTrue == assigned {
-					satisfied = true
-					break
-				}
-			}
-		}
-		if !satisfied {
-			newClauses = append(newClauses, clause)
-		}
-	}
-	s.cnf.Clauses = newClauses
-	s.cnf.NumClauses = len(newClauses)
+	// FIX: Do NOT remove satisfied clauses during preprocessing.
+	// The CNF must remain unchanged for sound model verification.
+	// Satisfied clauses will be handled efficiently by the watch system during search.
+	// Removing clauses breaks verification because we check against the modified CNF,
+	// not the original, leading to unsound SAT verdicts.
 }
 
 func (s *CDCLSolver) inprocessBlockedClauseElimination() {
@@ -2289,35 +2259,35 @@ func (s *CDCLSolver) inprocessUnitPropagation() {
 }
 
 func (s *CDCLSolver) simplifyAfterAssignment(varIdx uint32, value bool) bool {
-	newClauses := make([]cnf.Clause, 0, len(s.cnf.Clauses))
-	for _, clause := range s.cnf.Clauses {
-		satisfied := false
+	// FIX: Do NOT remove satisfied clauses during preprocessing.
+	// The CNF must remain unchanged for sound model verification.
+	// Only simplify clauses by removing false literals.
+	// Satisfied clauses will be handled by the watch system during search.
+	for i := range s.cnf.Clauses {
+		clause := &s.cnf.Clauses[i]
 		newLiterals := make([]cnf.Literal, 0, len(clause.Literals))
 
 		for _, lit := range clause.Literals {
 			if lit.Var() == varIdx {
 				litValue := !lit.IsNegated()
 				if litValue == value {
-					satisfied = true
-					break
+					// Clause is satisfied - keep it but don't remove
+					// The watch system will handle it efficiently during search
+					goto nextClause
 				}
 			} else {
 				newLiterals = append(newLiterals, lit)
 			}
 		}
 
-		if satisfied {
-			continue
-		}
-
 		if len(newLiterals) == 0 {
-			return true
+			return true // Empty clause - UNSAT
 		}
 
-		newClauses = append(newClauses, cnf.Clause{Literals: newLiterals, Learned: false})
+		// Simplify clause by removing false literals
+		clause.Literals = newLiterals
+	nextClause:
 	}
-	s.cnf.Clauses = newClauses
-	s.cnf.NumClauses = len(newClauses)
 	return false
 }
 
@@ -2575,7 +2545,29 @@ func (s *CDCLSolver) pureLiteralElimination() SolveResult {
 		}
 	}
 
-	if len(s.cnf.Clauses) == 0 {
+	// FIX: Check if all clauses are satisfied (not if clause list is empty)
+	// Since we no longer remove clauses during preprocessing, we need to check
+	// if all clauses are satisfied by the current assignments.
+	allSatisfied := true
+	for _, clause := range s.cnf.Clauses {
+		satisfied := false
+		for _, lit := range clause.Literals {
+			varIdx := lit.Var()
+			if s.assignments[varIdx].Level >= 0 {
+				litIsTrue := (s.assignments[varIdx].Value != lit.IsNegated())
+				if litIsTrue {
+					satisfied = true
+					break
+				}
+			}
+		}
+		if !satisfied {
+			allSatisfied = false
+			break
+		}
+	}
+
+	if allSatisfied {
 		if s.verbose {
 			fmt.Printf("c [verbose] Pure literal elimination: all clauses satisfied\n")
 		}
