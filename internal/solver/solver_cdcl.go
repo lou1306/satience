@@ -4165,6 +4165,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			fmt.Printf("c [learnClause] No resolution performed (all decisions) - skipping learned clause to avoid loop\n")
 		}
 		// Don't learn the clause, just backjump
+		// Backjump to maxLevel (second-highest level in conflict clause)
+		if maxLevel == 0 {
+			return 1
+		}
+		return maxLevel
 	}
 
 	// CRITICAL: Verify 1-UIP property to catch soundness bugs
