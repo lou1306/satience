@@ -1242,9 +1242,7 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 		Blit:      uint32(idx0),
 	})
 
-	// Store watched literal indices for fast removal
-	s.learnedWatchIdx0 = append(s.learnedWatchIdx0, idx0)
-	s.learnedWatchIdx1 = append(s.learnedWatchIdx1, idx1)
+	// Watch indices now stored in learnClause() for consistency
 }
 
 // removeLearnedClauseWatches removes all watches for a deleted learned clause
@@ -4363,18 +4361,22 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Add to watches
 		learnedIdx := s.learnedActiveCount - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
-		if s.watchInitialized && len(literals) >= 2 {
-			tmpClause := &cnf.Clause{Literals: literals, Learned: true}
-			s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
-			if s.verbose && s.conflicts <= 10 {
-				fmt.Printf("c [WATCH ADD] Learned clause %d: ", learnedIdx)
-				for _, lit := range literals {
-					fmt.Printf("%d%c ", lit.Var()+1, map[bool]byte{true: '-', false: '+'}[lit.IsNegated()])
-				}
-				fmt.Printf("\n")
+		
+		// Store watch indices for all clauses to maintain array consistency
+		if len(literals) >= 2 {
+			idx0 := cnf.LitToIndex(literals[0])
+			idx1 := cnf.LitToIndex(literals[1])
+			s.learnedWatchIdx0 = append(s.learnedWatchIdx0, idx0)
+			s.learnedWatchIdx1 = append(s.learnedWatchIdx1, idx1)
+			
+			if s.watchInitialized {
+				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
+				s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 			}
-		} else if s.verbose && s.conflicts <= 10 {
-			fmt.Printf("c [WATCH SKIP] learnedIdx=%d, watchInit=%v, len=%d\n", learnedIdx, s.watchInitialized, len(literals))
+		} else {
+			// Unit clause: use sentinel values
+			s.learnedWatchIdx0 = append(s.learnedWatchIdx0, -1)
+			s.learnedWatchIdx1 = append(s.learnedWatchIdx1, -1)
 		}
 
 		// Track unit clauses for O(1) propagation (OPTIMIZATION #1)
