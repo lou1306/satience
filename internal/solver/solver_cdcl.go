@@ -1519,6 +1519,7 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 	literals := make([]cnf.Literal, 0)
 	foundNeg := false
 	foundPos := false
+	seenVars := make(map[uint32]bool) // Track added literals to prevent duplicates
 
 	for _, lit := range c1.Literals {
 		if lit.Var() == varIdx {
@@ -1528,7 +1529,11 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 				foundPos = true
 			}
 		} else {
-			literals = append(literals, lit)
+			// Only add if not already present (prevent duplicates)
+			if !seenVars[lit.Var()] {
+				literals = append(literals, lit)
+				seenVars[lit.Var()] = true
+			}
 		}
 	}
 
@@ -1540,7 +1545,11 @@ func (s *CDCLSolver) resolveOnVar(c1, c2 cnf.Clause, varIdx uint32) *cnf.Clause 
 				foundPos = true
 			}
 		} else {
-			literals = append(literals, lit)
+			// Only add if not already present (prevent duplicates)
+			if !seenVars[lit.Var()] {
+				literals = append(literals, lit)
+				seenVars[lit.Var()] = true
+			}
 		}
 	}
 
