@@ -986,14 +986,15 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 
 	// Skip on very small instances - overhead outweighs benefits
-	if s.cnf.NumClauses < s.preprocessingMinClauses {
-		if s.verbose {
-			fmt.Printf("c [verbose] Skipping preprocessing: instance too small (%d clauses)\n", s.cnf.NumClauses)
-		}
-		s.cnf.RebuildLiteralPool()
-		s.initWatches()
-		return UNKNOWN
-	}
+	// DISABLED: Unit clauses must always be propagated, even on tiny instances
+	// if s.cnf.NumClauses < s.preprocessingMinClauses {
+	// 	if s.verbose {
+	// 		fmt.Printf("c [verbose] Skipping preprocessing: instance too small (%d clauses)\n", s.cnf.NumClauses)
+	// 	}
+	// 	s.cnf.RebuildLiteralPool()
+	// 	s.initWatches()
+	// 	return UNKNOWN
+	// }
 
 	// Skip on VERY large instances - preprocessing too slow
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
@@ -3560,8 +3561,10 @@ func (s *CDCLSolver) decide() bool {
 	// SYMMETRY BREAKING: Track this decision to apply recency penalty
 	s.vsids.TrackDecision(varIdx, s.conflicts)
 	if s.verbose && s.conflicts <= 10 {
-		fmt.Printf("c [DECIDE] Level %d (was %d): var %d = %v (decision), trailHead len=%d, trailHead=%v\n",
-			s.level, s.level-1, varIdx+1, phase, len(s.trailHead), s.trailHead)
+		// phase is the negated flag: true=negative lit (-var), false=positive lit (+var)
+		// Variable value is !phase: if lit is -var, var=FALSE; if lit is +var, var=TRUE
+		fmt.Printf("c [DECIDE] Level %d (was %d): var %d = %v (decision, lit=%d%c), trailHead len=%d, trailHead=%v\n",
+			s.level, s.level-1, varIdx+1, !phase, varIdx+1, map[bool]byte{true: '-', false: '+'}[phase], len(s.trailHead), s.trailHead)
 	}
 	return true
 }
