@@ -4447,26 +4447,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
 
 		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
-		
-		// TRACE learned clause 4 (which becomes corrupted)
-		if s.learnedActiveCount == 4 {
-			s.Log("c [TRACE] Learning clause 4 (conflict %d): ", s.conflicts)
-			for _, l := range s.tmpLearnedLits {
-				fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
-			}
-			fmt.Printf("0 (size=%d, offset=%d)\n", len(s.tmpLearnedLits), offset)
-		}
-		
-		// Verify clause 4 integrity periodically
-		if s.conflicts%100 == 0 && s.learnedActiveCount > 4 {
-			lits := s.getLearnedClauseLiterals(4)
-			s.Log("c [TRACE] Clause 4 at conflict %d: ", s.conflicts)
-			for _, l := range lits {
-				fmt.Printf("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
-			}
-			fmt.Printf("0 (stored size=%d, actual len=%d, offset=%d)\n", 
-				s.learnedSizes[4], len(lits), s.learnedOffsets[4])
-		}
 
 		// Append metadata (packed struct for cache efficiency)
 		s.learnedOffsets = append(s.learnedOffsets, offset)
