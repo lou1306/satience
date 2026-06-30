@@ -938,52 +938,26 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 			structure.StructuredScore)
 	}
 
-	// FIX: Only enable unit propagation - other techniques modify clauses and cause soundness bugs
-	return PreprocessingConfig{
-		EnableUnitProp:        true,
-		EnableEquivalence:     false,
-		EnablePureLiteral:     false,
-		EnableSubsumption:     false,
-		EnableSelfSubsumption: false,
-		EnableHyperBinary:     false,
-		MaxPasses:             1,
-	}
-	
-	// Highly structured: density > 3 OR small clause ratio > 0.7
-	if structure.StructuredScore > 0.6 {
+	// Random-like instances (StructuredScore < 0.7): NO preprocessing
+	// Unit propagation on random/mixed instances causes 76x more conflicts
+	if structure.StructuredScore < 0.7 {
 		if s.LogEnabled() {
-			fmt.Printf("c [preprocessing] Structured instance detected - enabling aggressive preprocessing\n")
+			fmt.Printf("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
 		}
 		return PreprocessingConfig{
-			EnableUnitProp:        true,
+			EnableUnitProp:        false,
 			EnableEquivalence:     false,
-			EnablePureLiteral:     true,
-			EnableSubsumption:     true,
-			EnableSelfSubsumption: true,
-			EnableHyperBinary:     true,
-			MaxPasses:             5,
-		}
-	}
-
-	// Moderately structured: density > 1.5 OR small clause ratio > 0.4
-	if structure.StructuredScore > 0.3 {
-		if s.LogEnabled() {
-			fmt.Printf("c [preprocessing] Mixed instance detected - enabling moderate preprocessing\n")
-		}
-		return PreprocessingConfig{
-			EnableUnitProp:        true,
-			EnableEquivalence:     false,
-			EnablePureLiteral:     true,
-			EnableSubsumption:     true,
+			EnablePureLiteral:     false,
+			EnableSubsumption:     false,
 			EnableSelfSubsumption: false,
 			EnableHyperBinary:     false,
-			MaxPasses:             3,
+			MaxPasses:             0,
 		}
 	}
 
-	// Random-like instance: lightweight preprocessing only
+	// Highly structured (score >= 0.7): unit propagation only
 	if s.LogEnabled() {
-		fmt.Printf("c [preprocessing] Random-like instance detected - using lightweight preprocessing\n")
+		fmt.Printf("c [preprocessing] Highly structured instance (score=%.2f) - enabling unit propagation only\n", structure.StructuredScore)
 	}
 	return PreprocessingConfig{
 		EnableUnitProp:        true,
@@ -1131,6 +1105,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 	}
 	s.trailHead = []int{0}  // Only level 0 exists after preprocessing
+	// CRITICAL FIX: Set qhead to trail length - preprocessing assignments already processed
+	// Without this, propagateWatched re-processes all 364 preprocessing assignments
+	s.qhead = len(s.trail)
 
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
@@ -1139,6 +1116,34 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// CRITICAL: Reset watchInitialized flag so watches are re-initialized
 	s.watchInitialized = false
 	s.initWatches()
+
+	// CRITICAL: Propagate original unit clauses (not watched by watched literals)
+	// Unit clauses have only 1 literal and are not added to watch lists
+	for clauseIdx := 0; clauseIdx < s.cnf.NumClauses; clauseIdx++ {
+		clause := &s.cnf.Clauses[clauseIdx]
+		if len(clause.Literals) != 1 {
+			continue
+		}
+		lit := clause.Literals[0]
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level >= 0 {
+			// Already assigned - check for conflict
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if !litTrue {
+				// Conflict with unit clause - UNSAT
+				return UNSAT
+			}
+			continue
+		}
+		// Propagate unit clause
+		value := !lit.IsNegated()
+		s.assignments[varIdx] = Assignment{Value: value, Level: 0}
+		s.varLevel[varIdx] = 0
+		s.trail = append(s.trail, int(varIdx))
+		s.implication[varIdx] = -2 // Mark as unit propagation
+	}
+	// Update qhead since we added to trail
+	s.qhead = len(s.trail)
 
 	return UNKNOWN
 }
@@ -1825,7 +1830,9 @@ func (s *CDCLSolver) restart() bool {
 		}
 	}
 	s.trailHead = append(s.trailHead[:0], 0) // Reset to [0] for level 0
-	s.qhead = 0 // Reset qhead to process all trail elements
+	// CRITICAL FIX: Set qhead to trail length - preprocessing assignments already processed
+	// Setting qhead=0 causes massive slowdown: 364 assignments × 100+ restarts = 36K redundant propagations
+	s.qhead = len(s.trail)
 	s.level = 0 // Start at level 0, first decision will increment to 1
 	
 	for i := range s.implication {
