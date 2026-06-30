@@ -1275,6 +1275,11 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	idx0 := s.learnedWatchIdx0[learnedIdx]
 	idx1 := s.learnedWatchIdx1[learnedIdx]
 
+	// Skip if watch indices are invalid (already removed or corrupted)
+	if idx0 < 0 || idx1 < 0 || idx0 >= len(s.watchLists) || idx1 >= len(s.watchLists) {
+		return
+	}
+
 	// Remove watch from lit0's watch list
 	watchList0 := s.watchLists[idx0]
 	for i := range watchList0 {
@@ -4732,26 +4737,30 @@ func (s *CDCLSolver) updateScoresIncrementally() {
 }
 
 func (s *CDCLSolver) deleteLearnedClauses() {
-	// SWAP-REMOVE clause deletion - avoids array rebuilding for better performance
-	// Moves active clauses into deleted slots instead of copying to new arrays
-	// Uses inline watch list updates to maintain clause index consistency
+	// TOMBSTONE-BASED DELETION with periodic compaction
+	// Mark deleted clauses with tombstones (size=0), compact when tombstones exceed threshold
+	// This avoids watch list corruption bugs in swap-remove while maintaining good performance
 
 	// Incremental scoring - only recompute dirty scores
 	s.updateScoresIncrementally()
 
 	// Build clause info for all active learned clauses (reuse tmpClauseInfo buffer)
-	if cap(s.tmpClauseInfo) < s.learnedActiveCount {
-		s.tmpClauseInfo = make([]clauseInfo, s.learnedActiveCount)
+	if cap(s.tmpClauseInfo) < s.learnedCapacity {
+		s.tmpClauseInfo = make([]clauseInfo, s.learnedCapacity)
 	}
-	if cap(s.tmpDeleted) < s.learnedActiveCount {
-		s.tmpDeleted = make([]bool, s.learnedActiveCount)
+	if cap(s.tmpDeleted) < s.learnedCapacity {
+		s.tmpDeleted = make([]bool, s.learnedCapacity)
 	}
-	if cap(s.tmpClauseUsedAsReason) < s.learnedActiveCount {
-		s.tmpClauseUsedAsReason = make([]bool, s.learnedActiveCount)
+	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
+		s.tmpClauseUsedAsReason = make([]bool, s.learnedCapacity)
 	}
 	clauses := s.tmpClauseInfo[:0]
 
-	for i := 0; i < s.learnedActiveCount; i++ {
+	// Only consider active (non-tombstone) clauses for deletion
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedSizes[i] == 0 {
+			continue // Skip tombstones
+		}
 		clauses = append(clauses, clauseInfo{
 			idx:       i,
 			lbd:       s.learnedMetadata[i].LBD,
@@ -4765,12 +4774,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// Determine how many clauses to keep
-	toKeep := int(float64(s.learnedActiveCount) * s.clauseDeletionKeepRatio)
+	toKeep := int(float64(len(clauses)) * s.clauseDeletionKeepRatio)
 	if toKeep < s.minLearned {
 		toKeep = s.minLearned
 	}
-	if toKeep > s.learnedActiveCount {
-		toKeep = s.learnedActiveCount
+	if toKeep > len(clauses) {
+		toKeep = len(clauses)
 	}
 	toDelete := len(clauses) - toKeep
 	
@@ -4783,18 +4792,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		sort.Sort(clauseInfoSlice(clauses))
 	}
 
-	// Mark clauses for deletion, protecting those used as implications
-	deleted := s.tmpDeleted
+	// Mark clauses used as implications (protected from deletion)
 	clauseUsedAsReason := s.tmpClauseUsedAsReason
-	for i := range deleted {
-		deleted[i] = false
-	}
 	for i := range clauseUsedAsReason {
 		clauseUsedAsReason[i] = false
 	}
 	
-	// Mark clauses used as implications (protected from deletion)
-	// CRITICAL: Check learnedCapacity, not learnedActiveCount
 	protectedCount := 0
 	for _, impIdx := range s.implication {
 		if impIdx < -1 {
@@ -4809,8 +4812,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		fmt.Printf("c [deleteLearnedClauses] Protected %d clauses used as implications\n", protectedCount)
 	}
 
-	// Mark clauses for deletion
+	// Mark clauses for deletion with tombstones
 	deletedCount := 0
+	deleted := s.tmpDeleted
+	for i := range deleted {
+		deleted[i] = false
+	}
 	
 	for i := 0; i < len(clauses); i++ {
 		idx := clauses[i].idx
@@ -4828,97 +4835,39 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		// Delete worst clauses until we reach toKeep
 		if deletedCount < toDelete {
 			deleted[idx] = true
-			// Remove watches before deleting
-			s.removeLearnedClauseWatches(idx)
 			deletedCount++
 		}
 	}
 
-	// Build clause index mapping (old -> new) for implication updates
-	// Track where each clause moves to, or -1 if deleted
-	if cap(s.tmpClauseIndexMap) < s.learnedCapacity {
-		s.tmpClauseIndexMap = make([]int, s.learnedCapacity)
-	}
-	clauseIndexMap := s.tmpClauseIndexMap[:s.learnedCapacity]
-	for i := range clauseIndexMap {
-		clauseIndexMap[i] = -1
-	}
-
-	// SWAP-REMOVE: Move active clauses into deleted slots
-	// CRITICAL FIX: Compact literal pool to prevent fragmentation and corruption
-	// Previously, clauses kept their original offsets after moving, leading to:
-	// 1. Fragmented literal pool with gaps
-	// 2. New clauses overwriting old clause literals
-	// 3. Duplicate/corrupted literals in conflict clauses
-	writeIdx := 0
-	nextOffset := 0  // Next available offset in compacted literal pool
-	watchUpdates := 0
-	
-	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
-		if deleted[readIdx] {
-			// Mark as tombstone (size=0) for future reuse
-			s.learnedSizes[readIdx] = 0
-			continue
-		}
-
-		// Record mapping for this clause
-		clauseIndexMap[readIdx] = writeIdx
-
-		// Move clause metadata from readIdx to writeIdx
-		oldStart := s.learnedOffsets[readIdx]
-		oldSize := s.learnedSizes[readIdx]
-		newStart := nextOffset  // Compact literals contiguously
-		
-		s.learnedOffsets[writeIdx] = newStart
-		s.learnedSizes[writeIdx] = oldSize
-		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
-		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
-		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
-
-		// Copy literals to compacted location
-		copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
-
-		// Update watch lists if clause moved
-		if writeIdx != readIdx {
-			// CRITICAL: Update watch lists inline - both regular and binary
-			s.updateWatchClauseIndices(writeIdx, readIdx)
-			watchUpdates++
-		}
-		
-		writeIdx++
-		nextOffset += oldSize  // Advance to next available offset
-	}
-
-	// Update implication array using the mapping (MUST be after all swaps)
-	// This ensures variables point to their reason clauses at the new locations
-	implicationUpdates := 0
-	implicationStale := 0
-	for varIdx := range s.implication {
-		if s.implication[varIdx] < -1 {
-			learnedIdx := -s.implication[varIdx] - 1
-			if learnedIdx < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
-				s.implication[varIdx] = -clauseIndexMap[learnedIdx] - 1
-				implicationUpdates++
-			} else if learnedIdx < len(clauseIndexMap) {
-				// Clause was deleted but wasn't protected - this is a bug
-				implicationStale++
-				if s.verbose && implicationStale <= 10 {
-					fmt.Printf("c [BUG] Stale implication: var %d -> clause %d (deleted, not protected)\n",
-						varIdx+1, learnedIdx)
-				}
-				// Reset to decision (variable will be re-propagated)
-				s.implication[varIdx] = -1
-			}
+	// Apply tombstones: mark size=0 and remove watches
+	tombstoneCount := 0
+	for i := 0; i < s.learnedCapacity; i++ {
+		if deleted[i] && s.learnedSizes[i] > 0 {
+			// Remove watches BEFORE marking as tombstone
+			s.removeLearnedClauseWatches(i)
+			// Mark as tombstone
+			s.learnedSizes[i] = 0
+			s.learnedWatchIdx0[i] = -1
+			s.learnedWatchIdx1[i] = -1
+			tombstoneCount++
+			
+			// Clear implication if pointing to deleted clause
+			// Will be re-propagated naturally
 		}
 	}
 
-	// Update active count and capacity
-	s.learnedActiveCount = writeIdx
-	s.learnedCapacity = writeIdx
+	// Update active count (excludes tombstones)
+	activeCount := 0
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedSizes[i] > 0 {
+			activeCount++
+		}
+	}
+	s.learnedActiveCount = activeCount
 
 	// Rebuild unit clause list from scratch
 	s.unitLearnedList = s.unitLearnedList[:0]
-	for i := 0; i < s.learnedActiveCount; i++ {
+	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedSizes[i] == 1 {
 			s.unitLearnedList = append(s.unitLearnedList, i)
 		}
@@ -4927,22 +4876,169 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
 
-	// Truncate arrays to new capacity (CRITICAL for append() to work correctly)
-	s.learnedLiterals = s.learnedLiterals[:nextOffset]  // Use compacted offset
+	// PERIODIC COMPACTION: Rebuild arrays when tombstones exceed 50%
+	tombstoneRatio := float64(tombstoneCount) / float64(s.learnedCapacity)
+	if tombstoneRatio > 0.5 {
+		s.compactLearnedClauses()
+	}
+
+	if s.verbose {
+		fmt.Printf("c [verbose] Deleted %d learned clauses via tombstones, kept %d active (tombstones=%d, ratio=%.1f%%)\n",
+			deletedCount, activeCount, tombstoneCount, tombstoneRatio*100)
+	}
+
+	// Reset buffers for next use (keep capacity)
+	s.tmpClauseInfo = clauses[:0]
+}
+
+// compactLearnedClauses rebuilds all learned clause arrays to remove tombstones
+// This is called periodically when tombstone ratio exceeds threshold
+func (s *CDCLSolver) compactLearnedClauses() {
+	if s.verbose {
+		fmt.Printf("c [compact] Compacting learned clauses: capacity=%d, active=%d\n",
+			s.learnedCapacity, s.learnedActiveCount)
+	}
+
+	// Build clause index mapping (old -> new compacted index)
+	if cap(s.tmpClauseIndexMap) < s.learnedCapacity {
+		s.tmpClauseIndexMap = make([]int, s.learnedCapacity)
+	}
+	clauseIndexMap := s.tmpClauseIndexMap[:s.learnedCapacity]
+	for i := range clauseIndexMap {
+		clauseIndexMap[i] = -1
+	}
+
+	// Compact clauses: move active clauses to contiguous positions
+	writeIdx := 0
+	nextOffset := 0
+	
+	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
+		if s.learnedSizes[readIdx] == 0 {
+			continue // Skip tombstones
+		}
+
+		// Record mapping
+		clauseIndexMap[readIdx] = writeIdx
+
+		// Move clause metadata
+		oldStart := s.learnedOffsets[readIdx]
+		oldSize := s.learnedSizes[readIdx]
+		newStart := nextOffset
+		
+		s.learnedOffsets[writeIdx] = newStart
+		s.learnedSizes[writeIdx] = oldSize
+		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
+		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
+
+		// Copy literals
+		copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
+		
+		writeIdx++
+		nextOffset += oldSize
+	}
+
+	// Update implication array using the mapping
+	for varIdx := range s.implication {
+		if s.implication[varIdx] < -1 {
+			learnedIdx := -s.implication[varIdx] - 1
+			if learnedIdx < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
+				s.implication[varIdx] = -clauseIndexMap[learnedIdx] - 1
+			} else if learnedIdx < len(clauseIndexMap) {
+				// Clause was deleted - reset to decision
+				s.implication[varIdx] = -1
+			}
+		}
+	}
+
+	// REBUILD ALL WATCH LISTS FROM SCRATCH (correct and simple)
+	s.watchLists = make([][]cnf.Watch, len(s.watchLists))
+	
+	// First, add original clauses
+	for i := 0; i < len(s.cnf.Clauses); i++ {
+		clause := &s.cnf.Clauses[i]
+		if len(clause.Literals) < 2 {
+			continue
+		}
+		idx0 := cnf.LitToIndex(clause.Literals[0])
+		idx1 := cnf.LitToIndex(clause.Literals[1])
+		
+		if s.watchLists[idx0] == nil {
+			s.watchLists[idx0] = make([]cnf.Watch, 0, 4)
+		}
+		if s.watchLists[idx1] == nil {
+			s.watchLists[idx1] = make([]cnf.Watch, 0, 4)
+		}
+		
+		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+			ClauseIdx: i,
+			Blit:      uint32(idx1),
+		})
+		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+			ClauseIdx: i,
+			Blit:      uint32(idx0),
+		})
+	}
+	
+	// Then, add learned clauses
+	for i := 0; i < writeIdx; i++ {
+		if s.learnedSizes[i] < 2 {
+			continue
+		}
+		literals := s.getLearnedClauseLiterals(i)
+		if len(literals) < 2 {
+			continue
+		}
+		clauseIdx := -i - 1
+		idx0 := cnf.LitToIndex(literals[0])
+		idx1 := cnf.LitToIndex(literals[1])
+		
+		if s.watchLists[idx0] == nil {
+			s.watchLists[idx0] = make([]cnf.Watch, 0, 4)
+		}
+		if s.watchLists[idx1] == nil {
+			s.watchLists[idx1] = make([]cnf.Watch, 0, 4)
+		}
+		
+		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+			ClauseIdx: clauseIdx,
+			Blit:      uint32(idx1),
+		})
+		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+			ClauseIdx: clauseIdx,
+			Blit:      uint32(idx0),
+		})
+		
+		// Update watch indices
+		s.learnedWatchIdx0[i] = idx0
+		s.learnedWatchIdx1[i] = idx1
+	}
+	
+	// Mark watches as initialized
+	s.watchInitialized = true
+
+	// Truncate arrays to new capacity
+	s.learnedLiterals = s.learnedLiterals[:nextOffset]
 	s.learnedOffsets = s.learnedOffsets[:writeIdx]
 	s.learnedSizes = s.learnedSizes[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
 	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
 	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]
+	s.learnedCapacity = writeIdx
+	s.learnedActiveCount = writeIdx
 
-	if s.verbose {
-		fmt.Printf("c [verbose] Deleted %d learned clauses via swap-remove, kept %d\n", toDelete, s.learnedActiveCount)
-		fmt.Printf("c [verbose] Watch updates: %d, implication updates: %d, stale: %d\n",
-			watchUpdates, implicationUpdates, implicationStale)
+	// Rebuild unit list
+	s.unitLearnedList = s.unitLearnedList[:0]
+	for i := 0; i < writeIdx; i++ {
+		if s.learnedSizes[i] == 1 {
+			s.unitLearnedList = append(s.unitLearnedList, i)
+		}
 	}
 
-	// Reset buffers for next use (keep capacity)
-	s.tmpClauseInfo = clauses[:0]
+	if s.verbose {
+		fmt.Printf("c [compact] Compaction complete: new capacity=%d, literals=%d\n",
+			writeIdx, nextOffset)
+	}
 }
 
 // updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx
