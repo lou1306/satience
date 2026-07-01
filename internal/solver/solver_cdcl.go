@@ -2724,22 +2724,23 @@ func (s *CDCLSolver) SolveWithPreprocessing() SolveResult {
 	s.vsids.InitializeFromClauses(s.cnf.Clauses)
 
 	// IMPROVEMENT #1: Improved VSIDS initialization after preprocessing
-	// After VE, clause structure reflects remaining variable importance
+	// After preprocessing, clause structure reflects remaining variable importance
 	// Variables in more/shorter clauses are more constrained = higher activity
+	// 
+	// OPTIMIZATION: Build occurrence counts in single pass O(clauses × avg_size)
+	// instead of O(vars × clauses) nested loop
+	occurrences := make([]int, s.cnf.NumVars)
+	for _, clause := range s.cnf.Clauses {
+		for _, lit := range clause.Literals {
+			occurrences[lit.Var()]++
+		}
+	}
+	
+	// Apply occurrence-based activity bonus
 	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
-			// Count occurrences in remaining clauses
-			occurrences := 0
-			for _, clause := range s.cnf.Clauses {
-				for _, lit := range clause.Literals {
-					if lit.Var() == uint32(i) {
-						occurrences++
-						break
-					}
-				}
-			}
 			// Base activity + bonus for constrained variables
-			s.vsids.activity[i] = 1.0 + float64(occurrences)*0.5
+			s.vsids.activity[i] = 1.0 + float64(occurrences[i])*0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
