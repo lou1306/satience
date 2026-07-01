@@ -1181,9 +1181,11 @@ func (s *CDCLSolver) initWatches() {
 	// This flag controls whether propagateWatched() is used instead of linear propagation
 	s.watchInitialized = true
 
+	if s.verbose {
 		totalWatches := 0
-	for _, wl := range s.watchLists {
-		totalWatches += len(wl)
+		for _, wl := range s.watchLists {
+			totalWatches += len(wl)
+		}
 		avgWatches := float64(totalWatches) / float64(numLits)
 		s.Log("c [verbose] Watched literals enabled: %d watch lists, %d total watches, %.1f avg per lit\n",
 			len(s.watchLists), totalWatches, avgWatches)
