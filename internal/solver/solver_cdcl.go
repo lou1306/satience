@@ -2141,18 +2141,32 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	s.trailHead[0] = 0
 	s.level = 0  // Unit propagations at level 0, decisions start at level 1
 
-		// Count unit clauses for debugging
+	// TIME BUDGET: Limit unit propagation to 500ms to avoid spending too long in preprocessing
+	// This allows running until fixpoint on small instances while preventing timeout on large ones
+	const timeBudget = 500 * time.Millisecond
+	startTime := time.Now()
+
+	// Count unit clauses for debugging
 	unitCount := 0
 	for _, clause := range s.cnf.Clauses {
 		if len(clause.Literals) == 1 {
 			unitCount++
 		}
-		s.Log("c [unit prop] Starting with %d unit clauses, %d existing assignments\n", unitCount, s.countAssignedVariables())
 	}
+	s.Log("c [unit prop] Starting with %d unit clauses, %d existing assignments\n", unitCount, s.countAssignedVariables())
 
 	changed := true
+	pass := 0
 	for changed {
+		// Check time budget
+		if time.Since(startTime) > timeBudget {
+			s.Log("c [unit prop] Time budget exceeded (%.1fms), stopping after %d passes, trail has %d units\n",
+				float64(time.Since(startTime).Nanoseconds())/1e6, pass, len(s.trail))
+			break
+		}
+		
 		changed = false
+		pass++
 
 		clauseCount := len(s.cnf.Clauses)
 		for clauseIdx := 0; clauseIdx < clauseCount; clauseIdx++ {
@@ -2184,7 +2198,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 			}
 
 			if unassignedCount == 0 && falseCount > 0 {
-								s.Log("c [verbose] Preprocessing: conflict in unit propagation\n")
+				s.Log("c [verbose] Preprocessing: conflict in unit propagation\n")
 				return UNSAT
 			}
 
@@ -2196,7 +2210,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					expectedValue := !unassignedLit.IsNegated()
 					if s.assignments[varIdx].Value != expectedValue {
 						// Conflict: variable already assigned opposite value
-												s.Log("c [verbose] Preprocessing: conflict - var %d already assigned opposite value\n", varIdx)
+						s.Log("c [verbose] Preprocessing: conflict - var %d already assigned opposite value\n", varIdx)
 						return UNSAT
 					}
 					// Already assigned correctly - skip
@@ -2214,14 +2228,14 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				s.implication[varIdx] = -2
 				changed = true
 				if s.verbose && len(clause.Literals) == 1 {
-			s.Log("c [unit prop] Propagated unit clause: var %d = %v, implication=%d\n", varIdx, value, s.implication[varIdx])
+					s.Log("c [unit prop] Propagated unit clause: var %d = %v, implication=%d\n", varIdx, value, s.implication[varIdx])
 				}
 				// Don't modify clauses - just track assignments in trail
 			}
 		}
 	}
 
-		s.Log("c [unit prop] Finished, trail has %d units\n", len(s.trail))
+	s.Log("c [unit prop] Finished after %d passes, trail has %d units\n", pass, len(s.trail))
 
 	// Set up trail for search - reset to initial state, units are at level 0
 	s.trailHead = []int{0}
