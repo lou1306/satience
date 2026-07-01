@@ -919,13 +919,12 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	structure := s.analyzeInstanceStructure()
 
-	if s.verbose {
-		s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Structured=%.2f\n",
+	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Structured=%.2f\n",
 			structure.Density,
 			structure.BinaryRatio*100,
 			structure.TernaryRatio*100,
 			structure.StructuredScore)
-	}
+
 
 	// Random-like instances (StructuredScore < 0.7): NO preprocessing
 	// Unit propagation on random/mixed instances causes 76x more conflicts
@@ -966,9 +965,8 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 }
 
 func (s *CDCLSolver) preprocessAggressive() SolveResult {
-	if s.verbose {
-		s.Log("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
-	}
+	s.Log("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+
 
 	// Skip on very small instances - overhead outweighs benefits
 	// DISABLED: Unit clauses must always be propagated, even on tiny instances
@@ -1057,9 +1055,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		initialClauses = s.cnf.NumClauses
 	}
 
-	if s.verbose {
-		s.Log("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
-	}
+	s.Log("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
+
 
 	// FIX: Do NOT clear preprocessing assignments (e.g., from pure literal elimination)
 	// These are permanent assignments that must be part of the final model.
@@ -1753,9 +1750,8 @@ func (s *CDCLSolver) shouldRestart() bool {
 }
 
 func (s *CDCLSolver) restart() bool {
-	if s.verbose {
-		s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
-	}
+	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
+
 
 	// CRITICAL: Reset VSIDS activity on restart to escape local minima
 	// Random instances need aggressive diversification - activity converges too quickly
@@ -1949,9 +1945,8 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 		return UNKNOWN
 	}
 
-	if s.verbose {
-		s.Log("c [verbose] Blocked clause elimination: checking %d clauses\n", s.cnf.NumClauses)
-	}
+	s.Log("c [verbose] Blocked clause elimination: checking %d clauses\n", s.cnf.NumClauses)
+
 
 	removedCount := 0
 	changed := true
@@ -1987,17 +1982,15 @@ func (s *CDCLSolver) blockedClauseElimination() SolveResult {
 		}
 	}
 
-	if s.verbose {
-		s.Log("c [verbose] Blocked clause elimination: removed %d clauses\n", removedCount)
-	}
+	s.Log("c [verbose] Blocked clause elimination: removed %d clauses\n", removedCount)
+
 
 	return UNKNOWN
 }
 
 func (s *CDCLSolver) inprocessing() bool {
-	if s.verbose {
-		s.Log("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
-	}
+	s.Log("c [inprocess] Inprocessing at conflict %d: %d clauses\n", s.conflicts, s.cnf.NumClauses)
+
 
 	initialClauses := s.cnf.NumClauses
 	startTime := time.Now()
@@ -2061,10 +2054,9 @@ func (s *CDCLSolver) inprocessing() bool {
 // Only eliminates variables with positive deficiency (net clause reduction)
 // Does NOT track eliminated variables for model reconstruction (too complex during search)
 func (s *CDCLSolver) inprocessPureLiteralElimination() {
-	if s.verbose {
-		s.Log("c [inprocess] Pure literal elimination during search: %d vars, %d clauses\n",
+	s.Log("c [inprocess] Pure literal elimination during search: %d vars, %d clauses\n",
 			s.cnf.NumVars, s.cnf.NumClauses)
-	}
+
 
 	startTime := time.Now()
 	timeLimit := 50 * time.Millisecond // Short time limit for inprocessing
@@ -4915,10 +4907,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 // compactLearnedClauses rebuilds all learned clause arrays to remove tombstones
 // This is called periodically when tombstone ratio exceeds threshold
 func (s *CDCLSolver) compactLearnedClauses() {
-	if s.verbose {
-		s.Log("c [compact] Compacting learned clauses: capacity=%d, active=%d\n",
+	s.Log("c [compact] Compacting learned clauses: capacity=%d, active=%d\n",
 			s.learnedCapacity, s.learnedActiveCount)
-	}
+
 
 	// Build clause index mapping (old -> new compacted index)
 	if cap(s.tmpClauseIndexMap) < s.learnedCapacity {
@@ -5056,10 +5047,9 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		}
 	}
 
-	if s.verbose {
-		s.Log("c [compact] Compaction complete: new capacity=%d, literals=%d\n",
+	s.Log("c [compact] Compaction complete: new capacity=%d, literals=%d\n",
 			writeIdx, nextOffset)
-	}
+
 }
 
 // updateWatchClauseIndices updates all watch references when a clause is moved from oldIdx to newIdx
@@ -5087,9 +5077,8 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 // remain in watch lists, causing unnecessary iteration during propagation.
 // This removes watches for clauses with size=0 (permanently deleted).
 func (s *CDCLSolver) compactWatchLists() {
-	if s.verbose {
-		s.Log("c [compact] Compacting watch lists: removing deleted clause watches\n")
-	}
+	s.Log("c [compact] Compacting watch lists: removing deleted clause watches\n")
+
 	
 	removedCount := 0
 	
@@ -5133,9 +5122,8 @@ func (s *CDCLSolver) compactWatchLists() {
 		}
 	}
 	
-	if s.verbose {
-		s.Log("c [compact] Watch list compaction: removed %d watches for deleted clauses\n", removedCount)
-	}
+	s.Log("c [compact] Watch list compaction: removed %d watches for deleted clauses\n", removedCount)
+
 }
 
 // backtrack backtracks (or backjumps) to a lower decision level
