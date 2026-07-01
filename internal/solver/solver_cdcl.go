@@ -326,7 +326,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		implication:          make([]int, formula.NumVars), // -1 = decision (no clause)
 		iterations:           0,
 		maxIter:              0,
-		learnedLiterals:      make([]cnf.Literal, 0, maxLearned*4),
+		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
+		// learnedLiterals: 8 literals per clause average (covers most learned clauses)
+		learnedLiterals:      make([]cnf.Literal, 0, maxLearned*8),
 		learnedOffsets:       make([]int, 0, maxLearned),
 		learnedSizes:         make([]int, 0, maxLearned),
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
@@ -359,12 +361,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decidedVarSet:        make([]bool, formula.NumVars),
 		restartDecisionCount: 0,
 		lastRandomDecision:   -1000,
-		// Pre-allocate reusable buffers
+		// P1: Pre-allocate reusable buffers with generous capacity to avoid reallocation
 		tmpLiteralInClause:   make([]bool, formula.NumVars),
 		tmpLiteralIsNegated:  make([]bool, formula.NumVars),
 		tmpLevelCount:        make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:    make([]bool, formula.NumVars+1),
-		tmpCandidates:        make([]resolveCandidate, 0, 100),
+		tmpCandidates:        make([]resolveCandidate, 0, 200),  // Increased from 100
 		tmpLevelSet:          make([]int, 0, formula.NumVars),
 		tmpLevelSetUsed:      make([]bool, formula.NumVars+1),
 		tmpResolved:          make([]bool, formula.NumVars),
@@ -372,9 +374,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpFlippedVars:       make([]bool, formula.NumVars),
 		tmpTouchedVars:       make([]uint32, 0, formula.NumVars),
 		tmpUnassignedVars:    make([]uint32, 0, formula.NumVars),
-		tmpLearnedLits:       make([]cnf.Literal, 0, 64),
-		tmpSortedLits:        make([]cnf.Literal, 0, 64),
-		tmpMinimizedLits:     make([]cnf.Literal, 0, 64),
+		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
+		tmpLearnedLits:       make([]cnf.Literal, 0, 256),
+		tmpSortedLits:        make([]cnf.Literal, 0, 256),
+		tmpMinimizedLits:     make([]cnf.Literal, 0, 256),
 		tmpIsGlue:            make([]bool, maxLearned),
 		tmpHasPositive:       make([]bool, formula.NumVars),
 		tmpHasNegative:       make([]bool, formula.NumVars),
