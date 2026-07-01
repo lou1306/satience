@@ -149,16 +149,11 @@ func TestPureLiteralBug1(t *testing.T) {
 }
 
 func TestPureLiteralBug2(t *testing.T) {
-	// Bug test: Check simplifyAfterAssignment logic
-	// FIX: Clauses are no longer removed during preprocessing for soundness.
-	// Satisfied clauses are kept (not removed) so verification can check against
-	// the original CNF. Only false literals are removed from clauses.
-	// When we assign x1=true:
-	// - Clause (x1 ∨ x2) is satisfied but KEPT (not removed)
-	// - Clause (¬x1 ∨ x3) becomes (x3) after removing ¬x1
+	// simplifyAfterAssignment only checks for conflicts, does NOT modify clauses
+	// Clause modification was disabled for soundness (caused bugs with pure literal elimination)
 	clauses := []cnf.Clause{
-		newClause(1, 2),  // x1 ∨ x2 (satisfied by x1=true, but kept)
-		newClause(-1, 3), // ¬x1 ∨ x3 (becomes x3 after removing ¬x1)
+		newClause(1, 2),  // x1 ∨ x2
+		newClause(-1, 3), // ¬x1 ∨ x3
 	}
 
 	cnfFormula := &cnf.CNF{
@@ -169,30 +164,24 @@ func TestPureLiteralBug2(t *testing.T) {
 
 	s := NewCDCLSolver(cnfFormula)
 
-	// Manually assign x1=true and simplify
+	// simplifyAfterAssignment only checks for conflicts, doesn't modify clauses
 	conflict := s.simplifyAfterAssignment(0, true) // var 0 (x1), value true
-
-	fmt.Println("\n=== Test: simplifyAfterAssignment ===")
-	fmt.Printf("Conflict: %v\n", conflict)
-	fmt.Printf("Remaining clauses: %d\n", len(s.cnf.Clauses))
-	for i, c := range s.cnf.Clauses {
-		fmt.Printf("  Clause %d: %v\n", i, c.Literals)
-	}
 
 	if conflict {
 		t.Errorf("Should not be conflict")
 	}
 
-	// FIX: Should have 2 clauses remaining (satisfied clause is kept, not removed)
-	// Clause 0: (x1 ∨ x2) - satisfied but kept
-	// Clause 1: (x3) - simplified from (¬x1 ∨ x3)
+	// Clauses are NOT modified - simplifyAfterAssignment only checks for conflicts
 	if len(s.cnf.Clauses) != 2 {
-		t.Errorf("Expected 2 clauses (satisfied clause kept), got %d", len(s.cnf.Clauses))
+		t.Errorf("Expected 2 clauses (unmodified), got %d", len(s.cnf.Clauses))
 	}
 
-	// Verify the second clause was simplified correctly
-	if len(s.cnf.Clauses[1].Literals) != 1 {
-		t.Errorf("Expected clause 1 to have 1 literal (simplified), got %d", len(s.cnf.Clauses[1].Literals))
+	// Clause literals are NOT simplified
+	if len(s.cnf.Clauses[0].Literals) != 2 {
+		t.Errorf("Expected clause 0 to have 2 literals (unmodified), got %d", len(s.cnf.Clauses[0].Literals))
+	}
+	if len(s.cnf.Clauses[1].Literals) != 2 {
+		t.Errorf("Expected clause 1 to have 2 literals (unmodified), got %d", len(s.cnf.Clauses[1].Literals))
 	}
 }
 
