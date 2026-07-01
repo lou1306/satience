@@ -3249,10 +3249,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLits = s.learnedLiterals[offset : offset+size]
 			}
 			blitIdx := watch.Blit
-			if s.verbose && s.conflicts <= 10 && watch.ClauseIdx < 0 {
-				learnedIdx := -watch.ClauseIdx - 1
-				s.Log("c [WATCH LEARNED] Clause %d, blit=%d, trailLit=%d\n", learnedIdx, blitIdx, watchIdx)
-			}
+			// OPTIMIZATION: Removed verbose logging from hot path - reduces branch overhead
 
 			// Inline IndexToLit
 			blitVarIdx := blitIdx >> 1
