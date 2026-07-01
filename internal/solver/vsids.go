@@ -379,16 +379,15 @@ func (v *VSIDS) SetRecencyPenaltyDecay(decay float64) {
 }
 
 // SetAggressiveDecay configures VSIDS for random-like instances
-// Lower decay = more aggressive activity decay = better search diversification
-// Default structured: 0.95 → 0.999 (slow decay, exploits structure)
-// Random instances: 0.50 → 0.80 (very fast decay, explores much more)
+// Much more aggressive decay to prevent any single variable from dominating
+// Decay every conflict (not every 10) with very low base (0.30→0.60)
 func (v *VSIDS) SetAggressiveDecay() {
-	v.initialDecayFactor = 0.50
-	v.maxDecayFactor = 0.80
-	v.decayFactor = 0.50
+	v.initialDecayFactor = 0.30
+	v.maxDecayFactor = 0.60
+	v.decayFactor = 0.30
 	v.inverseDecay = 1.0 / v.decayFactor
-	// Faster ramp-up to max decay
 	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / 5000.0
+	v.decayInterval = 1 // Decay every conflict, not every 10
 }
 
 // SetRecencyWindow sets the window for recency penalty (default 5 conflicts)
@@ -421,6 +420,26 @@ func (v *VSIDS) SetActivityResetScale(scale float64) {
 		scale = 0.5
 	}
 	v.activityResetScale = scale
+}
+
+// ResetActivityPartial partially resets activity to escape local minima
+// scale: fraction of activity to keep (0.0-1.0)
+// Adds random noise to break ties and prevent immediate re-convergence
+func (v *VSIDS) ResetActivityPartial(scale float64) {
+	if scale < 0.0 {
+		scale = 0.0
+	}
+	if scale > 1.0 {
+		scale = 1.0
+	}
+	for i := range v.activity {
+		// Keep partial activity
+		v.activity[i] *= scale
+		// Add random noise (0-10% of original) to break ties
+		noise := float64(i%100) / 1000.0
+		v.activity[i] += noise
+	}
+	v.heapValid = false // Force heap rebuild
 }
 
 // bumpLBD adds LBD bonus to variables in a learned clause

@@ -943,6 +943,12 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 		if s.verbose {
 			s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
 		}
+		// Configure extremely aggressive VSIDS decay for random instances
+		s.vsids.SetAggressiveDecay()
+		// Configure very aggressive restarts (Luby base=5, glucose ratio=1.1)
+		s.restartBase = 5
+		s.restartGlucoseRatio = 1.1
+		s.restartGlucoseMinConflicts = 10
 		return PreprocessingConfig{
 			EnableUnitProp:        false,
 			EnableEquivalence:     false,
@@ -1760,6 +1766,10 @@ func (s *CDCLSolver) restart() bool {
 	if s.verbose {
 		s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 	}
+
+	// CRITICAL: Reset VSIDS activity on restart to escape local minima
+	// Random instances need aggressive diversification - activity converges too quickly
+	s.vsids.ResetActivityPartial(0.3) // Keep 30% of activity, add noise
 
 
 	// CRITICAL: Run inprocessing at restart (not during search)
