@@ -69,33 +69,36 @@ const (
 // calculateMaxLearned scales the clause database limit with instance size.
 // MiniSat-style: base limit proportional to variables, grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
-	// Base limit: proportional to number of variables (MiniSat uses ~6*vars initially)
-	// This gives small instances room to learn, large instances don't explode
-	baseLimit := int(numVars) * 6
-
-	// Scale with instance size
-	if numVars >= 50000 {
-		baseLimit = 16000
-	} else if numVars >= 10000 {
-		baseLimit = 8000
-	} else if numVars >= 5000 {
-		baseLimit = 4000
-	} else if numVars >= 1000 {
-		baseLimit = 2000
+	// DYNAMIC LIMIT: Based on both variables AND clauses
+	// Key insight: Learned clause database should scale with instance size
+	// - Small instances (<1000 clauses): Need room to learn (min 300)
+	// - Medium instances: 10-20% of original clause count
+	// - Large instances: Cap to prevent memory explosion
+	
+	// Base: percentage of original clauses (primary factor)
+	baseLimit := int(float64(numClauses) * 0.15)  // 15% of original clauses
+	
+	// Also consider variable count (secondary factor)
+	varLimit := int(numVars) * 6
+	if varLimit > baseLimit {
+		baseLimit = varLimit
 	}
-
+	
+	// Scale with density for very sparse/dense instances
 	if numVars > 0 {
 		density := float64(numClauses) / float64(numVars)
 		if density > 10.0 {
-			baseLimit = int(float64(baseLimit) * 1.5)
+			// Dense instance: can handle more learned clauses
+			baseLimit = int(float64(baseLimit) * 1.3)
 		} else if density < 3.0 {
-			baseLimit = int(float64(baseLimit) * 0.75)
+			// Sparse instance: be conservative
+			baseLimit = int(float64(baseLimit) * 0.8)
 		}
 	}
-
-	// Minimum 300 for tiny instances (enough to learn useful clauses)
+	
+	// Absolute bounds
 	if baseLimit < 300 {
-		baseLimit = 300
+		baseLimit = 300  // Minimum for tiny instances
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
@@ -4896,11 +4899,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Mark LBD order as dirty
 	s.lbdOrderDirty = true
 
-	// PERIODIC COMPACTION: Rebuild arrays when tombstones exceed 50%
+	// WATCH LIST COMPACTION: Remove watches for deleted clauses (tombstones)
+	// This reduces propagation overhead by shrinking watch lists
+	s.compactWatchLists()
+	
+	// Track tombstone ratio for logging
 	tombstoneRatio := float64(tombstoneCount) / float64(s.learnedCapacity)
-	if tombstoneRatio > 0.5 {
-		s.compactLearnedClauses()
-	}
 
 	if s.verbose {
 		s.Log("c [verbose] Deleted %d learned clauses via LBD, kept %d active (tombstones=%d, ratio=%.1f%%)\n",
@@ -5073,6 +5077,64 @@ func (s *CDCLSolver) updateWatchClauseIndices(newIdx, oldIdx int) {
 				watchList[i].ClauseIdx = newClauseIdx
 			}
 		}
+	}
+}
+
+// compactWatchLists removes watches for deleted learned clauses (tombstones)
+// This is called after deleteLearnedClauses to clean up watch lists
+// 
+// Why needed: When learned clauses are deleted (marked as tombstones), their watches
+// remain in watch lists, causing unnecessary iteration during propagation.
+// This removes watches for clauses with size=0 (permanently deleted).
+func (s *CDCLSolver) compactWatchLists() {
+	if s.verbose {
+		s.Log("c [compact] Compacting watch lists: removing deleted clause watches\n")
+	}
+	
+	removedCount := 0
+	
+	// Scan each watch list and remove watches for deleted learned clauses
+	for litIdx := range s.watchLists {
+		watchList := s.watchLists[litIdx]
+		if len(watchList) == 0 {
+			continue
+		}
+		
+		// Compact in-place: move active watches forward
+		writeIdx := 0
+		for readIdx := range watchList {
+			watch := watchList[readIdx]
+			
+			// Check if learned clause is deleted (tombstone)
+			shouldRemove := false
+			if watch.ClauseIdx < 0 {
+				learnedIdx := -watch.ClauseIdx - 1
+				// Check if this learned clause is a tombstone (deleted)
+				if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] == 0 {
+					shouldRemove = true
+				}
+			}
+			// Note: We never remove original clauses from watch lists
+			
+			// Keep watch if clause is still active
+			if !shouldRemove {
+				if writeIdx != readIdx {
+					watchList[writeIdx] = watch
+				}
+				writeIdx++
+			} else {
+				removedCount++
+			}
+		}
+		
+		// Truncate watch list
+		if writeIdx < len(watchList) {
+			s.watchLists[litIdx] = watchList[:writeIdx]
+		}
+	}
+	
+	if s.verbose {
+		s.Log("c [compact] Watch list compaction: removed %d watches for deleted clauses\n", removedCount)
 	}
 }
 
