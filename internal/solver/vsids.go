@@ -378,6 +378,19 @@ func (v *VSIDS) SetRecencyPenaltyDecay(decay float64) {
 	v.recencyPenaltyDecay = decay
 }
 
+// SetAggressiveDecay configures VSIDS for random-like instances
+// Lower decay = more aggressive activity decay = better search diversification
+// Default structured: 0.95 → 0.999 (slow decay, exploits structure)
+// Random instances: 0.50 → 0.80 (very fast decay, explores much more)
+func (v *VSIDS) SetAggressiveDecay() {
+	v.initialDecayFactor = 0.50
+	v.maxDecayFactor = 0.80
+	v.decayFactor = 0.50
+	v.inverseDecay = 1.0 / v.decayFactor
+	// Faster ramp-up to max decay
+	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / 5000.0
+}
+
 // SetRecencyWindow sets the window for recency penalty (default 5 conflicts)
 // Variables decided within this window get penalty applied
 func (v *VSIDS) SetRecencyWindow(window int) {
