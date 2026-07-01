@@ -217,7 +217,6 @@ type CDCLSolver struct {
 	qhead int // Watched literals: next trail index to process
 
 	// Configurable parameters (exposed for tuning)
-	inprocessingMinConflicts int     // Run inprocessing at restart only after N conflicts (default 1000)
 	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
 	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
 	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
@@ -391,10 +390,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		minimizationMaxSize:       0, // Always minimize (no size limit)
 		minimizationMaxLBD:        0, // Always minimize (no LBD limit)
 		minimizationMaxReasonSize: 0, // Always try all reason clauses
-		// Variable elimination tracking
 		// Configurable parameters with defaults
-		inprocessingMinConflicts: 1000000000, // DISABLED: Inprocessing has soundness bugs
-		preprocessingMinClauses:  10,   // Lowered to enable inprocessing after aggressive VE
+		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
 		clauseDeletionMinLBD:     3,
@@ -505,16 +502,6 @@ func (s *CDCLSolver) SetRandomDecisionPeriod(period int) {
 func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
 	s.vsids.SetRandomSeed(seed)
-}
-
-// SetInprocessingInterval sets how often to run inprocessing (default 500 conflicts)
-// SetInprocessingMinConflicts sets the minimum conflicts before inprocessing runs at restart
-// Default is 1000 conflicts to avoid overhead on small instances
-func (s *CDCLSolver) SetInprocessingMinConflicts(minConflicts int) {
-	if minConflicts < 0 {
-		minConflicts = 0
-	}
-	s.inprocessingMinConflicts = minConflicts
 }
 
 // SetPreprocessingThresholds sets the preprocessing size thresholds
@@ -1770,19 +1757,6 @@ func (s *CDCLSolver) restart() bool {
 	// CRITICAL: Reset VSIDS activity on restart to escape local minima
 	// Random instances need aggressive diversification - activity converges too quickly
 	s.vsids.ResetActivityPartial(0.3) // Keep 30% of activity, add noise
-
-
-	// CRITICAL: Run inprocessing at restart (not during search)
-	// At restart, we're about to clear the trail anyway, so clause modifications
-	// won't cause trail/watch inconsistencies. This gives us inprocessing benefits
-	// without the soundness bugs from running it mid-search.
-	// Only run after inprocessingMinConflicts to avoid overhead on small instances
-	if s.conflicts >= s.inprocessingMinConflicts {
-		if s.inprocessing() {
-			// UNSAT detected during inprocessing
-			return true
-		}
-	}
 
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change

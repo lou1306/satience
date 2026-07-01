@@ -85,13 +85,16 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 - CHB (Conflict History Based) heuristic available via `-chb` flag
 - Conflict participation tracking
 
-### Preprocessing
-- Unit propagation (sound and complete)
-- Pure literal elimination
-- Subsumption elimination
-- Self-subsumption
-- Hyper-binary resolution
-- Equivalence detection (disabled by default)
+### Preprocessing (Adaptive, Structure-Aware)
+- **Adaptive Strategy** (`solver_cdcl.go:928-975`): Analyzes instance structure before preprocessing
+  - Structured instances (StructuredScore ≥ 0.7): Unit propagation enabled
+  - Random instances (StructuredScore < 0.7): ALL preprocessing disabled (causes 76× more conflicts)
+- **Unit Propagation** - Sound unit clause propagation before search (structured instances only)
+- **Pure Literal Elimination** - Implemented but disabled by default
+- **Subsumption Elimination** - Implemented but disabled by default
+- **Self-Subsumption** - Disabled (soundness bug - incorrect clause removal)
+- **Hyper-Binary Resolution** - Disabled (soundness bug - derives false empty clauses)
+- **Equivalence Detection** - Disabled (soundness bug - false equivalences)
 
 ### CLI Features
 - `-model`: Print satisfying assignment
@@ -189,15 +192,16 @@ benchmark/eval_small_random.sh [n_instances]
 ## Next Steps
 
 ### High Priority
-1. **Inprocessing** (2-3 days): Apply unit propagation during search (every 1000 conflicts)
-2. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
-3. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
+1. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
+2. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
+3. **Preprocessing** ✅: Implemented - adaptive strategy based on instance structure
 
 ### Medium Priority
-5. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
-6. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
+4. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
+5. **SAT Competition features** (1-2 days): JSON output, batch mode, progress reporting
 
 ### Not Planned (per constraints)
+- **Inprocessing**: Removed - unit propagation at restart caused 34-228% slowdown with no benefit
 - **Cardinality constraint detection**: PHP-like instances need specialized propagators for counting constraints. Expected 100-1000× speedup but requires fundamental architecture changes.
 - **Variable elimination**: Removed (June 2026) due to soundness bugs—pos=1 elimination produced wrong results on PHP instances (SAT instead of UNSAT)
 - Parallel solving
@@ -216,6 +220,7 @@ PHP UNSAT instances timeout while MiniSat solves instantly. This is **by design*
 Some random instances timeout. This is due to:
 - VSIDS exploits community structure (absent in random instances)
 - Lack of advanced heuristics (CHB, LRB tuning needed)
+- Preprocessing disabled on random instances (causes 76× more conflicts if enabled)
 
 ### Variable Elimination (Removed)
 Variable elimination was removed in June 2026 due to fundamental soundness issues:
@@ -223,9 +228,17 @@ Variable elimination was removed in June 2026 due to fundamental soundness issue
 - **Symptom**: php_6p_5h_unsat.cnf returned SAT instead of UNSAT after VE
 - **Resolution**: Removed ~800 lines of VE code; solver now relies on core CDCL techniques only
 
+### Inprocessing (Removed July 2026)
+Unit propagation inprocessing at restart was removed due to performance regression:
+- **Symptom**: 34-228% slowdown on MiniSat fast suite with no solving benefit
+- **Root cause**: Scanning all original clauses at every restart adds O(clauses) overhead per restart
+- **Resolution**: Removed inprocessing call from restart(); preprocessing unit propagation remains for structured instances
+
 ## Recent Commits
 
 ```
+<latest_commit> - Remove inprocessing from restart (34-228% slowdown with no benefit)
+<latest_commit> - Remove preprocessing and inprocessing configuration (simplify codebase)
 0845411 - Remove variable elimination (VE) due to soundness bugs
 ebb9fa8 - Implement swap-remove clause deletion to reduce GC pressure
 f53361a - Feature: Expose clause deletion scoring parameters as CLI options
@@ -242,6 +255,8 @@ f53361a - Feature: Expose clause deletion scoring parameters as CLI options
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
 - Compile with GOAMD64=v3 for AVX2/BMI2 optimizations
 - **Variable elimination removed**: ~800 lines deleted due to soundness bugs (June 2026)
+- **Inprocessing removed**: Unit propagation at restart caused 34-228% slowdown (July 2026)
+- **Preprocessing**: Adaptive strategy based on instance structure (structured score ≥ 0.7 enables unit propagation)
 
 ## Swap-Remove Implementation Details
 

@@ -48,8 +48,6 @@ func run() int {
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
-	// Inprocessing parameters
-	inprocessingMinConflicts := flag.Int("inprocessing-min-conflicts", 1000, "Run inprocessing at restart only after N conflicts (default=1000, 0=always)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -118,9 +116,6 @@ func run() int {
 	s.SetLBDBonusScale(*lbdScale)
 	s.SetBumpAmount(*bumpAmount)
 	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
-
-	// Configure inprocessing
-	s.SetInprocessingMinConflicts(*inprocessingMinConflicts)
 
 	// Configure clause minimization
 	switch *minimize {
