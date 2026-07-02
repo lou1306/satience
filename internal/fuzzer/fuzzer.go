@@ -258,7 +258,7 @@ func (f *Fuzzer) VerifyModel(formula *cnf.CNF, model []cnf.Literal) bool {
 		satisfied := false
 		for _, lit := range clause.Literals {
 			varIdx := int(lit.Var()) + 1
-			if varIdx > len(assignment) {
+			if varIdx >= len(assignment) {
 				return false
 			}
 			litIsNeg := lit.IsNegated()

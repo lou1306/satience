@@ -5,27 +5,6 @@ package solver
 
 import "fmt"
 
-// ClauseDeletionTelemetry tracks clause movements during deletion for debugging
-type ClauseDeletionTelemetry struct {
-	ImplicationUpdates int
-	ImplicationStale   int
-	WatchUpdates       int
-	FreeSlotsCreated   int
-	FreeSlotsReused    int
-}
-
-// logClauseDeletionTelemetry prints telemetry data for debugging swap-remove
-func logClauseDeletionTelemetry(s *CDCLSolver, telemetry *ClauseDeletionTelemetry) {
-	fmt.Printf("c [TELEMETRY] Clause deletion: implications_updated=%d, implications_stale=%d, watch_updates=%d, free_slots_created=%d, free_slots_reused=%d\n",
-		telemetry.ImplicationUpdates,
-		telemetry.ImplicationStale,
-		telemetry.WatchUpdates,
-		telemetry.FreeSlotsCreated,
-		telemetry.FreeSlotsReused)
-	fmt.Printf("c [TELEMETRY] Learned clauses: active=%d, capacity=%d, literals=%d\n",
-		s.learnedActiveCount, s.learnedCapacity, len(s.learnedLiterals))
-}
-
 // verifyClauseIndices validates that all clause references are consistent after deletion
 // This is a DEBUG-ONLY verification function for validating swap-remove correctness
 // Enabled with: go build -tags debug

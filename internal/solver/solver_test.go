@@ -1048,3 +1048,124 @@ func TestEmptyClauseUnsat(t *testing.T) {
 		t.Errorf("Expected UNSAT for empty clause (no preprocess), got %v", result2)
 	}
 }
+
+func TestEmptyFormulaSat(t *testing.T) {
+	// Empty formula (0 vars, 0 clauses) is trivially SAT
+	c := cnf.CNF{
+		NumVars:    0,
+		Clauses:    []cnf.Clause{},
+		NumClauses: 0,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT for empty formula, got %v", result)
+	}
+}
+
+func TestTautologySat(t *testing.T) {
+	// A tautological clause (x ∨ ¬x) is always satisfiable
+	c := cnf.CNF{
+		NumVars: 1,
+		Clauses: []cnf.Clause{
+			newClause(1, -1),
+		},
+		NumClauses: 1,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT for tautology, got %v", result)
+	}
+}
+
+func TestDuplicateLiterals(t *testing.T) {
+	// Duplicate literals in a clause should not cause issues
+	c := cnf.CNF{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			newClause(1, 1, 2),
+			newClause(-1, -1),
+		},
+		NumClauses: 2,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT for formula with duplicate literals, got %v", result)
+	}
+}
+
+func TestSolveWithoutPreprocessing(t *testing.T) {
+	// SolveWithoutPreprocessing should produce same results as SolveWithResult
+	c := cnf.CNF{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			newClause(1, 2),
+			newClause(-1, 3),
+			newClause(-2, -3),
+		},
+		NumClauses: 3,
+	}
+	s1 := NewCDCLSolver(&c)
+	r1 := s1.SolveWithResult()
+
+	s2 := NewCDCLSolver(&c)
+	r2 := s2.SolveWithoutPreprocessing()
+
+	if r1 != r2 {
+		t.Errorf("SolveWithResult=%v != SolveWithoutPreprocessing=%v", r1, r2)
+	}
+	if r1 != SAT {
+		t.Errorf("Expected SAT, got %v", r1)
+	}
+}
+
+func TestModelVerification(t *testing.T) {
+	// For SAT results, verify the model satisfies all clauses
+	tests := []struct {
+		name    string
+		numVars uint32
+		clauses []cnf.Clause
+	}{
+		{"simple_sat", 3, []cnf.Clause{newClause(1, 2), newClause(-1, 3)}},
+		{"unit_sat", 2, []cnf.Clause{newClause(1), newClause(2)}},
+		{"binary_sat", 4, []cnf.Clause{newClause(1, 2), newClause(3, 4), newClause(-1, -3)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := cnf.CNF{
+				NumVars:    tt.numVars,
+				Clauses:    tt.clauses,
+				NumClauses: len(tt.clauses),
+			}
+			s := NewCDCLSolver(&c)
+			result := s.SolveWithResult()
+			if result != SAT {
+				t.Fatalf("Expected SAT, got %v", result)
+			}
+
+			// Verify model satisfies all clauses
+			assignments := s.GetAssignments()
+			for i, clause := range tt.clauses {
+				satisfied := false
+				for _, lit := range clause.Literals {
+					varIdx := lit.Var()
+					if varIdx >= uint32(len(assignments)) {
+						t.Errorf("Variable %d out of bounds", varIdx)
+						continue
+					}
+					litTrue := (!lit.IsNegated() && assignments[varIdx].Value) || (lit.IsNegated() && !assignments[varIdx].Value)
+					if litTrue {
+						satisfied = true
+						break
+					}
+				}
+				if !satisfied {
+					t.Errorf("Clause %d not satisfied by model", i)
+				}
+			}
+		})
+	}
+}

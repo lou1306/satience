@@ -107,7 +107,6 @@ type VSIDS struct {
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
 	// Symmetry breaking: track activity momentum and decision recency
-	activityMomentum       []float64 // Rate of activity change (positive = increasing importance)
 	lastDecisionConflict   []int     // Last conflict where variable was decided (-1 if never)
 	decisionRecencyPenalty []float64 // Penalty for recently decided variables
 	// CHB (Conflict History Based) heuristic
@@ -152,7 +151,6 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		decayInterval:         DefaultDecayInterval,
 		randomSeed:            0,
 		// Symmetry breaking initialization
-		activityMomentum:       make([]float64, numVars),
 		lastDecisionConflict:   make([]int, numVars),
 		decisionRecencyPenalty: make([]float64, numVars),
 		// Default parameter values
@@ -240,33 +238,6 @@ func (v *VSIDS) EnableCHB() {
 	v.useCHB = true
 }
 
-// SetCHBDecayFactor sets the CHB decay factor (default 0.75)
-// Lower values = more aggressive decay = more focus on very recent conflicts
-func (v *VSIDS) SetCHBDecayFactor(factor float64) {
-	if factor < 0.5 || factor > 0.95 {
-		factor = 0.75
-	}
-	v.chbDecayFactor = factor
-}
-
-// SetCHBDecayInterval sets how often to decay CHB conflict frequency (default 50 conflicts)
-// Lower values = more frequent decay = shorter memory
-func (v *VSIDS) SetCHBDecayInterval(interval int) {
-	if interval < 10 {
-		interval = 10
-	}
-	v.chbDecayInterval = interval
-}
-
-// SetCHBWeight sets the weight for CHB in hybrid scoring (default 1.0)
-// Currently not used in hybrid mode, but available for future experimentation
-func (v *VSIDS) SetCHBWeight(weight float64) {
-	if weight < 0.0 {
-		weight = 0.0
-	}
-	v.chbWeight = weight
-}
-
 // SetRandomSeed sets the seed for deterministic random noise in tie-breaking
 func (v *VSIDS) SetRandomSeed(seed uint64) {
 	v.randomSeed = seed
@@ -341,16 +312,6 @@ func (v *VSIDS) SetLBDBonusScale(scale float64) {
 	}
 	v.lbdBonusScale = scale
 }
-
-// SetLBDBonusDecay sets the decay factor for LBD bonus (default 0.999)
-// Higher values = slower decay = glue clauses influence search longer
-func (v *VSIDS) SetLBDBonusDecay(decay float64) {
-	if decay < 0.9 || decay > 1.0 {
-		decay = 0.999
-	}
-	v.lbdBonusDecay = decay
-}
-
 // SetBaseBumpAmount sets the base bump amount for clauses (default 50.0)
 // Higher values = more aggressive activity increase for conflict variables
 func (v *VSIDS) SetBaseBumpAmount(amount float64) {
@@ -359,26 +320,6 @@ func (v *VSIDS) SetBaseBumpAmount(amount float64) {
 	}
 	v.baseBumpAmount = amount
 }
-
-// SetRecencyPenaltyScale sets the scale for recency penalty (default 50.0)
-// Higher values = stronger penalty against recently-decided variables
-func (v *VSIDS) SetRecencyPenaltyScale(scale float64) {
-	if scale < 0 {
-		scale = 0
-	}
-	v.recencyPenaltyScale = scale
-}
-
-// SetRecencyPenaltyDecay sets the decay for recency penalty (default 0.9)
-// Higher values = penalty persists longer
-func (v *VSIDS) SetRecencyPenaltyDecay(decay float64) {
-	if decay < 0.5 || decay > 1.0 {
-		decay = 0.9
-	}
-	v.recencyPenaltyDecay = decay
-}
-
-// SetAggressiveDecay configures VSIDS for random-like instances
 // Much more aggressive decay to prevent any single variable from dominating
 // Decay every conflict (not every 10) with very low base (0.30→0.60)
 func (v *VSIDS) SetAggressiveDecay() {
@@ -389,16 +330,6 @@ func (v *VSIDS) SetAggressiveDecay() {
 	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / 5000.0
 	v.decayInterval = 1 // Decay every conflict, not every 10
 }
-
-// SetRecencyWindow sets the window for recency penalty (default 5 conflicts)
-// Variables decided within this window get penalty applied
-func (v *VSIDS) SetRecencyWindow(window int) {
-	if window < 1 {
-		window = 1
-	}
-	v.recencyWindow = window
-}
-
 // SetClauseInitWeights sets the initialization weights for clauses
 // baseWeight: base weight for all clauses (default 10.0)
 // binaryWeight: weight multiplier for binary clauses (default 100.0)
@@ -412,16 +343,6 @@ func (v *VSIDS) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 	v.clauseInitBaseWeight = baseWeight
 	v.binaryClauseWeight = binaryWeight
 }
-
-// SetActivityResetScale sets the scale for activity reset on restart (default 0.5)
-// 0.5 = keep 50% of activity, 0.0 = reset completely, 1.0 = keep all
-func (v *VSIDS) SetActivityResetScale(scale float64) {
-	if scale < 0.0 || scale > 1.0 {
-		scale = 0.5
-	}
-	v.activityResetScale = scale
-}
-
 // ResetActivityPartial partially resets activity to escape local minima
 // scale: fraction of activity to keep (0.0-1.0)
 // Adds random noise to break ties and prevent immediate re-convergence
@@ -685,122 +606,4 @@ func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
 		}
 	}
 	return false
-}
-
-// ActivityForDebug returns the activity score for a variable (for debugging)
-func (v *VSIDS) ActivityForDebug(varIdx uint32) float64 {
-	if int(varIdx) >= len(v.activity) {
-		return 0
-	}
-	return v.activity[varIdx]
-}
-
-// ConflictParticipationForDebug returns the conflict participation count (for debugging)
-func (v *VSIDS) ConflictParticipationForDebug(varIdx uint32) int {
-	if int(varIdx) >= len(v.conflictParticipation) {
-		return 0
-	}
-	return v.conflictParticipation[varIdx]
-}
-
-// resetActivity resets activity scores to prevent choosing the same variables repeatedly
-// Called on restart. We scale down activity rather than zeroing it completely,
-// which preserves some learned information while allowing exploration of new variables.
-func (v *VSIDS) resetActivity(assignments []Assignment) {
-	// Scale down activity - preserves important variables but allows others to compete
-	// Skip pre-assigned variables (level 0) - not selectable
-	for i := range v.activity {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.activity[i] *= v.activityResetScale
-	}
-
-	// Reset LBD bonus completely - glue clause importance changes after restart
-	for i := range v.lbdBonus {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.lbdBonus[i] = 0
-	}
-
-	// Keep conflict participation for LRB - it's valuable long-term information
-	// Scale it down too
-	for i := range v.conflictParticipation {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
-	}
-	// Don't reset conflictCount - it's used for decay timing
-}
-
-// diversify performs aggressive diversification when stuck in local minima
-// Completely resets activity while preserving conflict history
-func (v *VSIDS) diversify(assignments []Assignment) {
-	// Reset activity to initial values (small uniform values)
-	// Skip pre-assigned variables (level 0) - not selectable
-	for i := range v.activity {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.activity[i] = 1.0
-	}
-
-	// Reset LBD bonus completely
-	for i := range v.lbdBonus {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.lbdBonus[i] = 0
-	}
-
-	// Keep conflict participation - it's still valuable
-	// Scale down more aggressively
-	for i := range v.conflictParticipation {
-		v.conflictParticipation[i] = v.conflictParticipation[i] / 4
-	}
-
-	// Invalidate heap - needs rebuild with new activities
-	v.heapValid = false
-}
-
-// diversifyAggressive performs very aggressive diversification when completely stuck
-// Resets all scores and adds deterministic noise to break symmetry
-func (v *VSIDS) diversifyAggressive(assignments []Assignment) {
-	// Reset activity with deterministic values to break symmetry
-	// Use XORShift64 for deterministic noise (seeded from v.randomSeed, default 0)
-	// Skip pre-assigned variables (level 0) - not selectable
-	for i := range v.activity {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.randomSeed ^= v.randomSeed << 13
-		v.randomSeed ^= v.randomSeed >> 7
-		v.randomSeed ^= v.randomSeed << 17
-		// Convert to float64 in range [0, 1)
-		v.activity[i] = 0.5 + float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF)*0.5
-	}
-
-	// Reset LBD bonus completely
-	for i := range v.lbdBonus {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.lbdBonus[i] = 0
-	}
-
-	// Reset conflict participation more aggressively
-	for i := range v.conflictParticipation {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.conflictParticipation[i] = v.conflictParticipation[i] / 8
-	}
-
-	// Reset decay factor to initial value to encourage exploration
-	v.decayFactor = 0.88
-
-	// Invalidate heap - needs rebuild with new activities
-	v.heapValid = false
 }

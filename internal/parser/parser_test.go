@@ -64,3 +64,44 @@ func TestParseEmptyClauses(t *testing.T) {
 		t.Errorf("Expected 0 clauses, got %d", cnf.NumClauses)
 	}
 }
+
+func TestParseMultiLineClause(t *testing.T) {
+	// Clause spanning multiple lines (terminated by 0 on second line)
+	input := `p cnf 5 1
+1 2 3
+4 5 0`
+
+	cnf, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if cnf.NumClauses != 1 {
+		t.Errorf("Expected 1 clause, got %d", cnf.NumClauses)
+	}
+}
+
+func TestParseUnterminatedClause(t *testing.T) {
+	// File ending without 0 terminator should error
+	input := `p cnf 1 2
+1 0
+-1`
+
+	_, err := Parse(strings.NewReader(input))
+	if err == nil {
+		t.Error("Expected error for unterminated clause")
+	}
+}
+
+func TestParseEmptyClause(t *testing.T) {
+	// Empty clause (just 0) is valid DIMACS
+	input := `p cnf 1 1
+0`
+
+	cnf, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if cnf.NumClauses != 1 {
+		t.Errorf("Expected 1 clause, got %d", cnf.NumClauses)
+	}
+}

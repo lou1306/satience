@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
 	"satience/internal/cnf"
@@ -19,13 +18,8 @@ func main() {
 
 func run() int {
 	// P4: Reduce GC pressure by increasing GC target percentage
-	// Default is 100% (GC when heap grows 100%), we use 150% to reduce GC frequency
-	// Trade-off: ~20-30% more memory usage for ~30-50% less GC overhead
 	debug.SetGCPercent(150)
-	
-	// Optional: Print GC settings in verbose mode
-	// Can be enabled for debugging GC behavior
-	_ = runtime.MemStats{}
+
 	model := flag.Bool("model", false, "Print satisfying assignment")
 	verify := flag.Bool("verify", false, "Verify model is correct (implies -model)")
 	dpll := flag.Bool("dpll", false, "Use plain DPLL algorithm (no clause learning)")
@@ -73,26 +67,34 @@ func run() int {
 			fmt.Fprintf(os.Stderr, "Error creating profile: %v\n", err)
 			return 1
 		}
-		pprof.StartCPUProfile(profileFile)
+		if err := pprof.StartCPUProfile(profileFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting CPU profile: %v\n", err)
+			profileFile.Close()
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			profileFile.Close()
+		}()
 	}
 
 	if flag.NArg() != 1 {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <file.cnf>\n", os.Args[0])
-		os.Exit(1)
+		return 1
 	}
 
 	filename := flag.Arg(0)
 	f, err := os.Open(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer f.Close()
 
 	cnfFormula, err := parser.Parse(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing CNF: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	s := solver.NewCDCLSolver(cnfFormula)
@@ -130,16 +132,13 @@ func run() int {
 	// Configure clause minimization
 	switch *minimize {
 	case "aggressive":
-		// Default: minimize all clauses (thresholds set high in solver_cdcl.go)
 	case "selective":
-		// Old behavior: minimize only small/low-LBD clauses
 		s.SetMinimizationThresholds(15, 5, 10)
 	case "none":
-		// Disable minimization
 		s.SetMinimizationThresholds(0, 0, 0)
 	default:
 		fmt.Fprintf(os.Stderr, "Invalid minimize option: %s (use aggressive, selective, or none)\n", *minimize)
-		os.Exit(1)
+		return 1
 	}
 
 	start := time.Now()
@@ -147,7 +146,6 @@ func run() int {
 	if *dpll {
 		result = s.SolveDPLL()
 	} else if *noPreprocess {
-		// Debug escape hatch: skip all preprocessing
 		result = s.SolveWithoutPreprocessing()
 	} else {
 		result = s.SolveWithResult()
@@ -162,35 +160,24 @@ func run() int {
 	case solver.SAT:
 		fmt.Println("s SATISFIABLE")
 		if *model {
-			printModel(s, cnfFormula, *verify)
-		}
-		if *cpuprofile != "" {
-			pprof.StopCPUProfile()
-			profileFile.Close()
+			if err := printModel(s, cnfFormula, *verify); err != nil {
+				fmt.Fprintf(os.Stderr, "c [ERROR] %v\n", err)
+				return 1
+			}
 		}
 		return 10
 	case solver.UNSAT:
 		fmt.Println("s UNSATISFIABLE")
-		if *cpuprofile != "" {
-			pprof.StopCPUProfile()
-			profileFile.Close()
-		}
 		return 20
 	default:
 		fmt.Println("s UNKNOWN")
-		if *cpuprofile != "" {
-			pprof.StopCPUProfile()
-			profileFile.Close()
-		}
 		return 0
 	}
 }
 
-func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
+func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) error {
 	assignments := s.GetAssignments()
 
-	// Print model - only output variables up to cnf.NumVars
-	// Include ALL assigned variables (Level >= 0), not just decisions
 	numVars := int(cnf.NumVars)
 	if len(assignments) < numVars {
 		numVars = len(assignments)
@@ -207,12 +194,11 @@ func printModel(s *solver.CDCLSolver, cnf *cnf.CNF, verify bool) {
 	}
 	fmt.Println("v 0")
 
-	// Verify model if requested
 	if verify {
 		if err := solver.VerifySolution(cnf, assignments, false); err != nil {
-			fmt.Fprintf(os.Stderr, "c [ERROR] Model verification failed: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("model verification failed: %w", err)
 		}
 		fmt.Println("c Model verified: all clauses satisfied")
 	}
+	return nil
 }
