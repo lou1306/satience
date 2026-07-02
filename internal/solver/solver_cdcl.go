@@ -969,7 +969,25 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	}
 }
 
+// hasEmptyClause returns true if any original clause has zero literals,
+// which makes the formula immediately UNSAT.
+func (s *CDCLSolver) hasEmptyClause() bool {
+	for i := range s.cnf.Clauses {
+		if len(s.cnf.Clauses[i].Literals) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *CDCLSolver) preprocessAggressive() SolveResult {
+	// Empty original clause = immediately UNSAT (watched literals skip clauses <2 lits,
+	// so an empty clause would be invisible to propagation and yield UNKNOWN instead of UNSAT)
+	if s.hasEmptyClause() {
+		s.printStats()
+		return UNSAT
+	}
+
 	s.Log("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 
 
@@ -2826,6 +2844,10 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 // loop after minimal setup. Intended as a debug escape hatch (the -no-preprocess
 // CLI flag); production code should use SolveWithResult.
 func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
+	if s.hasEmptyClause() {
+		s.printStats()
+		return UNSAT
+	}
 	s.cnf.RebuildLiteralPool()
 	s.initWatches()
 	s.initVSIDSOccurrenceBonus()
@@ -3704,9 +3726,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 						if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] == 1 {
 							isUnit = true
 						}
-					} else {
-						// Original clause
-						if impIdx < len(s.cnf.Clauses) && len(s.cnf.Clauses[impIdx].Literals) == 1 {
+				} else {
+					// Original clause (guard against preprocessing sentinels -2/-3/-4)
+					if impIdx >= 0 && impIdx < len(s.cnf.Clauses) && len(s.cnf.Clauses[impIdx].Literals) == 1 {
 							isUnit = true
 						}
 					}
@@ -4159,14 +4181,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Do NOT skip learning in this case - that would cripple the solver.
 
 	// CRITICAL: Verify 1-UIP property to catch soundness bugs
-	// If verification fails, the learned clause is invalid - stop learning (safer than wrong clause)
-	if !s.verifyLearnedClause(s.tmpLearnedLits) {
-		// 1-UIP verification failed - skip learning this clause
-		// This prevents propagating buggy learned clauses
+	// If verification fails, the learned clause is invalid - skip learning (safer than wrong clause)
+	// NON-CONVERGE clauses (currentCount > 1) are sound but may have >1 literal at current level,
+	// so check 3 is skipped for them.
+	if !s.verifyLearnedClause(s.tmpLearnedLits, currentCount > 1) {
 		if s.verbose {
 			s.Log("c [learnClause] Skipping buggy learned clause due to 1-UIP violation\n")
 		}
-		// Continue without learning - the search will continue but may be less efficient
+		return maxLevel
 	}
 
 	// Empty clause = UNSAT
@@ -5202,10 +5224,11 @@ func (s *CDCLSolver) ResetTrail() {
 	}
 }
 
-// verifyLearnedClause checks that a learned clause is sound
-// This catches bugs in conflict analysis
-// Returns true if the clause is valid, false otherwise
-func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
+// verifyLearnedClause checks that a learned clause is sound.
+// Checks 1-2 (all assigned, all false) always run. Check 3 (exactly 1 literal
+// at current level) is skipped when allowMultipleAtCurrentLevel is true, which
+// is the case for NON-CONVERGE clauses that are sound but non-asserting.
+func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal, allowMultipleAtCurrentLevel bool) bool {
 	if len(learnedLits) == 0 {
 		return true // Empty clause is valid (means UNSAT)
 	}
@@ -5214,56 +5237,37 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal) bool {
 	for _, lit := range learnedLits {
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level < 0 {
-			// Unassigned literal - clause is not a valid conflict clause
 			s.Log("c [SOUNDNESS BUG] Learned clause has unassigned literal: conflict=%d, var=%d\n",
 				s.conflicts, varIdx+1)
-			s.Log("c   Learned clause: ")
-			for _, l := range learnedLits {
-			s.Log("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
-			s.Log("\n")
-			}
 			return false
 		}
 	}
 
 	// Check 2: Learned clause must be falsified by current assignment
-	// (otherwise it's not a valid conflict clause)
 	for _, lit := range learnedLits {
 		varIdx := lit.Var()
 		litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
 		if litTrue {
-			s.Log("c [SOUNDNESS BUG] Learned clause has TRUE literal: conflict=%d, var=%d, value=%v, neg=%v\n",
-				s.conflicts, varIdx+1, s.assignments[varIdx].Value, lit.IsNegated())
-			s.Log("c   Learned clause: ")
-			for _, l := range learnedLits {
-			s.Log("%d%c(L%d,V=%v) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-					s.assignments[l.Var()].Level, s.assignments[l.Var()].Value)
-			s.Log("\n")
-			}
+			s.Log("c [SOUNDNESS BUG] Learned clause has TRUE literal: conflict=%d, var=%d\n",
+				s.conflicts, varIdx+1)
 			return false
 		}
 	}
 
-	// Check 3: 1-UIP property - EXACTLY 1 literal at current level
-	// This is REQUIRED for sound 1-UIP conflict analysis
-	// Multiple literals at current level means the clause was learned incorrectly
-	literalsAtCurrentLevel := 0
-	for _, lit := range learnedLits {
-		if s.assignments[lit.Var()].Level == s.level {
-			literalsAtCurrentLevel++
+	// Check 3: 1-UIP property - EXACTLY 1 literal at current level.
+	// Skipped for NON-CONVERGE clauses (sound but non-asserting, may have >1).
+	if !allowMultipleAtCurrentLevel {
+		literalsAtCurrentLevel := 0
+		for _, lit := range learnedLits {
+			if s.assignments[lit.Var()].Level == s.level {
+				literalsAtCurrentLevel++
+			}
 		}
-	}
-	if literalsAtCurrentLevel != 1 {
+		if literalsAtCurrentLevel != 1 {
 			s.Log("c [SOUNDNESS BUG] 1-UIP violation: conflict=%d, level=%d, literals_at_level=%d (expected exactly 1)\n",
-			s.conflicts, s.level, literalsAtCurrentLevel)
-		s.Log("c   Learned clause: ")
-		for _, l := range learnedLits {
-			s.Log("%d%c(L%d) ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()],
-				s.assignments[l.Var()].Level)
-			s.Log("\n")
+				s.conflicts, s.level, literalsAtCurrentLevel)
+			return false
 		}
-		return false
 	}
 
 	return true

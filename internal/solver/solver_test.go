@@ -1017,9 +1017,34 @@ func TestCDCLTseitinCycleUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (odd cycle), got %v", result)
+	}
+}
+
+func TestEmptyClauseUnsat(t *testing.T) {
+	// An empty clause (0 literals) makes the formula immediately UNSAT.
+	// The solver must detect this, not return UNKNOWN.
+	c := cnf.CNF{
+		NumVars: 1,
+		Clauses: []cnf.Clause{
+			{Literals: []cnf.Literal{}}, // empty clause
+		},
+		NumClauses: 1,
+	}
+
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT for empty clause, got %v", result)
+	}
+
+	// Also test via SolveWithoutPreprocessing
+	s2 := NewCDCLSolver(&c)
+	result2 := s2.SolveWithoutPreprocessing()
+	if result2 != UNSAT {
+		t.Errorf("Expected UNSAT for empty clause (no preprocess), got %v", result2)
 	}
 }
