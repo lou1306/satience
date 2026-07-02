@@ -5,132 +5,209 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"strings"
 
 	"satience/internal/cnf"
 )
 
 // Parse reads a DIMACS CNF file and returns a CNF formula
 func Parse(r io.Reader) (*cnf.CNF, error) {
-	scanner := bufio.NewScanner(r)
+	br := bufio.NewReader(r)
 
 	var numVars uint32
 	var numClauses int
 	var headerFound bool
+	var cnfFormula *cnf.CNF
 
-	// First pass: find header and count clauses
-	clauseLines := make([]string, 0)
+	// Reusable buffer for current clause literals
+	var currentLits []cnf.Literal
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines
-		if line == "" {
-			continue
-		}
-
-		// Skip comment lines
-		if strings.HasPrefix(line, "c") {
-			continue
-		}
-
-		// Parse problem line
-		if strings.HasPrefix(line, "p") {
-			if headerFound {
-				return nil, fmt.Errorf("duplicate problem line")
+	for {
+		line, err := br.ReadString('\n')
+		if len(line) > 0 {
+			// Process the line
+			if err := processLine(line, &numVars, &numClauses, &headerFound, &cnfFormula, &currentLits); err != nil {
+				return nil, err
 			}
-
-			parts := strings.Fields(line)
-			if len(parts) != 4 || parts[1] != "cnf" {
-				return nil, fmt.Errorf("invalid problem line: %s", line)
-			}
-
-			var err error
-			numVars, err = parseUint32(parts[2])
-			if err != nil {
-				return nil, fmt.Errorf("invalid numVars: %v", err)
-			}
-
-			numClauses, err = strconv.Atoi(parts[3])
-			if err != nil {
-				return nil, fmt.Errorf("invalid numClauses: %v", err)
-			}
-
-			headerFound = true
-			continue
 		}
-
-		// After header, collect clause lines
-		if headerFound {
-			clauseLines = append(clauseLines, line)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("error reading input: %v", err)
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading input: %v", err)
 	}
 
 	if !headerFound {
 		return nil, fmt.Errorf("missing problem line (p cnf <vars> <clauses>)")
 	}
 
-	// Build CNF
-	cnfFormula := cnf.NewCNF(numVars, numClauses)
-
-	for _, line := range clauseLines {
-		clause, err := parseClause(line, numVars)
-		if err != nil {
-			return nil, err
-		}
-		cnfFormula.AddClause(clause, false)
-	}
-
 	return cnfFormula, nil
 }
 
-func parseClause(line string, maxVar uint32) ([]cnf.Literal, error) {
-	tokens := strings.Fields(line)
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("empty clause")
+// processLine handles a single line of DIMACS CNF input
+func processLine(line string, numVars *uint32, numClauses *int, headerFound *bool,
+	cnfFormula **cnf.CNF, currentLits *[]cnf.Literal) error {
+
+	// Skip leading whitespace
+	i := 0
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+		i++
+	}
+	if i >= len(line) {
+		return nil // empty line
 	}
 
-	// Last token must be 0
-	if tokens[len(tokens)-1] != "0" {
-		return nil, fmt.Errorf("clause must end with 0")
+	first := line[i]
+
+	// Skip comment lines
+	if first == 'c' {
+		return nil
 	}
 
-	literals := make([]cnf.Literal, 0, len(tokens)-1)
-
-	for i := 0; i < len(tokens)-1; i++ {
-		val, err := strconv.Atoi(tokens[i])
-		if err != nil {
-			return nil, fmt.Errorf("invalid literal %q: %v", tokens[i], err)
+	// Problem line
+	if first == 'p' {
+		if *headerFound {
+			return fmt.Errorf("duplicate problem line")
 		}
+
+		// Parse "p cnf <vars> <clauses>" without strings.Fields
+		// Skip "p"
+		i++
+		// Skip spaces
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		// Read "cnf"
+		if i+3 > len(line) || line[i] != 'c' || line[i+1] != 'n' || line[i+2] != 'f' {
+			return fmt.Errorf("invalid problem line: expected 'cnf'")
+		}
+		i += 3
+		// Skip spaces
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		// Read numVars
+		nv, ni, err := parseUint32From(line, i)
+		if err != nil {
+			return fmt.Errorf("invalid numVars: %v", err)
+		}
+		*numVars = nv
+		i = ni
+		// Skip spaces
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		// Read numClauses
+		nc, ni, err := parseUint32From(line, i)
+		if err != nil {
+			return fmt.Errorf("invalid numClauses: %v", err)
+		}
+		*numClauses = int(nc)
+		*headerFound = true
+		*cnfFormula = cnf.NewCNF(*numVars, *numClauses)
+		return nil
+	}
+
+	// Clause line: parse integers directly
+	if !*headerFound {
+		return nil // skip lines before header
+	}
+
+	// Parse integers from the line
+	for i < len(line) {
+		// Skip whitespace
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+
+		// Parse integer
+		val, ni, err := parseIntFrom(line, i)
+		if err != nil {
+			return fmt.Errorf("invalid literal at position %d: %v", i, err)
+		}
+		i = ni
 
 		if val == 0 {
-			return nil, fmt.Errorf("unexpected 0 in middle of clause")
-		}
-
-		// Convert from 1-based DIMACS to 0-based internal
-		var varIdx uint32
-		var negated bool
-
-		if val > 0 {
-			varIdx = uint32(val) - 1
-			negated = false
+			// End of clause
+			lits := make([]cnf.Literal, len(*currentLits))
+			copy(lits, *currentLits)
+			(*cnfFormula).AddClause(lits, false)
+			*currentLits = (*currentLits)[:0]
 		} else {
-			varIdx = uint32(-val) - 1
-			negated = true
+			var varIdx uint32
+			var negated bool
+			if val > 0 {
+				varIdx = uint32(val) - 1
+				negated = false
+			} else {
+				varIdx = uint32(-val) - 1
+				negated = true
+			}
+			if varIdx >= *numVars {
+				return fmt.Errorf("variable %d exceeds declared max %d", varIdx+1, *numVars)
+			}
+			*currentLits = append(*currentLits, cnf.NewLiteral(varIdx, negated))
 		}
-
-		if varIdx >= maxVar {
-			return nil, fmt.Errorf("variable %d exceeds declared max %d", varIdx+1, maxVar)
-		}
-
-		literals = append(literals, cnf.NewLiteral(varIdx, negated))
 	}
 
-	return literals, nil
+	return nil
+}
+
+// parseUint32From parses a uint32 from string starting at position i
+// Returns the value, the next position, and any error
+func parseUint32From(s string, i int) (uint32, int, error) {
+	val, err := strconv.ParseUint(s[i:], 10, 32)
+	if err != nil {
+		// Try to find the end of the number
+		j := i
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		val, err = strconv.ParseUint(s[i:j], 10, 32)
+		if err != nil {
+			return 0, i, err
+		}
+		return uint32(val), j, nil
+	}
+	// Find where ParseUint stopped
+	j := i
+	if j < len(s) && (s[j] == '+' || s[j] == '-') {
+		j++
+	}
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	return uint32(val), j, nil
+}
+
+// parseIntFrom parses an int from string starting at position i
+// Returns the value, the next position, and any error
+func parseIntFrom(s string, i int) (int, int, error) {
+	neg := false
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	} else if i < len(s) && s[i] == '+' {
+		i++
+	}
+
+	if i >= len(s) || s[i] < '0' || s[i] > '9' {
+		return 0, i, fmt.Errorf("expected digit")
+	}
+
+	val := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		val = val*10 + int(s[i]-'0')
+		i++
+	}
+
+	if neg {
+		val = -val
+	}
+	return val, i, nil
 }
 
 func parseUint32(s string) (uint32, error) {
