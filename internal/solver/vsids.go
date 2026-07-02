@@ -569,20 +569,12 @@ func (v *VSIDS) decay(assignments []Assignment) {
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
 
-	// SYMMETRY BREAKING: Update activity momentum before decaying
-	// Momentum = bump amount (how much activity increased before decay)
-	// This tracks which variables are being bumped in recent conflicts
 	// OPTIMIZATION: Skip pre-assigned variables (level 0) - they're not selectable
 	for i := range v.activity {
 		if assignments[i].Level == 0 {
-			// Pre-assigned variable - skip decay to avoid wasting cycles
 			continue
 		}
-		oldActivity := v.activity[i]
 		v.activity[i] *= v.decayFactor
-		// Momentum = activity lost to decay (represents recent bumping)
-		v.activityMomentum[i] = oldActivity - v.activity[i]
-		// Decay recency penalty over time
 		v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
 	}
 

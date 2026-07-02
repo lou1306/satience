@@ -208,9 +208,10 @@ type CDCLSolver struct {
 	tmpKeepIndices        []int                // Pre-allocated buffer for indices of clauses to keep
 
 	// Watched literals infrastructure
-	watchLists        [][]cnf.Watch // watchLists[lit] = clauses watching lit
-	watchInitialized  bool          // True if watches have been initialized
-	learnedClauseBase int           // Base ID for learned clause watches (fixed at initialization)
+	watchLists          [][]cnf.Watch // watchLists[lit] = clauses watching lit
+	watchInitialized    bool          // True if watches have been initialized
+	learnedClauseBase   int           // Base ID for learned clause watches (fixed at initialization)
+	originalUnitClauses []int         // Precomputed indices of original unit clauses (for restart re-propagation)
 
 	// LBD-based learned clause ordering for propagation prioritization
 	learnedClauseOrder []int // Indices into learnedClauses/clauseLBD sorted by LBD
@@ -309,6 +310,18 @@ func computeCanonicalHash(literals []cnf.Literal, tmpSorted []cnf.Literal) uint6
 }
 
 // NewCDCLSolver creates a new CDCL solver (DPLL with VSIDS)
+// precomputeOriginalUnitClauses returns clause indices of original unit clauses (1 literal).
+// Used by restart() to re-propagate units without scanning all clauses.
+func precomputeOriginalUnitClauses(formula *cnf.CNF) []int {
+	var units []int
+	for i := range formula.Clauses {
+		if len(formula.Clauses[i].Literals) == 1 {
+			units = append(units, i)
+		}
+	}
+	return units
+}
+
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := calculateMaxLearned(formula.NumVars, formula.NumClauses)
 	minLearned := maxLearned / 2
@@ -398,6 +411,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseIndexMap:     make([]int, maxLearned),
 		tmpKeepIndices:        make([]int, 0, maxLearned),
 		learnedClauseBase:     int(formula.NumClauses),
+		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
 		// Minimization thresholds - aggressive for better clause quality
 		minimizationMaxSize:       0, // Always minimize (no size limit)
 		minimizationMaxLBD:        0, // Always minimize (no LBD limit)
@@ -1881,21 +1895,19 @@ func (s *CDCLSolver) restart() bool {
 	s.level = 0  // FIX: Start at level 0, decisions will be at level 1+
 	s.trailHead = s.trailHead[:0]
 	s.trailHead = append(s.trailHead, 0)
-	for i := 0; i < s.cnf.NumClauses; i++ {
-		clause := &s.cnf.Clauses[i]
-		if len(clause.Literals) == 1 {
-			lit := clause.Literals[0]
-			varIdx := lit.Var()
-			if s.assignments[varIdx].Level < 0 {
-				value := !lit.IsNegated()
-				s.assignments[varIdx] = Assignment{
-					Value: value,
-					Level: 0,  // Unit propagations from original clauses are permanent (level 0)
-				}
-				s.varLevel[varIdx] = 0
-				s.trail = append(s.trail, int(varIdx))
-				s.implication[varIdx] = i // Original clause index (positive)
+	for _, clauseIdx := range s.originalUnitClauses {
+		clause := &s.cnf.Clauses[clauseIdx]
+		lit := clause.Literals[0]
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level < 0 {
+			value := !lit.IsNegated()
+			s.assignments[varIdx] = Assignment{
+				Value: value,
+				Level: 0,
 			}
+			s.varLevel[varIdx] = 0
+			s.trail = append(s.trail, int(varIdx))
+			s.implication[varIdx] = clauseIdx
 		}
 	}
 	// FIX: Don't add spurious trailHead entry for unit propagations
@@ -4354,9 +4366,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// NOTE: Slot reuse disabled - swap-remove moves clauses but literals stay in place,
 		// causing corruption when freed slots are reused
 		offset := len(s.learnedLiterals)
-		s.learnedLiterals = append(s.learnedLiterals, make([]cnf.Literal, len(s.tmpLearnedLits))...)
-
-		copy(s.learnedLiterals[offset:offset+len(s.tmpLearnedLits)], s.tmpLearnedLits)
+		s.learnedLiterals = append(s.learnedLiterals, s.tmpLearnedLits...)
 
 		// Append metadata (packed struct for cache efficiency)
 		s.learnedOffsets = append(s.learnedOffsets, offset)
@@ -5065,25 +5075,6 @@ func (s *CDCLSolver) backtrack() bool {
 	s.qhead = 0
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
-
-	// SAFETY: Clear any variables with Level > bjLevel that aren't in the trail
-	// This catches bugs where trail was truncated without clearing assignments
-	for i := uint32(0); i < s.cnf.NumVars; i++ {
-		if s.assignments[i].Level > bjLevel {
-			inTrail := false
-			for _, t := range s.trail {
-				if uint32(t) == i {
-					inTrail = true
-					break
-				}
-			}
-			if !inTrail {
-				s.assignments[i] = Assignment{Level: -1}
-				s.varLevel[i] = -1
-				s.implication[i] = -1
-			}
-		}
-	}
 
 	// Reset conflicts at levels > bjLevel since we're backtracking
 	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
