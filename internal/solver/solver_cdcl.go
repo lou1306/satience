@@ -1301,18 +1301,18 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	})
 }
 
-// addLearnedClauseToWatches adds a learned clause to the watch lists
-// Watches the first two literals that are not both false
-// BINARY CLAUSE OPTIMIZATION: Binary clauses use separate watch lists for optimized propagation
-func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Clause, literals []cnf.Literal) {
+// addLearnedClauseToWatches adds a learned clause to the watch lists.
+// Watches the first two literals that are not both false (shared helper).
+// Returns the literal indices of the two watched literals.
+func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Clause, literals []cnf.Literal) (int, int) {
 	if len(literals) < 2 {
-		return
+		return -1, -1
 	}
 
 	// Choose watched literals that are not both false (shared helper).
 	watch0, watch1 := s.chooseWatchPositions(literals)
 	if watch0 < 0 || watch1 < 0 {
-		return
+		return -1, -1
 	}
 
 	lit0 := literals[watch0]
@@ -1325,7 +1325,6 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	clauseIdx := -learnedIdx - 1
 
 	// Add watches (symmetric watch tracking via ClauseIdx scanning)
-	// OPTIMIZATION: No Clause pointer - use ClauseIdx for all accesses
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(idx1),
@@ -1336,7 +1335,7 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 		Blit:      uint32(idx0),
 	})
 
-	// Watch indices now stored in learnClause() for consistency
+	return idx0, idx1
 }
 
 // removeLearnedClauseWatches removes all watches for a deleted learned clause
@@ -4394,15 +4393,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		
 		// Store watch indices for all clauses to maintain array consistency
 		if len(literals) >= 2 {
-			idx0 := cnf.LitToIndex(literals[0])
-			idx1 := cnf.LitToIndex(literals[1])
-			s.learnedWatchIdx0 = append(s.learnedWatchIdx0, idx0)
-			s.learnedWatchIdx1 = append(s.learnedWatchIdx1, idx1)
-			
+			var idx0, idx1 int
 			if s.watchInitialized {
 				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
-				s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
+				idx0, idx1 = s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
+			} else {
+				// Watches not yet initialized (preprocessing); store positions 0,1
+				// as placeholder — initWatches will choose correct positions later
+				idx0 = cnf.LitToIndex(literals[0])
+				idx1 = cnf.LitToIndex(literals[1])
 			}
+			s.learnedWatchIdx0 = append(s.learnedWatchIdx0, idx0)
+			s.learnedWatchIdx1 = append(s.learnedWatchIdx1, idx1)
 		} else {
 			// Unit clause: use sentinel values
 			s.learnedWatchIdx0 = append(s.learnedWatchIdx0, -1)

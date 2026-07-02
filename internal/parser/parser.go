@@ -41,6 +41,11 @@ func Parse(r io.Reader) (*cnf.CNF, error) {
 		return nil, fmt.Errorf("missing problem line (p cnf <vars> <clauses>)")
 	}
 
+	// Unterminated clause: literals accumulated without a closing 0
+	if len(currentLits) > 0 {
+		return nil, fmt.Errorf("unterminated clause at end of input (missing 0)")
+	}
+
 	return cnfFormula, nil
 }
 
