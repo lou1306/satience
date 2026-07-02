@@ -212,7 +212,7 @@ func TestPureLiteralWithPreprocessing(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(cnfFormula)
-	result := s.SolveWithPreprocessing()
+	result := s.SolveWithResult()
 
 	if result != SAT {
 		t.Errorf("Expected SAT through preprocessing, got %v", result)

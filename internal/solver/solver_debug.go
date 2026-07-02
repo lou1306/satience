@@ -34,8 +34,8 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 
 	// Check 1: All implications point to valid, non-deleted clauses
 	for varIdx, impIdx := range s.implication {
-		if impIdx < -1 {
-			learnedIdx := -impIdx - 1
+		if impIdx <= -5 {
+			learnedIdx := -impIdx - 5
 			if learnedIdx >= s.learnedCapacity {
 				fmt.Printf("c [VERIFY ERROR] Implication var %d -> clause %d (>= learnedCapacity %d)\n",
 					varIdx+1, learnedIdx, s.learnedCapacity)
@@ -66,23 +66,9 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 		}
 	}
 
-	// Check 3: Binary watch lists reference existing clauses
-	for litIdx := range s.watchListsBinary {
-		for i, watch := range s.watchListsBinary[litIdx] {
-			if watch.ClauseIdx < 0 {
-				learnedIdx := -watch.ClauseIdx - 1
-				if learnedIdx >= s.learnedCapacity {
-					fmt.Printf("c [VERIFY ERROR] BinaryWatch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
-						litIdx, i, learnedIdx, s.learnedCapacity)
-					errors++
-				} else if s.learnedSizes[learnedIdx] == 0 {
-					fmt.Printf("c [VERIFY ERROR] BinaryWatch[%d][%d] -> deleted clause %d (size=0)\n",
-						litIdx, i, learnedIdx)
-					errors++
-				}
-			}
-		}
-	}
+// Check 3 (removed): Binary watch lists reference existing clauses
+	// The CDCLSolver has no watchListsBinary field; this check referenced a
+	// nonexistent struct member and prevented `make debug` from compiling.
 
 	// Check 4: unitLearnedList only contains size=1 clauses
 	for i, learnedIdx := range s.unitLearnedList {

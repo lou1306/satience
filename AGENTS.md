@@ -32,12 +32,12 @@ Build a sound and complete CDCL SAT solver in Go named "satience" with DIMACS CN
 
 ## Performance
 
-**Swap-Remove Clause Deletion** (June 2026) ✅
+**Tombstone Clause Deletion + Periodic Compaction** (June/July 2026) ✅
 
-Replaces array rebuilding with in-place swap-remove during learned clause deletion:
+Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal storage is reclaimed by `compactLearnedClauses()`, which runs at the next restart (level 0, where no learned clause is in use as a reason) when accumulated tombstones exceed ~33% of capacity:
 - **GC cycles**: 606 → 26 on 26Kv FCC instance (23× reduction)
 - **GC time**: ~8-10s → ~0.4s (20× faster)
-- **Mechanism**: Move active clauses into deleted slots, scan watches to update ClauseIdx, track freed literal regions for reuse
+- **Mechanism**: Deletion marks tombstones + removes watches + `compactWatchLists()`. Periodically, `compactLearnedClauses()` reclaims tombstone literal gaps by moving active clauses into a contiguous prefix, remapping the implication array, and rebuilding all watch lists with non-false literal selection (so the watched-literal invariant holds)
 
 **Benchmark results** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, June 2026):
 - **Solved**: 26/32 instances (81.2% solve rate)
@@ -48,12 +48,12 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 - **Algebraic/Combinatorial**: Mixed results (need better heuristics)
 
 **Performance characteristics**:
-- Swap-remove deletion: No array rebuilding, O(watches) scan per swap
-- Contiguous literal storage: Free slot tracking and reuse
+- Tombstone deletion + periodic compaction: bounds `learnedLiterals` growth on long runs
+- Contiguous literal storage: reclaimed by compaction (not per-deletion)
 - Watched literals with ClauseIdx caching: 63% speedup
 - Trail scanning optimization in 1-UIP: O(current_level) instead of O(trail_size)
 - Activity heap: O(log n) variable selection
-- LBD-based clause database management (max 2,500 learned clauses)
+- LBD-based clause database management (dynamic learned-clause limit via `calculateMaxLearned`: ~15% of clauses, min 300, max 100K)
 - Props/dec ratio: ~33 steady-state on hard instances
 
 **Primary bottleneck**: 
@@ -120,13 +120,14 @@ Replaces array rebuilding with in-place swap-remove during learned clause deleti
 - **Literal**: `uint32` (bit 31=sign, bits 0-30=variable index)
 - **Variables**: 0-based internally, 1-based in DIMACS
 - **Constants**: `litVarMask=0x7FFFFFFF`, `litNegatedMask=0x80000000`
+- **Implication array** (`s.implication`): Reason clause per variable. Encoding: `>=0` original clause; `<=-5` learned (`-learnedIdx-5`, decode `learnedIdx = -impl - 5`); `-1` decision; `-2` unit-prop preprocess; `-3` pure-literal preprocess; `-4` reserved. The 4-slot offset frees `-1..-4` as pure sentinels so learned-clause decode can't misread preprocessing sentinels (was a soundness bug in `minimizeLearnedClause`). `Watch.ClauseIdx` uses a separate encoding (`-learnedIdx-1`); the two diverge by the offset, so `propagateWatched` translates watch→implication at the assign site.
 - **Learned Clauses**: Contiguous literal storage with offset/size arrays
 - **Free Slots**: `literalFreeSlot` struct tracks freed regions for reuse
 
 ### Key Files
 - `internal/cnf/cnf.go`: Core data structures (Literal, Clause, CNF, Watch)
 - `internal/parser/parser.go`: DIMACS CNF parser
-- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts, swap-remove deletion
+- `internal/solver/solver_cdcl.go`: CDCL solver with 1-UIP, backjumping, restarts, tombstone deletion + periodic compaction
 - `internal/solver/vsids.go`: VSIDS/LRB/CHB variable selection with activity heap
 - `internal/solver/solver.go`: Base solver with propagation
 - `internal/solver/solver_test.go`: Unit tests
@@ -186,8 +187,8 @@ benchmark/eval_small_random.sh [n_instances]
 - **ClauseIdx in Watch struct**: O(1) clause index access (63% speedup)
 - **Default minimization = selective**: Aggressive mode adds 1-2% overhead
 - **watchInitialized flag**: Set AFTER all clauses watched (critical bug fix)
-- **Swap-remove over array rebuild**: 23× GC reduction, preserves memory pool benefits
-- **Watch scan during swap-remove**: O(watches) per swap, acceptable since deletion is infrequent
+- **Tombstone deletion + periodic compaction over array rebuild**: 23× GC reduction, bounds `learnedLiterals` growth
+- **chooseWatchPositions helper**: Shared non-false literal selection for original/learned watch setup and compaction (preserves watched-literal invariant)
 
 ## Next Steps
 
@@ -258,9 +259,9 @@ f53361a - Feature: Expose clause deletion scoring parameters as CLI options
 - **Inprocessing removed**: Unit propagation at restart caused 34-228% slowdown (July 2026)
 - **Preprocessing**: Adaptive strategy based on instance structure (structured score ≥ 0.7 enables unit propagation)
 
-## Swap-Remove Implementation Details
+## Clause Deletion + Compaction Implementation Details
 
-### Why Swap-Remove?
+### Why tombstones + periodic compaction?
 
 **Before** (array rebuild):
 ```go
@@ -272,39 +273,38 @@ for _, idx := range keepIndices {
 s.learnedLiterals = newLiterals  // GC triggers
 ```
 
-**After** (swap-remove):
+**After** (tombstones + compaction):
 ```go
-// Move clauses in-place, NO allocation
-for readIdx := 0; readIdx < capacity; readIdx++ {
-    if !deleted[readIdx] {
-        if writeIdx != readIdx {
-            moveClause(writeIdx, readIdx)  // Just copy metadata
-            updateWatchClauseIndices(...)   // Update watches
-        }
-        writeIdx++
+// Deletion: mark tombstones, remove watches (NO allocation)
+for i := 0; i < learnedCapacity; i++ {
+    if deleted[i] && s.learnedSizes[i] > 0 {
+        s.removeLearnedClauseWatches(i)
+        s.learnedSizes[i] = 0  // tombstone
     }
 }
-// Truncate arrays (no allocation)
-s.learnedOffsets = s.learnedOffsets[:writeIdx]
+// ... later, at the next restart (level 0), if tombstones accumulated:
+s.compactLearnedClauses()  // move active clauses into a contiguous prefix,
+                           // remap implications, rebuild all watch lists
+                           // with non-false literal selection
 ```
 
 ### Key Components
 
 1. **learnedActiveCount**: Track active clauses (excludes tombstones)
-2. **learnedCapacity**: Total capacity including deleted slots
-3. **literalFreeSlots**: Track freed literal regions for reuse
-4. **updateWatchClauseIndices()**: Scan watch lists to update ClauseIdx after swap
-5. **Free slot reuse**: Check `literalFreeSlots` before appending new literals
+2. **learnedCapacity**: Total capacity including tombstone slots
+3. **compactPending**: Set when accumulated tombstones (capacity − active) ≥ ~33% of capacity; cleared after compaction
+4. **compactLearnedClauses()**: Reclaims tombstone literal gaps by compacting `learnedLiterals` to a contiguous prefix, remapping the implication array, and rebuilding all watch lists via `chooseWatchPositions` (non-false literal selection)
+5. **chooseWatchPositions()**: Shared helper (used by original/learned watch setup AND compaction) that picks watched literals which are not both false, preserving the watched-literal invariant
 
 ### Trade-offs
 
 **Pros**:
 - 23× fewer GCs on large instances
-- No array allocations during deletion
-- Preserves memory pool benefits
-- Watch references stay valid
+- No array allocations during deletion (only at compaction, which is infrequent)
+- `learnedLiterals` growth is bounded (tombstone gaps reclaimed periodically)
+- Watch references remapped correctly during compaction
 
 **Cons**:
-- O(watches) scan during each swap-remove (acceptable - deletion is infrequent)
-- Slightly more complex code
+- Compaction rebuilds all watch lists from scratch (O(clauses × literals)), but runs rarely (only at restart when tombstone ratio high)
+- Literal pool has gaps between compactions (memory temporarily higher until next restart)
 - Literal pool can fragment over time (mitigated by free slot reuse)

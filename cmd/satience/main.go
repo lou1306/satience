@@ -147,11 +147,10 @@ func run() int {
 	if *dpll {
 		result = s.SolveDPLL()
 	} else if *noPreprocess {
-		// Skip adaptive preprocessing, use lightweight preprocessing only
-		result = s.SolveWithResult()
+		// Debug escape hatch: skip all preprocessing
+		result = s.SolveWithoutPreprocessing()
 	} else {
-		// Use adaptive preprocessing based on instance structure analysis
-		result = s.SolveWithPreprocessing()
+		result = s.SolveWithResult()
 	}
 	elapsed := time.Since(start)
 

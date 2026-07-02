@@ -45,9 +45,11 @@ type perfTestInstance struct {
 // Baseline performance values (to be tuned with actual measurements)
 // These represent the current best-known performance
 var baselineInstances = []perfTestInstance{
-	// DISABLED: 0f4576a6e7399336e11f0828d32263dd.cnf has pre-existing 1-UIP soundness bug
-	// MiniSat says SAT, but solver returns UNSAT due to incorrect unit clause learning
-	// This bug exists in the base code (before preprocessing changes)
+	// DISABLED: 0f4576a6e7399336e11f0828d32263dd.cnf is SAT (per MiniSat) but satience
+	// times out on it (UNKNOWN), well outside the thresholds below. An earlier 1-UIP
+	// soundness bug (wrong UNSAT via incorrect unit clause learning) has been fixed;
+	// the instance now returns UNKNOWN rather than a wrong answer. Re-enable once
+	// heuristics improve enough to solve it within budget.
 	// Small random instance (quick smoke test)
 	// Note: This instance requires many conflicts due to its structure
 	// {

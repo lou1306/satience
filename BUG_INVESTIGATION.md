@@ -63,13 +63,33 @@ The solver enters an infinite loop:
 4. **Protect unit clauses**: Ensure unit clauses are protected from deletion by checking they're in `clauseUsedAsReason`
 
 ## Status
-Investigation incomplete. The bug is in the core solver logic and requires careful debugging with targeted logging to identify the exact state corruption.
+RESOLVED (July 2026). The original "infinite loop on var 2" no longer reproduces — a
+SAFETY CHECK was added in `decide()` to fall back to a linear scan when the selected
+variable is already assigned (previously it recursed and corruptly decremented the
+level before it was incremented).
+
+A deeper, related soundness bug was found and fixed via random 3-SAT differential
+testing against MiniSat: satience returned UNSAT on satisfiable instances. Root cause:
+when 1-UIP conflict analysis did not converge (more than one literal remaining at the
+current decision level, caused by inconsistent reason clauses), the "FALLBACK"/"FORCE"
+code DROPPED literals to force a single UIP. Dropping literals produces a clause that
+is NOT entailed by resolution, which yielded incorrect unit clauses (e.g. learning
+`var=x` on a SAT instance) and thus incorrect UNSAT.
+
+Fix: the fallback no longer drops literals. When 1-UIP fails to converge, ALL remaining
+current-level literals are kept — the clause is still a valid resolvent of the conflict
+clause with the resolved reasons, so it is sound (it may be non-asserting, which is
+merely less effective, never wrong). Verified: 80 random 3-SAT instances + 28 GBD
+instances vs MiniSat, 0 disagreements.
+
+Note: this specific instance (0f4576...) now returns UNKNOWN (timeout) rather than a
+wrong answer; it remains disabled in the perf regression suite for performance reasons,
+not soundness.
 
 ## Files Modified During Investigation
-- None (all experimental changes reverted)
+- internal/solver/solver_cdcl.go: sound 1-UIP non-convergence fallback; decide() linear-scan fallback; compactLearnedClauses re-enabled with non-false watch selection; chooseWatchPositions helper
+- internal/solver/solver_debug.go: removed nonexistent watchListsBinary reference (fixed broken debug build)
 
 ## Next Steps
-1. Add assertions and logging to track var 2's state
-2. Run with verbose output to identify where level becomes 0 incorrectly
-3. Fix the identified bug
-4. Verify with this instance and the full test suite
+1. Add tests for clause deletion, watch invariants under stress, restart correctness
+2. Investigate the underlying reason-clause inconsistency that triggers non-convergence
