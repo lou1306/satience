@@ -205,7 +205,7 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 // Only includes unassigned variables
 // Includes LBD bonus in activity score for selection
 func (v *VSIDS) buildHeap(assignments []Assignment) {
-	v.heap = make(vsidsHeap, 0, len(v.activity))
+	v.heap = v.heap[:0]
 
 	for i, act := range v.activity {
 		if assignments[i].Level < 0 {
