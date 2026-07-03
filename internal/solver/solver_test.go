@@ -1473,3 +1473,198 @@ func TestMinimizeGetReasonLitsForVar(t *testing.T) {
 		t.Errorf("Expected nil for preprocessing sentinel, got %v", lits)
 	}
 }
+
+// TestVivificationSoundness verifies that vivification produces correct results
+// on SAT/UNSAT instances. The vivification must not produce unsound clause
+// shortenings that change the satisfiability of the formula.
+func TestVivificationSoundness(t *testing.T) {
+	tests := []struct {
+		name     string
+		cnf      cnf.CNF
+		expected SolveResult
+	}{
+		{
+			name: "simple_sat",
+			cnf: cnf.CNF{
+				NumVars: 3, NumClauses: 2,
+				Clauses: []cnf.Clause{newClause(1, 2), newClause(-1, 3)},
+			},
+			expected: SAT,
+		},
+		{
+			name: "simple_unsat",
+			cnf: cnf.CNF{
+				NumVars: 2, NumClauses: 4,
+				Clauses: []cnf.Clause{
+					newClause(1), newClause(2),
+					newClause(-1), newClause(-2),
+				},
+			},
+			expected: UNSAT,
+		},
+		{
+			name: "implication_chain_sat",
+			cnf: cnf.CNF{
+				NumVars: 4, NumClauses: 3,
+				Clauses: []cnf.Clause{
+					newClause(-1, 2), newClause(-2, 3), newClause(-3, 4),
+				},
+			},
+			expected: SAT,
+		},
+		{
+			name: "pigeonhole_unsat",
+			cnf:   buildPigeonhole(3, 2),
+			expected: UNSAT,
+		},
+		{
+			name: "tseitin_unsat",
+			cnf: cnf.CNF{
+				NumVars: 40, NumClauses: 74,
+				Clauses: []cnf.Clause{
+					newClause(-17, 29), newClause(17, -29),
+					newClause(-17, -18, 30), newClause(-17, 18, -30),
+					newClause(17, -18, -30), newClause(17, 18, 30),
+					newClause(-18, -19, 31), newClause(-18, 19, -31),
+					newClause(18, -19, -31), newClause(18, 19, 31),
+					newClause(-19, 32), newClause(19, -32),
+					newClause(-20, -29, 33), newClause(-20, 29, -33),
+					newClause(20, -29, -33), newClause(20, 29, 33),
+					newClause(-20, -21, -30, 34), newClause(-20, -21, 30, -34),
+					newClause(-20, 21, -30, -34), newClause(-20, 21, 30, 34),
+					newClause(20, -21, -30, -34), newClause(20, -21, 30, 34),
+					newClause(20, 21, -30, 34), newClause(20, 21, 30, -34),
+					newClause(-21, -22, -31, 35), newClause(-21, -22, 31, -35),
+					newClause(-21, 22, -31, -35), newClause(-21, 22, 31, 35),
+					newClause(21, -22, -31, -35), newClause(21, -22, 31, 35),
+					newClause(21, 22, -31, 35), newClause(21, 22, 31, -35),
+					newClause(-22, -32, 36), newClause(-22, 32, -36),
+					newClause(22, -32, -36), newClause(22, 32, 36),
+					newClause(-23, -33, 37), newClause(-23, 33, -37),
+					newClause(23, -33, -37), newClause(23, 33, 37),
+					newClause(-23, -24, -34, 38), newClause(-23, -24, 34, -38),
+					newClause(-23, 24, -34, -38), newClause(-23, 24, 34, 38),
+					newClause(23, -24, -34, -38), newClause(23, -24, 34, 38),
+					newClause(23, 24, -34, 38), newClause(23, 24, 34, -38),
+					newClause(-24, -25, -35, 39), newClause(-24, -25, 35, -39),
+					newClause(-24, 25, -35, -39), newClause(-24, 25, 35, 39),
+					newClause(24, -25, -35, -39), newClause(24, -25, 35, 39),
+					newClause(24, 25, -35, 39), newClause(24, 25, 35, -39),
+					newClause(-25, -36, 40), newClause(-25, 36, -40),
+					newClause(25, -36, -40), newClause(25, 36, 40),
+					newClause(-26, 37), newClause(26, -37),
+					newClause(-26, -27, 38), newClause(-26, 27, -38),
+					newClause(26, -27, -38), newClause(26, 27, 38),
+					newClause(-27, -28, 39), newClause(-27, 28, -39),
+					newClause(27, -28, -39), newClause(27, 28, 39),
+					newClause(-28, 40), newClause(28, -40),
+					newClause(1), newClause(-1),
+				},
+			},
+			expected: UNSAT,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewCDCLSolver(&tt.cnf)
+			s.SetVivifyPeriod(1) // Run vivification at every restart
+			s.SetMaxIter(100000)
+			result := s.SolveWithResult()
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+			if result == SAT {
+				assignments := s.GetAssignments()
+				for i, clause := range tt.cnf.Clauses {
+					satisfied := false
+					for _, lit := range clause.Literals {
+						varIdx := lit.Var()
+						if varIdx >= uint32(len(assignments)) {
+							t.Errorf("Variable %d out of bounds", varIdx)
+							continue
+						}
+						litTrue := (!lit.IsNegated() && assignments[varIdx].Value) || (lit.IsNegated() && !assignments[varIdx].Value)
+						if litTrue {
+							satisfied = true
+							break
+						}
+					}
+					if !satisfied {
+						t.Errorf("Clause %d not satisfied by model", i)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestVivifyDisabled verifies that vivification can be disabled (period=0)
+// and the solver still produces correct results.
+func TestVivifyDisabled(t *testing.T) {
+	c := buildPigeonhole(3, 2)
+	s := NewCDCLSolver(&c)
+	s.SetVivifyPeriod(0) // Disable vivification
+	s.SetMaxIter(100000)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT with vivification disabled, got %v", result)
+	}
+}
+
+// TestCancelUntil verifies that cancelUntil correctly restores solver state
+// after trial assignments.
+func TestCancelUntil(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 5, NumClauses: 3,
+		Clauses: []cnf.Clause{
+			newClause(-1, 2), newClause(-2, 3), newClause(-3, 4),
+		},
+	}
+	s := NewCDCLSolver(&c)
+	s.initWatches()
+
+	// Make trial assignments at levels 1 and 2
+	s.level = 0
+	s.trailHead = []int{0}
+	// Level 1: assign var 0
+	s.level = 1
+	s.trailHead = append(s.trailHead, len(s.trail))
+	s.assignLiteral(cnf.NewLiteral(0, false), 1, -1)
+	// Level 2: assign var 1
+	s.level = 2
+	s.trailHead = append(s.trailHead, len(s.trail))
+	s.assignLiteral(cnf.NewLiteral(1, false), 2, -1)
+
+	// Verify assignments
+	if s.assignments[0].Level != 1 {
+		t.Errorf("var 0 should be at level 1, got %d", s.assignments[0].Level)
+	}
+	if s.assignments[1].Level != 2 {
+		t.Errorf("var 1 should be at level 2, got %d", s.assignments[1].Level)
+	}
+
+	// Cancel to level 1
+	s.cancelUntil(1)
+
+	// var 1 should be cleared, var 0 should remain
+	if s.assignments[0].Level != 1 {
+		t.Errorf("var 0 should still be at level 1, got %d", s.assignments[0].Level)
+	}
+	if s.assignments[1].Level != -1 {
+		t.Errorf("var 1 should be unassigned after cancelUntil(1), got level %d", s.assignments[1].Level)
+	}
+
+	// Cancel to level 0
+	s.cancelUntil(0)
+
+	if s.assignments[0].Level != -1 {
+		t.Errorf("var 0 should be unassigned after cancelUntil(0), got level %d", s.assignments[0].Level)
+	}
+	if s.level != 0 {
+		t.Errorf("level should be 0, got %d", s.level)
+	}
+	if len(s.trail) != 0 {
+		t.Errorf("trail should be empty, got len %d", len(s.trail))
+	}
+}

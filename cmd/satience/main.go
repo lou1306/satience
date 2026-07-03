@@ -32,6 +32,7 @@ func run() int {
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimizeDepth := flag.Int("minimize-depth", 100, "Max recursion depth for recursive clause minimization (default=100, 0=disabled)")
+	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
@@ -131,6 +132,9 @@ func run() int {
 
 	// Configure recursive clause minimization depth
 	s.SetMinimizeMaxDepth(*minimizeDepth)
+
+	// Configure clause vivification
+	s.SetVivifyPeriod(*vivifyPeriod)
 
 	start := time.Now()
 	var result solver.SolveResult
