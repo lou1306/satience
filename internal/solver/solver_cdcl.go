@@ -119,11 +119,12 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 // Fields are mostly private; use provided methods for interaction.
 
 type CDCLSolver struct {
-	cnf          *cnf.CNF
-	assignments  []Assignment
-	trail        []int
-	varLevel     []int // Cache of variable levels (avoids random assignments[].Level access)
-	trailHead    []int
+	cnf             *cnf.CNF
+	assignments     []Assignment
+	trail           []int
+	preprocessTrail []int // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	varLevel        []int // Cache of variable levels (avoids random assignments[].Level access)
+	trailHead       []int
 	level        int
 	vsids        *VSIDS
 	conflicts    int
@@ -165,9 +166,7 @@ type CDCLSolver struct {
 	decidedVars               []uint32 // Variables decided during current search phase
 	decidedVarSet             []bool   // Fast lookup for decided variables
 	restartDecisionCount      int      // Decisions since last restart (for diversity reset)
-	minimizationMaxSize       int      // Skip minimization for clauses > this size (0=all)
-	minimizationMaxLBD        int      // Skip minimization for clauses with LBD > this (0=all)
-	minimizationMaxReasonSize int      // Skip resolution with reason clauses > this size
+	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause   []bool
 	tmpSeenVar           []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
@@ -177,7 +176,7 @@ type CDCLSolver struct {
 	tmpCandidates        []resolveCandidate
 	tmpLevelSet          []int         // For LBD calculation (replaces map)
 	tmpLevelSetUsed      []bool        // Track which levels are in tmpLevelSet
-	tmpResolved          []bool        // Track resolved variables in 1-UIP to prevent cycles
+	tmpResolved          []bool        // Track resolved variables in 1-UIP to prevent re-resolution cycles
 	tmpResolvedVars      []uint32      // Track which variables were resolved (for fast reset)
 	tmpFlippedVars       []bool        // Track flipped variables at level 1 to prevent infinite loops
 	tmpTouchedVars       []uint32      // Track which variables were modified (for fast reset)
@@ -185,6 +184,7 @@ type CDCLSolver struct {
 	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
 	tmpMinimizedLits     []cnf.Literal // Reusable buffer for clause minimization (avoids allocation)
+	tmpMinSeenVars       []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
 	tmpIsGlue            []bool        // Bitmap for glue clause selection during restart (avoids allocation)
@@ -268,6 +268,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		cnf:                  formula,
 		assignments:          make([]Assignment, formula.NumVars),
 		trail:                make([]int, 0, formula.NumVars),
+		preprocessTrail:      make([]int, 0, formula.NumVars),
 		varLevel:             make([]int, formula.NumVars),
 		trailHead:            make([]int, 1),
 		qhead:                0,
@@ -327,6 +328,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLearnedLits:       make([]cnf.Literal, 0, 256),
 		tmpSortedLits:        make([]cnf.Literal, 0, 256),
 		tmpMinimizedLits:     make([]cnf.Literal, 0, 256),
+		tmpMinSeenVars:       make([]uint32, 0, 256),
 		conflictLitsBuf:     make([]cnf.Literal, 0, 256),
 		tmpIsGlue:            make([]bool, maxLearned),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
@@ -335,10 +337,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseIndexMap:     make([]int, maxLearned),
 		learnedClauseBase:     int(formula.NumClauses),
 		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
-		// Minimization thresholds - aggressive for better clause quality
-		minimizationMaxSize:       0, // Always minimize (no size limit)
-		minimizationMaxLBD:        0, // Always minimize (no LBD limit)
-		minimizationMaxReasonSize: 0, // Always try all reason clauses
+		// Recursive minimization: max depth of reason-chain exploration (safety cap)
+		minimizeMaxDepth: 100,
 		// Configurable parameters with defaults
 		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
@@ -368,9 +368,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	}
 
 	// FIX: Initialize all assignments as unassigned (Level=-1)
+	// Also initialize implication to -1 (no reason) — make([]int, N) zero-fills to 0,
+	// which looks like "original clause 0" and causes assignLiteralByClause to skip assignment.
 	for i := range solver.assignments {
 		solver.assignments[i] = Assignment{Level: -1}
 		solver.varLevel[i] = -1
+		solver.implication[i] = -1
 	}
 
 	// Initialize savedPhase to true (default positive phase)
@@ -395,8 +398,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		solver.vsids.SetBaseBumpAmount(25.0)
 		// Moderate LBD bonus - too high causes over-prioritization of glue clauses
 		solver.vsids.SetLBDBonusScale(2000.0)
-		// More aggressive clause minimization for small instances
-		solver.minimizationMaxReasonSize = 50 // Allow larger reason clauses for more minimization
 		// More aggressive restarts for small instances
 		// Luby base: 100 → 10 (restart 10× more frequently)
 		solver.restartBase = 10
@@ -607,14 +608,14 @@ func (s *CDCLSolver) SetClauseDeletionParameters(
 	s.clauseDeletionKeepRatio = keepRatio
 }
 
-// SetMinimizationThresholds configures clause minimization behavior
-// size: skip minimization for clauses larger than this (0=all clauses)
-// lbd: skip minimization for clauses with LBD larger than this (0=all clauses)
-// reasonSize: skip resolution with reason clauses larger than this
-func (s *CDCLSolver) SetMinimizationThresholds(size, lbd, reasonSize int) {
-	s.minimizationMaxSize = size
-	s.minimizationMaxLBD = lbd
-	s.minimizationMaxReasonSize = reasonSize
+// SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
+// minimization (safety/cost cap). The natural DAG bound of the implication
+// graph already terminates recursion; this is a defensive limit.
+func (s *CDCLSolver) SetMinimizeMaxDepth(d int) {
+	if d < 0 {
+		d = 0
+	}
+	s.minimizeMaxDepth = d
 }
 
 // GetStats returns solving statistics
@@ -677,6 +678,31 @@ func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
 	offset := s.learnedOffsets[clauseIdx]
 	size := s.learnedSizes[clauseIdx]
 	return s.learnedLiterals[offset : offset+size]
+}
+
+// getReasonLitsForVar returns the reason clause literals for a variable whose
+// truth was derived by propagation. Returns nil if the variable is a decision,
+// has a preprocessing sentinel reason, or the reason clause is gone (tombstone
+// or out-of-bounds). Decodes the implication array encoding:
+//   >=0  → original clause at that index
+//   <=-5 → learned clause (index = -impl-5)
+//   -1   → decision (no reason)
+//   -2/-3/-4 → preprocessing sentinels (no resolvable reason clause)
+func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
+	reasonClauseIdx := s.implication[v]
+	if reasonClauseIdx >= 0 {
+		if int(reasonClauseIdx) < len(s.cnf.Clauses) {
+			return s.cnf.Clauses[reasonClauseIdx].Literals
+		}
+		return nil
+	}
+	if reasonClauseIdx <= -5 {
+		learnedIdx := -reasonClauseIdx - 5
+		if int(learnedIdx) < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
+			return s.getLearnedClauseLiterals(int(learnedIdx))
+		}
+	}
+	return nil
 }
 
 func (s *CDCLSolver) getDetailedStats() SolverStats {
@@ -899,6 +925,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			s.cnf.NumVars, s.cnf.NumClauses)
 		s.cnf.RebuildLiteralPool()
 		s.initWatches()
+		// Still need to propagate original unit clauses + activate watches
+		if s.propagateOriginalUnitsAndActivateWatches() {
+			s.printStats()
+			return UNSAT
+		}
 		return UNKNOWN
 	}
 
@@ -958,20 +989,18 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		s.Log("c [verbose] Preserving %d preprocessing assignments for final model\n", preprocAssignments)
 	}
 
-	// CRITICAL FIX: Rebuild trail from all preprocessing assignments
-	// Pure literal elimination and other techniques assign variables but may not
-	// add them to the trail. The watch system needs all assignments in the trail
-	// to process watches correctly when search starts.
-	s.trail = s.trail[:0]
+	// CRITICAL FIX: Rebuild preprocessTrail from all preprocessing assignments.
+	// Preprocessing vars live on preprocessTrail (separate from search trail)
+	// so they are never cleared by backtrack/restart.
+	s.preprocessTrail = s.preprocessTrail[:0]
 	for i := range s.assignments {
 		if s.assignments[i].Level == 0 {
-			s.trail = append(s.trail, int(i))
+			s.preprocessTrail = append(s.preprocessTrail, int(i))
 		}
 	}
-	s.trailHead = []int{0}  // Only level 0 exists after preprocessing
-	// CRITICAL FIX: Set qhead to trail length - preprocessing assignments already processed
-	// Without this, propagateWatched re-processes all 364 preprocessing assignments
-	s.qhead = len(s.trail)
+	s.trail = s.trail[:0]
+	s.trailHead = []int{0}
+	s.qhead = 0
 
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
@@ -981,35 +1010,65 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	s.watchInitialized = false
 	s.initWatches()
 
-	// CRITICAL: Propagate original unit clauses (not watched by watched literals)
-	// Unit clauses have only 1 literal and are not added to watch lists
-	for clauseIdx := 0; clauseIdx < s.cnf.NumClauses; clauseIdx++ {
+	// CRITICAL: Propagate original unit clauses + activate watches for preprocessing vars.
+	if unsat := s.propagateOriginalUnitsAndActivateWatches(); unsat {
+		return UNSAT
+	}
+
+	return UNKNOWN
+}
+
+// propagateOriginalUnitsAndActivateWatches propagates original unit clauses (length 1,
+// not watched), stores them on preprocessTrail, then runs one propagation pass to
+// activate watches on preprocessing variables. Must be called after initWatches.
+// Returns true if UNSAT is detected (conflicting unit clauses).
+func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
+	// Propagate original unit clauses (not watched by watched literals)
+	for _, clauseIdx := range s.originalUnitClauses {
 		clause := &s.cnf.Clauses[clauseIdx]
-		if len(clause.Literals) != 1 {
-			continue
-		}
 		lit := clause.Literals[0]
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level >= 0 {
-			// Already assigned - check for conflict
 			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
 			if !litTrue {
-				// Conflict with unit clause - UNSAT
-				return UNSAT
+				return true // Conflict with unit clause - UNSAT
 			}
 			continue
 		}
-		// Propagate unit clause
 		value := !lit.IsNegated()
 		s.assignments[varIdx] = Assignment{Value: value, Level: 0}
 		s.varLevel[varIdx] = 0
-		s.trail = append(s.trail, int(varIdx))
-		s.implication[varIdx] = -2 // Mark as unit propagation
+		s.preprocessTrail = append(s.preprocessTrail, int(varIdx))
+		s.implication[varIdx] = -2
 	}
-	// Update qhead since we added to trail
-	s.qhead = len(s.trail)
 
-	return UNKNOWN
+	// Activate watches for preprocessing variables.
+	// Preprocessing vars live on preprocessTrail (not s.trail), so propagateWatched
+	// never processes them during search. Run one explicit activation pass: temporarily
+	// put preprocessTrail on s.trail, call propagateWatched to process watches, then
+	// move everything (including new propagations) back to preprocessTrail.
+	s.trail = append(s.trail[:0], s.preprocessTrail...)
+	s.qhead = 0
+	s.level = 0
+	s.trailHead = s.trailHead[:1]
+	s.trailHead[0] = 0
+	conflict, _ := s.propagateWatched()
+	if conflict {
+		return true
+	}
+	// Move all trail elements (original + any propagations) to preprocessTrail.
+	// Reset propagated vars from Level 1 (propLevel hack) to Level 0 (preprocessing).
+	for _, v := range s.trail {
+		if s.assignments[v].Level != 0 {
+			s.assignments[v] = Assignment{Value: s.assignments[v].Value, Level: 0}
+			s.varLevel[v] = 0
+		}
+	}
+	s.preprocessTrail = append(s.preprocessTrail[:0], s.trail...)
+	s.trail = s.trail[:0]
+	s.trailHead = []int{0}
+	s.qhead = 0
+	return false
 }
 
 // initWatches initializes watched literals for all clauses
@@ -1121,26 +1180,31 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 
 	watch0, watch1 := s.chooseWatchPositions(literals)
 	if watch0 < 0 || watch1 < 0 {
-		// Clause has < 2 literals - shouldn't happen after preprocessing
 		return
 	}
 
+	// Swap watched literals into positions 0 and 1 (MiniSat-style).
+	// This lets us find the blocking literal at position 1-WatchPos without storing Blit.
 	lit0 := literals[watch0]
 	lit1 := literals[watch1]
+	literals[0], literals[watch0] = lit0, literals[0]
+	if watch1 == 0 {
+		literals[1], literals[watch0] = lit1, literals[1]
+	} else {
+		literals[1], literals[watch1] = lit1, literals[1]
+	}
 
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Add watches (symmetric watch tracking via ClauseIdx scanning)
-	// OPTIMIZATION: No Clause pointer - use ClauseIdx for all accesses
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
-		ClauseIdx: clauseIdx,
-		Blit:      uint32(idx1),
+		ClauseIdx: int32(clauseIdx),
+		WatchPos:  0,
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-		ClauseIdx: clauseIdx,
-		Blit:      uint32(idx0),
+		ClauseIdx: int32(clauseIdx),
+		WatchPos:  1,
 	})
 }
 
@@ -1152,102 +1216,86 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 		return -1, -1
 	}
 
-	// Choose watched literals that are not both false (shared helper).
 	watch0, watch1 := s.chooseWatchPositions(literals)
 	if watch0 < 0 || watch1 < 0 {
 		return -1, -1
 	}
 
+	// Swap watched literals into positions 0 and 1 (MiniSat-style).
 	lit0 := literals[watch0]
 	lit1 := literals[watch1]
+	literals[0], literals[watch0] = lit0, literals[0]
+	if watch1 == 0 {
+		literals[1], literals[watch0] = lit1, literals[1]
+	} else {
+		literals[1], literals[watch1] = lit1, literals[1]
+	}
 
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Learned clause index is stored as negative: -learnedIdx-1
-	clauseIdx := -learnedIdx - 1
+	clauseIdx := int32(-learnedIdx - 1)
 
-	// Add watches (symmetric watch tracking via ClauseIdx scanning)
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: clauseIdx,
-		Blit:      uint32(idx1),
+		WatchPos:  0,
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: clauseIdx,
-		Blit:      uint32(idx0),
+		WatchPos:  1,
 	})
 
 	return idx0, idx1
 }
 
-// removeLearnedClauseWatches removes all watches for a deleted learned clause
-// FIX: Use stored watched literal indices instead of reading from potentially corrupted literals
+// removeLearnedClauseWatches removes all watches for a deleted learned clause.
+// With MiniSat-style watched literals (positions 0/1), no Blit updates needed.
 func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	if learnedIdx < 0 || learnedIdx >= s.learnedCapacity {
 		return
 	}
 
 	if s.learnedSizes[learnedIdx] < 2 {
-		return // Clause too short to have watches
+		return
 	}
 
-	clauseIdx := -learnedIdx - 1
+	clauseIdx := int32(-learnedIdx - 1)
 
-	// Use stored watched literal indices (not from potentially corrupted literals)
 	idx0 := s.learnedWatchIdx0[learnedIdx]
 	idx1 := s.learnedWatchIdx1[learnedIdx]
 
-	// Skip if watch indices are invalid (already removed or corrupted)
 	if idx0 < 0 || idx1 < 0 || idx0 >= len(s.watchLists) || idx1 >= len(s.watchLists) {
 		return
 	}
 
-	// Remove watch from lit0's watch list
-	watchList0 := s.watchLists[idx0]
-	for i := range watchList0 {
-		if watchList0[i].ClauseIdx == clauseIdx {
-			// Remove this watch by swapping with last
-			lastIdx := len(watchList0) - 1
+	// Remove watch from lit0's watch list (swap-remove, no Blit update needed)
+	wl0 := s.watchLists[idx0]
+	for i := range wl0 {
+		if wl0[i].ClauseIdx == clauseIdx {
+			lastIdx := len(wl0) - 1
 			if i != lastIdx {
-				watchList0[i] = watchList0[lastIdx]
-				// Update symmetric watch Blit
-				movedWatch := watchList0[i]
-				for symI := range s.watchLists[movedWatch.Blit] {
-					if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
-						s.watchLists[movedWatch.Blit][symI].Blit = uint32(idx0)
-						break
-					}
-				}
+				wl0[i] = wl0[lastIdx]
 			}
-			watchList0 = watchList0[:lastIdx]
+			wl0 = wl0[:lastIdx]
 			break
 		}
 	}
-	s.watchLists[idx0] = watchList0
+	s.watchLists[idx0] = wl0
 
 	// Remove watch from lit1's watch list
-	watchList1 := s.watchLists[idx1]
-	for i := range watchList1 {
-		if watchList1[i].ClauseIdx == clauseIdx {
-			// Remove this watch by swapping with last
-			lastIdx := len(watchList1) - 1
+	wl1 := s.watchLists[idx1]
+	for i := range wl1 {
+		if wl1[i].ClauseIdx == clauseIdx {
+			lastIdx := len(wl1) - 1
 			if i != lastIdx {
-				watchList1[i] = watchList1[lastIdx]
-				// Update symmetric watch Blit
-				movedWatch := watchList1[i]
-				for symI := range s.watchLists[movedWatch.Blit] {
-					if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
-						s.watchLists[movedWatch.Blit][symI].Blit = uint32(idx1)
-						break
-					}
-				}
+				wl1[i] = wl1[lastIdx]
 			}
-			watchList1 = watchList1[:lastIdx]
+			wl1 = wl1[:lastIdx]
 			break
 		}
 	}
-	s.watchLists[idx1] = watchList1
+	s.watchLists[idx1] = wl1
 }
 
 func luby(i int) int {
@@ -1376,45 +1424,19 @@ func (s *CDCLSolver) restart() bool {
 	// Restart is for escaping local minima, not for clause deletion
 	// Deleting clauses on restart throws away potentially useful learned information
 
-	// Clear trail and assignments
-	// FIX: Preserve ONLY preprocessing assignments (Level <= 1 AND implication <= -2)
-	// Learned clause propagations have Level > 1 and implication < -1, must be cleared
-	
-	// CRITICAL FIX: Rebuild trail from preserved preprocessing assignments
-	// After inprocessing rebuilds watches, preserved assignments must be in the trail
-	// so propagateWatched() processes them through the new watch lists.
-	// Without this, preserved assignments are invisible to the watch system.
+	// Clear search trail and assignments.
+	// Preprocessing vars live on preprocessTrail (separate, permanent) — no preservation check needed.
+	// Search assignments are always at Level >= 1 (propLevel hack ensures root-level props get Level 1).
 	s.trail = s.trail[:0]
+	s.trailHead = append(s.trailHead[:0], 0)
+	s.qhead = 0
+	s.level = 0
 	for i := range s.assignments {
-		// CRITICAL FIX: Only preserve preprocessing assignments
-		// Must check BOTH implication AND level:
-		// - Preprocessing: Level == 0 AND (implication >= 0 or -2 or -3)
-		// - Search: Level >= 1 (even if implication >= 0 from original clause propagation)
-		if s.assignments[i].Level == 0 && (s.implication[i] >= 0 || s.implication[i] == -2 || s.implication[i] == -3) {
-			s.trail = append(s.trail, int(i))
+		if s.assignments[i].Level > 0 {
+			s.assignments[i] = Assignment{Level: -1}
+			s.varLevel[i] = -1
+			s.implication[i] = -1
 		}
-	}
-	s.trailHead = append(s.trailHead[:0], 0) // Reset to [0] for level 0
-	// CRITICAL FIX: Set qhead to trail length - preprocessing assignments already processed
-	// Setting qhead=0 causes massive slowdown: 364 assignments × 100+ restarts = 36K redundant propagations
-	s.qhead = len(s.trail)
-	s.level = 0 // Start at level 0, first decision will increment to 1
-	
-	for i := range s.implication {
-		// CRITICAL FIX: Only preserve preprocessing assignments
-		// Clear ALL search assignments (learned clause propagations and decisions)
-		if s.assignments[i].Level == 0 && (s.implication[i] >= 0 || s.implication[i] == -2 || s.implication[i] == -3) {
-			continue
-		}
-		s.implication[i] = -1
-	}
-	for i := range s.assignments {
-		// CRITICAL FIX: Only preserve preprocessing assignments
-		if s.assignments[i].Level == 0 && (s.implication[i] >= 0 || s.implication[i] == -2 || s.implication[i] == -3) {
-			continue
-		}
-		s.assignments[i] = Assignment{Level: -1}
-		s.varLevel[i] = -1
 	}
 	// Reset conflicts at all levels
 	for i := range s.conflictsAtLevel {
@@ -1468,32 +1490,6 @@ func (s *CDCLSolver) restart() bool {
 	s.tmpLevelSet = s.tmpLevelSet[:0]
 	s.tmpCandidates = s.tmpCandidates[:0]
 	s.tmpResolvedVars = s.tmpResolvedVars[:0]
-
-	// CRITICAL FIX: Re-propagate unit clauses after restart
-	// Unit clauses (length 1) are NOT watched, so they won't be re-propagated
-	// by the watched literals scheme. We must re-assign them manually.
-	s.level = 0  // FIX: Start at level 0, decisions will be at level 1+
-	s.trailHead = s.trailHead[:0]
-	s.trailHead = append(s.trailHead, 0)
-	for _, clauseIdx := range s.originalUnitClauses {
-		clause := &s.cnf.Clauses[clauseIdx]
-		lit := clause.Literals[0]
-		varIdx := lit.Var()
-		if s.assignments[varIdx].Level < 0 {
-			value := !lit.IsNegated()
-			s.assignments[varIdx] = Assignment{
-				Value: value,
-				Level: 0,
-			}
-			s.varLevel[varIdx] = 0
-			s.trail = append(s.trail, int(varIdx))
-			s.implication[varIdx] = clauseIdx
-		}
-	}
-	// FIX: Don't add spurious trailHead entry for unit propagations
-	// CRITICAL: Update qhead to skip the unit propagations we just added
-	// Otherwise propagateWatched() will re-process them, causing massive slowdown
-	s.qhead = len(s.trail)
 
 	// Reclaim literal storage when too many tombstones have accumulated.
 	// This is the safe moment: we are at level 0 and no learned clause is in
@@ -1804,6 +1800,11 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	}
 	s.cnf.RebuildLiteralPool()
 	s.initWatches()
+	// Propagate original unit clauses + activate watches even without preprocessing
+	if s.propagateOriginalUnitsAndActivateWatches() {
+		s.printStats()
+		return UNSAT
+	}
 	s.initVSIDSOccurrenceBonus()
 	return s.cdclLoop()
 }
@@ -2014,36 +2015,32 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 
-			// Get current clause literals - ZERO ALLOCATION (use slice views directly)
-			// OPTIMIZATION: Eliminate make()/copy() for learned clauses - saves 570ms (5.6% of total)
-			var clause *cnf.Clause
+			// Get current clause literals
 			var clauseLits []cnf.Literal
 			if watch.ClauseIdx >= 0 {
-				// Bounds check for safety
-				if watch.ClauseIdx >= len(s.cnf.Clauses) {
+				if int(watch.ClauseIdx) >= len(s.cnf.Clauses) {
 					continue
 				}
-				clause = &s.cnf.Clauses[watch.ClauseIdx]
-				clauseLits = clause.Literals
+				clauseLits = s.cnf.Clauses[watch.ClauseIdx].Literals
 			} else {
 				learnedIdx := -watch.ClauseIdx - 1
-				// SAFETY CHECK: Skip deleted clauses (shouldn't happen if watch removal works correctly)
-				if learnedIdx >= len(s.learnedSizes) || s.learnedSizes[learnedIdx] == 0 {
+				if int(learnedIdx) >= len(s.learnedSizes) || s.learnedSizes[learnedIdx] == 0 {
 					continue
 				}
-				// OPTIMIZATION: Inline getLearnedClauseLiterals to eliminate function call overhead
 				offset := s.learnedOffsets[learnedIdx]
 				size := s.learnedSizes[learnedIdx]
 				clauseLits = s.learnedLiterals[offset : offset+size]
 			}
-			blitIdx := watch.Blit
-			// OPTIMIZATION: Removed verbose logging from hot path - reduces branch overhead
 
-			// Inline IndexToLit
-			blitVarIdx := blitIdx >> 1
-			blitNegated := (blitIdx & 1) != 0
+			// MiniSat-style: watched literals are at positions 0 and 1.
+			// This watch is at position watch.WatchPos; blocking literal at 1-watch.WatchPos.
+			myPos := int(watch.WatchPos)
+			blitPos := 1 - myPos
 
-			// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
+			blitLit := clauseLits[blitPos]
+			blitVarIdx := blitLit.Var()
+			blitNegated := blitLit.IsNegated()
+
 			blitLevel := s.varLevel[blitVarIdx]
 
 			if blitLevel >= 0 {
@@ -2056,149 +2053,100 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			// Look for replacement watch
 			foundReplacement := false
-			// OPTIMIZATION 1C: Move loop-invariant computation outside inner loop
-			// OPTIMIZATION 4: Pre-compute watchLitVar and blitLitVar as uint32 for fast comparison
 			watchLitVar := uint32(watchIdx >> 1)
-			blitLitVar := blitVarIdx
-			// OPTIMIZATION 1A: Cache clause literals pointer to avoid repeated field access
-			// clauseLits already set above
-			for j := 0; j < len(clauseLits); j++ {
+			for j := 2; j < len(clauseLits); j++ {
 				clauseLit := clauseLits[j]
 				clauseLitVar := clauseLit.Var()
 
-				// Skip the watched literals themselves
-				// OPTIMIZATION 4: Compare uint32 variables instead of full Literal type
-				if clauseLitVar == watchLitVar || clauseLitVar == blitLitVar {
+				if clauseLitVar == watchLitVar || clauseLitVar == blitVarIdx {
 					continue
 				}
 
-				// OPTIMIZATION 1B: Use varLevel cache instead of assignments[].Level
 				litLevel := s.varLevel[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
 				if litLevel >= 0 {
 					litValue := s.assignments[clauseLitVar].Value
 					litTrue := (!litNegated && litValue) || (litNegated && !litValue)
 					if !litTrue {
-						continue // false literal, not a replacement
+						continue
 					}
 				}
-				// Found replacement (unassigned or true) - move watch from falseLit to clauseLit
-				// OPTIMIZATION: Inline LitToIndex
+				// Found replacement - swap into myPos and add new watch
 				newWatchIdx := int(clauseLitVar) << 1
-					if litNegated {
-						newWatchIdx |= 1
-					}
+				if litNegated {
+					newWatchIdx |= 1
+				}
 
-					// Add new watch to clauseLit's watch list
-					// OPTIMIZATION: No Clause pointer - use ClauseIdx for all accesses
-					s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
-						ClauseIdx: watch.ClauseIdx,
-						Blit:      blitIdx,
-					})
+			// Swap replacement literal into position myPos
+			clauseLits[myPos], clauseLits[j] = clauseLit, clauseLits[myPos]
 
-					// Update symmetric watch Blit by scanning for ClauseIdx
-					for symI := range s.watchLists[blitIdx] {
-						if s.watchLists[blitIdx][symI].ClauseIdx == watch.ClauseIdx {
-							s.watchLists[blitIdx][symI].Blit = uint32(newWatchIdx)
-							break
-						}
+			s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+				ClauseIdx: watch.ClauseIdx,
+				WatchPos:  watch.WatchPos,
+			})
+			// Update learnedWatchIdx to track the new watch list (fixes stale
+			// index bug where removeLearnedClauseWatches would search the wrong
+			// list after a watch move, leaving orphaned watches for tombstoned
+			// clauses).
+			if watch.ClauseIdx < 0 {
+				li := int(-watch.ClauseIdx - 1)
+				if li < len(s.learnedWatchIdx0) {
+					if watch.WatchPos == 0 {
+						s.learnedWatchIdx0[li] = newWatchIdx
+					} else {
+						s.learnedWatchIdx1[li] = newWatchIdx
 					}
+				}
+			}
 
 				foundReplacement = true
 				break
 			}
 
 		if foundReplacement {
-				// Watch moved successfully - remove old watch using swap-with-last
+				// Watch moved - remove old watch using swap-with-last
 				lastIdx := len(watchList) - 1
 				if readIdx != lastIdx {
-					// Move last watch to current position
 					watchList[readIdx] = watchList[lastIdx]
-					// Update symmetric watch Blit by scanning for ClauseIdx
-					movedWatch := watchList[readIdx]
-					for symI := range s.watchLists[movedWatch.Blit] {
-						if s.watchLists[movedWatch.Blit][symI].ClauseIdx == movedWatch.ClauseIdx {
-							s.watchLists[movedWatch.Blit][symI].Blit = uint32(watchIdx)
-							break
-						}
-					}
-					// Don't increment readIdx - need to process the moved watch
 					readIdx--
 				}
-				// Truncate (remove last element which is now duplicated)
 				watchList = watchList[:lastIdx]
 				s.watchLists[watchIdx] = watchList
 				continue
 			}
 
 			// No replacement found - check if we can propagate or have conflict
-			// Re-read blitLevel - may have changed during replacement search
-			blitLevel = s.assignments[blitVarIdx].Level
+			blitLevel = s.varLevel[blitVarIdx]
 
 			if blitLevel < 0 {
 				// Unassigned blit - propagate it
-				blitLit := cnf.IndexToLit(int(blitIdx))
-				// CRITICAL FIX: Propagate at level 1 if s.level=0 (after restart)
-				// This prevents search propagations from being confused with preprocessing assignments
 				propLevel := s.level
 				if propLevel == 0 {
 					propLevel = 1
 				}
-				// Translate watch encoding (-learnedIdx-1) to implication encoding (-learnedIdx-5).
-			// The two encodings diverge by the sentinel offset; original clauses pass through unchanged.
-			reasonIdx := watch.ClauseIdx
-			if reasonIdx < 0 {
-				learnedIdx := -reasonIdx - 1
-				reasonIdx = -learnedIdx - 5
-			}
-			s.assignLiteralByClause(blitLit, propLevel, reasonIdx)
+				reasonIdx := int(watch.ClauseIdx)
+				if reasonIdx < 0 {
+					li := -reasonIdx - 1
+					reasonIdx = -li - 5
+				}
+				s.assignLiteralByClause(blitLit, propLevel, reasonIdx)
 				propagationCount++
 				s.propagations++
 				continue
 			}
 
-			// FIX: blitLevel == 0 means assigned by unit propagation - do NOT re-propagate
-			// Previously this case propagated again, causing unit assignments to be overwritten
-
-			// Re-check blit value - may have been assigned TRUE during replacement search
+			// Re-check blit value
 			blitValue := s.assignments[blitVarIdx].Value
 			blitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
 
 			if !blitTrue {
-				// Build conflict clause only when needed (avoid allocation in common case)
+				// Build conflict clause
 				var conflictClause *cnf.Clause
 				if watch.ClauseIdx >= 0 {
 					conflictClause = &s.cnf.Clauses[watch.ClauseIdx]
 				} else {
-					learnedIdx := -watch.ClauseIdx - 1
-					literals := s.getLearnedClauseLiterals(learnedIdx)
-					
-					// VERIFY: Check that watched literals are actually in the clause
-					watchLit := cnf.IndexToLit(int(watchIdx))
-					blitLit := cnf.IndexToLit(int(blitIdx))
-					hasWatch := false
-					hasBlit := false
-					for _, l := range literals {
-						if l == watchLit {
-							hasWatch = true
-						}
-						if l == blitLit {
-							hasBlit = true
-						}
-					}
-				if !hasWatch || !hasBlit {
-					if s.verbose {
-						s.Log("c [WATCH CORRUPTION] learnedIdx=%d: watch=%d%c blit=%d%c, clause=[",
-							learnedIdx, watchLit.Var()+1, map[bool]byte{true: '-', false: '+'}[watchLit.IsNegated()],
-							blitLit.Var()+1, map[bool]byte{true: '-', false: '+'}[blitLit.IsNegated()])
-						for _, l := range literals {
-							s.Log("%d%c ", l.Var()+1, map[bool]byte{true: '-', false: '+'}[l.IsNegated()])
-						}
-						s.Log("]\n")
-					}
-				}
-					
-					// Reuse pre-allocated buffer (conflict is consumed before next propagation)
+					li := -watch.ClauseIdx - 1
+					literals := s.getLearnedClauseLiterals(int(li))
 					s.conflictLitsBuf = s.conflictLitsBuf[:0]
 					s.conflictLitsBuf = append(s.conflictLitsBuf, literals...)
 					s.conflictClauseBuf.Literals = s.conflictLitsBuf
@@ -2206,35 +2154,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					conflictClause = &s.conflictClauseBuf
 				}
 
-				// Conflict at level 0 = UNSAT (no decisions to backtrack)
-				if s.level == 0 {
-					s.emptyClauseFound = true
+			if s.level == 0 {
+				s.emptyClauseFound = true
 					s.watchLists[watchIdx] = watchList
 					return true, conflictClause
 				}
 				if s.verbose {
-					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, learnedIdx=%d, blit=%d, level=%d\n",
-						watchIdx, watch.ClauseIdx, -watch.ClauseIdx-1, watch.Blit, s.level)
-					if watch.ClauseIdx < 0 {
-						learnedIdx := -watch.ClauseIdx - 1
-						if learnedIdx < len(s.learnedSizes) {
-							s.Log("c   Clause size=%d, LBD=%d\n", s.learnedSizes[learnedIdx], s.learnedMetadata[learnedIdx].LBD)
-						}
-						// Print conflict clause literals with levels
-						s.Log("c   Conflict clause (s.level=%d): ", s.level)
-						for _, cl := range conflictClause.Literals {
-							s.Log("%d%c(L%d) ", cl.Var()+1, map[bool]byte{true: '-', false: '+'}[cl.IsNegated()], s.assignments[cl.Var()].Level)
-						}
-						s.Log("\n")
-						// Count literals at current level
-						atCurrentLevel := 0
-						for _, cl := range conflictClause.Literals {
-							if s.assignments[cl.Var()].Level == s.level {
-								atCurrentLevel++
-							}
-						}
-						s.Log("c   Literals at current level %d: %d (should be >= 1)\n", s.level, atCurrentLevel)
-					}
+					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
+						watchIdx, watch.ClauseIdx, s.level)
 				}
 				s.watchLists[watchIdx] = watchList
 				return true, conflictClause
@@ -2681,7 +2608,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 											if s.verbose {
 						s.Log("c [handleConflict] Conflicting units on var %d: existing=%v (from unit), new=%v - UNSAT\n", varIdx+1, s.assignments[varIdx].Value, litValue)
 					}
-						s.emptyClauseFound = true
+					s.emptyClauseFound = true
 						return
 					}
 				}
@@ -2858,42 +2785,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		candidateIdx++
 		varIdx := candidate.varIdx
 
+		// Skip resolved variables (prevents re-resolution cycles when the
+		// trail-order invariant is violated by inconsistent reason clauses).
 		if s.tmpResolved[varIdx] {
+			continue
+		}
+		// Only resolve variables currently in the clause (a var may have been
+		// cancelled by a prior resolution and is no longer present — resolving it
+		// would produce an unsound super-clause and corrupt currentCount).
+		if !s.tmpLiteralInClause[varIdx] {
 			continue
 		}
 
 		reasonClauseIdx := s.implication[varIdx]
 		if reasonClauseIdx == -1 {
-			// Decision literal encountered - skip it (can't resolve on decisions)
-			// The decision will remain in the clause as the UIP
 			continue
 		}
-		// CRITICAL FIX: Don't resolve on level-0 literals (preprocessing assignments)
-		// These are permanent assignments from unit propagation/pure literals
-		// They have no meaningful "reason clause" for conflict analysis
 		if s.assignments[varIdx].Level == 0 {
-			if s.verbose && s.conflicts < 100 {
-			s.Log("c [1-UIP] SKIP var %d: level-0 preprocessing assignment\n", varIdx+1)
-			}
 			continue
 		}
 
-		// Get reason clause literals
-		var reasonLits []cnf.Literal
-		if reasonClauseIdx <= -5 {
-			// Learned clause
-			learnedIdx := -reasonClauseIdx - 5
-			if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
-				reasonLits = s.getLearnedClauseLiterals(learnedIdx)
-			}
-		} else {
-			// Original clause
-			if reasonClauseIdx < len(s.cnf.Clauses) {
-				reasonLits = s.cnf.Clauses[reasonClauseIdx].Literals
-			}
-		}
+		// Get reason clause literals via shared helper
+		reasonLits := s.getReasonLitsForVar(varIdx)
 		if reasonLits == nil {
-			continue // Invalid clause
+			continue
 		}
 
 		// DEBUG: Trace resolution step
@@ -2913,47 +2828,17 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.Log("0\n")
 		}
 
-		// FIX: Skip reason clauses with unassigned literals
-		// Such clauses are not valid conflict clauses
+		// Skip reason clauses with unassigned literals (invalid conflict clauses)
 		hasUnassigned := false
-		reasonAtCurrentLevel := 0
 		for _, lit := range reasonLits {
 			if s.assignments[lit.Var()].Level < 0 {
 				hasUnassigned = true
 				break
 			}
-			if s.assignments[lit.Var()].Level == s.level {
-				reasonAtCurrentLevel++
-			}
 		}
 		if hasUnassigned {
-			if s.verbose && s.conflicts < 100 {
-			s.Log("c [1-UIP] SKIP var %d: reason has unassigned literal\n", varIdx+1)
-			}
 			continue
 		}
-		// CRITICAL FIX: Skip learned clauses with unassigned literals (soundness bug)
-		// Original clauses can have multiple lits at current level - always valid to resolve
-		// Learned clauses with unassigned lits indicate corruption - skip them
-		hasUnassignedInReason := false
-		for _, rl := range reasonLits {
-			if s.assignments[rl.Var()].Level < 0 {
-				hasUnassignedInReason = true
-				break
-			}
-		}
-	if reasonClauseIdx < 0 && hasUnassignedInReason {
-		if s.verbose {
-			s.Log("c [1-UIP] SKIP var %d: learned clause %d has unassigned literal: ",
-				varIdx+1, -reasonClauseIdx-1)
-			for _, rl := range reasonLits {
-				s.Log("%d%c(L%d) ", rl.Var()+1, map[bool]byte{true: '-', false: '+'}[rl.IsNegated()],
-					s.assignments[rl.Var()].Level)
-				s.Log("\n")
-			}
-		}
-		continue
-	}
 
 		// Resolve: remove varIdx, add reason literals
 		s.tmpLiteralInClause[varIdx] = false
@@ -2990,14 +2875,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 						s.Log("c [1-UIP]   Keep var %d (same polarity)\n", v+1)
 					}
 				}
-			} else {
-				// FIX: Only add assigned literals (level >= 0)
-				// Unassigned literals (level < 0) cannot be part of a conflict clause
-				assignLevel := s.assignments[v].Level
-				if assignLevel < 0 {
-					// Skip unassigned literal - it's not part of the conflict
-					continue
-				}
+		} else {
+			// Only add assigned literals (level >= 0)
+			assignLevel := s.assignments[v].Level
+			if assignLevel < 0 {
+				continue
+			}
 				
 				// Add to clause
 				if s.verbose {
@@ -3067,10 +2950,28 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// CRITICAL FIX: If 1-UIP resolved away ALL literals (currentCount == 0), we derived empty clause = UNSAT
+	// NOTE: currentCount == 0 means resolution canceled all literals at the
+	// current decision level. The learned clause would be non-asserting (no
+	// literal at the current level to propagate after backjump). Skip learning
+	// it — the clause is sound but not useful, and backjump to s.level-1.
 	if currentCount == 0 {
-		s.emptyClauseFound = true
-		return 0
+		// Compute maxLevel from remaining literals for a better backjump target
+		bjLevel := 0
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] {
+				lvl := s.assignments[varIdx].Level
+				if lvl > 0 && lvl < s.level && lvl > bjLevel {
+					bjLevel = lvl
+				}
+			}
+		}
+		if bjLevel == 0 {
+			bjLevel = s.level - 1
+			if bjLevel < 0 {
+				bjLevel = 0
+			}
+		}
+		return bjLevel
 	}
 
 	// Calculate LBD and backjump level
@@ -3247,8 +3148,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				if existingValue != litValue {
 					// Conflicting unit found - UNSAT
 										if s.verbose {
-						s.Log("c [learnClause] Conflicting unit on var %d: existing=%v, new=%v - UNSAT\n", varIdx+1, existingValue, litValue)
-					}
+					s.Log("c [learnClause] Conflicting unit on var %d: existing=%v, new=%v - UNSAT\n", varIdx+1, existingValue, litValue)
+				}
 					s.emptyClauseFound = true
 					return 0
 				}
@@ -3309,7 +3210,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.learnedCapacity++
 
 		// Add to watches
-		learnedIdx := s.learnedActiveCount - 1
+		// CRITICAL: Use learnedCapacity - 1 (the index of the just-appended data),
+		// NOT learnedActiveCount - 1. After deleteLearnedClauses decrements
+		// learnedActiveCount, using learnedActiveCount - 1 would point to a
+		// tombstoned slot instead of the newly appended clause data, causing
+		// duplicate watches and stale watch corruption.
+		learnedIdx := s.learnedCapacity - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
 		
 		// Store watch indices for all clauses to maintain array consistency
@@ -3384,75 +3290,69 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 // score = age*10 + LBD*50 + size*5 - activity*20 + bonuses/penalties
 // Higher score = more likely to delete
 
-// minimizeLearnedClause reduces the size of a learned clause via self-subsumption
-// Aggressive minimization: always attempt for clauses > 2 literals
+// minimizeLearnedClause reduces the size of a learned clause via recursive
+// self-subsumption (MiniSat/Bier-style). A literal is removable if every other
+// literal in its reason clause is itself either already in the learned clause
+// or recursively removable. The UIP (single current-level literal) and level-0
+// literals are never removed — the clause must stay asserting and level-0
+// literals are global.
+//
+// Uses two mark arrays:
+//   - tmpLiteralInClause[v]: literal is currently in the clause (drives rebuild)
+//   - tmpSeenVar[v]: literal is "covered" (in clause OR proven-removable OR
+//     being-explored). Set during exploration; cleared on failed branches via
+//     snapshot rollback; cleared in full at the end via tmpMinSeenVars.
+//
+// Soundness rests on the CDCL resolution invariant: a literal removable via its
+// reason clause yields a valid resolution consequence, so dropping it produces a
+// strictly stronger (or equal) clause. Termination is guaranteed by the DAG
+// property of the implication graph within a decision level (reason clauses only
+// reference earlier trail literals). minimizeMaxDepth is a defensive cap.
 func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Literal {
-	// EARLY TERMINATION: Clauses ≤2 literals are already minimal
 	if len(learnedLits) <= 2 {
 		return learnedLits
 	}
 
-	// Mark all literals in learned clause (tmpLiteralInClause is already clean from build loop)
+	// Phase A: mark clause literals in both arrays and record for cleanup.
+	s.tmpMinSeenVars = s.tmpMinSeenVars[:0]
 	for _, lit := range learnedLits {
-		s.tmpLiteralInClause[lit.Var()] = true
+		v := lit.Var()
+		s.tmpLiteralInClause[v] = true
+		if !s.tmpSeenVar[v] {
+			s.tmpSeenVar[v] = true
+			s.tmpMinSeenVars = append(s.tmpMinSeenVars, v)
+		}
 	}
 
-	// Single-pass minimization: try to remove each literal via self-subsumption
+	// Phase B: try to remove each non-protected literal.
 	reductionAchieved := 0
-	attemptedRemovals := 0
 	for _, lit := range learnedLits {
-		varIdx := lit.Var()
-
-		// Skip if already removed
-		if !s.tmpLiteralInClause[varIdx] {
+		v := lit.Var()
+		if !s.tmpLiteralInClause[v] {
+			continue // already removed in this pass
+		}
+		// Protect the UIP / any current-level literal: removing it would make
+		// the clause non-asserting.
+		if s.assignments[v].Level == s.level {
 			continue
 		}
-
-		canRemove := false
-		reasonClauseIdx := s.implication[varIdx]
-		var reasonLits []cnf.Literal
-		if reasonClauseIdx >= 0 {
-			// Original clause
-			if reasonClauseIdx < len(s.cnf.Clauses) {
-				reasonLits = s.cnf.Clauses[reasonClauseIdx].Literals
-			}
-		} else if reasonClauseIdx <= -5 {
-			// Learned clause
-			learnedIdx := -reasonClauseIdx - 5
-			if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
-				reasonLits = s.getLearnedClauseLiterals(learnedIdx)
-			}
+		// Protect level-0 literals: they are global and never removable.
+		if s.assignments[v].Level == 0 {
+			continue
 		}
-		// else: -2/-3/-4 preprocessing sentinels — no resolvable reason clause
-
-		if reasonLits != nil {
-			attemptedRemovals++
-			// Check if all reason literals (except varIdx) are in the learned clause
-			// This is self-subsumption: if (A ∨ B ∨ C) and reason for A is (A ∨ D),
-			// and D is in learned clause, we can remove A
-			allCovered := true
-			for _, reasonLit := range reasonLits {
-				if reasonLit.Var() == varIdx {
-					continue
-				}
-				if !s.tmpLiteralInClause[reasonLit.Var()] {
-					allCovered = false
-					break
-				}
-			}
-
-			if allCovered && len(reasonLits) > 1 {
-				canRemove = true
-			}
+		// Skip decisions (no reason clause to resolve against).
+		if s.implication[v] == -1 {
+			continue
 		}
-
-		if canRemove {
-			s.tmpLiteralInClause[varIdx] = false
+		if s.recursiveTryRemove(v) {
+			s.tmpLiteralInClause[v] = false
 			reductionAchieved++
+			// tmpSeenVar[v] stays true — v is now "covered" for downstream
+			// checks in the same pass (it's removable given prior removals).
 		}
 	}
 
-	// Compact in-place: keep only literals whose tmpLiteralInClause is still true
+	// Phase C: compact in-place, keeping literals still marked.
 	writeIdx := 0
 	for _, lit := range learnedLits {
 		if s.tmpLiteralInClause[lit.Var()] {
@@ -3461,12 +3361,94 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		}
 	}
 
+	// Phase D: clear tmpSeenVar marks recorded in tmpMinSeenVars. Also clear
+	// tmpLiteralInClause (defensive — the next-conflict cleanup at learnClause
+	// would do it, but keeping the buffer clean here is safer and matches the
+	// pre-minimization invariant).
+	for _, v := range s.tmpMinSeenVars {
+		s.tmpSeenVar[v] = false
+	}
+	for _, lit := range learnedLits {
+		s.tmpLiteralInClause[lit.Var()] = false
+	}
+	s.tmpMinSeenVars = s.tmpMinSeenVars[:0]
+
 	if s.verbose && reductionAchieved > 0 {
 		s.Log("c [minimize] Reduced: %d→%d literals (removed %d)\n",
 			len(learnedLits), writeIdx, reductionAchieved)
 	}
 
 	return learnedLits[:writeIdx]
+}
+
+// recursiveTryRemove attempts to prove that literal v (currently in the learned
+// clause) is redundant: every other literal in v's reason clause is either
+// already covered (in the clause or proven removable) or recursively removable.
+// On success returns true (v may be dropped). On failure returns false and
+// rolls back ALL marks pushed during this call via a snapshot of tmpMinSeenVars,
+// so failed explorations leave no stale "covered" marks (this correctly handles
+// the diamond case where a prior successful sub-exploration is invalidated by a
+// later sibling failure).
+func (s *CDCLSolver) recursiveTryRemove(v uint32) bool {
+	snapshot := len(s.tmpMinSeenVars)
+	result := s.exploreRemovable(v, 0)
+	if !result {
+		// Roll back: unmark everything pushed during this call.
+		for i := snapshot; i < len(s.tmpMinSeenVars); i++ {
+			s.tmpSeenVar[s.tmpMinSeenVars[i]] = false
+		}
+		s.tmpMinSeenVars = s.tmpMinSeenVars[:snapshot]
+	}
+	return result
+}
+
+// exploreRemovable is the recursive core. It does NOT roll back on failure —
+// that is the caller's job (recursiveTryRemove) via the snapshot. This avoids
+// double-unmarking in the diamond case: a nested success pushes marks that
+// remain valid only if the whole top-level call succeeds; if a sibling later
+// fails, the top-level rollback clears them all in one pass.
+//
+// Returns true iff every non-resolved literal in v's reason clause is covered
+// (tmpSeenVar) or recursively removable within minimizeMaxDepth.
+func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
+	if depth > s.minimizeMaxDepth {
+		return false
+	}
+	reasonLits := s.getReasonLitsForVar(v)
+	if reasonLits == nil {
+		return false // decision, preprocessing sentinel, or stale clause
+	}
+	if len(reasonLits) <= 1 {
+		// Unit reason: the asserting literal alone — nothing to resolve against,
+		// so v is not removable via this reason.
+		return false
+	}
+	for _, rl := range reasonLits {
+		rv := rl.Var()
+		if rv == v {
+			continue // the asserting (resolved) literal of the reason
+		}
+		if s.tmpSeenVar[rv] {
+			continue // already covered
+		}
+		// Level-0 literals are global: a reason depending on one cannot be
+		// resolved away without losing global information.
+		if s.assignments[rv].Level == 0 {
+			return false
+		}
+		// Decisions cannot be resolved away.
+		if s.implication[rv] == -1 {
+			return false
+		}
+		// Optimistically mark rv as "being explored" to prevent cycles within
+		// this call, then recurse.
+		s.tmpSeenVar[rv] = true
+		s.tmpMinSeenVars = append(s.tmpMinSeenVars, rv)
+		if !s.exploreRemovable(rv, depth+1) {
+			return false
+		}
+	}
+	return true
 }
 
 // computeClauseScore calculates the deletion score for a clause
@@ -3748,15 +3730,24 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		}
 		idx0 := cnf.LitToIndex(literals[watch0])
 		idx1 := cnf.LitToIndex(literals[watch1])
-		clauseIdx := -i - 1
+		// Swap watched literals into positions 0 and 1 (MiniSat-style)
+		lit0 := literals[watch0]
+		lit1 := literals[watch1]
+		literals[0], literals[watch0] = lit0, literals[0]
+		if watch1 == 0 {
+			literals[1], literals[watch0] = lit1, literals[1]
+		} else {
+			literals[1], literals[watch1] = lit1, literals[1]
+		}
+		clauseIdx := int32(-i - 1)
 
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 			ClauseIdx: clauseIdx,
-			Blit:      uint32(idx1),
+			WatchPos:  0,
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 			ClauseIdx: clauseIdx,
-			Blit:      uint32(idx0),
+			WatchPos:  1,
 		})
 
 		// Update stored watch indices to the chosen literals
@@ -3820,8 +3811,7 @@ func (s *CDCLSolver) compactWatchLists() {
 			shouldRemove := false
 			if watch.ClauseIdx < 0 {
 				learnedIdx := -watch.ClauseIdx - 1
-				// Check if this learned clause is a tombstone (deleted)
-				if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] == 0 {
+				if int(learnedIdx) < s.learnedCapacity && s.learnedSizes[learnedIdx] == 0 {
 					shouldRemove = true
 				}
 			}
@@ -3935,15 +3925,10 @@ func (s *CDCLSolver) backtrack() bool {
 			decisionVar+1, decisionPoint, s.assignments[decisionVar].Level, decisionValue, !decisionValue)
 	}
 
-	// Clear all assignments from decisionPoint onwards
-	// FIX: Skip ONLY preprocessing assignments (Level == 0 AND implication <= -2)
-	// Search propagations have Level >= 1 even though implication < -1, and MUST be cleared
+	// Clear all assignments from decisionPoint onwards.
+	// No preprocessing check needed — preprocessing vars are on preprocessTrail (not s.trail).
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
-		// Skip preprocessing: Level == 0 (unit prop or pure literal)
-		if s.assignments[varIdx].Level == 0 && s.implication[varIdx] <= -2 {
-			continue
-		}
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
