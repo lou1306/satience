@@ -1199,11 +1199,13 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
+		Blit:      uint32(lit1),
 		WatchPos:  0,
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
+		Blit:      uint32(lit0),
 		WatchPos:  1,
 	})
 }
@@ -1238,11 +1240,13 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: clauseIdx,
+		Blit:      uint32(lit1),
 		WatchPos:  0,
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: clauseIdx,
+		Blit:      uint32(lit0),
 		WatchPos:  1,
 	})
 
@@ -2015,7 +2019,27 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 
-			// Get current clause literals
+			// FAST PATH: Check the cached blocking literal (Blit) before
+			// accessing clause data. If Blit is true, the clause is satisfied
+			// and we can skip it entirely — no need to dereference clauseLits
+			// (which may cause a cache miss to random memory). Blit may be
+			// stale (if the other watch was moved), but a stale-true Blit is
+			// sound: the literal it references is still assigned and true, so
+			// the clause is still satisfied.
+			blitLit := cnf.Literal(watch.Blit)
+			blitVarIdx := blitLit.Var()
+			blitNegated := blitLit.IsNegated()
+			blitLevel := s.varLevel[blitVarIdx]
+			if blitLevel >= 0 {
+				blitValue := s.assignments[blitVarIdx].Value
+				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
+				if blitLitTrue {
+					continue
+				}
+			}
+
+			// SLOW PATH: Blocking literal is not true (or unassigned).
+			// Access clause data for replacement search / conflict detection.
 			var clauseLits []cnf.Literal
 			if watch.ClauseIdx >= 0 {
 				if int(watch.ClauseIdx) >= len(s.cnf.Clauses) {
@@ -2033,23 +2057,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// MiniSat-style: watched literals are at positions 0 and 1.
-			// This watch is at position watch.WatchPos; blocking literal at 1-watch.WatchPos.
 			myPos := int(watch.WatchPos)
 			blitPos := 1 - myPos
 
-			blitLit := clauseLits[blitPos]
-			blitVarIdx := blitLit.Var()
-			blitNegated := blitLit.IsNegated()
-
-			blitLevel := s.varLevel[blitVarIdx]
-
-			if blitLevel >= 0 {
-				blitValue := s.assignments[blitVarIdx].Value
-				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
-				if blitLitTrue {
-					continue
-				}
-			}
+			// Re-read the actual blocking literal from clause data (Blit may be stale).
+			// The fast-path Blit check already filtered out the true case; here we
+			// need the actual literal for the replacement guard, propagation, and
+			// conflict detection.
+			blitLit = clauseLits[blitPos]
+			blitVarIdx = blitLit.Var()
+			blitNegated = blitLit.IsNegated()
 
 			// Look for replacement watch
 			foundReplacement := false
@@ -2080,8 +2097,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Swap replacement literal into position myPos
 			clauseLits[myPos], clauseLits[j] = clauseLit, clauseLits[myPos]
 
+			// The blocking literal (at 1-myPos) hasn't changed — cache it in Blit
+			// so future propagations can skip clause data access when it's true.
+			newBlit := uint32(clauseLits[1-myPos])
+
 			s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 				ClauseIdx: watch.ClauseIdx,
+				Blit:      newBlit,
 				WatchPos:  watch.WatchPos,
 			})
 			// Update learnedWatchIdx to track the new watch list (fixes stale
@@ -3743,10 +3765,12 @@ func (s *CDCLSolver) compactLearnedClauses() {
 
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 			ClauseIdx: clauseIdx,
+			Blit:      uint32(lit1),
 			WatchPos:  0,
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 			ClauseIdx: clauseIdx,
+			Blit:      uint32(lit0),
 			WatchPos:  1,
 		})
 
