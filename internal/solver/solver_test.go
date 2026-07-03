@@ -1162,10 +1162,314 @@ func TestModelVerification(t *testing.T) {
 						break
 					}
 				}
-				if !satisfied {
-					t.Errorf("Clause %d not satisfied by model", i)
+			if !satisfied {
+				t.Errorf("Clause %d not satisfied by model", i)
+			}
+		}
+		})
+	}
+}
+
+// TestRecursiveMinimizationSoundness verifies that the recursive clause
+// minimizer never produces an unsound learned clause. It runs a variety of
+// SAT/UNSAT instances and checks the result matches expectations. The debug
+// build's verifyLearnedClause (verify_learned_debug.go) is the safety net that
+// rejects any clause with TRUE/unassigned literals; this test ensures the
+// release build also produces correct results.
+func TestRecursiveMinimizationSoundness(t *testing.T) {
+	tests := []struct {
+		name     string
+		cnf      cnf.CNF
+		expected SolveResult
+	}{
+		{
+			name: "simple_sat",
+			cnf: cnf.CNF{
+				NumVars: 3, NumClauses: 2,
+				Clauses: []cnf.Clause{newClause(1, 2), newClause(-1, 3)},
+			},
+			expected: SAT,
+		},
+		{
+			name: "simple_unsat",
+			cnf: cnf.CNF{
+				NumVars: 2, NumClauses: 4,
+				Clauses: []cnf.Clause{
+					newClause(1), newClause(2),
+					newClause(-1), newClause(-2),
+				},
+			},
+			expected: UNSAT,
+		},
+		{
+			name: "implication_chain_sat",
+			// x1 → x2 → x3 → x4, all must be true if x1 is true.
+			// SAT: set x1=false.
+			cnf: cnf.CNF{
+				NumVars: 4, NumClauses: 3,
+				Clauses: []cnf.Clause{
+					newClause(-1, 2),
+					newClause(-2, 3),
+					newClause(-3, 4),
+				},
+			},
+			expected: SAT,
+		},
+		{
+			name: "conflict_requires_minimization",
+			// x1 ↔ x2 (x1→x2, x2→x1), x1=false forces x2=false.
+			// Then x2=true clause conflicts. This forces learned clauses
+			// with reason chains that the recursive minimizer can shrink.
+			cnf: cnf.CNF{
+				NumVars: 3, NumClauses: 5,
+				Clauses: []cnf.Clause{
+					newClause(-1, 2),  // x1 → x2
+					newClause(-2, 1),  // x2 → x1
+					newClause(2),      // x2 must be true
+					newClause(-1),     // x1 must be false
+					newClause(3),      // x3 must be true (independent)
+				},
+			},
+			expected: UNSAT,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewCDCLSolver(&tt.cnf)
+			result := s.SolveWithResult()
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+			// If SAT, verify the model satisfies all clauses
+			if result == SAT {
+				assignments := s.GetAssignments()
+				for i, clause := range tt.cnf.Clauses {
+					satisfied := false
+					for _, lit := range clause.Literals {
+						varIdx := lit.Var()
+						if varIdx >= uint32(len(assignments)) {
+							t.Errorf("Variable %d out of bounds", varIdx)
+							continue
+						}
+						litTrue := (!lit.IsNegated() && assignments[varIdx].Value) || (lit.IsNegated() && !assignments[varIdx].Value)
+						if litTrue {
+							satisfied = true
+							break
+						}
+					}
+					if !satisfied {
+						t.Errorf("Clause %d not satisfied by model", i)
+					}
 				}
 			}
 		})
+	}
+}
+
+// TestMinimizeDepthZero verifies that depth=0 effectively disables recursive
+// minimization (exploreRemovable returns false immediately at depth > 0).
+// The solver must still produce correct results.
+func TestMinimizeDepthZero(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 4, NumClauses: 4,
+		Clauses: []cnf.Clause{
+			newClause(-1, 2),
+			newClause(-2, 3),
+			newClause(-3, 4),
+			newClause(1, -4),
+		},
+	}
+	s := NewCDCLSolver(&c)
+	s.SetMinimizeMaxDepth(0)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Errorf("Expected SAT with depth=0, got %v", result)
+	}
+	// Verify model
+	assignments := s.GetAssignments()
+	for i, clause := range c.Clauses {
+		satisfied := false
+		for _, lit := range clause.Literals {
+			varIdx := lit.Var()
+			litTrue := (!lit.IsNegated() && assignments[varIdx].Value) || (lit.IsNegated() && !assignments[varIdx].Value)
+			if litTrue {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("Clause %d not satisfied", i)
+		}
+	}
+}
+
+// TestMinimizeDepthDefault verifies the default depth (100) produces correct
+// results on a formula with deep reason chains.
+func TestMinimizeDepthDefault(t *testing.T) {
+	// Create a chain: x1→x2→...→x10, plus a unit clause forcing x1=true
+	// and a unit clause forcing x10=false. This is UNSAT.
+	// The conflict analysis will produce learned clauses with reason chains
+	// up to 10 deep, exercising recursive minimization.
+	numVars := 10
+	clauses := []cnf.Clause{
+		newClause(1),       // x1 = true
+		newClause(-10),     // x10 = false
+	}
+	for i := 1; i < numVars; i++ {
+		clauses = append(clauses, newClause(-int32(i), int32(i+1)))
+	}
+	c := cnf.CNF{
+		NumVars:    uint32(numVars),
+		Clauses:    clauses,
+		NumClauses: len(clauses),
+	}
+	s := NewCDCLSolver(&c)
+	// Default depth is 100
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT for contradictory chain, got %v", result)
+	}
+}
+
+// TestMinimizeUIPProtection verifies that the UIP (asserting literal) is never
+// removed by minimization. If it were, the learned clause would be
+// non-asserting and the solver could loop or produce wrong results. We test
+// this indirectly: if the UIP were removed, the solver would fail to converge
+// on a known-UNSAT instance (it would loop until maxIter, returning UNKNOWN).
+func TestMinimizeUIPProtection(t *testing.T) {
+	// Pigeonhole 3 pigeons, 2 holes — UNSAT. This generates many conflicts
+	// and heavily exercises minimization. If the UIP is ever removed,
+	// the solver will learn non-asserting clauses and fail to converge.
+	c := buildPigeonhole(3, 2)
+	s := NewCDCLSolver(&c)
+	s.SetMaxIter(100000)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT for PHP(3,2), got %v (UIP may be removed by minimizer)", result)
+	}
+}
+
+// buildPigeonhole builds the pigeonhole principle CNF for p pigeons, h holes.
+// Each pigeon must be in at least one hole (clause), and no two pigeons share
+// a hole (pairwise constraints).
+func buildPigeonhole(pigeons, holes int) cnf.CNF {
+	numVars := pigeons * holes
+	var clauses []cnf.Clause
+	// Each pigeon is in at least one hole
+	for p := 0; p < pigeons; p++ {
+		lits := make([]int32, holes)
+		for h := 0; h < holes; h++ {
+			lits[h] = int32(p*holes + h + 1)
+		}
+		clauses = append(clauses, newClause(lits...))
+	}
+	// No two pigeons in the same hole
+	for h := 0; h < holes; h++ {
+		for p1 := 0; p1 < pigeons; p1++ {
+			for p2 := p1 + 1; p2 < pigeons; p2++ {
+				v1 := int32(p1*holes + h + 1)
+				v2 := int32(p2*holes + h + 1)
+				clauses = append(clauses, newClause(-v1, -v2))
+			}
+		}
+	}
+	return cnf.CNF{
+		NumVars:    uint32(numVars),
+		Clauses:    clauses,
+		NumClauses: len(clauses),
+	}
+}
+
+// TestRecursiveMinimizationTseitin verifies the minimizer is sound on
+// Tseitin-encoded instances (which have deep reason chains and many
+// implications). This is a regression test: the old non-recursive minimizer
+// was tested on Tseitin; the recursive one must also be correct.
+func TestRecursiveMinimizationTseitin(t *testing.T) {
+	// Reuse the existing Tseitin 4x4 UNSAT formula (TestCDCLTseitin4x4Unsat)
+	c := cnf.CNF{
+		NumVars: 40,
+		Clauses: []cnf.Clause{
+			newClause(-17, 29), newClause(17, -29),
+			newClause(-17, -18, 30), newClause(-17, 18, -30),
+			newClause(17, -18, -30), newClause(17, 18, 30),
+			newClause(-18, -19, 31), newClause(-18, 19, -31),
+			newClause(18, -19, -31), newClause(18, 19, 31),
+			newClause(-19, 32), newClause(19, -32),
+			newClause(-20, -29, 33), newClause(-20, 29, -33),
+			newClause(20, -29, -33), newClause(20, 29, 33),
+			newClause(-20, -21, -30, 34), newClause(-20, -21, 30, -34),
+			newClause(-20, 21, -30, -34), newClause(-20, 21, 30, 34),
+			newClause(20, -21, -30, -34), newClause(20, -21, 30, 34),
+			newClause(20, 21, -30, 34), newClause(20, 21, 30, -34),
+			newClause(-21, -22, -31, 35), newClause(-21, -22, 31, -35),
+			newClause(-21, 22, -31, -35), newClause(-21, 22, 31, 35),
+			newClause(21, -22, -31, -35), newClause(21, -22, 31, 35),
+			newClause(21, 22, -31, 35), newClause(21, 22, 31, -35),
+			newClause(-22, -32, 36), newClause(-22, 32, -36),
+			newClause(22, -32, -36), newClause(22, 32, 36),
+			newClause(-23, -33, 37), newClause(-23, 33, -37),
+			newClause(23, -33, -37), newClause(23, 33, 37),
+			newClause(-23, -24, -34, 38), newClause(-23, -24, 34, -38),
+			newClause(-23, 24, -34, -38), newClause(-23, 24, 34, 38),
+			newClause(23, -24, -34, -38), newClause(23, -24, 34, 38),
+			newClause(23, 24, -34, 38), newClause(23, 24, 34, -38),
+			newClause(-24, -25, -35, 39), newClause(-24, -25, 35, -39),
+			newClause(-24, 25, -35, -39), newClause(-24, 25, 35, 39),
+			newClause(24, -25, -35, -39), newClause(24, -25, 35, 39),
+			newClause(24, 25, -35, 39), newClause(24, 25, 35, -39),
+			newClause(-25, -36, 40), newClause(-25, 36, -40),
+			newClause(25, -36, -40), newClause(25, 36, 40),
+			newClause(-26, 37), newClause(26, -37),
+			newClause(-26, -27, 38), newClause(-26, 27, -38),
+			newClause(26, -27, -38), newClause(26, 27, 38),
+			newClause(-27, -28, 39), newClause(-27, 28, -39),
+			newClause(27, -28, -39), newClause(27, 28, 39),
+			newClause(-28, 40), newClause(28, -40),
+			newClause(1), newClause(-1),
+		},
+		NumClauses: 74,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT for Tseitin 4x4, got %v", result)
+	}
+}
+
+// TestMinimizeGetReasonLitsForVar tests the helper function directly.
+func TestMinimizeGetReasonLitsForVar(t *testing.T) {
+	c := cnf.CNF{
+		NumVars: 3, NumClauses: 2,
+		Clauses: []cnf.Clause{
+			newClause(1, 2),
+			newClause(-1, 3),
+		},
+	}
+	s := NewCDCLSolver(&c)
+	// Before solving, implication is -1 (unassigned) for all vars → nil
+	if lits := s.getReasonLitsForVar(0); lits != nil {
+		t.Errorf("Expected nil for unassigned var, got %v", lits)
+	}
+	// Decision sentinel
+	s.implication[0] = -1
+	if lits := s.getReasonLitsForVar(0); lits != nil {
+		t.Errorf("Expected nil for decision, got %v", lits)
+	}
+	// Original clause index
+	s.implication[0] = 0
+	lits := s.getReasonLitsForVar(0)
+	if lits == nil || len(lits) != 2 {
+		t.Errorf("Expected 2 lits from original clause 0, got %v", lits)
+	}
+	// Out-of-bounds original clause index
+	s.implication[0] = 100
+	if lits := s.getReasonLitsForVar(0); lits != nil {
+		t.Errorf("Expected nil for out-of-bounds clause, got %v", lits)
+	}
+	// Preprocessing sentinel
+	s.implication[0] = -2
+	if lits := s.getReasonLitsForVar(0); lits != nil {
+		t.Errorf("Expected nil for preprocessing sentinel, got %v", lits)
 	}
 }

@@ -31,7 +31,7 @@ func run() int {
 	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
 	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
-	minimize := flag.String("minimize", "selective", "Clause minimization: aggressive (all), selective (size≤15,LBD≤5, default), none")
+	minimizeDepth := flag.Int("minimize-depth", 100, "Max recursion depth for recursive clause minimization (default=100, 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
@@ -129,17 +129,8 @@ func run() int {
 	s.SetBumpAmount(*bumpAmount)
 	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
 
-	// Configure clause minimization
-	switch *minimize {
-	case "aggressive":
-	case "selective":
-		s.SetMinimizationThresholds(15, 5, 10)
-	case "none":
-		s.SetMinimizationThresholds(0, 0, 0)
-	default:
-		fmt.Fprintf(os.Stderr, "Invalid minimize option: %s (use aggressive, selective, or none)\n", *minimize)
-		return 1
-	}
+	// Configure recursive clause minimization depth
+	s.SetMinimizeMaxDepth(*minimizeDepth)
 
 	start := time.Now()
 	var result solver.SolveResult
