@@ -42,11 +42,13 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 }
 
 // Watch represents a watched literal reference for a clause
-// Used in the watched literals scheme for efficient propagation
-// OPTIMIZATION: Index-only references (no pointers) for better cache efficiency and GC pressure
+// Used in the watched literals scheme for efficient propagation.
+// Watched literals are always kept at positions 0 and 1 in the clause
+// (MiniSat-style), so the blocking literal is always at position 1-WatchPos.
+// This eliminates the O(n) symmetric Blit scan on watch moves.
 type Watch struct {
-	ClauseIdx int     // Clause index: >=0 for original, <0 for learned (-learnedIdx-1)
-	Blit      uint32  // Blocking literal index (the other watched literal)
+	ClauseIdx int32 // Clause index: >=0 for original, <0 for learned (-learnedIdx-1)
+	WatchPos  uint8  // Position of this watch in the clause (0 or 1)
 }
 
 // Clause represents a disjunction of literals

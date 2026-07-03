@@ -32,7 +32,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 		for i, watch := range s.watchLists[litIdx] {
 			if watch.ClauseIdx < 0 {
 				learnedIdx := -watch.ClauseIdx - 1
-				if learnedIdx >= s.learnedCapacity {
+			if int(learnedIdx) >= s.learnedCapacity {
 					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
 						litIdx, i, learnedIdx, s.learnedCapacity)
 					errors++
