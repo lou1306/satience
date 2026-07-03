@@ -167,6 +167,8 @@ type CDCLSolver struct {
 	decidedVarSet             []bool   // Fast lookup for decided variables
 	restartDecisionCount      int      // Decisions since last restart (for diversity reset)
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
+	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
+	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause   []bool
 	tmpSeenVar           []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
@@ -339,6 +341,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
 		minimizeMaxDepth: 100,
+		// Vivification: run every 50 restarts (configurable via CLI)
+		vivifyPeriod:     50,
+		vivifyEnabled:    true,
 		// Configurable parameters with defaults
 		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
@@ -616,6 +621,12 @@ func (s *CDCLSolver) SetMinimizeMaxDepth(d int) {
 		d = 0
 	}
 	s.minimizeMaxDepth = d
+}
+
+// SetVivifyPeriod sets how often vivification runs (every Nth restart).
+// 0 disables vivification entirely.
+func (s *CDCLSolver) SetVivifyPeriod(p int) {
+	s.vivifyPeriod = p
 }
 
 // GetStats returns solving statistics
@@ -1253,6 +1264,240 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	return idx0, idx1
 }
 
+// vivifyClause attempts to shorten a learned clause by detecting redundant
+// literals via trial propagation. For each literal li in the clause, we assume
+// ¬li and propagate. If a prior literal is forced true by the assumptions → it's
+// redundant, remove it. If ¬li causes conflict → the prefix is implied, shrink
+// to it.
+//
+// Returns true if the clause was modified (caller must update watches and
+// possibly compact). Returns false if no change. The solver state (trail,
+// assignments, level) is always restored to level 0 on return.
+//
+// Soundness: a literal li is removed only if (¬l1 ∧ ... ∧ ¬l(k-1)) → li,
+// meaning (l1 ∨ ... ∨ l(k-1) ∨ li) ≡ (l1 ∨ ... ∨ l(k-1)). If the negation
+// of a prefix causes conflict, that prefix is implied by the empty set, so the
+// full clause is a tautology — shrinking to the prefix is sound.
+func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
+	offset := s.learnedOffsets[learnedIdx]
+	size := s.learnedSizes[learnedIdx]
+	literals := s.learnedLiterals[offset : offset+size]
+
+	if size <= 2 {
+		return false
+	}
+
+	// Build the new clause: keep literals that survive vivification.
+	// We reuse tmpLearnedLits (it's not in use during restart).
+	newLits := s.tmpLearnedLits[:0]
+	s.level = 0
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.trailHead[0] = 0
+	s.qhead = 0
+
+	modified := false
+
+	for i := 0; i < len(literals); i++ {
+		lit := literals[i]
+		varIdx := lit.Var()
+
+		// If already true at level 0, clause is satisfied — no change needed.
+		if s.assignments[varIdx].Level == 0 {
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if litTrue {
+				s.cancelUntil(0)
+				return false
+			}
+		}
+
+		// If already false at level 0, keep in new clause (can't assume it).
+		if s.assignments[varIdx].Level == 0 {
+			newLits = append(newLits, lit)
+			continue
+		}
+
+		// If already true at level > 0 (forced by prior assumptions), it's redundant — skip.
+		if s.assignments[varIdx].Level > 0 {
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if litTrue {
+				modified = true
+				continue
+			}
+		}
+
+		// Unassigned or false at level > 0: keep in new clause, assume ¬lit.
+		newLits = append(newLits, lit)
+
+		// Assume ¬lit: assign it false at a new level and propagate.
+		s.level++
+		s.trailHead = append(s.trailHead, len(s.trail))
+		// Assign ¬lit (the negation of the literal in the clause)
+		negLit := cnf.NewLiteral(varIdx, !lit.IsNegated())
+		s.assignLiteralByClause(negLit, s.level, -1)
+
+		conflict, _ := s.propagateWatched()
+		if conflict {
+			// ¬l1 ∧ ... ∧ ¬li causes conflict → (l1 ∨ ... ∨ li) is a tautology.
+			// Shrink to the prefix (newLits so far, including li).
+			s.cancelUntil(0)
+			if len(newLits) < size {
+				modified = true
+			} else {
+				modified = false
+			}
+			goto done
+		}
+	}
+
+	s.cancelUntil(0)
+
+	done:
+	if !modified || len(newLits) == size || len(newLits) == 0 {
+		return false
+	}
+
+	// Don't shrink to 1 literal during vivification — unit clauses propagate
+	// immediately and can cause false conflicts with other clauses being
+	// vivified in the same round.
+	if len(newLits) == 1 {
+		return false
+	}
+	// Defer all modifications until after the round. We only record what the
+	// new clause should be — we do NOT modify learnedLiterals, learnedSizes,
+	// or watches here. This ensures that propagateWatched (called during
+	// subsequent vivifyClause calls in the same round) sees the ORIGINAL
+	// (unmodified) clause, which is weaker than the vivified version. Using
+	// the original clause in trial propagation is sound — it can only miss
+	// conflicts that the stronger version would find, never produce false ones.
+	//
+	// The caller (runVivification) applies all modifications after the round.
+	s.Log("c [vivify] clause %d: %d→%d literals (deferred)\n", -learnedIdx-1, size, len(newLits))
+	return true
+}
+
+// runVivification runs one round of clause vivification on the learned clause
+// database. Processes clauses with LBD > 2 and size > 2 that are not currently
+// used as reasons. Time-bounded to avoid excessive overhead.
+//
+// Returns true if UNSAT was detected (empty clause derived).
+func (s *CDCLSolver) runVivification() bool {
+	if !s.vivifyEnabled || s.vivifyPeriod <= 0 {
+		return false
+	}
+	if s.learnedActiveCount == 0 {
+		return false
+	}
+
+	s.Log("c [vivify] Starting vivification round: %d active clauses\n", s.learnedActiveCount)
+
+	const timeBudget = 500 * time.Millisecond
+	startTime := time.Now()
+
+	// Mark clauses used as reasons (cannot vivify these — they're in use).
+	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
+		s.tmpClauseUsedAsReason = make([]bool, s.learnedCapacity)
+	}
+	protected := s.tmpClauseUsedAsReason[:s.learnedCapacity]
+	for i := range protected {
+		protected[i] = false
+	}
+	for _, impIdx := range s.implication {
+		if impIdx <= -5 {
+			learnedIdx := -impIdx - 5
+			if int(learnedIdx) < s.learnedCapacity {
+				protected[learnedIdx] = true
+			}
+		}
+	}
+
+	modifiedCount := 0
+	checkedCount := 0
+	type vivifyResult struct {
+		idx   int
+		newLits []cnf.Literal
+	}
+	results := make([]vivifyResult, 0, 64)
+
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedSizes[i] <= 2 {
+			continue
+		}
+		if protected[i] {
+			continue
+		}
+		if s.learnedMetadata[i].LBD <= 2 {
+			continue
+		}
+
+		// Time budget check
+		if time.Since(startTime) > timeBudget {
+			break
+		}
+
+		checkedCount++
+		oldSize := s.learnedSizes[i]
+		if s.vivifyClause(i) {
+			// vivifyClause left the new literals in tmpLearnedLits
+			newSize := len(s.tmpLearnedLits)
+			if newSize > 0 && newSize < oldSize {
+				newLits := make([]cnf.Literal, newSize)
+				copy(newLits, s.tmpLearnedLits)
+				results = append(results, vivifyResult{idx: i, newLits: newLits})
+				modifiedCount++
+			}
+		}
+
+		// Check for UNSAT
+		if s.emptyClauseFound {
+			s.Log("c [vivify] UNSAT detected (conflicting unit clauses)\n")
+			return true
+		}
+	}
+
+	// Restore solver state (vivification may have left trail in a weird state).
+	s.cancelUntil(0)
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.trailHead[0] = 0
+	s.qhead = 0
+	s.level = 0
+
+	// Apply all modifications NOW (after the round — trial propagation is done).
+	for _, r := range results {
+		offset := s.learnedOffsets[r.idx]
+		oldSize := s.learnedSizes[r.idx]
+		// Remove old watches (while size is still oldSize >= 2)
+		s.removeLearnedClauseWatches(r.idx)
+		// Rewrite literals
+		copy(s.learnedLiterals[offset:offset+oldSize], r.newLits)
+		s.learnedSizes[r.idx] = len(r.newLits)
+		// Rebuild watches
+		if len(r.newLits) >= 2 {
+			lits := s.learnedLiterals[offset : offset+len(r.newLits)]
+			tmpClause := &cnf.Clause{Literals: lits, Learned: true}
+			idx0, idx1 := s.addLearnedClauseToWatches(r.idx, tmpClause, lits)
+			if r.idx < len(s.learnedWatchIdx0) {
+				s.learnedWatchIdx0[r.idx] = idx0
+				s.learnedWatchIdx1[r.idx] = idx1
+			}
+		} else if len(r.newLits) == 1 {
+			if r.idx < len(s.learnedWatchIdx0) {
+				s.learnedWatchIdx0[r.idx] = -1
+				s.learnedWatchIdx1[r.idx] = -1
+			}
+			s.unitLearnedList = append(s.unitLearnedList, r.idx)
+		}
+	}
+
+	if modifiedCount > 0 {
+		s.compactPending = true
+		s.Log("c [vivify] Vivified %d/%d clauses\n", modifiedCount, checkedCount)
+	}
+
+	return false
+}
+
 // removeLearnedClauseWatches removes all watches for a deleted learned clause.
 // With MiniSat-style watched literals (positions 0/1), no Blit updates needed.
 func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
@@ -1386,6 +1631,32 @@ func (s *CDCLSolver) shouldRestart() bool {
 	return false
 }
 
+// cancelUntil backtracks to the given decision level, unassigning all variables
+// above it. Used by vivification to roll back trial assignments. Unlike
+// backtrack(), this does not flip decisions or perform conflict analysis — it
+// is a pure state rollback.
+func (s *CDCLSolver) cancelUntil(level int) {
+	if level >= s.level {
+		return
+	}
+	var decisionPoint int
+	if level+1 < len(s.trailHead) {
+		decisionPoint = s.trailHead[level+1]
+	} else {
+		decisionPoint = len(s.trail)
+	}
+	for i := decisionPoint; i < len(s.trail); i++ {
+		varIdx := uint32(s.trail[i])
+		s.assignments[varIdx] = Assignment{Level: -1}
+		s.varLevel[varIdx] = -1
+		s.implication[varIdx] = -1
+	}
+	s.trail = s.trail[:decisionPoint]
+	s.trailHead = s.trailHead[:level+1]
+	s.level = level
+	s.qhead = len(s.trail)
+}
+
 func (s *CDCLSolver) restart() bool {
 	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 
@@ -1505,6 +1776,15 @@ func (s *CDCLSolver) restart() bool {
 		s.compactLearnedClauses()
 		s.compactPending = false
 		s.qhead = 0
+	}
+
+	// Run vivification every Nth restart (after compaction, at level 0
+	// with no learned clause in use as a reason — same safety conditions
+	// as compaction).
+	if s.vivifyEnabled && s.vivifyPeriod > 0 && s.lubyIndex > 0 && s.lubyIndex%s.vivifyPeriod == 0 {
+		if s.runVivification() {
+			return true // UNSAT detected
+		}
 	}
 
 	return false // No UNSAT detected
