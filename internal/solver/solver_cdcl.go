@@ -3465,8 +3465,14 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// Store learned clause in database
-	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
+	// Store learned clause in database.
+	// MiniSat stores ALL learned clauses and uses LBD for deletion priority,
+	// not for initial storage. Filtering by LBD at learning time creates a
+	// vicious cycle: high-LBD clauses are discarded → no learning → same
+	// conflicts repeat → LBD stays high → no learning. On small structured
+	// instances (e.g. 44092fcc, 90v), this caused 20K+ conflicts with 0
+	// stored clauses.
+	if len(s.tmpLearnedLits) > 0 {
 		// Check for duplicate literals (SOUNDNESS CHECK)
 		hasDup := false
 		for _, lit := range s.tmpLearnedLits {
