@@ -11,74 +11,99 @@ const DefaultDecayInterval = 10
 
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
-	varIdx   uint32
-	activity float64
+	varIdx uint32
+	score  float64
 }
 
-// vsidsHeap is a custom max-heap for activity-based variable selection
-// Implemented without container/heap to avoid interface{} type assertions
+// vsidsHeap is a max-heap of vsidsHeapItem.
+// A separate heapPos array (owned by VSIDS) maps variable → heap index for
+// O(log n) increaseKey/decreaseKey without full rebuilds.
 type vsidsHeap []vsidsHeapItem
 
-// up restores the heap property by moving an element up the tree
-// Used after inserting a new element at the end
-func (h *vsidsHeap) up(pos int) {
-	for pos > 0 {
-		parent := (pos - 1) / 2
-		if (*h)[pos].activity <= (*h)[parent].activity {
+// up sifts the item at position i upward to restore the heap property.
+func (h *vsidsHeap) up(heapPos []int, i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if (*h)[i].score <= (*h)[parent].score {
 			break
 		}
-		(*h)[pos], (*h)[parent] = (*h)[parent], (*h)[pos]
-		pos = parent
+		(*h)[i], (*h)[parent] = (*h)[parent], (*h)[i]
+		heapPos[(*h)[i].varIdx] = i
+		heapPos[(*h)[parent].varIdx] = parent
+		i = parent
 	}
 }
 
-// down restores the heap property by moving an element down the tree
-// Used after removing the root element
-func (h *vsidsHeap) down(pos int) {
+// down sifts the item at position i downward to restore the heap property.
+func (h *vsidsHeap) down(heapPos []int, i int) {
 	n := len(*h)
 	for {
-		left := 2*pos + 1
+		left := 2*i + 1
 		if left >= n {
 			break
 		}
 		right := left + 1
 		largest := left
-		if right < n && (*h)[right].activity > (*h)[left].activity {
+		if right < n && (*h)[right].score > (*h)[left].score {
 			largest = right
 		}
-		if (*h)[pos].activity >= (*h)[largest].activity {
+		if (*h)[i].score >= (*h)[largest].score {
 			break
 		}
-		(*h)[pos], (*h)[largest] = (*h)[largest], (*h)[pos]
-		pos = largest
+		(*h)[i], (*h)[largest] = (*h)[largest], (*h)[i]
+		heapPos[(*h)[i].varIdx] = i
+		heapPos[(*h)[largest].varIdx] = largest
+		i = largest
 	}
 }
 
-// push adds an element to the heap
-func (h *vsidsHeap) push(item vsidsHeapItem) {
-	*h = append(*h, item)
-	h.up(len(*h) - 1)
+// insert adds a variable to the heap with the given score.
+func (h *vsidsHeap) insert(heapPos []int, varIdx uint32, score float64) {
+	pos := len(*h)
+	*h = append(*h, vsidsHeapItem{varIdx: varIdx, score: score})
+	heapPos[varIdx] = pos
+	h.up(heapPos, pos)
 }
 
-// pop removes and returns the maximum element (root of the heap)
-func (h *vsidsHeap) pop() vsidsHeapItem {
+// removeMax removes and returns the maximum element (root).
+func (h *vsidsHeap) removeMax(heapPos []int) vsidsHeapItem {
 	n := len(*h)
-	// Swap root with last element
-	(*h)[0], (*h)[n-1] = (*h)[n-1], (*h)[0]
-	item := (*h)[n-1]
+	item := (*h)[0]
+	heapPos[item.varIdx] = -1
+	(*h)[0] = (*h)[n-1]
+	heapPos[(*h)[0].varIdx] = 0
 	*h = (*h)[:n-1]
-	if len(*h) > 0 {
-		h.down(0)
+	if n > 1 {
+		h.down(heapPos, 0)
 	}
 	return item
 }
 
-// init builds a heap from an unsorted slice in O(n) time
-func (h *vsidsHeap) init() {
+// increaseKey updates the score of varIdx (must be in heap) and sifts up.
+func (h *vsidsHeap) increaseKey(heapPos []int, varIdx uint32, score float64) {
+	pos := heapPos[varIdx]
+	if pos < 0 {
+		return
+	}
+	(*h)[pos].score = score
+	h.up(heapPos, pos)
+}
+
+// decreaseKey updates the score of varIdx (must be in heap) and sifts down.
+func (h *vsidsHeap) decreaseKey(heapPos []int, varIdx uint32, score float64) {
+	pos := heapPos[varIdx]
+	if pos < 0 {
+		return
+	}
+	(*h)[pos].score = score
+	h.down(heapPos, pos)
+}
+
+// init builds a heap from an unsorted slice in O(n) time.
+func (h *vsidsHeap) init(heapPos []int) {
 	n := len(*h)
-	// Start from the last non-leaf node and heapify down
 	for i := n/2 - 1; i >= 0; i-- {
-		h.down(i)
+		h.down(heapPos, i)
 	}
 }
 
@@ -103,6 +128,7 @@ type VSIDS struct {
 	maxDecayFactor        float64   // Maximum decay factor
 	decayIncrement        float64   // Increment per conflict
 	heap                  vsidsHeap // Activity heap for O(log n) selection
+	heapPos               []int     // Position of each variable in heap (-1 = not in heap)
 	heapValid             bool      // True if heap is up-to-date
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
@@ -147,6 +173,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		maxDecayFactor:        maxDecay,
 		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
 		heap:                  make(vsidsHeap, 0, numVars),
+		heapPos:               make([]int, numVars),
 		heapValid:             false,
 		decayInterval:         DefaultDecayInterval,
 		randomSeed:            0,
@@ -175,6 +202,9 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	for i := range v.lastDecisionConflict {
 		v.lastDecisionConflict[i] = -1
 	}
+	for i := range v.heapPos {
+		v.heapPos[i] = -1
+	}
 	return v
 }
 
@@ -199,25 +229,24 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 	v.heapValid = false // Invalidate heap after modifying activities
 }
 
-// buildHeap rebuilds the activity heap from current activity scores
-// Only includes unassigned variables
-// Includes LBD bonus in activity score for selection
+// buildHeap rebuilds the activity heap from current activity scores.
+// Only includes unassigned variables. Called on init and after restart.
 func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heap = v.heap[:0]
-
+	for i := range v.heapPos {
+		v.heapPos[i] = -1
+	}
 	for i, act := range v.activity {
 		if assignments[i].Level < 0 {
-			// Add LBD bonus to activity for selection
-			effectiveActivity := act + v.lbdBonus[i]
+			score := act + v.lbdBonus[i]
 			v.heap = append(v.heap, vsidsHeapItem{
-				varIdx:   uint32(i),
-				activity: effectiveActivity,
+				varIdx: uint32(i),
+				score:  score,
 			})
+			v.heapPos[i] = len(v.heap) - 1
 		}
 	}
-
-	// Build heap in O(n) time
-	v.heap.init()
+	v.heap.init(v.heapPos)
 	v.heapValid = true
 }
 
@@ -363,6 +392,16 @@ func (v *VSIDS) ResetActivityPartial(scale float64) {
 	v.heapValid = false // Force heap rebuild
 }
 
+// onUnassign re-inserts a variable into the heap after it is unassigned
+// (e.g. by backtrack). If the variable is already in the heap (it was
+// propagated, not yet popped), this is a no-op.
+func (v *VSIDS) onUnassign(varIdx uint32) {
+	if v.heapPos[varIdx] < 0 {
+		score := v.activity[varIdx] + v.lbdBonus[varIdx]
+		v.heap.insert(v.heapPos, varIdx, score)
+	}
+}
+
 // bumpLBD adds LBD bonus to variables in a learned clause
 // Lower LBD = higher bonus (glue clauses are most important)
 func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
@@ -377,6 +416,9 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
+		// Incrementally update heap position.
+		score := v.activity[lit.Var()] + v.lbdBonus[lit.Var()]
+		v.heap.increaseKey(v.heapPos, lit.Var(), score)
 	}
 }
 
@@ -402,7 +444,9 @@ func (v *VSIDS) bump(varIdx uint32) {
 // Used for variables in conflict clauses to make them more likely to be chosen
 func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 	v.activity[varIdx] += amount
-	v.heapValid = false // Invalidate heap after modifying activity
+	// Incrementally update heap position (O(log n)) instead of invalidating.
+	score := v.activity[varIdx] + v.lbdBonus[varIdx]
+	v.heap.increaseKey(v.heapPos, varIdx, score)
 }
 
 // bumpClause increases activity for all variables in a clause
@@ -424,7 +468,9 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 		if v.conflictParticipation[lit.Var()] > 500 {
 			v.activity[lit.Var()] = 1.0 // Reset to prevent lock-in
 			v.conflictParticipation[lit.Var()] = 0
-			v.heapValid = false // Force heap rebuild
+			// Decrease heap key instead of full rebuild.
+			score := 1.0 + v.lbdBonus[lit.Var()]
+			v.heap.decreaseKey(v.heapPos, lit.Var(), score)
 		}
 
 		// CHB: Track conflict frequency with aggressive bump
@@ -499,41 +545,30 @@ func (v *VSIDS) decay(assignments []Assignment) {
 		v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
 	}
 
-	// Invalidate heap since all activities changed
-	v.heapValid = false
+	// Do NOT invalidate the heap. Uniform scaling of activity preserves relative
+	// order, so the heap structure is still valid. lbdBonus is scaled by a
+	// different factor (decayLBD), causing minor drift that self-corrects on
+	// the next bump (increaseKey). This eliminates the O(n) rebuild that was
+	// the single largest CPU hotspot (27% of runtime).
 }
 
-// selectVariableWithHeap returns the unassigned variable with highest activity using a heap
-// This provides O(log n) selection instead of O(n) linear scan
-// SYMMETRY BREAKING: Uses activity momentum and recency penalty to break ties
-// CHB: Uses conflict frequency instead of VSIDS activity when enabled
+// selectVariableWithHeap returns the unassigned variable with highest activity.
+// Uses an incremental heap: pop the max, skip assigned (discard them — they'll
+// be re-inserted on backtrack via onUnassign). The selected variable is NOT
+// re-inserted (it's about to be assigned); it will be re-inserted on backtrack.
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	if !v.heapValid || len(v.heap) == 0 {
 		v.buildHeap(assignments)
 	}
 
 	for len(v.heap) > 0 {
-		item := v.heap.pop()
-		varIdx := int(item.varIdx)
+		item := v.heap.removeMax(v.heapPos)
+		varIdx := item.varIdx
 
-		if varIdx >= len(assignments) || assignments[varIdx].Level >= 0 {
-			continue
+		if int(varIdx) >= len(assignments) || assignments[varIdx].Level >= 0 {
+			continue // assigned — discard, re-inserted on backtrack
 		}
-
-		recencyPenalty := v.decisionRecencyPenalty[varIdx]
-
-		// CHB: Use conflict frequency instead of VSIDS activity
-		var effectiveActivity float64
-		if v.useCHB {
-			effectiveActivity = v.conflictFrequency[varIdx] + v.lbdBonus[varIdx] - recencyPenalty
-		} else {
-			effectiveActivity = v.activity[varIdx] + v.lbdBonus[varIdx] - recencyPenalty
-		}
-
-		item.activity = effectiveActivity
-		v.heap.push(item)
-
-		return uint32(varIdx)
+		return varIdx
 	}
 
 	// Fallback to linear scan if heap is empty

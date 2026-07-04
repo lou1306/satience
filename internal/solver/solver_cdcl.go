@@ -166,6 +166,7 @@ type CDCLSolver struct {
 	decidedVars               []uint32 // Variables decided during current search phase
 	decidedVarSet             []bool   // Fast lookup for decided variables
 	restartDecisionCount      int      // Decisions since last restart (for diversity reset)
+	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
@@ -1500,6 +1501,7 @@ func (s *CDCLSolver) runVivification() bool {
 			s.assignments[i] = Assignment{Level: -1}
 			s.varLevel[i] = -1
 			s.implication[i] = -1
+			s.numUnassigned++
 		}
 	}
 	s.level = 0
@@ -1664,6 +1666,7 @@ func (s *CDCLSolver) cancelUntil(level int) {
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
+		s.numUnassigned++
 	}
 	s.trail = s.trail[:decisionPoint]
 	s.trailHead = s.trailHead[:level+1]
@@ -1725,6 +1728,7 @@ func (s *CDCLSolver) restart() bool {
 			s.assignments[i] = Assignment{Level: -1}
 			s.varLevel[i] = -1
 			s.implication[i] = -1
+			s.numUnassigned++
 		}
 	}
 	// Reset conflicts at all levels
@@ -2084,6 +2088,14 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	s.initVSIDSOccurrenceBonus()
 
+	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
+	s.numUnassigned = 0
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level < 0 {
+			s.numUnassigned++
+		}
+	}
+
 	return s.cdclLoop()
 }
 
@@ -2104,6 +2116,13 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 		return UNSAT
 	}
 	s.initVSIDSOccurrenceBonus()
+	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
+	s.numUnassigned = 0
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		if s.assignments[i].Level < 0 {
+			s.numUnassigned++
+		}
+	}
 	return s.cdclLoop()
 }
 
@@ -2131,12 +2150,7 @@ func (s *CDCLSolver) GetAssignments() []Assignment {
 }
 
 func (s *CDCLSolver) allAssigned() bool {
-	for i := uint32(0); i < s.cnf.NumVars; i++ {
-		if s.assignments[i].Level < 0 {
-			return false
-		}
-	}
-	return true
+	return s.numUnassigned == 0
 }
 
 // verifyModel checks if the current assignment satisfies all clauses
@@ -2243,6 +2257,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
 			s.varLevel[varIdx] = propLevel
 			s.trail = append(s.trail, int(varIdx))
+			s.numUnassigned--
 			// Store learned clause index as negative: -learnedIdx-5
 			// Offset by 4 so clause 0 maps to -5, freeing -1/-2/-3/-4 as sentinels
 			// (-1 decision, -2 unit-prop preprocess, -3 pure-literal preprocess, -4 reserved)
@@ -2668,7 +2683,7 @@ func (s *CDCLSolver) selectRandomUnassigned() uint32 {
 }
 
 func (s *CDCLSolver) decide() bool {
-	if !s.vsids.hasUnassigned(s.assignments, s.cnf.NumVars) {
+	if s.numUnassigned == 0 {
 		return false
 	}
 
@@ -2851,6 +2866,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
+	s.numUnassigned--
 
 	if s.verbose && level > 0 {
 		reasonStr := "propagation"
@@ -2888,6 +2904,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 	}
 	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
+	s.numUnassigned--
 
 	// Store clause index
 	s.implication[varIdx] = clauseIdx
@@ -4257,6 +4274,8 @@ func (s *CDCLSolver) backtrack() bool {
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
+		s.vsids.onUnassign(varIdx)
+		s.numUnassigned++
 	}
 	s.trail = s.trail[:decisionPoint]
 	// FIX: Reset qhead to 0 to re-scan entire trail after backjump
@@ -4283,6 +4302,7 @@ func (s *CDCLSolver) backtrack() bool {
 	}
 	s.varLevel[decisionVar] = bjLevel
 	s.trail = append(s.trail, int(decisionVar))
+	s.numUnassigned--
 
 	// CRITICAL FIX: Update trailHead[bjLevel] to point to the flipped decision
 	// Without this, 1-UIP analysis uses wrong trail range and learns duplicate clauses

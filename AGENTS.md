@@ -197,6 +197,8 @@ benchmark/eval_small_random.sh [n_instances]
 - **watchInitialized flag**: Set AFTER all clauses watched (critical bug fix)
 - **Tombstone deletion + periodic compaction over array rebuild**: 23× GC reduction, bounds `learnedLiterals` growth
 - **chooseWatchPositions helper**: Shared non-false literal selection for original/learned watch setup and compaction (preserves watched-literal invariant)
+- **Incremental VSIDS heap over full rebuild**: `heapPos` array + `increaseKey`/`decreaseKey` eliminates O(n) `buildHeap` on every conflict; `decay` doesn't invalidate (uniform scaling preserves order); `selectVariableWithHeap` uses `removeMax` + `onUnassign` on backtrack (MiniSat-style)
+- **O(1) unassigned count over O(n) scan**: `numUnassigned` field maintained at all assign/unassign sites replaces `allAssigned()`/`hasUnassigned()` linear scans
 
 ## Next Steps
 
@@ -204,6 +206,25 @@ benchmark/eval_small_random.sh [n_instances]
 1. **CHB/LRB tuning** (1-2 days): Better parameter tuning for random instances
 2. **Watch list pre-allocation** ✅: Implemented - accounts for original + learned clauses, caps at 256 capacity
 3. **Preprocessing** ✅: Implemented - adaptive strategy based on instance structure
+
+### Performance Optimizations (from profiling)
+Identified via CPU profiling on GBD instances. P0 items implemented; P1/P2 pending.
+
+**P0 (Implemented July 2026)**:
+- **Incremental VSIDS heap** (`vsids.go`): Replaced O(n) `buildHeap` on every conflict with O(log n) `increaseKey`/`decreaseKey` using a `heapPos` position array. `decay` no longer invalidates the heap (uniform scaling preserves order). `selectVariableWithHeap` uses `removeMax` + `onUnassign` on backtrack (MiniSat-style). Eliminated 27% of runtime from `buildHeap`/`heap.init`. Decide overhead: 33% → 14%.
+- **O(1) unassigned count** (`solver_cdcl.go`): `numUnassigned` field replaces O(n) `allAssigned()`/`hasUnassigned()` scans. Maintained at all assignment/unassignment sites.
+
+**P1 (Pending)**:
+- **`qhead = 0` after every backtrack** (`solver_cdcl.go:4264`): Re-processes the ENTIRE trail through watch lists after every conflict. Should set `qhead = trailHead[bjLevel]` instead — only trail elements from the backjump level onward need reprocessing. Currently O(trail × watchlist_size) per conflict.
+- **`Assignment` struct 16 bytes + redundant `varLevel` array** (`solver.go:8`): `Assignment{Value bool; Level int}` is 16 bytes (7 padding). `varLevel []int` duplicates `assignments[].Level`, forcing 2 cache line accesses per variable in the fast path. Fix: change `Level int` → `Level int32` (struct → 8 bytes), remove `varLevel`, use `assignments[i].Level` directly.
+- **Unit scan O(units) on every `propagateWatched` call** (`solver_cdcl.go:2207`): Scans `unitLearnedList` on every propagation call. Dead entries accumulate between compactions. Fix: gate on a `unitsDirty` flag set during backtrack, or watch unit clauses via the standard watch mechanism.
+- **`decay`/`decayLBD` O(n) scans every 10 conflicts / every conflict** (`vsids.go:475,385`): `decay` scans all activities every 10 conflicts (9.9% of runtime). `decayLBD` scans all lbdBonus every conflict (7.1% of runtime). Fix: use lazy decay (multiply bump amount by `1/decayFactor` instead of scaling all activities), or accept the cost (it's inherent to VSIDS).
+
+**P2 (Pending)**:
+- **Redundant watch list writeback** (`solver_cdcl.go:2495`): `s.watchLists[watchIdx] = watchList` written unconditionally every trail element, even when the slice header hasn't changed. Only necessary after swap-remove (line 2437).
+- **`Watch` struct 12 bytes (3 padding for 1-bit `WatchPos`)** (`cnf.go:48`): 5 watches per cache line vs possible 8. Fix: drop `WatchPos` field, derive `myPos` by comparing watched literal against `clauseLits[0]`. Shrinks to 8 bytes.
+- **Contiguous literal pool built but unused in hot path** (`cnf.go:82`): Original clause literals accessed via per-clause slices (pointer chase) while a contiguous `literalPool` exists but is only used in the cold fallback path. Fix: route hot-path access through the pool, or remove the pool.
+- **uint32 indices defeat BCE** (throughout): Every `s.varLevel[blitVarIdx]`, `s.assignments[blitVarIdx]` etc. uses a `uint32` index from `lit.Var()`. Go's bounds-check elimination cannot prove `uint32 < len(slice)`. Converting to `int` where possible would let BCE remove some checks.
 
 ### Medium Priority
 4. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
