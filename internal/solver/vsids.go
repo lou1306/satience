@@ -240,10 +240,9 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 	}
 	for i, act := range v.activity {
 		if assignments[i].Level < 0 {
-			score := act + v.lbdBonus[i]
 			v.heap = append(v.heap, vsidsHeapItem{
 				varIdx: uint32(i),
-				score:  score,
+				score:  act + v.lbdBonus[i],
 			})
 			v.heapPos[i] = len(v.heap) - 1
 		}
@@ -546,11 +545,11 @@ func (v *VSIDS) decay(assignments []Assignment) {
 		v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
 	}
 
-	// Do NOT invalidate the heap. Uniform scaling of activity preserves relative
-	// order, so the heap structure is still valid. lbdBonus is scaled by a
-	// different factor (decayLBD), causing minor drift that self-corrects on
-	// the next bump (increaseKey). This eliminates the O(n) rebuild that was
-	// the single largest CPU hotspot (27% of runtime).
+	// Invalidate the heap. The heap key is activity + lbdBonus, and decay
+	// only scales activity (not lbdBonus), so the relative ordering can change.
+	// Rebuilding every decayInterval (10) conflicts is O(n/10) per conflict —
+	// far cheaper than the old O(n) per-conflict rebuild.
+	v.heapValid = false
 }
 
 // selectVariableWithHeap returns the unassigned variable with highest activity.
