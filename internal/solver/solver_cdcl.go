@@ -1598,11 +1598,12 @@ func luby(i int) int {
 // - If Glucose criterion not met: Fall back to Luby (configurable base)
 
 // What Happens on Restart:
-// 1. Clear the trail (all assignments)
-// 2. Keep only "glue clauses" (LBD ≤ restartKeepGlueLBD) - most valuable learned clauses
-// 3. Delete all other learned clauses (50-90% reduction)
-// 4. Reset LBD statistics for fresh measurement
-// 5. Continue search with same VSIDS scores (learnings preserved)
+// 1. Clear the trail (all search assignments; preprocessing vars preserved on preprocessTrail)
+// 2. Keep ALL learned clauses (deletion is handled by deleteLearnedClauses based on
+//    database size, NOT by restart)
+// 3. Reset LBD statistics for fresh measurement
+// 4. Continue search with same VSIDS scores (activity preserved across restarts)
+// 5. Run compaction if tombstones accumulated, vivification every Nth restart
 
 // Why Keep Glue Clauses?
 // Glue clauses (LBD ≤ 3) are the "backbone" of the search:
@@ -2199,8 +2200,9 @@ func (s *CDCLSolver) verifyModel() bool {
 // - >= 0 for original clauses
 // - < 0 for learned clauses (encoded as -learnedIdx-1)
 //
-// CRITICAL: Process ALL trail elements (trailIndex starts at 0), not just current level.
-// Skipping trail elements from lower levels causes missed conflicts and unsoundness.
+// CRITICAL: Process all trail elements from s.qhead to end-of-trail, not just
+// current level. s.qhead is set to decisionPoint after backjump (see backtrack),
+// so skipped elements were already processed before the conflict.
 
 func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	if !s.watchInitialized {
@@ -3043,6 +3045,14 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 // The backjump level is the second-highest decision level in the learned clause.
 // This is the highest level we can backjump to while still preventing the conflict.
 // We backjump to this level and flip the decision there.
+//
+// Asserting Clause Invariant:
+// After analysis, the learned clause is reordered so the UIP (single current-level
+// literal) is at position 0 and a backjump-level literal is at position 1. Positions
+// 0/1 are watched directly. After backjump, qhead=decisionPoint skips re-processing
+// the earlier trail; the asserting literal is propagated explicitly by
+// propagateAssertingLiteral() since the watched literals sit at trail positions
+// < decisionPoint.
 
 // LBD (Literal Block Distance):
 // LBD = number of distinct decision levels in the learned clause.
