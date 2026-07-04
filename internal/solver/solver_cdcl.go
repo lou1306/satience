@@ -4323,29 +4323,30 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 // CDCL solvers use backjumping (non-chronological backtracking) to skip
 // irrelevant decision levels.
 
-// How Backjumping Works:
+// How Backjumping Works (standard CDCL):
 // 1. After 1-UIP conflict analysis, the learned clause has exactly one literal
 //    at the current decision level (the UIP - Unique Implication Point)
 // 2. The backjump level is the second-highest level in the learned clause
 // 3. Instead of backtracking to level-1, we jump directly to backjumpLevel
-// 4. At backjumpLevel, we flip the decision that led to the conflict
+// 4. At backjumpLevel, the learned clause is unit: all non-UIP literals are
+//    false at levels <= backjumpLevel. propagateAssertingLiteral() assigns the
+//    UIP at backjumpLevel. The decision at backjumpLevel is NOT flipped.
 
 // Why Backjumping is Sound:
 // The learned clause explains why the conflict occurred. All literals in the
 // learned clause except the UIP are already false at levels < current.
-// By backjumping to the second-highest level and flipping that decision,
-// we ensure the learned clause becomes unit and propagates the UIP literal
-// to false, preventing the same conflict.
+// By backjumping to the second-highest level, the learned clause becomes unit
+// and propagates the UIP literal, preventing the same conflict.
 
 // Example:
 // Decisions: x=1 (level 1), y=1 (level 2), z=1 (level 3)
 // Conflict at level 3
 // Learned clause: (¬x ∨ ¬y ∨ ¬z) with LBD=3 (levels 1,2,3)
 // Backjump level = 2 (second-highest in learned clause)
-// After backjump: trail = [x=1, y=0], z is unassigned
+// After backjump: trail = [x=1, y=1], z is unassigned
 // The learned clause is now unit: ¬z is forced at level 2
 
-// This skips exploring the entire subtree under (x=1, y=1) at level 2,
+// This skips exploring the entire subtree under (x=1, y=1, z=1) at level 3,
 // which would all lead to the same conflict.
 func (s *CDCLSolver) backtrack() bool {
 	s.unitsDirty = true // Backtrack may unassign unit-propagated variables
@@ -4365,45 +4366,34 @@ func (s *CDCLSolver) backtrack() bool {
 	if bjLevel < 0 {
 		bjLevel = s.level - 1
 	}
-	// CRITICAL FIX: Allow bjLevel == s.level for unit clause flips
-	// When bjLevel == s.level, we stay at current level and flip the decision
-	// This is correct for unit learned clauses where the UIP is the decision literal
-	// Only adjust if bjLevel > s.level (which would be a bug)
-	if bjLevel > s.level {
+	// Always backtrack at least one level below the conflict level.
+	if bjLevel >= s.level {
 		bjLevel = s.level - 1
 	}
-	// Allow bjLevel=0 to backtrack to root level (needed for unit clause conflicts with decisions)
 	if bjLevel < 0 {
-			s.Log("c [BACKTRACK] bjLevel=%d invalid at level %d - returning UNSAT\n", bjLevel, s.level)
+		s.Log("c [BACKTRACK] bjLevel=%d invalid at level %d - returning UNSAT\n", bjLevel, s.level)
 		return false
 	}
 
-	// Find the decision point at the backjump level
-	// SPECIAL CASE: If bjLevel=0, we're backtracking to root, so clear all decisions (start from trailHead[1])
+	// Standard CDCL backjump: unassign everything at levels > bjLevel, KEEP the
+	// decision and propagations at bjLevel. The asserting literal (UIP) is then
+	// propagated at bjLevel by propagateAssertingLiteral().
+	//
+	// The previous implementation used trailHead[bjLevel] (start of level bjLevel)
+	// as the decision point, which unassigned the decision at bjLevel and then
+	// re-assigned it with the FLIPPED value. That is DPLL chronological backtracking:
+	// it discards all propagations at bjLevel and explores the opposite branch,
+	// defeating conflict-driven learning. Standard CDCL (MiniSat, Glucose) keeps
+	// level bjLevel and lets the asserting literal propagate — that is what
+	// cancelUntil() already does.
 	var decisionPoint int
-	if bjLevel == 0 {
-		if len(s.trailHead) > 1 {
-			decisionPoint = s.trailHead[1]
-		} else {
-			decisionPoint = 0
-		}
+	if bjLevel+1 < len(s.trailHead) {
+		decisionPoint = s.trailHead[bjLevel+1]
 	} else {
-		decisionPoint = s.trailHead[bjLevel]
-	}
-	if decisionPoint >= len(s.trail) {
-			s.Log("c [BACKTRACK] FAIL: decision point %d >= trail len %d at conflict %d\n", decisionPoint, len(s.trail), s.conflicts)
-		return false
+		decisionPoint = len(s.trail)
 	}
 
-	decisionVar := uint32(s.trail[decisionPoint])
-	decisionValue := s.assignments[decisionVar].Value
-
-	if s.verbose && s.conflicts <= 10 {
-		s.Log("c [BACKTRACK] Flipping var %d (decision at trail pos %d, level %d) from %v to %v\n",
-			decisionVar+1, decisionPoint, s.assignments[decisionVar].Level, decisionValue, !decisionValue)
-	}
-
-	// Clear all assignments from decisionPoint onwards.
+	// Clear all assignments above bjLevel.
 	// No preprocessing check needed — preprocessing vars are on preprocessTrail (not s.trail).
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
@@ -4414,48 +4404,13 @@ func (s *CDCLSolver) backtrack() bool {
 		s.numUnassigned++
 	}
 	s.trail = s.trail[:decisionPoint]
-	// For bjLevel > 0, start propagation from the decision point (skip
-	// re-processing the earlier trail — the asserting literal is propagated
-	// explicitly by propagateAssertingLiteral). For bjLevel == 0, re-scan from
-	// the start (root-level backjump; unit scan handles the asserting literal).
-	if bjLevel > 0 {
-		s.qhead = decisionPoint
-	} else {
-		s.qhead = 0
-	}
+	s.qhead = decisionPoint
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
 
 	// Reset conflicts at levels > bjLevel since we're backtracking
 	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
 		s.conflictsAtLevel[i] = 0
-	}
-
-	// SPECIAL CASE: If bjLevel=0, we've backtracked to root. Don't flip a decision -
-	// the unit clause will be propagated in the next iteration.
-	if bjLevel == 0 {
-		return true
-	}
-
-	// Flip the decision at the backjump level
-	s.assignments[decisionVar] = Assignment{
-		Value: !decisionValue,
-		Level: bjLevel,
-	}
-	s.varLevel[decisionVar] = bjLevel
-	s.trail = append(s.trail, int(decisionVar))
-	s.numUnassigned--
-
-	// CRITICAL FIX: Update trailHead[bjLevel] to point to the flipped decision
-	// Without this, 1-UIP analysis uses wrong trail range and learns duplicate clauses
-	s.trailHead[bjLevel] = len(s.trail) - 1
-
-	if s.verbose && s.conflicts <= 10 {
-		s.Log("c [BACKTRACK POST] trail len=%d, trailHead=%v, s.level=%d\n", len(s.trail), s.trailHead, s.level)
-		for i, t := range s.trail {
-			v := uint32(t)
-			s.Log("c   trail[%d] = var %d (level %d)\n", i, v+1, s.assignments[v].Level)
-		}
 	}
 
 	return true
