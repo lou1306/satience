@@ -2691,128 +2691,22 @@ func (s *CDCLSolver) decide() bool {
 		return false
 	}
 
-
-
-	// Track conflicts at current level
-	if s.level > 0 && s.level < len(s.conflictsAtLevel) {
-		s.conflictsAtLevel[s.level]++
-	}
-
-	// Determine if we should make a random decision
-	// Two modes:
-	// 1. Configurable random rate (s.randomDecisionRate) - only after 100 conflicts
-	// 2. Diversification when stuck (existing logic)
-	makeRandom := false
-
-	// Check configurable random rate (only after initial search phase)
-	if s.randomDecisionRate > 0.0 && s.conflicts >= 100 {
-		if float64(s.conflicts%1000)/1000.0 < s.randomDecisionRate {
-			makeRandom = true
-		}
-	}
-
-	// Diversification: force random decision if severely stuck
-	if !makeRandom {
-		stuckThreshold := 1000 // conflicts at same level before forcing random
-		forceRandom := false
-
-		if s.level > 0 && s.level < len(s.conflictsAtLevel) && s.conflictsAtLevel[s.level] > stuckThreshold {
-			// Severely stuck - force random decision
-			if s.conflicts-s.lastRandomDecision > 500 { // At least 500 conflicts since last random
-				forceRandom = true
-			}
-		}
-
-		// Add periodic random decisions as fallback (configurable frequency, 0 = disabled)
-		if !forceRandom && s.randomDecisionPeriod > 0 && s.conflicts > 0 && s.conflicts%s.randomDecisionPeriod == 0 {
-			forceRandom = true
-		}
-
-		if forceRandom {
-			makeRandom = true
-		}
-	}
-
+	// Select variable using VSIDS heuristic with phase saving.
+	// Standard CDCL: no random decisions, no diversification overrides.
 	var varIdx uint32
 	var phase bool
+	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
 
-	if makeRandom {
-		// Select random unassigned variable
-		varIdx = s.selectRandomUnassigned()
-		// Random phase
-		phase = s.conflicts%2 == 0
-		s.lastRandomDecision = s.conflicts
-
-		if s.verbose && s.conflicts%1000 == 0 {
-			s.Log("c [verbose] Random decision at conflict %d, level %d (rate=%.2f)\n", s.conflicts, s.level, s.randomDecisionRate)
-		}
-
-		// Reset conflicts at this level after random decision
-		if s.level > 0 && s.level < len(s.conflictsAtLevel) {
-			s.conflictsAtLevel[s.level] = 0
-		}
-
-		// Reset flip tracking
-		s.consecutiveFlips = 0
+	// Use saved phase (phase saving heuristic).
+	if int(varIdx) < len(s.savedPhase) {
+		phase = s.savedPhase[varIdx]
 	} else {
-		// Select variable using VSIDS heuristic
-		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
-
-		// IMPROVEMENT #3: Force exploration diversity when stuck
-		// Only override VSIDS if same variable selected too many times
-		if int(varIdx) < len(s.decidedVarSet) && s.decidedVarSet[varIdx] {
-			s.restartDecisionCount++
-			// Force alternative if same var selected > 10 times this restart
-			if s.restartDecisionCount > 10 {
-				for i := range s.assignments {
-					if i >= int(s.cnf.NumVars) {
-						break
-					}
-					if s.assignments[i].Level < 0 && !s.decidedVarSet[i] {
-						varIdx = uint32(i)
-						s.restartDecisionCount = 0
-						break
-					}
-				}
-			}
-		} else {
-			s.restartDecisionCount = 0
-		}
-
-		// Track this decision for diversity
-		if int(varIdx) < len(s.decidedVarSet) && !s.decidedVarSet[varIdx] {
-			s.decidedVarSet[varIdx] = true
-			s.decidedVars = append(s.decidedVars, varIdx)
-		}
-
-		// Use saved phase from previous decisions (phase saving heuristic)
-		// This remembers the polarity that worked well in previous search attempts
-		if int(varIdx) < len(s.savedPhase) {
-			phase = s.savedPhase[varIdx]
-		} else {
-			phase = true // Default to positive phase
-		}
-
-		// Detect variable flipping (same variable chosen consecutively)
-		if s.conflicts > 0 && varIdx == s.lastDecisionVar {
-			s.consecutiveFlips++
-
-			// DISABLED: Aggressive diversification was counterproductive on structured instances
-			// It resets VSIDS activity, preventing convergence on the right variables
-			// Instead, let VSIDS naturally escape local minima through decay and restarts
-		} else {
-			s.consecutiveFlips = 0
-		}
-		s.lastDecisionVar = varIdx
+		phase = false // Default to positive phase (variable = true)
 	}
 
 	// SAFETY CHECK: Ensure variable is unassigned before deciding.
-	// The selection functions should already return unassigned variables,
-	// but a stale heap entry can slip through. Fall back to a linear scan
-	// for the first unassigned variable. NOTE: s.level has NOT been
-	// incremented yet at this point, so it must not be modified here.
+	// A stale heap entry can slip through; fall back to linear scan.
 	if int(varIdx) < len(s.assignments) && s.assignments[varIdx].Level >= 0 {
-		s.Log("c [DECIDE BUG] var %d already assigned at level %d, falling back to linear scan\n", varIdx+1, s.assignments[varIdx].Level)
 		found := false
 		for i := uint32(0); i < s.cnf.NumVars; i++ {
 			if s.assignments[i].Level < 0 {
@@ -2820,7 +2714,7 @@ func (s *CDCLSolver) decide() bool {
 				if int(varIdx) < len(s.savedPhase) {
 					phase = s.savedPhase[varIdx]
 				} else {
-					phase = true
+					phase = false
 				}
 				found = true
 				break
@@ -2836,13 +2730,9 @@ func (s *CDCLSolver) decide() bool {
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1) // -1 = decision
 	s.savedPhase[varIdx] = phase                                // Save phase for decisions only
 	s.decisions++
-	// SYMMETRY BREAKING: Track this decision to apply recency penalty
-	s.vsids.TrackDecision(varIdx, s.conflicts)
 	if s.verbose && s.conflicts <= 10 {
-		// phase is the negated flag: true=negative lit (-var), false=positive lit (+var)
-		// Variable value is !phase: if lit is -var, var=FALSE; if lit is +var, var=TRUE
-		s.Log("c [DECIDE] Level %d (was %d): var %d = %v (decision, lit=%d%c), trailHead len=%d, trailHead=%v\n",
-			s.level, s.level-1, varIdx+1, !phase, varIdx+1, map[bool]byte{true: '-', false: '+'}[phase], len(s.trailHead), s.trailHead)
+		s.Log("c [DECIDE] Level %d (was %d): var %d = %v (decision, lit=%d%c), trailHead len=%d\n",
+			s.level, s.level-1, varIdx+1, !phase, varIdx+1, map[bool]byte{true: '-', false: '+'}[phase], len(s.trailHead))
 	}
 	return true
 }
