@@ -39,12 +39,11 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - **GC time**: ~8-10s → ~0.4s (20× faster)
 - **Mechanism**: Deletion marks tombstones + removes watches + `compactWatchLists()`. Periodically, `compactLearnedClauses()` reclaims tombstone literal gaps by moving active clauses into a contiguous prefix, remapping the implication array, and rebuilding all watch lists with non-false literal selection (so the watched-literal invariant holds)
 
-**Benchmark results** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, June 2026):
-- **Solved**: 26/32 instances (81.2% solve rate)
-- **40 smallest CNFs**: 28/40 (70.0%) with 5s timeout
+**Benchmark results** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, July 2026):
+- **Solved**: 42/72 instances (58.3% solve rate)
 - **Tseitin**: All solved (4×4, 5×5, 6×6 - both SAT and UNSAT) ✅
 - **Arg chain**: Solved ✅
-- **PHP UNSAT**: Timeout (cardinality constraint reasoning needed)
+- **PHP UNSAT**: php_6p_5h now solved (2.1s); larger PHP still timeout (cardinality constraint reasoning needed)
 - **Algebraic/Combinatorial**: Mixed results (need better heuristics)
 
 **Performance characteristics**:
@@ -68,8 +67,8 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - Backjumping (intelligent backtrack level from learned clause)
 - LBD-based clause database management (maxLearned=2500, keep all LBD≤2)
 - Phase saving heuristic (remembers satisfying polarity)
-- Adaptive restarts (Glucose-style for LBD >2× avg AND >6)
-- Luby restart sequence fallback (base=50)
+- Adaptive restarts (Glucose-style EMA LBD > ratio×avg, now actually functional after fixing dead lbdSum/lbdCount increment bug; disabled for random instances where Luby base=5 suffices)
+- Luby restart sequence fallback (base=100 default, base=5 for random instances)
 - Clause minimization via self-subsumption
 - Watched literals propagation with O(1) clause index access
 - Clause quality tracking (useCount, propCount metrics)
@@ -191,9 +190,9 @@ benchmark/eval_small_random.sh [n_instances]
 
 - **Name**: satience (SAT + science/patience/essence)
 - **1-UIP validation**: Skip clauses with ≠1 literal at current level
-- **Activity reset on restart**: Prevents VSIDS loops
+- **Activity reset on restart**: Prevents VSIDS loops — **REMOVED**: Standard MiniSat behavior preserves activity across restarts; 0.3× reset destroys search memory
 - **Phase saving for decisions only**: Don't save forced propagations
-- **Restart policy**: Aggressive Glucose-style (1.2× avg LBD, min 25 conflicts)
+- **Restart policy**: Glucose-style EMA LBD > ratio×avg (now functional after fixing dead lbdSum/lbdCount increment); disabled for random instances (Luby base=5 suffices); Luby fallback base=100 (base=5 for random)
 - **maxLearned=2500**: Learned clause limit
 - **ClauseIdx in Watch struct**: O(1) clause index access (63% speedup)
 - **Default minimization = selective**: Aggressive mode adds 1-2% overhead
@@ -207,6 +206,9 @@ benchmark/eval_small_random.sh [n_instances]
 - **Redundant watch list writeback removal**: Slice header writebacks only needed after swap-remove (which re-slices `watchList`); element mutations visible through shared backing array. Removed 3 unnecessary stores per trail element.
 - **Batch writeback reverted**: Tracking `wlLen` separately caused 3.9% regression from register pressure — per-swap-remove writes are to a hot cache line (L1 hits), so `wlLen` overhead exceeds savings.
 - **Contiguous literal pool skipped**: Only 1.2% of `propagateWatched` time; not worth routing original clause access through pool (complexity/risk of pool as source of truth).
+- **EMA restart signal over single lastConflictLBD**: EMA (α=0.1, half-life ~7 conflicts) smooths individual LBD spikes. Single-LBD triggers spurious restarts every 2-5 conflicts at ratio=1.5. EMA detects sustained LBD increases without noise.
+- **Glucose disabled for random instances**: Luby base=5 already restarts every 5-20 conflicts; adding Glucose changes the search trajectory without benefit. Glucose is only active for structured instances (default ratio=1.5 from CLI).
+- **Fuzzer assignmentsToModel fix**: `Level > 0` → `>= 0` — preprocessing assigns at Level 0; excluding Level 0 produced empty models for unit-propagated instances, causing false soundness failures in the fuzzer (not a solver bug).
 
 ## Next Steps
 
@@ -283,7 +285,8 @@ Clause vivification was re-enabled after fixing three soundness bugs that caused
 ## Recent Commits
 
 ```
-<latest_commit> - P2 perf: Watch struct 12→8 bytes, redundant writeback removal, uint32→int indices (5-6% faster)
+04b8207 - Fix dead Glucose restart criterion + EMA restart signal + fuzzer model fix
+7848083 - Stop resetting VSIDS activity on restart + P2 perf + unitsDirty gate
 dc98229 - P0 perf: incremental VSIDS heap + O(1) unassigned count
 da92ca7 - Fix vivification soundness bugs causing false UNSAT, re-enable by default
 c2d0b03 - Add -vivify-period CLI flag + vivification tests
