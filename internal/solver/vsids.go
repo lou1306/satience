@@ -70,11 +70,13 @@ func (h *vsidsHeap) removeMax(heapPos []int) vsidsHeapItem {
 	n := len(*h)
 	item := (*h)[0]
 	heapPos[item.varIdx] = -1
-	(*h)[0] = (*h)[n-1]
-	heapPos[(*h)[0].varIdx] = 0
-	*h = (*h)[:n-1]
 	if n > 1 {
+		(*h)[0] = (*h)[n-1]
+		heapPos[(*h)[0].varIdx] = 0
+		*h = (*h)[:n-1]
 		h.down(heapPos, 0)
+	} else {
+		*h = (*h)[:0]
 	}
 	return item
 }
@@ -517,12 +519,11 @@ func (v *VSIDS) decayCHB(assignments []Assignment) {
 // decay decays all activity scores periodically (MiniSat-style)
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
-// Only decays every v.decayInterval conflicts to reduce heap rebuild overhead
+// Only decays every v.decayInterval conflicts to reduce overhead
 func (v *VSIDS) decay(assignments []Assignment) {
 	v.conflictCount++
 
 	// Lazy decay: only decay every decayInterval conflicts
-	// This reduces heap rebuilds while maintaining good variable selection quality
 	if v.conflictCount%v.decayInterval != 0 {
 		return
 	}

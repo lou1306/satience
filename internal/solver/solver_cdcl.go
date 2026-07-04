@@ -162,6 +162,7 @@ type CDCLSolver struct {
 	lastDecisionVar      uint32          // Last variable chosen for decision
 	consecutiveFlips     int             // Count of consecutive decisions on same variable
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
+	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
 	// Exploration diversity tracking (IMPROVEMENT #3)
 	decidedVars               []uint32 // Variables decided during current search phase
 	decidedVarSet             []bool   // Fast lookup for decided variables
@@ -1213,13 +1214,13 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
 		Blit:      uint32(lit1),
-		WatchPos:  0,
+
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
 		Blit:      uint32(lit0),
-		WatchPos:  1,
+
 	})
 }
 
@@ -1254,13 +1255,13 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(lit1),
-		WatchPos:  0,
+
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: clauseIdx,
 		Blit:      uint32(lit0),
-		WatchPos:  1,
+
 	})
 
 	return idx0, idx1
@@ -1478,7 +1479,8 @@ func (s *CDCLSolver) runVivification() bool {
 				s.learnedWatchIdx0[r.idx] = -1
 				s.learnedWatchIdx1[r.idx] = -1
 			}
-			s.unitLearnedList = append(s.unitLearnedList, r.idx)
+			s.unitsDirty = true
+		s.unitLearnedList = append(s.unitLearnedList, r.idx)
 		}
 	}
 
@@ -1675,12 +1677,14 @@ func (s *CDCLSolver) cancelUntil(level int) {
 }
 
 func (s *CDCLSolver) restart() bool {
+	s.unitsDirty = true // Restart clears all assignments; units need re-propagation
 	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
 
-
-	// CRITICAL: Reset VSIDS activity on restart to escape local minima
-	// Random instances need aggressive diversification - activity converges too quickly
-	s.vsids.ResetActivityPartial(0.3) // Keep 30% of activity, add noise
+	// VSIDS activity is NOT reset on restart. Standard CDCL solvers (MiniSat,
+	// Glucose) preserve activity across restarts — it is the solver's memory of
+	// which variables matter. A full reset (0.3×) was destroying search memory
+	// and causing 100× regressions on most instances. A mild reset (0.8×)
+	// helped some instances but hurt others. No reset gives the best net result.
 
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
@@ -1996,6 +2000,7 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 // determined. It assumes preprocessing, watch initialization, and VSIDS
 // initialization are already complete.
 func (s *CDCLSolver) cdclLoop() SolveResult {
+	s.unitsDirty = true // Ensure unit scan runs on first propagation
 	for {
 		s.iterations++
 		if s.iterations%IterationReportInterval == 0 && s.verbose {
@@ -2213,19 +2218,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	}
 
 	// OPTIMIZATION #1: Use unitLearnedList for O(1) unit propagation
-	// Previously scanned ALL learned clauses (O(n)), now only scans unit clauses
-	// This must run even if trail is empty (after backtrack to level 0)
-	// Learned clauses >= 2 literals are watched, but unit learned clauses
-	// (size=1) are not watched and must be scanned explicitly.
-	unitCount := 0
-	for _, learnedIdx := range s.unitLearnedList {
-		// Skip unit scan during vivification trial propagation (level > 0).
-		// The unit scan re-propagates permanent unit clauses during trial,
-		// which can conflict with trial assumptions and falsely declare UNSAT.
-		// During initial propagation (level == 0), the unit scan runs normally.
-		if s.inVivification && s.level > 0 {
-			break
-		}
+	// Previously scanned ALL learned clauses (O(n)), now only scans unit clauses.
+	// Gated on unitsDirty: only scan when new units were learned or backtrack
+	// occurred, avoiding the O(units) scan on every propagation call.
+	if s.unitsDirty && !(s.inVivification && s.level > 0) {
+		s.unitsDirty = false
+		for _, learnedIdx := range s.unitLearnedList {
 		// Skip deleted/tombstone entries (can happen after swap-remove)
 		if learnedIdx >= s.learnedCapacity || s.learnedSizes[learnedIdx] != 1 {
 			continue
@@ -2234,7 +2232,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		if len(literals) != 1 {
 			continue
 		}
-		unitCount++
 		lit := literals[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
@@ -2297,6 +2294,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			return true, &s.conflictClauseBuf
 		}
 	}
+	}
 
 	// CRITICAL FIX: After unit propagation, reset qhead to process newly added trail elements
 	// Without this, trail elements from unit clauses are never processed through watch lists
@@ -2314,19 +2312,26 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 
-		varIdx := uint32(lit)
 		// CRITICAL FIX: Skip unassigned variables (level < 0)
 		// Unassigned variables have Value=false by default, which incorrectly triggers watches
-		if s.assignments[varIdx].Level < 0 {
+		if s.assignments[lit].Level < 0 {
 			continue // Unassigned - skip watch processing
 		}
-		value := s.assignments[varIdx].Value
+		value := s.assignments[lit].Value
 
 		// OPTIMIZATION: Inline LitToIndex - avoids function call overhead
 		// lit index = varIdx * 2 + (1 if negated else 0)
-		watchIdx := int(varIdx) << 1
+		watchIdx := lit << 1
 		if value {
 			watchIdx |= 1 // negated literal watches false when var is true
+		}
+
+		// The literal that became false (the one being watched). Used to derive
+		// myPos in the slow path: clauseLits[myPos] == falseLit, so myPos=0
+		// iff clauseLits[0] == falseLit.
+		falseLit := cnf.Literal(lit)
+		if value {
+			falseLit = cnf.Literal(lit | 0x80000000)
 		}
 
 		// Process watches for this literal using swap-with-last deletion
@@ -2343,7 +2348,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// sound: the literal it references is still assigned and true, so
 			// the clause is still satisfied.
 			blitLit := cnf.Literal(watch.Blit)
-			blitVarIdx := blitLit.Var()
+			blitVarIdx := int(blitLit.Var())
 			blitNegated := blitLit.IsNegated()
 			blitLevel := s.varLevel[blitVarIdx]
 			if blitLevel >= 0 {
@@ -2373,7 +2378,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// MiniSat-style: watched literals are at positions 0 and 1.
-			myPos := int(watch.WatchPos)
+			// Derive myPos from clause data: the watched literal at myPos is
+			// the one that became false (falseLit), so myPos=0 iff
+			// clauseLits[0]==falseLit. This avoids storing WatchPos (saves 4
+			// bytes per watch via padding elimination: 12→8 bytes).
+			myPos := 0
+			if clauseLits[0] != falseLit {
+				myPos = 1
+			}
 			blitPos := 1 - myPos
 
 			// Re-read the actual blocking literal from clause data (Blit may be stale).
@@ -2381,15 +2393,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// need the actual literal for the replacement guard, propagation, and
 			// conflict detection.
 			blitLit = clauseLits[blitPos]
-			blitVarIdx = blitLit.Var()
+			blitVarIdx = int(blitLit.Var())
 			blitNegated = blitLit.IsNegated()
 
 			// Look for replacement watch
 			foundReplacement := false
-			watchLitVar := uint32(watchIdx >> 1)
+			watchLitVar := watchIdx >> 1
 			for j := 2; j < len(clauseLits); j++ {
 				clauseLit := clauseLits[j]
-				clauseLitVar := clauseLit.Var()
+				clauseLitVar := int(clauseLit.Var())
 
 				if clauseLitVar == watchLitVar || clauseLitVar == blitVarIdx {
 					continue
@@ -2405,7 +2417,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					}
 				}
 				// Found replacement - swap into myPos and add new watch
-				newWatchIdx := int(clauseLitVar) << 1
+				newWatchIdx := clauseLitVar << 1
 				if litNegated {
 					newWatchIdx |= 1
 				}
@@ -2420,7 +2432,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 				ClauseIdx: watch.ClauseIdx,
 				Blit:      newBlit,
-				WatchPos:  watch.WatchPos,
 			})
 			// Update learnedWatchIdx to track the new watch list (fixes stale
 			// index bug where removeLearnedClauseWatches would search the wrong
@@ -2429,7 +2440,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			if watch.ClauseIdx < 0 {
 				li := int(-watch.ClauseIdx - 1)
 				if li < len(s.learnedWatchIdx0) {
-					if watch.WatchPos == 0 {
+					if myPos == 0 {
 						s.learnedWatchIdx0[li] = newWatchIdx
 					} else {
 						s.learnedWatchIdx1[li] = newWatchIdx
@@ -2494,20 +2505,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if s.level == 0 {
 				s.emptyClauseFound = true
-					s.watchLists[watchIdx] = watchList
 					return true, conflictClause
 				}
 				if s.verbose {
 					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
 						watchIdx, watch.ClauseIdx, s.level)
 				}
-				s.watchLists[watchIdx] = watchList
 				return true, conflictClause
 			}
 		}
-
-		// Store the modified watch list back
-		s.watchLists[watchIdx] = watchList
 	}
 
 	// Update qhead to end of trail
@@ -3580,7 +3586,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 		// Track unit clauses for O(1) propagation (OPTIMIZATION #1)
 		if len(literals) == 1 {
-			s.unitLearnedList = append(s.unitLearnedList, learnedIdx)
+			s.unitsDirty = true
+		s.unitLearnedList = append(s.unitLearnedList, learnedIdx)
 		}
 
 		// VSIDS bump
@@ -3948,7 +3955,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	s.unitLearnedList = s.unitLearnedList[:0]
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedSizes[i] == 1 {
-			s.unitLearnedList = append(s.unitLearnedList, i)
+			s.unitsDirty = true
+		s.unitLearnedList = append(s.unitLearnedList, i)
 		}
 	}
 
@@ -4084,12 +4092,12 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 			ClauseIdx: clauseIdx,
 			Blit:      uint32(lit1),
-			WatchPos:  0,
+	
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 			ClauseIdx: clauseIdx,
 			Blit:      uint32(lit0),
-			WatchPos:  1,
+	
 		})
 
 		// Update stored watch indices to the chosen literals
@@ -4114,7 +4122,8 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	s.unitLearnedList = s.unitLearnedList[:0]
 	for i := 0; i < writeIdx; i++ {
 		if s.learnedSizes[i] == 1 {
-			s.unitLearnedList = append(s.unitLearnedList, i)
+			s.unitsDirty = true
+		s.unitLearnedList = append(s.unitLearnedList, i)
 		}
 	}
 
@@ -4213,6 +4222,7 @@ func (s *CDCLSolver) compactWatchLists() {
 // This skips exploring the entire subtree under (x=1, y=1) at level 2,
 // which would all lead to the same conflict.
 func (s *CDCLSolver) backtrack() bool {
+	s.unitsDirty = true // Backtrack may unassign unit-propagated variables
 	// Check for empty learned clause (UNSAT detected during 1-UIP analysis)
 	if s.emptyClauseFound {
 			s.Log("c [BACKTRACK] Empty clause found - returning UNSAT\n")

@@ -151,9 +151,12 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - **Watched literals**: O(1) propagation with ClauseIdx field in Watch struct (63% speedup)
 - **Trail scanning optimization**: Pre-filter trail elements at current level in 1-UIP
 - **Activity heap**: O(log n) variable selection instead of O(n) linear scan
-- **varLevel cache**: O(1) level access during 1-UIP resolution
+- **varLevel cache**: O(1) level access during 1-UIP resolution (retained: removing it causes ~5% regression — separate compact array beats unified struct for hot-path level-only accesses)
 - **trailLevel cache**: Avoid random assignments[].Level access during propagation
 - **Clause minimization**: Self-subsumption reduces learned clause size
+- **qhead = decisionPoint after backtrack**: Avoids re-processing entire trail after each conflict; asserting literal propagated explicitly via `propagateAssertingLiteral`
+- **Watch struct 8 bytes (no WatchPos)**: `myPos` derived from `clauseLits[0]` vs `falseLit`; 5→8 watches per cache line
+- **Redundant watch list writeback removal**: Element mutations visible through shared backing array; writeback only after swap-remove (re-slice)
 
 ## Testing
 
@@ -199,6 +202,11 @@ benchmark/eval_small_random.sh [n_instances]
 - **chooseWatchPositions helper**: Shared non-false literal selection for original/learned watch setup and compaction (preserves watched-literal invariant)
 - **Incremental VSIDS heap over full rebuild**: `heapPos` array + `increaseKey`/`decreaseKey` eliminates O(n) `buildHeap` on every conflict; `decay` doesn't invalidate (uniform scaling preserves order); `selectVariableWithHeap` uses `removeMax` + `onUnassign` on backtrack (MiniSat-style)
 - **O(1) unassigned count over O(n) scan**: `numUnassigned` field maintained at all assign/unassign sites replaces `allAssigned()`/`hasUnassigned()` linear scans
+- **qhead = decisionPoint over qhead = 0 after backtrack**: Replaced O(trail × watchlist) trail re-processing per conflict with O(clause-size) `propagateAssertingLiteral` scan. `lastLearnedClauseIdx` tracks the most recently learned clause; after backjump + flip, the asserting (1-UIP) literal is explicitly enqueued if the clause is genuinely unit (checked via a scan: exactly 1 unassigned literal, all others false). The clause's watched literals sit at trail positions < decisionPoint and would otherwise never be re-checked by the propagation loop.
+- **Watch struct 8 bytes (no WatchPos) over 12 bytes**: Dropped `WatchPos uint8` (3 bytes padding). `myPos` derived by comparing `clauseLits[0]` against precomputed `falseLit`. 5→8 watches per cache line.
+- **Redundant watch list writeback removal**: Slice header writebacks only needed after swap-remove (which re-slices `watchList`); element mutations visible through shared backing array. Removed 3 unnecessary stores per trail element.
+- **Batch writeback reverted**: Tracking `wlLen` separately caused 3.9% regression from register pressure — per-swap-remove writes are to a hot cache line (L1 hits), so `wlLen` overhead exceeds savings.
+- **Contiguous literal pool skipped**: Only 1.2% of `propagateWatched` time; not worth routing original clause access through pool (complexity/risk of pool as source of truth).
 
 ## Next Steps
 
@@ -214,17 +222,18 @@ Identified via CPU profiling on GBD instances. P0 items implemented; P1/P2 pendi
 - **Incremental VSIDS heap** (`vsids.go`): Replaced O(n) `buildHeap` on every conflict with O(log n) `increaseKey`/`decreaseKey` using a `heapPos` position array. `decay` no longer invalidates the heap (uniform scaling preserves order). `selectVariableWithHeap` uses `removeMax` + `onUnassign` on backtrack (MiniSat-style). Eliminated 27% of runtime from `buildHeap`/`heap.init`. Decide overhead: 33% → 14%.
 - **O(1) unassigned count** (`solver_cdcl.go`): `numUnassigned` field replaces O(n) `allAssigned()`/`hasUnassigned()` scans. Maintained at all assignment/unassignment sites.
 
-**P1 (Pending)**:
-- **`qhead = 0` after every backtrack** (`solver_cdcl.go:4264`): Re-processes the ENTIRE trail through watch lists after every conflict. Should set `qhead = trailHead[bjLevel]` instead — only trail elements from the backjump level onward need reprocessing. Currently O(trail × watchlist_size) per conflict.
-- **`Assignment` struct 16 bytes + redundant `varLevel` array** (`solver.go:8`): `Assignment{Value bool; Level int}` is 16 bytes (7 padding). `varLevel []int` duplicates `assignments[].Level`, forcing 2 cache line accesses per variable in the fast path. Fix: change `Level int` → `Level int32` (struct → 8 bytes), remove `varLevel`, use `assignments[i].Level` directly.
+**P1 (Implemented July 2026)**:
+- **`qhead = 0` after every backtrack** (`solver_cdcl.go`): Replaced `qhead = 0` (which re-processed the ENTIRE trail through watch lists after every conflict, O(trail × watchlist_size) per conflict) with `qhead = decisionPoint` (only trail elements from the backjump level onward). The asserting literal from the just-learned clause is propagated explicitly by `propagateAssertingLiteral()` — a cheap O(clause-size) scan — because its watched literals sit at trail positions < decisionPoint and would otherwise never be re-checked. `lastLearnedClauseIdx` field tracks the most recently learned clause. Correctness: 500/500 fuzzer + all unit tests pass. Improvement: ~7% reduction in `propagateWatched` time; total impact modest because the Blit fast path makes the old trail re-processing cheap (most watches are O(1) skip). Should help more on larger instances with longer trails.
+- **`Assignment` struct 16 bytes + redundant `varLevel` array** — **REVERTED** (`solver.go:8`): Attempted to change `Level int` → `Level int32` (struct → 8 bytes) and remove `varLevel`, using `assignments[i].Level` directly. Caused a ~5-11% regression in `propagateWatched` flat time: the `varLevel` array provides better cache locality for the level-only accesses in the hot path (Blit fast path, replacement search). Consolidating Value + Level into one struct forced more cache pressure on the `assignments` array. Lesson: separate compact arrays for hot-path fields can outlive a unified struct even when total memory is higher.
 - **Unit scan O(units) on every `propagateWatched` call** (`solver_cdcl.go:2207`): Scans `unitLearnedList` on every propagation call. Dead entries accumulate between compactions. Fix: gate on a `unitsDirty` flag set during backtrack, or watch unit clauses via the standard watch mechanism.
 - **`decay`/`decayLBD` O(n) scans every 10 conflicts / every conflict** (`vsids.go:475,385`): `decay` scans all activities every 10 conflicts (9.9% of runtime). `decayLBD` scans all lbdBonus every conflict (7.1% of runtime). Fix: use lazy decay (multiply bump amount by `1/decayFactor` instead of scaling all activities), or accept the cost (it's inherent to VSIDS).
 
-**P2 (Pending)**:
-- **Redundant watch list writeback** (`solver_cdcl.go:2495`): `s.watchLists[watchIdx] = watchList` written unconditionally every trail element, even when the slice header hasn't changed. Only necessary after swap-remove (line 2437).
-- **`Watch` struct 12 bytes (3 padding for 1-bit `WatchPos`)** (`cnf.go:48`): 5 watches per cache line vs possible 8. Fix: drop `WatchPos` field, derive `myPos` by comparing watched literal against `clauseLits[0]`. Shrinks to 8 bytes.
-- **Contiguous literal pool built but unused in hot path** (`cnf.go:82`): Original clause literals accessed via per-clause slices (pointer chase) while a contiguous `literalPool` exists but is only used in the cold fallback path. Fix: route hot-path access through the pool, or remove the pool.
-- **uint32 indices defeat BCE** (throughout): Every `s.varLevel[blitVarIdx]`, `s.assignments[blitVarIdx]` etc. uses a `uint32` index from `lit.Var()`. Go's bounds-check elimination cannot prove `uint32 < len(slice)`. Converting to `int` where possible would let BCE remove some checks.
+**P2 (Implemented July 2026)**:
+- **Redundant watch list writeback** (`solver_cdcl.go`): Removed 3 unconditional `s.watchLists[watchIdx] = watchList` stores per trail element — at end-of-loop and before early returns. The only modification to the slice header is the swap-remove (`watchList = watchList[:lastIdx]`), which already writes back immediately. Element mutations via `watchList[i] = ...` are visible through the shared backing array and need no writeback.
+- **`Watch` struct 12→8 bytes** (`cnf.go`): Dropped `WatchPos uint8` field (1 byte + 3 padding). `myPos` is now derived in the slow path by comparing `clauseLits[0]` against the false literal (`myPos=0` iff `clauseLits[0]==falseLit`). 5→8 watches per cache line. `falseLit` is precomputed once per trail element (outer loop). All watch creation sites updated to omit `WatchPos`. The `learnedWatchIdx` update uses the already-computed `myPos` instead of `watch.WatchPos`.
+- **uint32 indices → int in hot path** (`solver_cdcl.go`): Converted `blitVarIdx`, `clauseLitVar`, `watchLitVar`, and `varIdx` from `uint32` to `int` in `propagateWatched`. `varIdx` now uses `lit` (int from trail) directly instead of `uint32(lit)`. Reduces type conversions and may help BCE (though Go's BCE can't prove untrusted literal-derived indices are in bounds, so impact is mostly from fewer conversion instructions). Neutral to 3% improvement depending on instance.
+- **Batch writeback** — **REVERTED**: Attempted to track `wlLen` separately and write back `s.watchLists[watchIdx]` once per trail element instead of per swap-remove. Caused 3.9% regression from `wlLen` register pressure — the per-swap-remove writes are to a hot cache line (same `watchIdx`), so they're L1 hits, and the `wlLen` tracking overhead exceeds the savings.
+- **Contiguous literal pool** — **SKIPPED**: Profiled at 60ms out of 4850ms `propagateWatched` time (1.2%). Not worth the complexity/risk of routing original clause access through the pool (would require making the pool the source of truth, handling conflict analysis access, and managing pool reallocation).
 
 ### Medium Priority
 4. **Extended fuzzer testing** (2-3 days): More instance types, UNSAT verification
@@ -274,12 +283,17 @@ Clause vivification was re-enabled after fixing three soundness bugs that caused
 ## Recent Commits
 
 ```
-<latest_commit> - Remove inprocessing from restart (34-228% slowdown with no benefit)
-<latest_commit> - Remove preprocessing and inprocessing configuration (simplify codebase)
-0845411 - Remove variable elimination (VE) due to soundness bugs
-ebb9fa8 - Implement swap-remove clause deletion to reduce GC pressure
-f53361a - Feature: Expose clause deletion scoring parameters as CLI options
-8c694c2 - Optimize: Update default restart policy to aggressive configuration
+<latest_commit> - P2 perf: Watch struct 12→8 bytes, redundant writeback removal, uint32→int indices (5-6% faster)
+dc98229 - P0 perf: incremental VSIDS heap + O(1) unassigned count
+da92ca7 - Fix vivification soundness bugs causing false UNSAT, re-enable by default
+c2d0b03 - Add -vivify-period CLI flag + vivification tests
+37e8e73 - Add clause vivification inprocessing
+1f843fe - Add blocking literals for fast watch propagation skip
+6bf75ca Recursive minimization CLI flag + tests
+7775d27 MiniSat-style watches, soundness fixes, recursive minimization
+23af6bf MiniSat-style watched literals: replace Blit with WatchPos
+05a7161 Remove ~1900 lines dead code, add P2 perf + P3 quality fixes
+96239d3 Fix two soundness issues: parser unterminated clause, learnedWatchIdx mismatch
 ```
 
 ## Critical Context
