@@ -169,6 +169,7 @@ type CDCLSolver struct {
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
+	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause   []bool
 	tmpSeenVar           []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
@@ -1287,7 +1288,8 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 		return false
 	}
 
-	// Build the new clause: keep literals that survive vivification.
+	// Copy literals to a local buffer — propagation may swap literals in the
+	// clause's storage (watch replacement), which would corrupt our iteration.
 	// We reuse tmpLearnedLits (it's not in use during restart).
 	newLits := s.tmpLearnedLits[:0]
 	s.level = 0
@@ -1302,31 +1304,22 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 		lit := literals[i]
 		varIdx := lit.Var()
 
-		// If already true at level 0, clause is satisfied — no change needed.
-		if s.assignments[varIdx].Level == 0 {
+		// If already assigned (permanent or trial), check if clause is satisfied.
+		if s.assignments[varIdx].Level >= 0 {
 			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
 			if litTrue {
+				// Clause is satisfied — no vivification possible.
 				s.cancelUntil(0)
 				return false
 			}
-		}
-
-		// If already false at level 0, keep in new clause (can't assume it).
-		if s.assignments[varIdx].Level == 0 {
+			// Literal is false under existing assignments — keep it (can't assume ¬lit
+			// since it's already true). These include permanent assignments (unit
+			// clauses, preprocessing) and trial propagations from prior assumptions.
 			newLits = append(newLits, lit)
 			continue
 		}
 
-		// If already true at level > 0 (forced by prior assumptions), it's redundant — skip.
-		if s.assignments[varIdx].Level > 0 {
-			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
-			if litTrue {
-				modified = true
-				continue
-			}
-		}
-
-		// Unassigned or false at level > 0: keep in new clause, assume ¬lit.
+		// Unassigned: keep in new clause, assume ¬lit.
 		newLits = append(newLits, lit)
 
 		// Assume ¬lit: assign it false at a new level and propagate.
@@ -1338,7 +1331,7 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 
 		conflict, _ := s.propagateWatched()
 		if conflict {
-			// ¬l1 ∧ ... ∧ ¬li causes conflict → (l1 ∨ ... ∨ li) is a tautology.
+			// ¬l1 ∧ ... ∧ ¬li causes conflict → (l1 ∨ ... ∨ li) is implied.
 			// Shrink to the prefix (newLits so far, including li).
 			s.cancelUntil(0)
 			if len(newLits) < size {
@@ -1363,15 +1356,10 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 	if len(newLits) == 1 {
 		return false
 	}
-	// Defer all modifications until after the round. We only record what the
-	// new clause should be — we do NOT modify learnedLiterals, learnedSizes,
-	// or watches here. This ensures that propagateWatched (called during
-	// subsequent vivifyClause calls in the same round) sees the ORIGINAL
-	// (unmodified) clause, which is weaker than the vivified version. Using
-	// the original clause in trial propagation is sound — it can only miss
-	// conflicts that the stronger version would find, never produce false ones.
-	//
-	// The caller (runVivification) applies all modifications after the round.
+	// Update s.tmpLearnedLits so the caller can read the correct length and data.
+	// Without this, len(s.tmpLearnedLits) would be stale (from the last
+	// learnClause call), causing runVivification to copy wrong number of literals.
+	s.tmpLearnedLits = newLits
 	s.Log("c [vivify] clause %d: %d→%d literals (deferred)\n", -learnedIdx-1, size, len(newLits))
 	return true
 }
@@ -1390,6 +1378,9 @@ func (s *CDCLSolver) runVivification() bool {
 	}
 
 	s.Log("c [vivify] Starting vivification round: %d active clauses\n", s.learnedActiveCount)
+
+	s.inVivification = true
+	defer func() { s.inVivification = false }()
 
 	const timeBudget = 500 * time.Millisecond
 	startTime := time.Now()
@@ -1494,6 +1485,29 @@ func (s *CDCLSolver) runVivification() bool {
 		s.compactPending = true
 		s.Log("c [vivify] Vivified %d/%d clauses\n", modifiedCount, checkedCount)
 	}
+
+	// CRITICAL: Clear all Level > 0 assignments and re-propagate from scratch.
+	// Vivification trial propagation may have moved watches on clauses. After
+	// cancelUntil(0), the trial assignments are cleared, but the watch moves
+	// are NOT undone. The base assignments (unit clause propagations at Level 1)
+	// are still in s.assignments but NOT in the trail. Without re-propagation,
+	// the watch system may miss propagations for these base-assigned variables
+	// (because their watches were moved during trial), leading to incomplete
+	// propagation and potential false UNSAT.
+	s.inVivification = false
+	for i := range s.assignments {
+		if s.assignments[i].Level > 0 {
+			s.assignments[i] = Assignment{Level: -1}
+			s.varLevel[i] = -1
+			s.implication[i] = -1
+		}
+	}
+	s.level = 0
+	s.trail = s.trail[:0]
+	s.trailHead = s.trailHead[:1]
+	s.trailHead[0] = 0
+	s.qhead = 0
+	s.propagateWatched()
 
 	return false
 }
@@ -2191,6 +2205,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// (size=1) are not watched and must be scanned explicitly.
 	unitCount := 0
 	for _, learnedIdx := range s.unitLearnedList {
+		// Skip unit scan during vivification trial propagation (level > 0).
+		// The unit scan re-propagates permanent unit clauses during trial,
+		// which can conflict with trial assumptions and falsely declare UNSAT.
+		// During initial propagation (level == 0), the unit scan runs normally.
+		if s.inVivification && s.level > 0 {
+			break
+		}
 		// Skip deleted/tombstone entries (can happen after swap-remove)
 		if learnedIdx >= s.learnedCapacity || s.learnedSizes[learnedIdx] != 1 {
 			continue

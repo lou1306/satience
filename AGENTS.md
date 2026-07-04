@@ -96,6 +96,13 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - **Hyper-Binary Resolution** - Disabled (soundness bug - derives false empty clauses)
 - **Equivalence Detection** - Disabled (soundness bug - false equivalences)
 
+### Inprocessing
+- **Clause Vivification** (`solver_cdcl.go:1284`): Shortens learned clauses by detecting redundant literals via trial propagation. Runs every Nth restart (default 50, configurable via `-vivify-period`, 0=disabled). Adaptive: structured instances only. Soundness verified via 500K+ fuzzer iterations.
+  - For each literal li in a clause, assume ¬li and propagate. If the prefix causes conflict, shrink to it (sound: the prefix is implied).
+  - Uses `inVivification` flag to suppress false UNSAT from the unit scan during trial propagation (level > 0).
+  - After the round, clears all Level > 0 assignments and re-propagates from scratch (trial propagation moves watches; without re-propagation, base assignments miss propagation → false UNSAT).
+  - Does NOT remove literals that are TRUE under existing assignments (can't distinguish permanent unit-propagated from trial-forced without the `inVivification` flag; removal was unsound).
+
 ### CLI Features
 - `-model`: Print satisfying assignment
 - `-verbose`: Show solving statistics
@@ -106,6 +113,7 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - `-minimize`: Clause minimization mode (aggressive/selective/none, default=selective)
 - `-restart-base`: Luby restart base (default=20)
 - `-restart-glucose-ratio`: Glucose restart LBD ratio (default=1.2)
+- `-vivify-period`: Run clause vivification every Nth restart (default=50, 0=disabled)
 - `-clause-del-*`: Clause deletion scoring parameters
 
 ### SAT Competition 2026 Format
@@ -229,11 +237,18 @@ Variable elimination was removed in June 2026 due to fundamental soundness issue
 - **Symptom**: php_6p_5h_unsat.cnf returned SAT instead of UNSAT after VE
 - **Resolution**: Removed ~800 lines of VE code; solver now relies on core CDCL techniques only
 
-### Inprocessing (Removed July 2026)
+### Unit Propagation Inprocessing (Removed July 2026)
 Unit propagation inprocessing at restart was removed due to performance regression:
 - **Symptom**: 34-228% slowdown on MiniSat fast suite with no solving benefit
 - **Root cause**: Scanning all original clauses at every restart adds O(clauses) overhead per restart
 - **Resolution**: Removed inprocessing call from restart(); preprocessing unit propagation remains for structured instances
+
+### Clause Vivification (Re-enabled July 2026)
+Clause vivification was re-enabled after fixing three soundness bugs that caused false UNSAT:
+- **Stale `len(s.tmpLearnedLits)`**: `vivifyClause` used a local slice but `runVivification` read `len(s.tmpLearnedLits)` (stale from last `learnClause`), appending stale literals to vivified clauses. Fixed by `s.tmpLearnedLits = newLits` before return.
+- **Unit scan false UNSAT**: The unit scan in `propagateWatched` set `emptyClauseFound` when a unit clause conflicted with a trial assumption — declaring UNSAT from a mere trial conflict. Fixed with `inVivification` flag (skip unit scan during trial, level > 0).
+- **Watch moves not re-checked**: Trial propagation moved watches; after `cancelUntil(0)`, base assignments remained in `s.assignments` but weren't in the trail, causing missed propagations. Fixed by clearing Level > 0 assignments and re-propagating from scratch after the round.
+- Also stopped removing TRUE literals at Level > 0 (unsound: can't distinguish permanent unit-propagated from trial-forced).
 
 ## Recent Commits
 
