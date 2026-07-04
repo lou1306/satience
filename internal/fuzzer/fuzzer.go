@@ -231,7 +231,7 @@ func (f *Fuzzer) WriteCNF(formula *cnf.CNF, filename string) error {
 func (f *Fuzzer) assignmentsToModel(formula *cnf.CNF, assignments []solver.Assignment) []cnf.Literal {
 	model := make([]cnf.Literal, 0, formula.NumVars)
 	for i := range assignments {
-		if assignments[i].Level > 0 {
+		if assignments[i].Level >= 0 {
 			varIdx := uint32(i)
 			if assignments[i].Value {
 				model = append(model, cnf.NewLiteral(varIdx, false))

@@ -154,6 +154,7 @@ type CDCLSolver struct {
 	lbdSum               int
 	lbdCount             int
 	lastConflictLBD      int
+	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
 	conflictsAtLevel     []int           // Track conflicts per decision level
 	lastRandomDecision   int             // Last conflict where we made random decision
 	randomDecisionRate   float64         // Probability of making a random decision (0.0 = never, 1.0 = always)
@@ -880,12 +881,16 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// Unit propagation on random/mixed instances causes 76x more conflicts
 	if structure.StructuredScore < 0.7 {
 			s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
-		// Configure extremely aggressive VSIDS decay for random instances
+		// Configure aggressive VSIDS decay for random instances
 		s.vsids.SetAggressiveDecay()
-		// Configure very aggressive restarts (Luby base=5, glucose ratio=1.1)
+		// Keep aggressive Luby base (5) — frequent restarts help random instances
+		// escape local minima. Disable Glucose criterion (ratio=100 effectively
+		// never fires): with Luby base=5 already restarting every 5-20 conflicts,
+		// additional Glucose restarts change the search trajectory and can cause
+		// regressions on specific instances (e.g. 0f4576a6 SAT→TIMEOUT).
 		s.restartBase = 5
-		s.restartGlucoseRatio = 1.1
-		s.restartGlucoseMinConflicts = 10
+		s.restartGlucoseRatio = 100.0
+		s.restartGlucoseMinConflicts = 1000000
 		return PreprocessingConfig{
 			EnableUnitProp: false,
 			MaxPasses:      0,
@@ -1628,12 +1633,13 @@ func (s *CDCLSolver) shouldRestart() bool {
 	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 {
 		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
 
-		// Glucose criterion: restart when recent LBD is much worse than average
-		// Configurable via restartGlucoseRatio (default 1.5×)
-		recentLBD := float64(s.lastConflictLBD)
-		if recentLBD > avgLBD*s.restartGlucoseRatio {
-			s.Log("c [restart] Glucose: LBD %.1f > avg %.1f × %.2f\n",
-				recentLBD, avgLBD, s.restartGlucoseRatio)
+		// Glucose criterion: restart when the EMA of recent LBDs exceeds
+		// ratio × overall average. Using EMA (α=0.1, half-life ~7 conflicts)
+		// instead of single lastConflictLBD avoids noise from individual
+		// LBD spikes triggering spurious restarts.
+		if s.emaLBD > avgLBD*s.restartGlucoseRatio {
+			s.Log("c [restart] Glucose: EMA LBD %.1f > avg %.1f × %.2f\n",
+				s.emaLBD, avgLBD, s.restartGlucoseRatio)
 			return true
 		}
 	}
@@ -1761,6 +1767,7 @@ func (s *CDCLSolver) restart() bool {
 		s.tmpFlippedVars[k] = false
 	}
 	s.lastConflictLBD = 0
+	s.emaLBD = 0
 	s.backjumpLevel = 0
 
 	// CRITICAL FIX: DO NOT reset VSIDS activity on restart
@@ -3419,6 +3426,11 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				originalSize, len(s.tmpLearnedLits), originalLBD, lbd)
 		}
 	}
+
+	s.lbdSum += lbd
+	s.lbdCount++
+	s.lastConflictLBD = lbd
+	s.emaLBD = 0.9*s.emaLBD + 0.1*float64(lbd)
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
 	// SPECIAL CASE: If learned clause is unit (1 literal) at current level, backjump to level 0
