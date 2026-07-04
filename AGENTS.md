@@ -40,10 +40,10 @@ Learned clause deletion uses tombstones (set `learnedSizes[i]=0`); literal stora
 - **Mechanism**: Deletion marks tombstones + removes watches + `compactWatchLists()`. Periodically, `compactLearnedClauses()` reclaims tombstone literal gaps by moving active clauses into a contiguous prefix, remapping the implication array, and rebuilding all watch lists with non-false literal selection (so the watched-literal invariant holds)
 
 **Benchmark results** (MiniSat Fast Suite, 30s timeout, GOAMD64=v3, July 2026):
-- **Solved**: 42/72 instances (58.3% solve rate)
+- **Solved**: 43/72 instances (59.7% solve rate)
 - **Tseitin**: All solved (4×4, 5×5, 6×6 - both SAT and UNSAT) ✅
 - **Arg chain**: Solved ✅
-- **PHP UNSAT**: php_6p_5h now solved (2.1s); larger PHP still timeout (cardinality constraint reasoning needed)
+- **PHP UNSAT**: php_6p_5h solved (0.2s); larger PHP timeout (cardinality constraint reasoning needed)
 - **Algebraic/Combinatorial**: Mixed results (need better heuristics)
 
 **Performance characteristics**:
@@ -209,6 +209,9 @@ benchmark/eval_small_random.sh [n_instances]
 - **EMA restart signal over single lastConflictLBD**: EMA (α=0.1, half-life ~7 conflicts) smooths individual LBD spikes. Single-LBD triggers spurious restarts every 2-5 conflicts at ratio=1.5. EMA detects sustained LBD increases without noise.
 - **Glucose disabled for random instances**: Luby base=5 already restarts every 5-20 conflicts; adding Glucose changes the search trajectory without benefit. Glucose is only active for structured instances (default ratio=1.5 from CLI).
 - **Fuzzer assignmentsToModel fix**: `Level > 0` → `>= 0` — preprocessing assigns at Level 0; excluding Level 0 produced empty models for unit-propagated instances, causing false soundness failures in the fuzzer (not a solver bug).
+- **1-UIP resolved-variable fix** (`solver_cdcl.go`): Skip re-adding already-resolved variables to the clause during 1-UIP analysis. Root cause of non-convergence: when a variable is resolved and later re-added by another reason clause, `tmpResolved` prevents re-resolution but `currentCount` is inflated, causing the 1-UIP loop to never converge. The old fallback (dropping literals to force a 1-UIP) was unsound and caused false UNSAT on SAT instances (e.g. 3d937949). The fix makes the 1-UIP converge naturally — 0 fallbacks on all test instances. Soundness verified: 500 fuzzer iterations + all unit tests pass.
+- **VSIDS heap invalidation after decay** (`vsids.go`): The heap key is `activity + lbdBonus`, and `decay()` only scales `activity` (not `lbdBonus`). Without invalidation, the heap becomes stale (the "uniform scaling preserves order" claim was wrong — lbdBonus is NOT scaled). Fix: set `heapValid = false` after decay, triggering a rebuild on the next `selectVariableWithHeap` call. Cost: O(n) every `decayInterval` (10) conflicts = O(n/10) per conflict, far cheaper than the old O(n) per-conflict rebuild.
+- **Level-0 literal skip in 1-UIP**: Don't add level-0 literals to learned clauses. They're always true (root-level units), so including them makes clauses longer with no propagation benefit. Matches old code behavior (57bc5f5).
 
 ## Next Steps
 
