@@ -212,7 +212,8 @@ type CDCLSolver struct {
 	emptyClauseFound    bool                     // Set when empty learned clause derived (UNSAT)
 	compactPending      bool                     // Set when learned-clause tombstone ratio is high; compaction runs at the next restart (level 0)
 
-	qhead int // Watched literals: next trail index to process
+	qhead                int // Watched literals: next trail index to process
+	lastLearnedClauseIdx int // Index of most recently learned clause (-1 = none); for asserting literal propagation
 
 	// Configurable parameters (exposed for tuning)
 	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
@@ -278,6 +279,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		varLevel:             make([]int, formula.NumVars),
 		trailHead:            make([]int, 1),
 		qhead:                0,
+		lastLearnedClauseIdx: -1,
 		level:                0,
 		vsids:                NewVSIDS(formula.NumVars),
 		conflicts:            0,
@@ -393,27 +395,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	// Enable LBD-based VSIDS for better variable selection
 	// Variables in low-LBD clauses get higher priority
 	solver.vsids.EnableLBD()
-
-	// TUNE VSIDS parameters based on instance size
-	// Small instances need faster decay to quickly identify important variables
-	if formula.NumVars < 1000 {
-		// Faster decay (0.90 vs 0.95) = quicker adaptation to search progress
-		// Lower initial decay means activity drops faster, focusing on recent conflicts
-		solver.vsids.SetInitialDecayFactor(0.90)
-		// Faster ramp-up to max decay (5000 vs 10000 conflicts)
-		// Stay in aggressive exploration phase longer
-		solver.vsids.SetDecayRampUpConflicts(5000)
-		// Moderate bump amount - large bumps can cause activity inflation
-		solver.vsids.SetBaseBumpAmount(25.0)
-		// Moderate LBD bonus - too high causes over-prioritization of glue clauses
-		solver.vsids.SetLBDBonusScale(2000.0)
-		// More aggressive restarts for small instances
-		// Luby base: 100 → 10 (restart 10× more frequently)
-		solver.restartBase = 10
-		// Glucose restart: start earlier and more aggressive
-		solver.restartGlucoseRatio = 1.2 // Restart when LBD > 1.2× avg (very aggressive)
-		solver.restartGlucoseMinConflicts = 20 // Start adaptive restarts after 20 conflicts
-	}
 
 	return solver
 }
@@ -2040,6 +2021,14 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			}
 			s.backjumpLevel = 0
 
+			// Explicitly propagate the asserting literal from the just-learned
+			// clause. With qhead=decisionPoint, the learned clause's watched
+			// literals sit at trail positions < decisionPoint and would never
+			// be re-checked by the propagation loop. This is a no-op when the
+			// clause is not unit or satisfied. Must run before shouldRestart
+			// since restart() clears the trail and re-propagates from scratch.
+			s.propagateAssertingLiteral()
+
 			if s.shouldRestart() {
 				if s.restart() {
 					// UNSAT detected during restart/inprocessing
@@ -3060,6 +3049,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 // Lower LBD = better clause (involves fewer decision levels).
 // Clauses with LBD=2 are "glue clauses" - most valuable, never delete.
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
+	s.lastLearnedClauseIdx = -1
 	if s.verbose && s.conflicts <= DebugConflictLimit {
 		s.Log("c [conflict] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
 			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
@@ -3549,6 +3539,32 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
+	// Reorder so the UIP (current-level literal) is at position 0 and a
+	// backjump-level literal is at position 1 (MiniSat asserting-clause
+	// invariant). This lets us watch positions 0/1 directly and propagate
+	// the asserting literal explicitly after backjump (qhead=decisionPoint),
+	// avoiding an O(trail) re-scan of the earlier trail after each conflict.
+	if len(s.tmpLearnedLits) >= 2 {
+		uipPos := 0
+		for i, lit := range s.tmpLearnedLits {
+			if s.assignments[lit.Var()].Level == s.level {
+				uipPos = i
+				break
+			}
+		}
+		if uipPos != 0 {
+			s.tmpLearnedLits[0], s.tmpLearnedLits[uipPos] = s.tmpLearnedLits[uipPos], s.tmpLearnedLits[0]
+		}
+		for i := 1; i < len(s.tmpLearnedLits); i++ {
+			if s.assignments[s.tmpLearnedLits[i].Var()].Level == maxLevel {
+				if i != 1 {
+					s.tmpLearnedLits[1], s.tmpLearnedLits[i] = s.tmpLearnedLits[i], s.tmpLearnedLits[1]
+				}
+				break
+			}
+		}
+	}
+
 	// Store learned clause in database
 	if len(s.tmpLearnedLits) > 0 && lbd <= 8 {
 		// Check for duplicate literals (SOUNDNESS CHECK)
@@ -3609,13 +3625,23 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// duplicate watches and stale watch corruption.
 		learnedIdx := s.learnedCapacity - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
-		
+		s.lastLearnedClauseIdx = learnedIdx
+
 		// Store watch indices for all clauses to maintain array consistency
 		if len(literals) >= 2 {
 			var idx0, idx1 int
 			if s.watchInitialized {
-				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
-				idx0, idx1 = s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
+				// Watch positions 0 and 1 directly (UIP at 0, backjump-level at 1).
+				// The asserting-clause invariant guarantees position 0 (UIP) is
+				// unassigned and position 1 is false after backjump, satisfying the
+				// watched-literal invariant (at most one watched literal is false).
+				lit0 := literals[0]
+				lit1 := literals[1]
+				idx0 = cnf.LitToIndex(lit0)
+				idx1 = cnf.LitToIndex(lit1)
+				clauseIdx := int32(-learnedIdx - 1)
+				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx, Blit: uint32(lit1)})
+				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx, Blit: uint32(lit0)})
 			} else {
 				// Watches not yet initialized (preprocessing); store positions 0,1
 				// as placeholder — initWatches will choose correct positions later
@@ -4235,6 +4261,50 @@ func (s *CDCLSolver) compactWatchLists() {
 
 }
 
+// propagateAssertingLiteral propagates the UIP (asserting literal) from the
+// most recently learned clause after a backjump. With qhead=decisionPoint,
+// the learned clause's watched literals sit at trail positions < decisionPoint
+// and would otherwise never be re-checked by the propagation loop. This is a
+// cheap O(clause-size) scan that assigns the UIP true when the clause is unit
+// (exactly one unassigned literal, all others false). It is a no-op when the
+// clause is not unit (e.g., some literals were unassigned by the backjump and
+// will be re-propagated by the watch system) or satisfied (e.g., the flipped
+// decision satisfies it).
+func (s *CDCLSolver) propagateAssertingLiteral() {
+	if s.lastLearnedClauseIdx < 0 || s.lastLearnedClauseIdx >= s.learnedCapacity {
+		return
+	}
+	learnedIdx := s.lastLearnedClauseIdx
+	if s.learnedSizes[learnedIdx] < 2 {
+		return // unit clauses are handled via unitLearnedList
+	}
+	literals := s.getLearnedClauseLiterals(learnedIdx)
+	var unassignedLit cnf.Literal
+	unassignedCount := 0
+	for _, lit := range literals {
+		varIdx := lit.Var()
+		if s.assignments[varIdx].Level < 0 {
+			unassignedCount++
+			if unassignedCount > 1 {
+				return // not unit — let the watch system handle it
+			}
+			unassignedLit = lit
+		} else {
+			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			if litTrue {
+				return // clause satisfied — no propagation needed
+			}
+		}
+	}
+	if unassignedCount == 1 {
+		propLevel := s.level
+		if propLevel == 0 {
+			propLevel = 1
+		}
+		s.assignLiteralByClause(unassignedLit, propLevel, -learnedIdx-5)
+	}
+}
+
 // backtrack backtracks (or backjumps) to a lower decision level
 // Returns false if backtracking to level 0 (UNSAT)
 
@@ -4334,9 +4404,15 @@ func (s *CDCLSolver) backtrack() bool {
 		s.numUnassigned++
 	}
 	s.trail = s.trail[:decisionPoint]
-	// FIX: Reset qhead to 0 to re-scan entire trail after backjump
-	// This ensures watches on newly learned clauses are checked against all assigned variables
-	s.qhead = 0
+	// For bjLevel > 0, start propagation from the decision point (skip
+	// re-processing the earlier trail — the asserting literal is propagated
+	// explicitly by propagateAssertingLiteral). For bjLevel == 0, re-scan from
+	// the start (root-level backjump; unit scan handles the asserting literal).
+	if bjLevel > 0 {
+		s.qhead = decisionPoint
+	} else {
+		s.qhead = 0
+	}
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
 
