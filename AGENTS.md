@@ -8,8 +8,13 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 - SAT Competition 2026 output format (exit 10=SAT, 20=UNSAT, 0=UNKNOWN)
 
 ## Status
-Sound and complete. 15/15 unit tests, 100% soundness on 800+ fuzzer iterations.
-MiniSat Fast Suite (30s timeout): **47/72 solved** (July 2026). Tseitin/arg-chain all solve; PHP_6p_5h solves; larger PHP/PHP_7p_6h timeout.
+Sound and complete. 15/15 unit tests, 100% soundness on 300+ fuzzer iterations.
+MiniSat Fast Suite (30s timeout): **54/72 solved** (July 2026). Tseitin/arg-chain all solve; PHP up to 8p_7h solves; large GBD instances (29K-290K vars) solve.
+
+### Recent Fixes (July 2026)
+- **CDCL backjump** (`backtrack()`): Was using `trailHead[bjLevel]` (start of level bjLevel) as decision point, which unassigned the decision at bjLevel and re-assigned it FLIPPED (DPLL chronological backtracking). Fixed to `trailHead[bjLevel+1]` (keep level bjLevel, let `propagateAssertingLiteral()` handle the UIP). Matches `cancelUntil()`.
+- **LBD storage filter**: `learnClause()` was discarding clauses with LBD > 8, meaning the solver did conflict analysis and threw away the result. Removed filter — store ALL learned clauses, use LBD for deletion priority only.
+- **decide() simplification**: Removed non-standard diversification logic (random decisions, decidedVarSet override, consecutiveFlips tracking) that was overriding VSIDS. Standard CDCL: VSIDS + phase saving only.
 
 ## Architecture
 
