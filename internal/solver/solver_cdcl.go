@@ -173,6 +173,19 @@ type CDCLSolver struct {
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
+	// Diagnostic counters for learned-clause minimization (always-on; reported in
+	// printStats and a periodic solve-loop log). Pure instrumentation — no behavior.
+	minimizeCalls       uint64 // recursive self-subsumption invocations (clauses >2 lits)
+	minimizeLiteralsIn  uint64 // literals seen by minimizer across all calls
+	minimizeLiteralsOut uint64 // literals remaining after minimization across all calls
+	vivifyRoundsRun     uint64 // vivification rounds actually executed
+	vivifyClausesChecked uint64 // clauses passed to vivifyClause
+	vivifyClausesModified uint64 // clauses shortened by vivify
+	vivifyLiteralsRemoved  uint64 // literals removed by vivify
+	// Histogram of final learned-clause sizes (post-minimization, at learn time).
+	// Buckets: [<=2, 3-5, 6-10, 11-20, 21-50, >50].
+	learnedLenHist     [6]uint64
+	maxLearnedClauseSize int
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
 	tmpLiteralInClause   []bool
 	tmpSeenVar           []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
@@ -701,6 +714,32 @@ func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
 	return nil
 }
 
+// recordLearnedClauseSize updates the learned-clause length histogram and the
+// max-observed-size tracker. Called once per stored learned clause at learn
+// time (after minimization, so this reflects final sizes). Buckets:
+// [<=2, 3-5, 6-10, 11-20, 21-50, >50]. Pure instrumentation.
+func (s *CDCLSolver) recordLearnedClauseSize(size int) {
+	if size > s.maxLearnedClauseSize {
+		s.maxLearnedClauseSize = size
+	}
+	bucket := 0
+	switch {
+	case size <= 2:
+		bucket = 0
+	case size <= 5:
+		bucket = 1
+	case size <= 10:
+		bucket = 2
+	case size <= 20:
+		bucket = 3
+	case size <= 50:
+		bucket = 4
+	default:
+		bucket = 5
+	}
+	s.learnedLenHist[bucket]++
+}
+
 func (s *CDCLSolver) getDetailedStats() SolverStats {
 	stats := SolverStats{
 		Conflicts:      s.conflicts,
@@ -759,7 +798,25 @@ func (s *CDCLSolver) printStats() {
 	if stats.AvgLBD > 0 {
 		s.Log("c Avg LBD:       %d\n", stats.AvgLBD)
 	}
+	s.logDiagnostics()
 	s.Log("c \n")
+}
+
+// logDiagnostics prints a compact one-line summary of learned-clause
+// minimization activity: recursive self-subsumption counters, vivification
+// counters, and the learned-clause length histogram. Pure instrumentation.
+// Buckets: [<=2, 3-5, 6-10, 11-20, 21-50, >50].
+func (s *CDCLSolver) logDiagnostics() {
+	minRemoved := s.minimizeLiteralsIn - s.minimizeLiteralsOut
+	minRate := 0.0
+	if s.minimizeLiteralsIn > 0 {
+		minRate = float64(minRemoved) * 100.0 / float64(s.minimizeLiteralsIn)
+	}
+	s.Log("c [diag] minimize: calls=%d in=%d out=%d removed=%d (%.1f%%) | vivify: rounds=%d checked=%d modified=%d removed=%d | hist=[%d %d %d %d %d %d] max=%d\n",
+		s.minimizeCalls, s.minimizeLiteralsIn, s.minimizeLiteralsOut, minRemoved, minRate,
+		s.vivifyRoundsRun, s.vivifyClausesChecked, s.vivifyClausesModified, s.vivifyLiteralsRemoved,
+		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
+		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5], s.maxLearnedClauseSize)
 }
 
 // InstanceStructure captures metrics about CNF structure for adaptive preprocessing
@@ -1365,6 +1422,7 @@ func (s *CDCLSolver) runVivification() bool {
 		return false
 	}
 
+	s.vivifyRoundsRun++
 	s.Log("c [vivify] Starting vivification round: %d active clauses\n", s.learnedActiveCount)
 
 	s.inVivification = true
@@ -1415,6 +1473,7 @@ func (s *CDCLSolver) runVivification() bool {
 		}
 
 		checkedCount++
+		s.vivifyClausesChecked++
 		oldSize := s.learnedSizes[i]
 		if s.vivifyClause(i) {
 			// vivifyClause left the new literals in tmpLearnedLits
@@ -1424,6 +1483,8 @@ func (s *CDCLSolver) runVivification() bool {
 				copy(newLits, s.tmpLearnedLits)
 				results = append(results, vivifyResult{idx: i, newLits: newLits})
 				modifiedCount++
+				s.vivifyClausesModified++
+				s.vivifyLiteralsRemoved += uint64(oldSize - newSize)
 			}
 		}
 
@@ -2015,6 +2076,9 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 				}
 				s.Log("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n",
 					s.conflicts, s.level, s.learnedActiveCount, s.decisions, s.propagations, propsPerDec)
+			}
+			if s.conflicts%1000 == 0 && s.verbose {
+				s.logDiagnostics()
 			}
 			if !s.backtrack() {
 				s.printStats()
@@ -3507,6 +3571,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// Append metadata (packed struct for cache efficiency)
 		s.learnedOffsets = append(s.learnedOffsets, offset)
 		s.learnedSizes = append(s.learnedSizes, len(s.tmpLearnedLits))
+		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
 			Age:        s.currentAge,
 			Size:       len(s.tmpLearnedLits),
@@ -3638,11 +3703,16 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		return learnedLits
 	}
 
+	s.minimizeCalls++
+	s.minimizeLiteralsIn += uint64(len(learnedLits))
 	// Phase A: mark clause literals in both arrays and record for cleanup.
+	// Also set tmpLiteralIsNegated for each literal — needed by exploreRemovable
+	// to look up binary implications for the correct polarity.
 	s.tmpMinSeenVars = s.tmpMinSeenVars[:0]
 	for _, lit := range learnedLits {
 		v := lit.Var()
 		s.tmpLiteralInClause[v] = true
+		s.tmpLiteralIsNegated[v] = lit.IsNegated()
 		if !s.tmpSeenVar[v] {
 			s.tmpSeenVar[v] = true
 			s.tmpMinSeenVars = append(s.tmpMinSeenVars, v)
@@ -3703,6 +3773,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			len(learnedLits), writeIdx, reductionAchieved)
 	}
 
+	s.minimizeLiteralsOut += uint64(writeIdx)
 	return learnedLits[:writeIdx]
 }
 
@@ -3727,46 +3798,37 @@ func (s *CDCLSolver) recursiveTryRemove(v uint32) bool {
 	return result
 }
 
-// exploreRemovable is the recursive core. It does NOT roll back on failure —
-// that is the caller's job (recursiveTryRemove) via the snapshot. This avoids
-// double-unmarking in the diamond case: a nested success pushes marks that
-// remain valid only if the whole top-level call succeeds; if a sibling later
-// fails, the top-level rollback clears them all in one pass.
-//
-// Returns true iff every non-resolved literal in v's reason clause is covered
-// (tmpSeenVar) or recursively removable within minimizeMaxDepth.
+// exploreRemovable is the recursive core of Bier's algorithm. It does NOT roll
+// back on failure — that is the caller's job (recursiveTryRemove) via the
+// snapshot. Returns true iff every non-resolved literal in v's reason clause is
+// covered (tmpSeenVar) or recursively removable within minimizeMaxDepth. Sound
+// via the DAG property of the implication graph (reason clauses only reference
+// earlier trail literals, preventing cycles).
 func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
 	if depth > s.minimizeMaxDepth {
 		return false
 	}
 	reasonLits := s.getReasonLitsForVar(v)
 	if reasonLits == nil {
-		return false // decision, preprocessing sentinel, or stale clause
+		return false
 	}
 	if len(reasonLits) <= 1 {
-		// Unit reason: the asserting literal alone — nothing to resolve against,
-		// so v is not removable via this reason.
 		return false
 	}
 	for _, rl := range reasonLits {
 		rv := rl.Var()
 		if rv == v {
-			continue // the asserting (resolved) literal of the reason
+			continue
 		}
 		if s.tmpSeenVar[rv] {
-			continue // already covered
+			continue
 		}
-		// Level-0 literals are global: a reason depending on one cannot be
-		// resolved away without losing global information.
 		if s.assignments[rv].Level == 0 {
 			return false
 		}
-		// Decisions cannot be resolved away.
 		if s.implication[rv] == -1 {
 			return false
 		}
-		// Optimistically mark rv as "being explored" to prevent cycles within
-		// this call, then recurse.
 		s.tmpSeenVar[rv] = true
 		s.tmpMinSeenVars = append(s.tmpMinSeenVars, rv)
 		if !s.exploreRemovable(rv, depth+1) {

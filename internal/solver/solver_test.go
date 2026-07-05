@@ -1612,6 +1612,65 @@ func TestVivifyDisabled(t *testing.T) {
 	}
 }
 
+// TestMinimizationDiagnostics verifies that the diagnostic counters for
+// learned-clause minimization (recursive self-subsumption, vivification, and
+// the learned-clause length histogram) increment correctly during a solve that
+// exercises conflict analysis. Uses PHP(4,3), an UNSAT instance with size-3
+// "at-least-one" clauses that force learned clauses > 2 literals, triggering
+// the recursive minimizer.
+func TestMinimizationDiagnostics(t *testing.T) {
+	c := buildPigeonhole(4, 3)
+	s := NewCDCLSolver(&c)
+	s.SetVivifyPeriod(1)             // Run vivification at every restart
+	s.SetRestartParameters(2, 1.5, 1, 3) // Aggressive restarts (base=2) to ensure vivify fires
+	s.SetMaxIter(200000)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Fatalf("Expected UNSAT for PHP(4,3), got %v", result)
+	}
+
+	// Recursive minimizer must have fired on at least one clause > 2 literals.
+	if s.minimizeCalls == 0 {
+		t.Errorf("minimizeCalls = 0; expected recursive minimizer to fire on PHP(4,3)")
+	}
+	if s.minimizeLiteralsIn == 0 {
+		t.Errorf("minimizeLiteralsIn = 0; expected non-zero input literals")
+	}
+	if s.minimizeLiteralsOut == 0 {
+		t.Errorf("minimizeLiteralsOut = 0; expected non-zero output literals")
+	}
+	// Minimizer never adds literals.
+	if s.minimizeLiteralsOut > s.minimizeLiteralsIn {
+		t.Errorf("minimizeLiteralsOut (%d) > minimizeLiteralsIn (%d); minimizer must not add literals",
+			s.minimizeLiteralsOut, s.minimizeLiteralsIn)
+	}
+
+	// Histogram must have recorded at least one learned clause.
+	histSum := uint64(0)
+	for i := 0; i < 6; i++ {
+		histSum += s.learnedLenHist[i]
+	}
+	if histSum == 0 {
+		t.Errorf("learnedLenHist is all zeros; expected at least one learned clause recorded")
+	}
+	// The minimizer never adds literals, so maxLearnedClauseSize >= 1 (at
+	// least one clause was stored). With binary clause resolution, clauses
+	// may be aggressively shrunk to ≤ 2, so we only assert >= 1.
+	if s.maxLearnedClauseSize < 1 {
+		t.Errorf("maxLearnedClauseSize = %d; expected >= 1", s.maxLearnedClauseSize)
+	}
+
+	// Vivification must have run at least once (period=1, PHP restarts).
+	if s.vivifyRoundsRun == 0 {
+		t.Errorf("vivifyRoundsRun = 0; expected vivification to run with period=1")
+	}
+	// If any clause was checked, modified <= checked and removed is non-negative.
+	if s.vivifyClausesModified > s.vivifyClausesChecked {
+		t.Errorf("vivifyClausesModified (%d) > vivifyClausesChecked (%d)",
+			s.vivifyClausesModified, s.vivifyClausesChecked)
+	}
+}
+
 // TestCancelUntil verifies that cancelUntil correctly restores solver state
 // after trial assignments.
 func TestCancelUntil(t *testing.T) {
