@@ -4,10 +4,14 @@ import (
 	"satience/internal/cnf"
 )
 
-// Assignment tracks variable assignments
+// Assignment tracks variable assignments.
+// Packed to 8 bytes (Level int32 + Value bool) so a single cache-line load
+// fetches both fields. This replaces the former separate varLevel []int cache
+// (which caused a second cache miss on every variable lookup in the
+// propagation hot path) and halves the per-variable memory footprint.
 type Assignment struct {
+	Level int32
 	Value bool // true = positive, false = negative
-	Level int  // Decision level (0 = unassigned)
 }
 
 // Solver implements a basic DPLL algorithm with backtracking
@@ -146,7 +150,7 @@ func (s *Solver) assignLiteral(lit cnf.Literal, level int) {
 	value := !lit.IsNegated()
 	s.assignments[varIdx] = Assignment{
 		Value: value,
-		Level: level,
+		Level: int32(level),
 	}
 	s.trail = append(s.trail, int(varIdx))
 }
@@ -186,7 +190,7 @@ func (s *Solver) backtrack() bool {
 
 		for i := decisionPoint; i < len(s.trail); i++ {
 			varIdx := uint32(s.trail[i])
-			if s.assignments[varIdx].Level == s.level {
+			if s.assignments[varIdx].Level == int32(s.level) {
 				decisionVar = varIdx
 				decisionValue = s.assignments[varIdx].Value
 				foundDecision = true
@@ -200,7 +204,7 @@ func (s *Solver) backtrack() bool {
 		for i := 0; i < decisionPoint; i++ {
 			varIdx := uint32(s.trail[i])
 			// Keep assignments from lower levels
-			if s.assignments[varIdx].Level < s.level {
+			if s.assignments[varIdx].Level < int32(s.level) {
 				newTrail = append(newTrail, s.trail[i])
 			}
 			// Clear assignments at current level (shouldn't be any before decisionPoint)

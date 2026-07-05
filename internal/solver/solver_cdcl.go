@@ -123,7 +123,6 @@ type CDCLSolver struct {
 	assignments     []Assignment
 	trail           []int
 	preprocessTrail []int // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
-	varLevel        []int // Cache of variable levels (avoids random assignments[].Level access)
 	trailHead       []int
 	level        int
 	vsids        *VSIDS
@@ -289,7 +288,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		assignments:          make([]Assignment, formula.NumVars),
 		trail:                make([]int, 0, formula.NumVars),
 		preprocessTrail:      make([]int, 0, formula.NumVars),
-		varLevel:             make([]int, formula.NumVars),
 		trailHead:            make([]int, 1),
 		qhead:                0,
 		lastLearnedClauseIdx: -1,
@@ -396,7 +394,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	// which looks like "original clause 0" and causes assignLiteralByClause to skip assignment.
 	for i := range solver.assignments {
 		solver.assignments[i] = Assignment{Level: -1}
-		solver.varLevel[i] = -1
 		solver.implication[i] = -1
 	}
 
@@ -1094,7 +1091,6 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 		}
 		value := !lit.IsNegated()
 		s.assignments[varIdx] = Assignment{Value: value, Level: 0}
-		s.varLevel[varIdx] = 0
 		s.preprocessTrail = append(s.preprocessTrail, int(varIdx))
 		s.implication[varIdx] = -2
 	}
@@ -1118,7 +1114,6 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 	for _, v := range s.trail {
 		if s.assignments[v].Level != 0 {
 			s.assignments[v] = Assignment{Value: s.assignments[v].Value, Level: 0}
-			s.varLevel[v] = 0
 		}
 	}
 	s.preprocessTrail = append(s.preprocessTrail[:0], s.trail...)
@@ -1548,7 +1543,6 @@ func (s *CDCLSolver) runVivification() bool {
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
 			s.assignments[i] = Assignment{Level: -1}
-			s.varLevel[i] = -1
 			s.implication[i] = -1
 			s.numUnassigned++
 		}
@@ -1715,7 +1709,6 @@ func (s *CDCLSolver) cancelUntil(level int) {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{Level: -1}
-		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
 		s.numUnassigned++
 	}
@@ -1779,7 +1772,6 @@ func (s *CDCLSolver) restart() bool {
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
 			s.assignments[i] = Assignment{Level: -1}
-			s.varLevel[i] = -1
 			s.implication[i] = -1
 			s.numUnassigned++
 		}
@@ -1951,7 +1943,6 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					Value: value,
 					Level: 0,  // Unit propagations at level 0
 				}
-				s.varLevel[varIdx] = 0
 				s.trail = append(s.trail, int(varIdx))
 				// FIX: Set implication to prevent re-propagation during search
 				// Use -2 to indicate "assigned by preprocessing unit propagation"
@@ -2273,8 +2264,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		return s.propagate()
 	}
 
-	propagationCount := 0
-
 	if s.verbose && s.conflicts <= 10 {
 		s.Log("c [PROPAGATE] qhead=%d, trail len=%d, level=%d\n", s.qhead, len(s.trail), s.level)
 	}
@@ -2313,8 +2302,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		if s.verbose {
 			s.Log("c [UNIT PROP] var=%d, value=%v, level=%d (s.level=%d)\n", varIdx+1, litValue, propLevel, s.level)
 		}
-			s.assignments[varIdx] = Assignment{Value: litValue, Level: propLevel}
-			s.varLevel[varIdx] = propLevel
+			s.assignments[varIdx] = Assignment{Value: litValue, Level: int32(propLevel)}
 			s.trail = append(s.trail, int(varIdx))
 			s.numUnassigned--
 			// Store learned clause index as negative: -learnedIdx-5
@@ -2412,7 +2400,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitLit := cnf.Literal(watch.Blit)
 			blitVarIdx := int(blitLit.Var())
 			blitNegated := blitLit.IsNegated()
-			blitLevel := s.varLevel[blitVarIdx]
+			blitLevel := s.assignments[blitVarIdx].Level
 			if blitLevel >= 0 {
 				blitValue := s.assignments[blitVarIdx].Value
 				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
@@ -2469,7 +2457,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					continue
 				}
 
-				litLevel := s.varLevel[clauseLitVar]
+				litLevel := s.assignments[clauseLitVar].Level
 				litNegated := clauseLit.IsNegated()
 				if litLevel >= 0 {
 					litValue := s.assignments[clauseLitVar].Value
@@ -2527,7 +2515,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// No replacement found - check if we can propagate or have conflict
-			blitLevel = s.varLevel[blitVarIdx]
+			blitLevel = s.assignments[blitVarIdx].Level
 
 			if blitLevel < 0 {
 				// Unassigned blit - propagate it
@@ -2541,7 +2529,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					reasonIdx = -li - 5
 				}
 				s.assignLiteralByClause(blitLit, propLevel, reasonIdx)
-				propagationCount++
 				s.propagations++
 				continue
 			}
@@ -2819,9 +2806,8 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	value := !lit.IsNegated()
 	s.assignments[varIdx] = Assignment{
 		Value: value,
-		Level: level,
+		Level: int32(level),
 	}
-	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
 	s.numUnassigned--
@@ -2858,9 +2844,8 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 	value := !lit.IsNegated()
 	s.assignments[varIdx] = Assignment{
 		Value: value,
-		Level: level,
+		Level: int32(level),
 	}
-	s.varLevel[varIdx] = level
 	s.trail = append(s.trail, int(varIdx))
 	s.numUnassigned--
 
@@ -2881,7 +2866,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 		lit := conflictClause.Literals[0]
 		varIdx := lit.Var()
 		litValue := !lit.IsNegated()
-		if s.assignments[varIdx].Level != 0 || s.varLevel[varIdx] != 0 {
+		if s.assignments[varIdx].Level != 0 {
 			if s.assignments[varIdx].Value != litValue {
 				// Variable assigned with opposite value
 				// Check if existing assignment was from a unit propagation (not a decision)
@@ -3050,7 +3035,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.tmpLiteralInClause[varIdx] = true
 			s.tmpLiteralIsNegated[varIdx] = lit.IsNegated()
 			s.tmpTouchedVars = append(s.tmpTouchedVars, varIdx)
-			lvl := s.assignments[varIdx].Level
+			lvl := int(s.assignments[varIdx].Level)
 			if lvl >= 0 && lvl <= s.level {
 				// Ensure arrays are large enough for this level
 				if lvl >= len(s.tmpLevelCountUsed) {
@@ -3078,7 +3063,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.tmpCandidates = s.tmpCandidates[:0]
 	for i := len(s.trail) - 1; i >= 0; i-- {
 		varIdx := uint32(s.trail[i])
-		if s.varLevel[varIdx] == s.level && s.tmpLiteralInClause[varIdx] {
+		if s.assignments[varIdx].Level == int32(s.level) && s.tmpLiteralInClause[varIdx] {
 			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx})
 		}
 	}
@@ -3173,8 +3158,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 						s.Log("c [1-UIP]   CANCEL var %d (neg=%v vs %v)\n", v+1, s.tmpLiteralIsNegated[v], litNegated)
 					}
 					s.tmpLiteralInClause[v] = false
-					s.tmpLevelCount[s.varLevel[v]]--
-					if s.varLevel[v] == s.level {
+					s.tmpLevelCount[int(s.assignments[v].Level)]--
+					if s.assignments[v].Level == int32(s.level) {
 						currentCount--
 					}
 				} else {
@@ -3186,7 +3171,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			// Only add assigned literals (level > 0)
 			// Level-0 literals are always true (root-level units) — including them
 			// in learned clauses makes them longer with no benefit.
-			assignLevel := s.assignments[v].Level
+			assignLevel := int(s.assignments[v].Level)
 			if assignLevel <= 0 {
 				continue
 			}
@@ -3206,7 +3191,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				s.tmpLiteralInClause[v] = true
 				s.tmpLiteralIsNegated[v] = litNegated
 				s.tmpTouchedVars = append(s.tmpTouchedVars, v)
-				lvl := assignLevel // Use assignment level, not varLevel cache
+				lvl := assignLevel
 				if lvl <= s.level {
 					if !s.tmpLevelCountUsed[lvl] {
 						s.tmpLevelCountUsed[lvl] = true
@@ -3228,7 +3213,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	decisionsAtCurrentLevel := 0
 	propagationsAtCurrentLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
-		if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == s.level {
+		if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
 			if s.implication[varIdx] == -1 {
 				decisionsAtCurrentLevel++
 			} else {
@@ -3264,7 +3249,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		var uipVar uint32 = 0
 		var uipTrailPos int = -1
 		for _, varIdx := range s.tmpTouchedVars {
-			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == s.level {
+			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
 				for ti := len(s.trail) - 1; ti >= 0; ti-- {
 					if uint32(s.trail[ti]) == varIdx {
 						if uipTrailPos < 0 || ti > uipTrailPos {
@@ -3281,7 +3266,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		if uipVar != 0 {
 			for _, varIdx := range s.tmpTouchedVars {
 				if s.tmpLiteralInClause[varIdx] &&
-					s.assignments[varIdx].Level == s.level &&
+					s.assignments[varIdx].Level == int32(s.level) &&
 					varIdx != uipVar {
 					s.tmpLiteralInClause[varIdx] = false
 					s.tmpLevelCount[s.level]--
@@ -3300,7 +3285,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		bjLevel := 0
 		for _, varIdx := range s.tmpTouchedVars {
 			if s.tmpLiteralInClause[varIdx] {
-				lvl := s.assignments[varIdx].Level
+				lvl := int(s.assignments[varIdx].Level)
 				if lvl > 0 && lvl < s.level && lvl > bjLevel {
 					bjLevel = lvl
 				}
@@ -3321,7 +3306,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	maxLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
-			lvl := s.assignments[varIdx].Level
+			lvl := int(s.assignments[varIdx].Level)
 			if lvl > 0 {
 				// Ensure arrays are large enough for this level
 				if lvl >= len(s.tmpLevelSetUsed) {
@@ -3392,7 +3377,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		for _, lit := range s.tmpLearnedLits {
 			varIdx := lit.Var()
-			lvl := s.assignments[varIdx].Level
+			lvl := int(s.assignments[varIdx].Level)
 			if lvl >= 0 {
 				if lvl >= len(s.tmpLevelSetUsed) {
 					newSize := lvl + 1
@@ -3435,7 +3420,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	if len(s.tmpLearnedLits) == 1 {
 		// Unit clause: check if the literal's variable is at current level
 		lit := s.tmpLearnedLits[0]
-		if s.assignments[lit.Var()].Level == s.level {
+		if s.assignments[lit.Var()].Level == int32(s.level) {
 			// Unit literal at current level: backjump to 0 to flip the decision
 			backjumpLevel = 0
 		} else if backjumpLevel == 0 {
@@ -3511,7 +3496,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	if len(s.tmpLearnedLits) >= 2 {
 		uipPos := 0
 		for i, lit := range s.tmpLearnedLits {
-			if s.assignments[lit.Var()].Level == s.level {
+			if s.assignments[lit.Var()].Level == int32(s.level) {
 				uipPos = i
 				break
 			}
@@ -3520,7 +3505,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.tmpLearnedLits[0], s.tmpLearnedLits[uipPos] = s.tmpLearnedLits[uipPos], s.tmpLearnedLits[0]
 		}
 		for i := 1; i < len(s.tmpLearnedLits); i++ {
-			if s.assignments[s.tmpLearnedLits[i].Var()].Level == maxLevel {
+			if s.assignments[s.tmpLearnedLits[i].Var()].Level == int32(maxLevel) {
 				if i != 1 {
 					s.tmpLearnedLits[1], s.tmpLearnedLits[i] = s.tmpLearnedLits[i], s.tmpLearnedLits[1]
 				}
@@ -3728,7 +3713,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		}
 		// Protect the UIP / any current-level literal: removing it would make
 		// the clause non-asserting.
-		if s.assignments[v].Level == s.level {
+		if s.assignments[v].Level == int32(s.level) {
 			continue
 		}
 		// Protect level-0 literals: they are global and never removable.
@@ -4356,7 +4341,6 @@ func (s *CDCLSolver) backtrack() bool {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{Level: -1}
-		s.varLevel[varIdx] = -1
 		s.implication[varIdx] = -1
 		s.vsids.onUnassign(varIdx)
 		s.numUnassigned++
