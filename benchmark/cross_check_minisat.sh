@@ -40,14 +40,14 @@ while IFS= read -r instance; do
     [ ! -f "$instance_path" ] && continue
     base="${instance%.cnf}"
 
-    # Run satience
-    sat_out=$(timeout $TIMEOUT "$REPO_ROOT/satience_bench" "$instance_path" 2>&1)
-    sat_ec=$?
+    # Run satience (capture exit code without triggering set -e on SAT/UNSAT)
+    sat_out=$(timeout $TIMEOUT "$REPO_ROOT/satience_bench" "$instance_path" 2>&1) || sat_ec=$?
+    sat_ec=${sat_ec:-0}
     if [ $sat_ec -eq 10 ]; then sat_st="SAT"; elif [ $sat_ec -eq 20 ]; then sat_st="UNSAT"; else sat_st="TIMEOUT"; fi
 
-    # Run minisat
-    mini_out=$(timeout $TIMEOUT minisat "$instance_path" /dev/null 2>&1)
-    mini_ec=$?
+    # Run minisat (capture exit code without triggering set -e on SAT/UNSAT)
+    mini_out=$(timeout $TIMEOUT minisat "$instance_path" /dev/null 2>&1) || mini_ec=$?
+    mini_ec=${mini_ec:-0}
     if [ $mini_ec -eq 10 ]; then mini_st="SAT"; elif [ $mini_ec -eq 20 ]; then mini_st="UNSAT"; else mini_st="TIMEOUT"; fi
 
     if [ "$sat_st" = "TIMEOUT" ] || [ "$mini_st" = "TIMEOUT" ]; then
