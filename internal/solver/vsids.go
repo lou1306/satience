@@ -423,14 +423,17 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 	}
 }
 
-// decayLBD decays LBD bonus scores (called every conflict)
-// Use very slow decay to preserve glue clause importance
+// decayLBD decays LBD bonus scores.
+// Gated by decayInterval (same as activity decay) to avoid O(n) every conflict.
+// Called after decay() which increments conflictCount, so the gate check is valid.
 func (v *VSIDS) decayLBD() {
 	if !v.useLBD {
 		return
 	}
+	if v.conflictCount%v.decayInterval != 0 {
+		return
+	}
 
-	// Decay LBD bonus scores
 	for i := range v.lbdBonus {
 		v.lbdBonus[i] *= v.lbdBonusDecay
 	}
@@ -462,19 +465,23 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 	}
 
 	for _, lit := range literals {
-		conflictBoost := 1.0 + float64(v.conflictParticipation[lit.Var()])*0.05
-		v.bumpLarge(lit.Var(), bumpAmount*conflictBoost)
-		v.conflictParticipation[lit.Var()]++
-		// IMPROVEMENT #3: Reset activity after too many conflicts (prevent lock-in)
-		if v.conflictParticipation[lit.Var()] > 500 {
-			v.activity[lit.Var()] = 1.0 // Reset to prevent lock-in
-			v.conflictParticipation[lit.Var()] = 0
-			// Decrease heap key instead of full rebuild.
-			score := 1.0 + v.lbdBonus[lit.Var()]
-			v.heap.decreaseKey(v.heapPos, lit.Var(), score)
+		v.bumpLarge(lit.Var(), bumpAmount)
+
+		// LRB/CHB bookkeeping — only when those heuristics are active.
+		// When useLRB/useCHB are false (the default), skip the per-variable
+		// conflictParticipation increment and the non-standard anti-lock-in
+		// reset (hard reset to 1.0 + decreaseKey when > 500), which are pure
+		// overhead serving no purpose under VSIDS-only selection.
+		if v.useLRB || v.useCHB {
+			v.conflictParticipation[lit.Var()]++
+			if v.conflictParticipation[lit.Var()] > 500 {
+				v.activity[lit.Var()] = 1.0
+				v.conflictParticipation[lit.Var()] = 0
+				score := 1.0 + v.lbdBonus[lit.Var()]
+				v.heap.decreaseKey(v.heapPos, lit.Var(), score)
+			}
 		}
 
-		// CHB: Track conflict frequency with aggressive bump
 		if v.useCHB {
 			v.conflictFrequency[lit.Var()] += bumpAmount
 		}
@@ -542,7 +549,9 @@ func (v *VSIDS) decay(assignments []Assignment) {
 			continue
 		}
 		v.activity[i] *= v.decayFactor
-		v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
+		if v.useLRB {
+			v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
+		}
 	}
 
 	// Invalidate the heap. The heap key is activity + lbdBonus, and decay

@@ -3987,10 +3987,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 
 	// Mark LBD order as dirty
 
-	// WATCH LIST COMPACTION: Remove watches for deleted clauses (tombstones)
-	// This reduces propagation overhead by shrinking watch lists
-	s.compactWatchLists()
-	
 	// Track tombstone ratio for logging
 	tombstoneRatio := float64(tombstoneCount) / float64(s.learnedCapacity)
 
@@ -4076,6 +4072,21 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	// blindly violates the watched-literal invariant and causes missed
 	// propagations/conflicts (soundness bug).
 	s.watchLists = make([][]cnf.Watch, len(s.watchLists))
+
+	// Pre-allocate watch lists with estimated capacity to avoid reallocations
+	// (same logic as initWatches). Without this, every append grows from nil,
+	// causing many small reallocations during the rebuild.
+	totalClauses := s.cnf.NumClauses + s.learnedActiveCount
+	avgWatchesPerLit := (totalClauses * 2) / len(s.watchLists)
+	if avgWatchesPerLit < 32 {
+		avgWatchesPerLit = 32
+	}
+	if avgWatchesPerLit > 256 {
+		avgWatchesPerLit = 256
+	}
+	for i := range s.watchLists {
+		s.watchLists[i] = make([]cnf.Watch, 0, avgWatchesPerLit)
+	}
 
 	// First, add original clauses
 	for i := 0; i < len(s.cnf.Clauses); i++ {

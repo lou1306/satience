@@ -9,9 +9,10 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 
 ## Status
 Sound and complete. 15/15 unit tests, 100% soundness on 300+ fuzzer iterations.
-MiniSat Fast Suite (30s timeout): **54/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 53 solved instances, 0 mismatches.
+MiniSat Fast Suite (30s timeout): **56/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 53 solved instances, 0 mismatches.
 
 ### Recent Fixes (July 2026)
+- **VSIDS per-conflict overhead reduction**: Gated `decayLBD()` by `decayInterval` (was O(n) every conflict, now O(n/10)). Removed dead LRB/CHB bookkeeping from `bumpClause` (conflictParticipation increment, anti-lock-in reset, conflictBoost) and `decay` (decisionRecencyPenalty scaling) when LRB/CHB are disabled (always). Preallocated watch list capacity in `compactLearnedClauses` (was growing from nil). Removed `compactWatchLists` belt-and-suspenders scan after `removeLearnedClauseWatches`. 54/72 → 56/72.
 - **Assignment packing**: Packed `Assignment` to 8 bytes (`Level int32` + `Value bool`), eliminated separate `varLevel []int` cache. Every variable lookup now hits one 8-byte struct instead of two arrays on different cache lines. Memory for 290K vars: 5.7MB → 2.3MB.
 - **CDCL backjump** (`backtrack()`): Was using `trailHead[bjLevel]` (start of level bjLevel) as decision point, which unassigned the decision at bjLevel and re-assigned it FLIPPED (DPLL chronological backtracking). Fixed to `trailHead[bjLevel+1]` (keep level bjLevel, let `propagateAssertingLiteral()` handle the UIP). Matches `cancelUntil()`.
 - **LBD storage filter**: `learnClause()` was discarding clauses with LBD > 8, meaning the solver did conflict analysis and threw away the result. Removed filter — store ALL learned clauses, use LBD for deletion priority only.
