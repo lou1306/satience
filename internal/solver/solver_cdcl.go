@@ -133,8 +133,7 @@ type CDCLSolver struct {
 	maxIter      int
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals      []cnf.Literal         // All learned clause literals in one contiguous slice
-	learnedOffsets       []int                 // Start offset in learnedLiterals for each clause
-	learnedSizes         []int                 // Number of literals in each clause (0 = deleted/tombstone)
+	learnedLoc           []LearnedClauseLoc    // Packed (Offset, Size) per learned clause; Size=0 means tombstone
 	learnedMetadata      []cnf.ClauseMetadata  // OPTIMIZATION: Packed metadata (LBD, age, activity, useCount, propCount, score)
 	learnedWatchIdx0     []int                 // First watched literal index (for fast watch removal)
 	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
@@ -300,8 +299,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
 		// learnedLiterals: 8 literals per clause average (covers most learned clauses)
 		learnedLiterals:      make([]cnf.Literal, 0, maxLearned*8),
-		learnedOffsets:       make([]int, 0, maxLearned),
-		learnedSizes:         make([]int, 0, maxLearned),
+		learnedLoc:           make([]LearnedClauseLoc, 0, maxLearned),
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedWatchIdx0:     make([]int, 0, maxLearned), // Watched literal indices
 		learnedWatchIdx1:     make([]int, 0, maxLearned),
@@ -673,17 +671,17 @@ func (s *CDCLSolver) GetLearnedCount() int {
 func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemoryKB int) {
 	activeClauses = s.learnedActiveCount
 	poolLiterals = len(s.learnedLiterals)
-	// Approximate memory: literals (4 bytes each) + offsets/sizes/metadata (8 bytes each × 7 arrays × capacity)
-	cap := cap(s.learnedOffsets)
-	poolMemoryKB = (len(s.learnedLiterals)*4 + cap*8*7) / 1024
+	// Approximate memory: literals (4 bytes each) + per-clause metadata arrays
+	// (learnedLoc 8B + learnedMetadata 64B + learnedWatchIdx0/1 8B each = 88B) × capacity
+	cap := cap(s.learnedLoc)
+	poolMemoryKB = (len(s.learnedLiterals)*4 + cap*88) / 1024
 	return activeClauses, poolLiterals, poolMemoryKB
 }
 
 // getLearnedClauseLiterals returns the literals for a learned clause (view into contiguous pool)
 func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
-	offset := s.learnedOffsets[clauseIdx]
-	size := s.learnedSizes[clauseIdx]
-	return s.learnedLiterals[offset : offset+size]
+	loc := s.learnedLoc[clauseIdx]
+	return s.learnedLiterals[loc.Offset : int(loc.Offset)+int(loc.Size)]
 }
 
 // getReasonLitsForVar returns the reason clause literals for a variable whose
@@ -704,7 +702,7 @@ func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
 	}
 	if reasonClauseIdx <= -5 {
 		learnedIdx := -reasonClauseIdx - 5
-		if int(learnedIdx) < s.learnedCapacity && s.learnedSizes[learnedIdx] > 0 {
+		if int(learnedIdx) < s.learnedCapacity && s.learnedLoc[learnedIdx].Size > 0 {
 			return s.getLearnedClauseLiterals(int(learnedIdx))
 		}
 	}
@@ -748,12 +746,12 @@ func (s *CDCLSolver) getDetailedStats() SolverStats {
 
 	// Calculate clause size statistics
 	if s.learnedActiveCount > 0 {
-		minSize := s.learnedSizes[0]
+		minSize := int(s.learnedLoc[0].Size)
 		maxSize := minSize
 		totalSize := 0
 
-		for i := range s.learnedSizes {
-			size := s.learnedSizes[i]
+		for i := range s.learnedLoc {
+			size := int(s.learnedLoc[i].Size)
 			totalSize += size
 			if size < minSize {
 				minSize = size
@@ -1163,7 +1161,7 @@ func (s *CDCLSolver) initWatches() {
 	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
 
 	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
-		if s.learnedSizes[learnedIdx] == 0 {
+		if s.learnedLoc[learnedIdx].Size == 0 {
 			continue // Skip tombstones
 		}
 		literals := s.getLearnedClauseLiterals(learnedIdx)
@@ -1320,8 +1318,9 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 // of a prefix causes conflict, that prefix is implied by the empty set, so the
 // full clause is a tautology — shrinking to the prefix is sound.
 func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
-	offset := s.learnedOffsets[learnedIdx]
-	size := s.learnedSizes[learnedIdx]
+	loc := s.learnedLoc[learnedIdx]
+	offset := int(loc.Offset)
+	size := int(loc.Size)
 	literals := s.learnedLiterals[offset : offset+size]
 
 	if size <= 2 {
@@ -1452,7 +1451,7 @@ func (s *CDCLSolver) runVivification() bool {
 	results := make([]vivifyResult, 0, 64)
 
 	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedSizes[i] <= 2 {
+		if s.learnedLoc[i].Size <= 2 {
 			continue
 		}
 		if protected[i] {
@@ -1469,7 +1468,7 @@ func (s *CDCLSolver) runVivification() bool {
 
 		checkedCount++
 		s.vivifyClausesChecked++
-		oldSize := s.learnedSizes[i]
+		oldSize := int(s.learnedLoc[i].Size)
 		if s.vivifyClause(i) {
 			// vivifyClause left the new literals in tmpLearnedLits
 			newSize := len(s.tmpLearnedLits)
@@ -1500,13 +1499,13 @@ func (s *CDCLSolver) runVivification() bool {
 
 	// Apply all modifications NOW (after the round — trial propagation is done).
 	for _, r := range results {
-		offset := s.learnedOffsets[r.idx]
-		oldSize := s.learnedSizes[r.idx]
+		offset := int(s.learnedLoc[r.idx].Offset)
+		oldSize := int(s.learnedLoc[r.idx].Size)
 		// Remove old watches (while size is still oldSize >= 2)
 		s.removeLearnedClauseWatches(r.idx)
 		// Rewrite literals
 		copy(s.learnedLiterals[offset:offset+oldSize], r.newLits)
-		s.learnedSizes[r.idx] = len(r.newLits)
+		s.learnedLoc[r.idx].Size = int32(len(r.newLits))
 		// Rebuild watches
 		if len(r.newLits) >= 2 {
 			lits := s.learnedLiterals[offset : offset+len(r.newLits)]
@@ -1564,7 +1563,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 		return
 	}
 
-	if s.learnedSizes[learnedIdx] < 2 {
+	if s.learnedLoc[learnedIdx].Size < 2 {
 		return
 	}
 
@@ -1733,17 +1732,17 @@ func (s *CDCLSolver) restart() bool {
 	glueCount := 0
 	
 	// Ensure tmpIsGlue buffer is large enough
-	if cap(s.tmpIsGlue) < len(s.learnedOffsets) {
-		s.tmpIsGlue = make([]bool, len(s.learnedOffsets))
+	if cap(s.tmpIsGlue) < len(s.learnedLoc) {
+		s.tmpIsGlue = make([]bool, len(s.learnedLoc))
 	}
-	isGlue := s.tmpIsGlue[:len(s.learnedOffsets)]
-	
+	isGlue := s.tmpIsGlue[:len(s.learnedLoc)]
+
 	// Clear buffer
 	for i := range isGlue {
 		isGlue[i] = false
 	}
 
-	for i := 0; i < len(s.learnedOffsets); i++ {
+	for i := 0; i < len(s.learnedLoc); i++ {
 		lbd := s.learnedMetadata[i].LBD
 
 		// Keep glue clauses (configurable via restartKeepGlueLBD, default 3)
@@ -2276,7 +2275,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		s.unitsDirty = false
 		for _, learnedIdx := range s.unitLearnedList {
 		// Skip deleted/tombstone entries (can happen after swap-remove)
-		if learnedIdx >= s.learnedCapacity || s.learnedSizes[learnedIdx] != 1 {
+		if learnedIdx >= s.learnedCapacity || s.learnedLoc[learnedIdx].Size != 1 {
 			continue
 		}
 		literals := s.getLearnedClauseLiterals(learnedIdx)
@@ -2419,11 +2418,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLits = s.cnf.Clauses[watch.ClauseIdx].Literals
 			} else {
 				learnedIdx := -watch.ClauseIdx - 1
-				if int(learnedIdx) >= len(s.learnedSizes) || s.learnedSizes[learnedIdx] == 0 {
+				if int(learnedIdx) >= len(s.learnedLoc) || s.learnedLoc[learnedIdx].Size == 0 {
 					continue
 				}
-				offset := s.learnedOffsets[learnedIdx]
-				size := s.learnedSizes[learnedIdx]
+				loc := s.learnedLoc[learnedIdx]
+				offset := int(loc.Offset)
+				size := int(loc.Size)
 				clauseLits = s.learnedLiterals[offset : offset+size]
 			}
 
@@ -2649,11 +2649,11 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 
 		// Simple linear scanning of learned clauses (O(n) but correct)
 		for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
-			if s.learnedSizes[learnedIdx] == 0 {
+			if s.learnedLoc[learnedIdx].Size == 0 {
 				continue // Skip tombstones
 			}
 			literals := s.getLearnedClauseLiterals(learnedIdx)
-			clauseSize := s.learnedSizes[learnedIdx]
+			clauseSize := int(s.learnedLoc[learnedIdx].Size)
 
 			satisfiedCount := 0
 			falseCount := 0
@@ -2877,7 +2877,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 				if impIdx <= -5 {
 					// Learned clause
 					learnedIdx := -impIdx - 5
-						if learnedIdx < s.learnedCapacity && s.learnedSizes[learnedIdx] == 1 {
+						if learnedIdx < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 1 {
 							isUnit = true
 						}
 				} else {
@@ -3466,7 +3466,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 		// Check if opposite unit already exists
 		for i := 0; i < s.learnedCapacity; i++ {
-			if s.learnedSizes[i] != 1 {
+			if s.learnedLoc[i].Size != 1 {
 				continue
 			}
 			existingLits := s.getLearnedClauseLiterals(i)
@@ -3554,12 +3554,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.learnedLiterals = append(s.learnedLiterals, s.tmpLearnedLits...)
 
 		// Append metadata (packed struct for cache efficiency)
-		s.learnedOffsets = append(s.learnedOffsets, offset)
-		s.learnedSizes = append(s.learnedSizes, len(s.tmpLearnedLits))
+		s.learnedLoc = append(s.learnedLoc, LearnedClauseLoc{
+			Offset: int32(offset),
+			Size:   int32(len(s.tmpLearnedLits)),
+		})
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
 			Age:        s.currentAge,
-			Size:       len(s.tmpLearnedLits),
 			LBD:        lbd,
 			Activity:   0.0,
 			UseCount:   0,
@@ -3828,7 +3829,7 @@ func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
 // Used for incremental scoring optimization
 func (s *CDCLSolver) computeClauseScore(idx int) float64 {
 	lbd := s.learnedMetadata[idx].LBD
-	size := s.learnedSizes[idx]
+	size := int(s.learnedLoc[idx].Size)
 	age := s.currentAge - s.learnedMetadata[idx].Age
 	activity := s.learnedMetadata[idx].Activity
 	useCount := s.learnedMetadata[idx].UseCount
@@ -3887,7 +3888,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	currentActive := 0
 	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedSizes[i] > 0 {
+		if s.learnedLoc[i].Size > 0 {
 			currentActive++
 		}
 	}
@@ -3929,7 +3930,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	// Delete clauses with LBD > 5 first (aggressive but safe)
 	for i := 0; i < s.learnedCapacity && deletedCount < toDelete; i++ {
-		if s.learnedSizes[i] == 0 || protected[i] {
+		if s.learnedLoc[i].Size == 0 || protected[i] {
 			continue
 		}
 		
@@ -3942,7 +3943,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// If still need to delete more, lower threshold to LBD > 3
 	if deletedCount < toDelete {
 		for i := 0; i < s.learnedCapacity && deletedCount < toDelete; i++ {
-			if s.learnedSizes[i] == 0 || protected[i] || deleted[i] {
+			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
 				continue
 			}
 			
@@ -3956,11 +3957,11 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Apply tombstones: mark size=0 and remove watches
 	tombstoneCount := 0
 	for i := 0; i < s.learnedCapacity; i++ {
-		if deleted[i] && s.learnedSizes[i] > 0 {
+		if deleted[i] && s.learnedLoc[i].Size > 0 {
 			// Remove watches BEFORE marking as tombstone
 			s.removeLearnedClauseWatches(i)
 			// Mark as tombstone
-			s.learnedSizes[i] = 0
+			s.learnedLoc[i].Size = 0
 			s.learnedWatchIdx0[i] = -1
 			s.learnedWatchIdx1[i] = -1
 			tombstoneCount++
@@ -3970,7 +3971,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Update active count (excludes tombstones)
 	activeCount := 0
 	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedSizes[i] > 0 {
+		if s.learnedLoc[i].Size > 0 {
 			activeCount++
 		}
 	}
@@ -3979,7 +3980,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Rebuild unit clause list from scratch
 	s.unitLearnedList = s.unitLearnedList[:0]
 	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedSizes[i] == 1 {
+		if s.learnedLoc[i].Size == 1 {
 			s.unitsDirty = true
 		s.unitLearnedList = append(s.unitLearnedList, i)
 		}
@@ -4027,7 +4028,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	nextOffset := 0
 	
 	for readIdx := 0; readIdx < s.learnedCapacity; readIdx++ {
-		if s.learnedSizes[readIdx] == 0 {
+		if s.learnedLoc[readIdx].Size == 0 {
 			continue // Skip tombstones
 		}
 
@@ -4035,19 +4036,18 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		clauseIndexMap[readIdx] = writeIdx
 
 		// Move clause metadata
-		oldStart := s.learnedOffsets[readIdx]
-		oldSize := s.learnedSizes[readIdx]
+		oldStart := int(s.learnedLoc[readIdx].Offset)
+		oldSize := int(s.learnedLoc[readIdx].Size)
 		newStart := nextOffset
-		
-		s.learnedOffsets[writeIdx] = newStart
-		s.learnedSizes[writeIdx] = oldSize
+
+		s.learnedLoc[writeIdx] = LearnedClauseLoc{Offset: int32(newStart), Size: int32(oldSize)}
 		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
 		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
 		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
 
 		// Copy literals
 		copy(s.learnedLiterals[newStart:newStart+oldSize], s.learnedLiterals[oldStart:oldStart+oldSize])
-		
+
 		writeIdx++
 		nextOffset += oldSize
 	}
@@ -4099,7 +4099,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 
 	// Then, add learned clauses (and store the chosen watch literal indices)
 	for i := 0; i < writeIdx; i++ {
-		if s.learnedSizes[i] < 2 {
+		if s.learnedLoc[i].Size < 2 {
 			continue
 		}
 		literals := s.getLearnedClauseLiterals(i)
@@ -4146,8 +4146,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 
 	// Truncate arrays to new capacity
 	s.learnedLiterals = s.learnedLiterals[:nextOffset]
-	s.learnedOffsets = s.learnedOffsets[:writeIdx]
-	s.learnedSizes = s.learnedSizes[:writeIdx]
+	s.learnedLoc = s.learnedLoc[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
 	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
 	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]
@@ -4157,7 +4156,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	// Rebuild unit list
 	s.unitLearnedList = s.unitLearnedList[:0]
 	for i := 0; i < writeIdx; i++ {
-		if s.learnedSizes[i] == 1 {
+		if s.learnedLoc[i].Size == 1 {
 			s.unitsDirty = true
 		s.unitLearnedList = append(s.unitLearnedList, i)
 		}
@@ -4198,7 +4197,7 @@ func (s *CDCLSolver) compactWatchLists() {
 			shouldRemove := false
 			if watch.ClauseIdx < 0 {
 				learnedIdx := -watch.ClauseIdx - 1
-				if int(learnedIdx) < s.learnedCapacity && s.learnedSizes[learnedIdx] == 0 {
+				if int(learnedIdx) < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 0 {
 					shouldRemove = true
 				}
 			}
@@ -4239,7 +4238,7 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 		return
 	}
 	learnedIdx := s.lastLearnedClauseIdx
-	if s.learnedSizes[learnedIdx] < 2 {
+	if s.learnedLoc[learnedIdx].Size < 2 {
 		return // unit clauses are handled via unitLearnedList
 	}
 	literals := s.getLearnedClauseLiterals(learnedIdx)

@@ -28,8 +28,8 @@ func (s *CDCLSolver) VerifyModel(reason string) error {
 		}
 	}
 
-	for i := range s.learnedOffsets {
-		if s.learnedSizes[i] == 0 {
+	for i := range s.learnedLoc {
+		if s.learnedLoc[i].Size == 0 {
 			continue
 		}
 		clause := cnf.Clause{Literals: s.getLearnedClauseLiterals(i), Learned: true}

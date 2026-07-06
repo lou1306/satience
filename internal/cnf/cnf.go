@@ -61,10 +61,10 @@ type Clause struct {
 
 // ClauseMetadata packs all learned clause metadata into a single struct for cache efficiency
 // This reduces cache line misses during clause scoring and deletion (SoA -> AoS transformation)
-// Size: 7 ints + 2 float64s + 1 bool = 64 bytes on 64-bit (fits in 1 cache line)
+// Size: 4 ints + 2 float64s + 1 bool + 1 uint32 = 56 bytes on 64-bit (fits in 1 cache line)
+// (Offset/Size live in the separate LearnedClauseLoc packed struct, co-located with
+// nothing else needed here.)
 type ClauseMetadata struct {
-	Offset     int     // Start offset in learnedLiterals
-	Size       int     // Number of literals (0 = deleted/tombstone)
 	LBD        int     // LBD at time of learning
 	Age        int     // Age (conflicts since learning)
 	UseCount   int     // Times used in conflict analysis

@@ -9,11 +9,12 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 
 ## Status
 Sound and complete. 15/15 unit tests, 100% soundness on 300+ fuzzer iterations.
-MiniSat Fast Suite (30s timeout): **56/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 53 solved instances, 0 mismatches.
+MiniSat Fast Suite (30s timeout): **56/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 56 matched instances, 0 mismatches.
 
 ### Recent Fixes (July 2026)
 - **VSIDS per-conflict overhead reduction**: Gated `decayLBD()` by `decayInterval` (was O(n) every conflict, now O(n/10)). Removed dead LRB/CHB bookkeeping from `bumpClause` (conflictParticipation increment, anti-lock-in reset, conflictBoost) and `decay` (decisionRecencyPenalty scaling) when LRB/CHB are disabled (always). Preallocated watch list capacity in `compactLearnedClauses` (was growing from nil). Removed `compactWatchLists` belt-and-suspenders scan after `removeLearnedClauseWatches`. 54/72 → 56/72.
 - **Assignment packing**: Packed `Assignment` to 8 bytes (`Level int32` + `Value bool`), eliminated separate `varLevel []int` cache. Every variable lookup now hits one 8-byte struct instead of two arrays on different cache lines. Memory for 290K vars: 5.7MB → 2.3MB.
+- **LearnedClauseLoc packing**: Packed `learnedOffsets` + `learnedSizes` (two `[]int` = 16B across two cache lines) into single `[]LearnedClauseLoc` (`Offset int32` + `Size int32` = 8B). All 60 access sites use the same index for both fields (verified — no mismatched-index co-access). Also removed dead `ClauseMetadata.Offset`/`.Size` fields (never read; `Size` was set once but unused). `ClauseMetadata`: 72B → 56B (genuinely 1 cache line now; old comment claiming 64B was wrong).
 - **CDCL backjump** (`backtrack()`): Was using `trailHead[bjLevel]` (start of level bjLevel) as decision point, which unassigned the decision at bjLevel and re-assigned it FLIPPED (DPLL chronological backtracking). Fixed to `trailHead[bjLevel+1]` (keep level bjLevel, let `propagateAssertingLiteral()` handle the UIP). Matches `cancelUntil()`.
 - **LBD storage filter**: `learnClause()` was discarding clauses with LBD > 8, meaning the solver did conflict analysis and threw away the result. Removed filter — store ALL learned clauses, use LBD for deletion priority only.
 - **decide() simplification**: Removed non-standard diversification logic (random decisions, decidedVarSet override, consecutiveFlips tracking) that was overriding VSIDS. Standard CDCL: VSIDS + phase saving only.
@@ -26,7 +27,7 @@ MiniSat Fast Suite (30s timeout): **56/72 solved** (July 2026). Verified sound v
 ### Data Structures
 - **Literal**: `uint32` (bit 31=sign, bits 0-30=variable index). Variables 0-based internally, 1-based in DIMACS.
 - **Implication array encoding** (`s.implication`): `>=0` original clause; `<=-5` learned (`-learnedIdx-5`); `-1` decision; `-2` unit-prop preprocess; `-3` pure-literal; `-4` reserved. The 4-slot offset frees `-1..-4` as sentinels so learned-clause decode can't misread preprocessing sentinels (was a soundness bug). `Watch.ClauseIdx` uses a separate encoding (`-learnedIdx-1`); `propagateWatched` translates watch→implication at the assign site.
-- **Learned clauses**: Contiguous literal pool with offset/size arrays. Deletion uses tombstones (`learnedSizes[i]=0`); `compactLearnedClauses()` reclaims gaps at the next restart (level 0) when tombstones exceed ~33% of capacity.
+- **Learned clauses**: Contiguous literal pool with packed `LearnedClauseLoc` (`Offset int32` + `Size int32`) replacing separate offset/size arrays. Deletion uses tombstones (`learnedLoc[i].Size=0`); `compactLearnedClauses()` reclaims gaps at the next restart (level 0) when tombstones exceed ~33% of capacity.
 
 ### Key Files
 - `internal/solver/solver_cdcl.go`: CDCL solver (1-UIP, backjumping, restarts, deletion+compaction, vivification)

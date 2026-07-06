@@ -14,6 +14,16 @@ type Assignment struct {
 	Value bool // true = positive, false = negative
 }
 
+// LearnedClauseLoc packs a learned clause's offset and size into 8 bytes so a
+// single load fetches both fields. Replaces the former separate
+// learnedOffsets/learnedSizes arrays (16 bytes across two allocations, often
+// on different cache lines). int32 is safe: offsets max out at ~2M literals
+// (100K clauses * ~20 lits) << int32 limit (2.1B), and sizes <= variable count.
+type LearnedClauseLoc struct {
+	Offset int32 // Start offset in learnedLiterals
+	Size   int32 // Number of literals (0 = deleted/tombstone)
+}
+
 // Solver implements a basic DPLL algorithm with backtracking
 type Solver struct {
 	cnf         *cnf.CNF

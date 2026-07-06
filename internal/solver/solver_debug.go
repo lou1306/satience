@@ -19,7 +19,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 				fmt.Printf("c [VERIFY ERROR] Implication var %d -> clause %d (>= learnedCapacity %d)\n",
 					varIdx+1, learnedIdx, s.learnedCapacity)
 				errors++
-			} else if s.learnedSizes[learnedIdx] == 0 {
+			} else if s.learnedLoc[learnedIdx].Size == 0 {
 				fmt.Printf("c [VERIFY ERROR] Implication var %d -> deleted clause %d (size=0)\n",
 					varIdx+1, learnedIdx)
 				errors++
@@ -36,7 +36,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
 						litIdx, i, learnedIdx, s.learnedCapacity)
 					errors++
-				} else if s.learnedSizes[learnedIdx] == 0 {
+				} else if s.learnedLoc[learnedIdx].Size == 0 {
 					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> deleted clause %d (size=0)\n",
 						litIdx, i, learnedIdx)
 					errors++
@@ -55,9 +55,9 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 			fmt.Printf("c [VERIFY ERROR] unitLearnedList[%d] -> clause %d (>= learnedCapacity %d)\n",
 				i, learnedIdx, s.learnedCapacity)
 			errors++
-		} else if s.learnedSizes[learnedIdx] != 1 {
+		} else if s.learnedLoc[learnedIdx].Size != 1 {
 			fmt.Printf("c [VERIFY ERROR] unitLearnedList[%d] -> clause %d (size=%d, expected 1)\n",
-				i, learnedIdx, s.learnedSizes[learnedIdx])
+				i, learnedIdx, s.learnedLoc[learnedIdx].Size)
 			errors++
 		}
 	}

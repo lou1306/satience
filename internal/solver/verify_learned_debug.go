@@ -36,7 +36,7 @@ func (s *CDCLSolver) verifyLearnedClause(learnedLits []cnf.Literal, allowMultipl
 	if !allowMultipleAtCurrentLevel {
 		literalsAtCurrentLevel := 0
 		for _, lit := range learnedLits {
-			if s.assignments[lit.Var()].Level == s.level {
+			if int(s.assignments[lit.Var()].Level) == s.level {
 				literalsAtCurrentLevel++
 			}
 		}
