@@ -1096,6 +1096,157 @@ func TestDuplicateLiterals(t *testing.T) {
 	}
 }
 
+func TestTautologyRemoval(t *testing.T) {
+	// A formula with a tautological clause and a non-tautological clause.
+	// The tautology (x ∨ ¬x) should be removed; the remaining clause (¬x) forces x=false.
+	c := cnf.CNF{
+		NumVars: 1,
+		Clauses: []cnf.Clause{
+			newClause(1, -1), // tautology - should be removed
+			newClause(-1),    // unit clause forcing x=false
+		},
+		NumClauses: 2,
+	}
+	s := NewCDCLSolver(&c)
+	removed := s.removeTautologiesAndDuplicates()
+	if removed != 1 {
+		t.Errorf("Expected 1 tautological clause removed, got %d", removed)
+	}
+	if s.cnf.NumClauses != 1 {
+		t.Errorf("Expected 1 clause remaining, got %d", s.cnf.NumClauses)
+	}
+}
+
+func TestDuplicateLiteralDedup(t *testing.T) {
+	// A clause with duplicate literals should be deduplicated to a single occurrence.
+	c := cnf.CNF{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			newClause(1, 1, 1, 2), // three copies of lit 1
+		},
+		NumClauses: 1,
+	}
+	s := NewCDCLSolver(&c)
+	removed := s.removeTautologiesAndDuplicates()
+	if removed != 0 {
+		t.Errorf("Expected 0 clauses removed (no tautology), got %d", removed)
+	}
+	if len(s.cnf.Clauses[0].Literals) != 2 {
+		t.Errorf("Expected 2 literals after dedup, got %d", len(s.cnf.Clauses[0].Literals))
+	}
+}
+
+func TestPureLiteralElimination(t *testing.T) {
+	// Var 2 (index 1) appears only positively, var 3 (index 2) appears only negatively.
+	// PLE should assign both and remove all clauses containing them.
+	c := cnf.CNF{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			newClause(1, 2),  // var 2 is pure positive
+			newClause(-1, -3), // var 3 is pure negative
+		},
+		NumClauses: 2,
+	}
+	s := NewCDCLSolver(&c)
+	assigned := s.pureLiteralElimination()
+	if assigned != 2 {
+		t.Errorf("Expected 2 pure literals assigned, got %d", assigned)
+	}
+	if s.cnf.NumClauses != 0 {
+		t.Errorf("Expected 0 clauses remaining, got %d", s.cnf.NumClauses)
+	}
+	// var 2 (index 1) should be true (only positive occurrences)
+	if s.assignments[1].Value != true || s.assignments[1].Level != 0 {
+		t.Errorf("Expected var 2 = true (Level 0), got Value=%v Level=%d", s.assignments[1].Value, s.assignments[1].Level)
+	}
+	// var 3 (index 2) should be false (only negative occurrences)
+	if s.assignments[2].Value != false || s.assignments[2].Level != 0 {
+		t.Errorf("Expected var 3 = false (Level 0), got Value=%v Level=%d", s.assignments[2].Value, s.assignments[2].Level)
+	}
+}
+
+func TestPureLiteralEliminationNegativePolarity(t *testing.T) {
+	// Variable that appears only negatively should be assigned false.
+	c := cnf.CNF{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			newClause(-1, 2),
+			newClause(-1, -2),
+		},
+		NumClauses: 2,
+	}
+	s := NewCDCLSolver(&c)
+	assigned := s.pureLiteralElimination()
+	// var 1 appears only negatively → pure, assigned false
+	if assigned < 1 {
+		t.Errorf("Expected at least 1 pure literal, got %d", assigned)
+	}
+	if s.assignments[0].Level == 0 && s.assignments[0].Value != false {
+		t.Errorf("Expected pure-negative var 1 = false, got %v", s.assignments[0].Value)
+	}
+}
+
+func TestTautologyRemovalUnsatPreserved(t *testing.T) {
+	// Tautology removal must not remove a genuinely unsat formula.
+	// (x) ∧ (¬x) is UNSAT. Adding a tautology (y ∨ ¬y) should not change that.
+	c := cnf.CNF{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			newClause(1),
+			newClause(-1),
+			newClause(2, -2), // tautology
+		},
+		NumClauses: 3,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != UNSAT {
+		t.Errorf("Expected UNSAT, got %v", result)
+	}
+}
+
+func TestPureLiteralEliminationModelValid(t *testing.T) {
+	// After PLE, the solver should still produce a valid model for the original formula.
+	c := cnf.CNF{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			newClause(1, 2),
+			newClause(-1, 3),
+		},
+		NumClauses: 2,
+	}
+	s := NewCDCLSolver(&c)
+	result := s.SolveWithResult()
+	if result != SAT {
+		t.Fatalf("Expected SAT, got %v", result)
+	}
+	assignments := s.GetAssignments()
+	// var 2 (index 1) is pure positive → should be true
+	if assignments[1].Value != true {
+		t.Errorf("Expected pure literal var 2 = true, got %v", assignments[1].Value)
+	}
+	// var 3 (index 2) is pure positive → should be true
+	if assignments[2].Value != true {
+		t.Errorf("Expected pure literal var 3 = true, got %v", assignments[2].Value)
+	}
+	// The model must satisfy the original clauses
+	origClauses := []cnf.Clause{newClause(1, 2), newClause(-1, 3)}
+	for i, clause := range origClauses {
+		satisfied := false
+		for _, lit := range clause.Literals {
+			varIdx := lit.Var()
+			litTrue := (!lit.IsNegated() && assignments[varIdx].Value) || (lit.IsNegated() && !assignments[varIdx].Value)
+			if litTrue {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("Original clause %d not satisfied by model", i)
+		}
+	}
+}
+
 func TestSolveWithoutPreprocessing(t *testing.T) {
 	// SolveWithoutPreprocessing should produce same results as SolveWithResult
 	c := cnf.CNF{

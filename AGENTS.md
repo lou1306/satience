@@ -9,10 +9,10 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 
 ## Status
 Sound and complete. 15/15 unit tests, 100% soundness on 300+ fuzzer iterations.
-MiniSat Fast Suite (30s timeout): **56/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 56 matched instances, 0 mismatches.
+MiniSat Fast Suite (30s timeout): **55/72 solved** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 57 matched instances, 0 mismatches.
 
 ### Recent Fixes (July 2026)
-- **VSIDS per-conflict overhead reduction**: Gated `decayLBD()` by `decayInterval` (was O(n) every conflict, now O(n/10)). Removed dead LRB/CHB bookkeeping from `bumpClause` (conflictParticipation increment, anti-lock-in reset, conflictBoost) and `decay` (decisionRecencyPenalty scaling) when LRB/CHB are disabled (always). Preallocated watch list capacity in `compactLearnedClauses` (was growing from nil). Removed `compactWatchLists` belt-and-suspenders scan after `removeLearnedClauseWatches`. 54/72 → 56/72.
+- **Tautology + duplicate-literal removal + pure literal elimination**: New preprocessing passes in `preprocessAggressive()` (before the structure gate). `removeTautologiesAndDuplicates()` scans all clauses, removes tautologies and dedups repeated literals in O(total literals) with a temporary seen-array. `pureLiteralElimination()` assigns single-polarity variables and removes satisfied clauses. Both run on ALL instances (trivially sound; don't change search trajectory the way forced unit propagation does). 54/72 → 55/72 (+2 gained: `66e6fea6` TIMEOUT→UNSAT, `b40a1e31` TIMEOUT→SAT; -1 lost: `8d58ca18` SAT@26.7s→TIMEOUT, boundary).
 - **Assignment packing**: Packed `Assignment` to 8 bytes (`Level int32` + `Value bool`), eliminated separate `varLevel []int` cache. Every variable lookup now hits one 8-byte struct instead of two arrays on different cache lines. Memory for 290K vars: 5.7MB → 2.3MB.
 - **LearnedClauseLoc packing**: Packed `learnedOffsets` + `learnedSizes` (two `[]int` = 16B across two cache lines) into single `[]LearnedClauseLoc` (`Offset int32` + `Size int32` = 8B). All 60 access sites use the same index for both fields (verified — no mismatched-index co-access). Also removed dead `ClauseMetadata.Offset`/`.Size` fields (never read; `Size` was set once but unused). `ClauseMetadata`: 72B → 56B (genuinely 1 cache line now; old comment claiming 64B was wrong).
 - **CDCL backjump** (`backtrack()`): Was using `trailHead[bjLevel]` (start of level bjLevel) as decision point, which unassigned the decision at bjLevel and re-assigned it FLIPPED (DPLL chronological backtracking). Fixed to `trailHead[bjLevel+1]` (keep level bjLevel, let `propagateAssertingLiteral()` handle the UIP). Matches `cancelUntil()`.
@@ -55,7 +55,9 @@ These capture the *why* behind choices that aren't obvious from the code.
 - `chooseWatchPositions()`: Shared non-false literal selection for original/learned watch setup and compaction (preserves watched-literal invariant).
 
 ### Preprocessing (Adaptive)
-- StructuredScore ≥ 0.7: unit propagation enabled. Score < 0.7: ALL preprocessing disabled (causes 76× more conflicts on random instances).
+- **Tautology + duplicate-literal removal** (`removeTautologiesAndDuplicates`): Runs on ALL instances before the structure gate. O(total literals) with a temporary seen-array; removes tautological clauses and dedups repeated literals. Trivially sound.
+- **Pure literal elimination** (`pureLiteralElimination`): Runs on ALL instances before the structure gate. Assigns variables appearing with one polarity only, removes satisfied clauses. Trivially sound (no clause contains the opposite polarity).
+- StructuredScore ≥ 0.7: unit propagation enabled. Score < 0.7: unit propagation disabled (causes 76× more conflicts on random instances). Tautology/duplicate removal and PLE still run on all instances.
 
 ### VSIDS Heap
 - Incremental heap (`heapPos` + `increaseKey`/`decreaseKey`); `decay()` sets `heapValid=false` (NOT uniform scaling — `lbdBonus` is NOT scaled by decay). O(n/10) per conflict vs old O(n) per-conflict rebuild.

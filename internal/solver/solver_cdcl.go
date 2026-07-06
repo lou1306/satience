@@ -949,6 +949,163 @@ func (s *CDCLSolver) hasEmptyClause() bool {
 	return false
 }
 
+// compactClauses removes clauses marked in the removed slice from s.cnf.Clauses,
+// updates NumClauses, and recomputes originalUnitClauses (indices shift after
+// compaction). Caller is responsible for calling RebuildLiteralPool afterwards.
+func (s *CDCLSolver) compactClauses(removed []bool) {
+	writeIdx := 0
+	for readIdx := 0; readIdx < len(s.cnf.Clauses); readIdx++ {
+		if !removed[readIdx] {
+			if writeIdx != readIdx {
+				s.cnf.Clauses[writeIdx] = s.cnf.Clauses[readIdx]
+			}
+			writeIdx++
+		}
+	}
+	s.cnf.Clauses = s.cnf.Clauses[:writeIdx]
+	s.cnf.NumClauses = writeIdx
+	// Recompute original unit clause indices (shifted by compaction)
+	s.originalUnitClauses = precomputeOriginalUnitClauses(s.cnf)
+}
+
+// removeTautologiesAndDuplicates scans all original clauses and:
+//   - Removes tautological clauses (containing both x and ¬x for some variable)
+//   - Deduplicates repeated literals within each clause
+//
+// Returns the number of clauses removed. Both operations are trivially sound:
+// a tautology is always satisfied and a duplicate literal is redundant.
+// Runs in O(total literals) with a temporary seen-array indexed by literal.
+func (s *CDCLSolver) removeTautologiesAndDuplicates() int {
+	numLits := int(s.cnf.NumVars) * 2
+	if numLits == 0 {
+		return 0
+	}
+	seenLit := make([]bool, numLits)
+	var touched []int
+
+	removed := make([]bool, s.cnf.NumClauses)
+	removedCount := 0
+
+	for i := range s.cnf.Clauses {
+		lits := s.cnf.Clauses[i].Literals
+		if len(lits) <= 1 {
+			continue // unit and empty clauses cannot be tautologies
+		}
+
+		touched = touched[:0]
+		writeIdx := 0
+		isTautology := false
+
+		for _, lit := range lits {
+			litIdx := cnf.LitToIndex(lit)
+			if seenLit[litIdx] {
+				continue // duplicate literal — skip
+			}
+			negIdx := litIdx ^ 1
+			if seenLit[negIdx] {
+				isTautology = true
+				break
+			}
+			seenLit[litIdx] = true
+			touched = append(touched, litIdx)
+			lits[writeIdx] = lit
+			writeIdx++
+		}
+
+		// Reset seenLit for touched entries
+		for _, idx := range touched {
+			seenLit[idx] = false
+		}
+
+		if isTautology {
+			removed[i] = true
+			removedCount++
+			continue
+		}
+
+		if writeIdx < len(lits) {
+			s.cnf.Clauses[i].Literals = lits[:writeIdx]
+		}
+	}
+
+	if removedCount > 0 {
+		s.compactClauses(removed)
+	}
+	return removedCount
+}
+
+// pureLiteralElimination assigns variables that appear with only one polarity
+// throughout the formula and removes all clauses satisfied by them. Returns the
+// number of variables assigned. Sound: a pure literal's assignment never
+// conflicts with any clause (no clause contains the opposite polarity).
+// Runs in O(total literals).
+func (s *CDCLSolver) pureLiteralElimination() int {
+	if s.cnf.NumVars == 0 {
+		return 0
+	}
+	posCount := make([]int, s.cnf.NumVars)
+	negCount := make([]int, s.cnf.NumVars)
+
+	for i := range s.cnf.Clauses {
+		for _, lit := range s.cnf.Clauses[i].Literals {
+			if lit.IsNegated() {
+				negCount[lit.Var()]++
+			} else {
+				posCount[lit.Var()]++
+			}
+		}
+	}
+
+	// Identify and assign pure literals
+	isPure := make([]bool, s.cnf.NumVars)
+	pureValue := make([]bool, s.cnf.NumVars)
+	assignedCount := 0
+
+	for v := uint32(0); v < s.cnf.NumVars; v++ {
+		if s.assignments[v].Level >= 0 {
+			continue // already assigned (e.g., by tautology removal creating a unit)
+		}
+		if posCount[v] > 0 && negCount[v] == 0 {
+			isPure[v] = true
+			pureValue[v] = true
+		} else if negCount[v] > 0 && posCount[v] == 0 {
+			isPure[v] = true
+			pureValue[v] = false
+		}
+
+		if isPure[v] {
+			s.assignments[v] = Assignment{Value: pureValue[v], Level: 0}
+			s.preprocessTrail = append(s.preprocessTrail, int(v))
+			s.implication[v] = -3 // pure literal preprocessing
+			assignedCount++
+		}
+	}
+
+	if assignedCount == 0 {
+		return 0
+	}
+
+	// Remove all clauses containing any pure literal (all occurrences are the
+	// satisfying polarity since the variable is pure)
+	removed := make([]bool, s.cnf.NumClauses)
+	removedCount := 0
+
+	for i := range s.cnf.Clauses {
+		for _, lit := range s.cnf.Clauses[i].Literals {
+			if isPure[lit.Var()] {
+				removed[i] = true
+				removedCount++
+				break
+			}
+		}
+	}
+
+	if removedCount > 0 {
+		s.compactClauses(removed)
+	}
+	return assignedCount
+}
+
 func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// Empty original clause = immediately UNSAT (watched literals skip clauses <2 lits,
 	// so an empty clause would be invisible to propagation and yield UNKNOWN instead of UNSAT)
@@ -959,17 +1116,27 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	s.Log("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 
+	// Tautology and duplicate-literal removal (all instances, trivially sound).
+	// Runs before the structure gate: these never change the search trajectory
+	// the way forced unit propagation does, so they are safe for random-like
+	// instances too.
+	if tautRemoved := s.removeTautologiesAndDuplicates(); tautRemoved > 0 {
+		s.Log("c [preprocessing] Removed %d tautological clauses\n", tautRemoved)
+		s.cnf.RebuildLiteralPool()
+	}
 
-	// Skip on very small instances - overhead outweighs benefits
-	// DISABLED: Unit clauses must always be propagated, even on tiny instances
-	// if s.cnf.NumClauses < s.preprocessingMinClauses {
-	// 	if s.verbose {
-	// 		s.Log("c [verbose] Skipping preprocessing: instance too small (%d clauses)\n", s.cnf.NumClauses)
-	// 	}
-	// 	s.cnf.RebuildLiteralPool()
-	// 	s.initWatches()
-	// 	return UNKNOWN
-	// }
+	// Pure literal elimination (all instances, trivially sound).
+	if pleAssigned := s.pureLiteralElimination(); pleAssigned > 0 {
+		s.Log("c [preprocessing] Pure literal elimination: assigned %d variables\n", pleAssigned)
+		s.cnf.RebuildLiteralPool()
+	}
+
+	// Empty clause may have appeared from dedup (e.g. a clause of all-identical
+	// literals becomes a unit, not empty — but check defensively).
+	if s.hasEmptyClause() {
+		s.printStats()
+		return UNSAT
+	}
 
 	// Skip on VERY large instances - preprocessing too slow
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
@@ -1974,18 +2141,7 @@ func (s *CDCLSolver) countAssignedVariables() int {
 	}
 	return count
 }
-// Implements bounded variable elimination (BVE) with:
-//   - Occurrence cutoff: skip variables appearing in too many clauses
-//   - Deficiency heuristic: only eliminate if resolvents < original clauses
-//   - Resolvent size bound: skip if product of pos/neg occurrences exceeds threshold
-//   - Subsumption check: filter resolvents subsumed by existing clauses
-//   - Time limit: abort if VE takes too long
-//   - Iteration limit: max variables eliminated per pass
-//
-// CRITICAL: Processes one variable at a time and re-computes elimination candidates after each elimination
 
-// variableEliminationSinglePass eliminates variables with pos=1 from the ORIGINAL formula only
-// This is sound because definitions don't have transitive dependencies
 // Solve determines if the CNF formula is satisfiable.
 //
 // Returns true if SAT, false if UNSAT or UNKNOWN.
