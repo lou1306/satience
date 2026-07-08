@@ -24,7 +24,6 @@ package solver
 import (
 	"runtime"
 	"satience/internal/cnf"
-	"time"
 )
 
 // SolveResult represents the result of SAT solving.
@@ -2050,10 +2049,13 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	s.trailHead[0] = 0
 	s.level = 0  // Unit propagations at level 0, decisions start at level 1
 
-	// TIME BUDGET: Limit unit propagation to 500ms to avoid spending too long in preprocessing
-	// This allows running until fixpoint on small instances while preventing timeout on large ones
-	const timeBudget = 500 * time.Millisecond
-	startTime := time.Now()
+	// DETERMINISTIC BUDGET: cap the fixpoint loop at NumVars+1 passes.
+	// Provably sufficient: each progressive pass assigns >=1 previously-unassigned
+	// variable (changed=true is set only at the assignment site, gated by the
+	// unassigned check), so fixpoint is reached in <= NumVars+1 passes. This cap
+	// is never hit before fixpoint — it replaces the old 500ms wall-clock backstop,
+	// which truncated mid-fixpoint nondeterministically and perturbed the search.
+	maxPasses := int(s.cnf.NumVars) + 1
 
 	// Count unit clauses for debugging
 	unitCount := 0
@@ -2067,10 +2069,8 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	changed := true
 	pass := 0
 	for changed {
-		// Check time budget
-		if time.Since(startTime) > timeBudget {
-			s.Log("c [unit prop] Time budget exceeded (%.1fms), stopping after %d passes, trail has %d units\n",
-				float64(time.Since(startTime).Nanoseconds())/1e6, pass, len(s.trail))
+		if pass >= maxPasses {
+			s.Log("c [unit prop] Pass cap reached (%d) before fixpoint — unexpected\n", maxPasses)
 			break
 		}
 
