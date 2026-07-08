@@ -169,6 +169,8 @@ type CDCLSolver struct {
 	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
+	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
+	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
 	// Diagnostic counters for learned-clause minimization (always-on; reported in
@@ -359,6 +361,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:     50,
 		vivifyEnabled:    true,
+		// Min conflicts between vivify rounds. Without this gate, small/fast-restart
+		// instances fire vivify every ~50 restarts = every few hundred conflicts,
+		// thrashing the solver with low-yield rounds. 20000 ensures vivify only
+		// fires on genuinely hard instances (those exceeding ~20K conflicts); easy
+		// instances solve before vivify ever triggers.
+		vivifyMinConflictGap: 20000,
 		// Configurable parameters with defaults
 		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
@@ -620,6 +628,12 @@ func (s *CDCLSolver) SetMinimizeMaxDepth(d int) {
 // 0 disables vivification entirely.
 func (s *CDCLSolver) SetVivifyPeriod(p int) {
 	s.vivifyPeriod = p
+}
+
+// SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
+// between two vivification rounds. 0 disables the gap gate (restart-based only).
+func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
+	s.vivifyMinConflictGap = g
 }
 
 // GetStats returns solving statistics
@@ -1584,13 +1598,18 @@ func (s *CDCLSolver) runVivification() bool {
 	}
 
 	s.vivifyRoundsRun++
+	s.conflictsAtLastVivify = s.conflicts
 	s.Log("c [vivify] Starting vivification round: %d active clauses\n", s.learnedActiveCount)
 
 	s.inVivification = true
 	defer func() { s.inVivification = false }()
 
-	const timeBudget = 500 * time.Millisecond
-	startTime := time.Now()
+	// Deterministic clause-count budget (replaces wall-clock time budget).
+	// The old 500ms time budget made vivify nondeterministic: wall-clock
+	// truncation checked different clauses per run, perturbing the search
+	// trajectory and causing flaky SAT/TIMEOUT results on small instances.
+	// A clause-count cap is fully deterministic and bounded.
+	const maxCheckPerRound = 2000
 
 	// Mark clauses used as reasons (cannot vivify these — they're in use).
 	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
@@ -1628,8 +1647,8 @@ func (s *CDCLSolver) runVivification() bool {
 			continue
 		}
 
-		// Time budget check
-		if time.Since(startTime) > timeBudget {
+		// Deterministic clause-count budget (replaces wall-clock time budget)
+		if checkedCount >= maxCheckPerRound {
 			break
 		}
 
@@ -2010,8 +2029,10 @@ func (s *CDCLSolver) restart() bool {
 
 	// Run vivification every Nth restart (after compaction, at level 0
 	// with no learned clause in use as a reason — same safety conditions
-	// as compaction).
-	if s.vivifyEnabled && s.vivifyPeriod > 0 && s.lubyIndex > 0 && s.lubyIndex%s.vivifyPeriod == 0 {
+	// as compaction). Gated by a minimum conflict gap so small/fast-restart
+	// instances don't thrash on low-yield vivify rounds.
+	if s.vivifyEnabled && s.vivifyPeriod > 0 && s.lubyIndex > 0 && s.lubyIndex%s.vivifyPeriod == 0 &&
+		(s.vivifyMinConflictGap <= 0 || s.conflicts-s.conflictsAtLastVivify >= s.vivifyMinConflictGap) {
 		if s.runVivification() {
 			return true // UNSAT detected
 		}
@@ -2052,7 +2073,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				float64(time.Since(startTime).Nanoseconds())/1e6, pass, len(s.trail))
 			break
 		}
-		
+
 		changed = false
 		pass++
 

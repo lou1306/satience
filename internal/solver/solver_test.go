@@ -1773,6 +1773,7 @@ func TestMinimizationDiagnostics(t *testing.T) {
 	c := buildPigeonhole(4, 3)
 	s := NewCDCLSolver(&c)
 	s.SetVivifyPeriod(1)             // Run vivification at every restart
+	s.SetVivifyMinConflictGap(0)     // Disable conflict gap gate (test wants restart-based triggering)
 	s.SetRestartParameters(2, 1.5, 1, 3) // Aggressive restarts (base=2) to ensure vivify fires
 	s.SetMaxIter(200000)
 	result := s.SolveWithResult()
