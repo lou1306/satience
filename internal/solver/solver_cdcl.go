@@ -2543,15 +2543,22 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		return false, nil
 	}
 
+	// Cache slice headers as locals — the compiler can't prove s.assignments
+	// isn't aliased through method calls, so it reloads the slice header on every
+	// access. The backing array is never reallocated (allocated once in the
+	// constructor), so the cached header stays valid for the whole call.
+	assignments := s.assignments
+
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 
 		// CRITICAL FIX: Skip unassigned variables (level < 0)
 		// Unassigned variables have Value=false by default, which incorrectly triggers watches
-		if s.assignments[lit].Level < 0 {
+		litAsg := assignments[lit]
+		if litAsg.Level < 0 {
 			continue // Unassigned - skip watch processing
 		}
-		value := s.assignments[lit].Value
+		value := litAsg.Value
 
 		// OPTIMIZATION: Inline LitToIndex - avoids function call overhead
 		// lit index = varIdx * 2 + (1 if negated else 0)
@@ -2570,6 +2577,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		// Process watches for this literal using swap-with-last deletion
 		watchList := s.watchLists[watchIdx]
+		watchLitVar := watchIdx >> 1 // Constant for all watches on this list
 
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
@@ -2584,10 +2592,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitLit := cnf.Literal(watch.Blit)
 			blitVarIdx := int(blitLit.Var())
 			blitNegated := blitLit.IsNegated()
-			blitLevel := s.assignments[blitVarIdx].Level
-			if blitLevel >= 0 {
-				blitValue := s.assignments[blitVarIdx].Value
-				blitLitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
+			blitAsg := assignments[blitVarIdx]
+			if blitAsg.Level >= 0 {
+				blitLitTrue := (!blitNegated && blitAsg.Value) || (blitNegated && !blitAsg.Value)
 				if blitLitTrue {
 					continue
 				}
@@ -2633,7 +2640,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			// Look for replacement watch
 			foundReplacement := false
-			watchLitVar := watchIdx >> 1
 			for j := 2; j < len(clauseLits); j++ {
 				clauseLit := clauseLits[j]
 				clauseLitVar := int(clauseLit.Var())
@@ -2642,11 +2648,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					continue
 				}
 
-				litLevel := s.assignments[clauseLitVar].Level
+				clauseAsg := assignments[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
-				if litLevel >= 0 {
-					litValue := s.assignments[clauseLitVar].Value
-					litTrue := (!litNegated && litValue) || (litNegated && !litValue)
+				if clauseAsg.Level >= 0 {
+					litTrue := (!litNegated && clauseAsg.Value) || (litNegated && !clauseAsg.Value)
 					if !litTrue {
 						continue
 					}
@@ -2700,9 +2705,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// No replacement found - check if we can propagate or have conflict
-			blitLevel = s.assignments[blitVarIdx].Level
+			blitAsg = assignments[blitVarIdx]
 
-			if blitLevel < 0 {
+			if blitAsg.Level < 0 {
 				// Unassigned blit - propagate it
 				propLevel := s.level
 				if propLevel == 0 {
@@ -2719,8 +2724,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// Re-check blit value
-			blitValue := s.assignments[blitVarIdx].Value
-			blitTrue := (!blitNegated && blitValue) || (blitNegated && !blitValue)
+			blitTrue := (!blitNegated && blitAsg.Value) || (blitNegated && !blitAsg.Value)
 
 			if !blitTrue {
 				// Build conflict clause
