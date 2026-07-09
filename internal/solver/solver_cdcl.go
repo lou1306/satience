@@ -826,6 +826,7 @@ type InstanceStructure struct {
 	Density          float64 // clauses / vars
 	BinaryRatio      float64 // binary clauses / total
 	TernaryRatio     float64 // 3-literal clauses / total
+	LongClauseRatio  float64 // clauses with >3 literals / total
 	SmallClauseRatio float64 // (binary + ternary) / total
 	StructuredScore  float64 // 0.0 = random, 1.0 = highly structured
 }
@@ -850,6 +851,7 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	// Clause size distribution
 	binaryCount := 0
 	ternaryCount := 0
+	longCount := 0
 	smallCount := 0
 
 	for i := 0; i < s.cnf.NumClauses; i++ {
@@ -860,25 +862,36 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		} else if size == 3 {
 			ternaryCount++
 			smallCount++
+		} else if size > 3 {
+			longCount++
 		}
 	}
 
 	if s.cnf.NumClauses > 0 {
 		structure.BinaryRatio = float64(binaryCount) / float64(s.cnf.NumClauses)
 		structure.TernaryRatio = float64(ternaryCount) / float64(s.cnf.NumClauses)
+		structure.LongClauseRatio = float64(longCount) / float64(s.cnf.NumClauses)
 		structure.SmallClauseRatio = float64(smallCount) / float64(s.cnf.NumClauses)
 	}
 
 	// Structured score: weighted combination of metrics
-	// Key insight: structured instances have HIGH BINARY ratio + mixed clause sizes
-	// Random k-SAT has uniform clause sizes (all 3-literal), low binary ratio
+	// Key insight: structured instances have EITHER many binary clauses OR many
+	// long (>3 literal) clauses with varied sizes. Random k-SAT has uniform clause
+	// sizes (all k-literal), zero binary, zero long clauses.
 	// 
 	// Components:
-	// 1. Binary ratio (weight 0.6): structured instances often have many binary clauses
+	// 1. Size score (weight 0.6): max(binary ratio, long-clause ratio). Structured
+	//    instances score high on at least one; random k-SAT scores 0 on both.
 	// 2. Density (weight 0.2): moderate contribution
 	// 3. Mixed sizes (weight 0.2): structured instances have varied clause sizes
 	
 	binaryScore := structure.BinaryRatio
+	longScore := structure.LongClauseRatio
+	
+	sizeScore := binaryScore
+	if longScore > sizeScore {
+		sizeScore = longScore
+	}
 	
 	densityScore := 0.0
 	if structure.Density > 0 {
@@ -901,7 +914,7 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		mixedSizeScore = 0.3
 	}
 	
-	structure.StructuredScore = binaryScore*0.6 + densityScore*0.2 + mixedSizeScore*0.2
+	structure.StructuredScore = sizeScore*0.6 + densityScore*0.2 + mixedSizeScore*0.2
 
 	return structure
 }
@@ -910,10 +923,11 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	structure := s.analyzeInstanceStructure()
 
-	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Structured=%.2f\n",
+	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f\n",
 			structure.Density,
 			structure.BinaryRatio*100,
 			structure.TernaryRatio*100,
+			structure.LongClauseRatio*100,
 			structure.StructuredScore)
 
 
