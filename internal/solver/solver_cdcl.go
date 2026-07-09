@@ -2950,7 +2950,6 @@ func (s *CDCLSolver) decide() bool {
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1) // -1 = decision
-	s.savedPhase[varIdx] = phase                                // Save phase for decisions only
 	s.decisions++
 	if s.verbose && s.conflicts <= 10 {
 		s.Log("c [DECIDE] Level %d (was %d): var %d = %v (decision, lit=%d%c), trailHead len=%d\n",
@@ -2981,6 +2980,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	}
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
+	s.savedPhase[varIdx] = lit.IsNegated()
 	s.numUnassigned--
 
 	if s.verbose && level > 0 {
@@ -3022,6 +3022,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 
 	// Store clause index
 	s.implication[varIdx] = clauseIdx
+	s.savedPhase[varIdx] = lit.IsNegated()
 }
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
