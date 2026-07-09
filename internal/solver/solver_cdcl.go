@@ -75,13 +75,7 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 	
 	// Base: percentage of original clauses (primary factor)
 	baseLimit := int(float64(numClauses) * 0.15)  // 15% of original clauses
-	
-	// Also consider variable count (secondary factor)
-	varLimit := int(numVars) * 6
-	if varLimit > baseLimit {
-		baseLimit = varLimit
-	}
-	
+
 	// Scale with density for very sparse/dense instances
 	if numVars > 0 {
 		density := float64(numClauses) / float64(numVars)
