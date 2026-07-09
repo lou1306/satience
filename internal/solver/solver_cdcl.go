@@ -2783,8 +2783,8 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 			var unassignedLit cnf.Literal
 
 			// Inline literal iteration (avoids range overhead)
-			for i := 0; i < size; i++ {
-				lit := cnf.Literal(pool[offset+i])
+		for i := 0; i < size; i++ {
+			lit := pool[offset+i]
 				varIdx := lit.Var()
 				litLevel := s.assignments[varIdx].Level
 				if litLevel < 0 {
