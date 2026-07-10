@@ -24,6 +24,7 @@ package solver
 import (
 	"runtime"
 	"satience/internal/cnf"
+	"sort"
 )
 
 // SolveResult represents the result of SAT solving.
@@ -207,6 +208,7 @@ type CDCLSolver struct {
 	tmpDeleted            []bool               // Bitmap for deleted clauses
 	tmpClauseUsedAsReason []bool               // Track clauses used as implications
 	tmpClauseIndexMap     []int                // Pre-allocated buffer for old->new clause index mapping
+	tmpDeletionCandidates []int                 // Pre-allocated buffer for deletion candidate sorting
 
 	// Watched literals infrastructure
 	watchLists          [][]cnf.Watch // watchLists[lit] = clauses watching lit
@@ -349,6 +351,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpDeleted:            make([]bool, maxLearned),
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
 		tmpClauseIndexMap:     make([]int, maxLearned),
+		tmpDeletionCandidates: make([]int, 0, maxLearned),
 		learnedClauseBase:     int(formula.NumClauses),
 		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
@@ -1711,6 +1714,14 @@ func (s *CDCLSolver) runVivification() bool {
 		// Rewrite literals
 		copy(s.learnedLiterals[offset:offset+oldSize], r.newLits)
 		s.learnedLoc[r.idx].Size = int32(len(r.newLits))
+		// Update LBD: LBD ≤ clause size, so if the clause shrank, the LBD
+		// may have decreased. Use min(oldLBD, newSize) as a conservative
+		// overestimate — prevents valuable post-vivification glue clauses
+		// from being deleted as high-LBD.
+		newSize := len(r.newLits)
+		if newSize < int(s.learnedMetadata[r.idx].LBD) {
+			s.learnedMetadata[r.idx].LBD = newSize
+		}
 		// Rebuild watches
 		if len(r.newLits) >= 2 {
 			lits := s.learnedLiterals[offset : offset+len(r.newLits)]
@@ -4170,33 +4181,58 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 	
 	deletedCount := 0
-	
-	// Delete clauses with LBD > 5 first (aggressive but safe)
-	for i := 0; i < s.learnedCapacity && deletedCount < toDelete; i++ {
+
+	// Usage-aware deletion: within each LBD tier, delete clauses with the
+	// lowest PropCount first (least useful = least propagated). This keeps
+	// high-traffic clauses that frequently cause propagations and deletes
+	// clauses that were learned but never contributed to search.
+	candidates := s.tmpDeletionCandidates[:0]
+
+	// Pass 1: collect LBD > 5 candidates, sort by PropCount, delete lowest
+	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size == 0 || protected[i] {
 			continue
 		}
-		
 		if s.learnedMetadata[i].LBD > 5 {
-			deleted[i] = true
-			deletedCount++
+			candidates = append(candidates, i)
 		}
 	}
-	
-	// If still need to delete more, lower threshold to LBD > 3
+	sort.Slice(candidates, func(a, b int) bool {
+		return s.learnedMetadata[candidates[a]].PropCount < s.learnedMetadata[candidates[b]].PropCount
+	})
+	for _, idx := range candidates {
+		if deletedCount >= toDelete {
+			break
+		}
+		deleted[idx] = true
+		deletedCount++
+	}
+
+	// Pass 2: lower threshold to LBD > 3
 	if deletedCount < toDelete {
-		for i := 0; i < s.learnedCapacity && deletedCount < toDelete; i++ {
+		candidates = candidates[:0]
+		for i := 0; i < s.learnedCapacity; i++ {
 			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
 				continue
 			}
-			
 			if s.learnedMetadata[i].LBD > 3 {
-				deleted[i] = true
-				deletedCount++
+				candidates = append(candidates, i)
 			}
 		}
+		sort.Slice(candidates, func(a, b int) bool {
+			return s.learnedMetadata[candidates[a]].PropCount < s.learnedMetadata[candidates[b]].PropCount
+		})
+		for _, idx := range candidates {
+			if deletedCount >= toDelete {
+				break
+			}
+			deleted[idx] = true
+			deletedCount++
+		}
 	}
-	
+
+	s.tmpDeletionCandidates = candidates
+
 	// Apply tombstones: mark size=0 and remove watches
 	tombstoneCount := 0
 	for i := 0; i < s.learnedCapacity; i++ {
