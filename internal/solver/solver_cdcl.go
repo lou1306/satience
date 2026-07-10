@@ -169,6 +169,10 @@ type CDCLSolver struct {
 	lbdScaleOverride      bool    // True if user explicitly set LBD scale via CLI (skip adaptive)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
+	// Equivalence detection (SCC-based): stores mapping for model reconstruction.
+	equivRep           []uint32 // Representative variable for each variable (identity if not merged)
+	equivNeg           []bool   // Whether variable is equivalent to negation of its representative
+	hasEquivalences    bool     // True if detectEquivalences found and merged any equivalences
 	// Diagnostic counters for learned-clause minimization (always-on; reported in
 	// printStats and a periodic solve-loop log). Pure instrumentation — no behavior.
 	minimizeCalls       uint64 // recursive self-subsumption invocations (clauses >2 lits)
@@ -1172,6 +1176,14 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	if s.hasEmptyClause() {
 		s.printStats()
 		return UNSAT
+	}
+
+	// SCC-based equivalence detection (all instances, sound).
+	// Runs before the size gate: O(V+E) and can significantly reduce instance
+	// size by merging equivalent variables.
+	if equivResult := s.detectEquivalences(); equivResult != UNKNOWN {
+		s.printStats()
+		return equivResult
 	}
 
 	// Skip on VERY large instances - preprocessing too slow
@@ -2389,7 +2401,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		}
 	}
 
-	return s.cdclLoop()
+	result := s.cdclLoop()
+	if result == SAT {
+		s.extendModel()
+	}
+	return result
 }
 
 // SolveWithoutPreprocessing skips all preprocessing (no unit propagation, no
