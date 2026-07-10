@@ -164,6 +164,8 @@ type CDCLSolver struct {
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
+	randomPhaseRate       float64 // Probability of flipping the saved phase per decision (0=disabled)
+	lbdScaleOverride      bool    // True if user explicitly set LBD scale via CLI (skip adaptive)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
 	// Diagnostic counters for learned-clause minimization (always-on; reported in
@@ -360,6 +362,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// fires on genuinely hard instances (those exceeding ~20K conflicts); easy
 		// instances solve before vivify ever triggers.
 		vivifyMinConflictGap: 20000,
+		randomPhaseRate:       0,
 		// Configurable parameters with defaults
 		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
@@ -510,10 +513,13 @@ func (s *CDCLSolver) SetDecayRampup(conflicts int) {
 	s.vsids.SetDecayRampUpConflicts(conflicts)
 }
 
-// SetLBDBonusScale sets the LBD bonus scale for VSIDS (default 2000.0)
-// Higher values = stronger preference for low-LBD (glue) clauses
+// SetLBDBonusScale sets the LBD bonus scale for VSIDS.
+// A non-zero value marks the scale as user-overridden (skips adaptive scaling).
 func (s *CDCLSolver) SetLBDBonusScale(scale float64) {
 	s.vsids.SetLBDBonusScale(scale)
+	if scale > 0 {
+		s.lbdScaleOverride = true
+	}
 }
 
 // SetBumpAmount sets the base bump amount for conflicts (default 50.0)
@@ -627,6 +633,12 @@ func (s *CDCLSolver) SetVivifyPeriod(p int) {
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
 	s.vivifyMinConflictGap = g
+}
+
+// SetRandomPhaseRate sets the probability of flipping the saved phase per decision.
+// 0 disables phase jitter. Default 0.01 (1%).
+func (s *CDCLSolver) SetRandomPhaseRate(r float64) {
+	s.randomPhaseRate = r
 }
 
 // GetStats returns solving statistics
@@ -2329,6 +2341,35 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 
 	s.initVSIDSOccurrenceBonus()
 
+	// Size- and structure-adaptive LBD bonus scale.
+	// Binary-heavy small instances benefit from strong LBD guidance (glue
+	// clauses steer search away from bad trajectories). Long-clause and large
+	// instances benefit from pure VSIDS (LBD guidance dominates activity,
+	// causing deep search). Formula: scale = max(10, 200000 * binaryRatio /
+	// numVars). This gives ~2000 for a 100v binary-heavy instance, ~10 for a
+	// 100v long-clause instance, ~10 for 20K+v instances.
+	// Skipped if the user explicitly set -lbd-scale via CLI.
+	if !s.lbdScaleOverride {
+		binaryCount := 0
+		for i := range s.cnf.Clauses {
+			if len(s.cnf.Clauses[i].Literals) == 2 {
+				binaryCount++
+			}
+		}
+		binaryRatio := float64(binaryCount) / float64(len(s.cnf.Clauses))
+		adaptiveScale := 200000.0 * binaryRatio / float64(s.cnf.NumVars)
+		if adaptiveScale < 10.0 {
+			adaptiveScale = 10.0
+		}
+		s.vsids.SetLBDBonusScale(adaptiveScale)
+	}
+
+	// Ensure PRNG seed is non-zero (XORShift(0)=0, so seed=0 would never
+	// produce random numbers for phase jitter).
+	if s.randomSeed == 0 {
+		s.randomSeed = 0x2545F4914F6CDD1D
+	}
+
 	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
 	s.numUnassigned = 0
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
@@ -2962,6 +3003,18 @@ func (s *CDCLSolver) decide() bool {
 		}
 		if !found {
 			return false
+		}
+	}
+
+	// Random phase jitter: with small probability, flip the saved phase.
+	// This perturbs the search trajectory to escape fixed paths caused by
+	// preserved VSIDS activity + phase saving across restarts.
+	if s.randomPhaseRate > 0 {
+		s.randomSeed ^= s.randomSeed << 13
+		s.randomSeed ^= s.randomSeed >> 7
+		s.randomSeed ^= s.randomSeed << 17
+		if float64(s.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) < s.randomPhaseRate {
+			phase = !phase
 		}
 	}
 

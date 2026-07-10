@@ -34,6 +34,7 @@ func run() int {
 	minimizeDepth := flag.Int("minimize-depth", 100, "Max recursion depth for recursive clause minimization (default=100, 0=disabled)")
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
+	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
@@ -50,7 +51,7 @@ func run() int {
 	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
 	maxDecay := flag.Float64("max-decay", 0.999, "VSIDS maximum decay factor (default=0.999)")
 	decayRampup := flag.Int("decay-rampup", 5000, "Conflicts to reach max decay (default=5000)")
-	lbdScale := flag.Float64("lbd-scale", 10.0, "LBD bonus scale for VSIDS (default=10.0)")
+	lbdScale := flag.Float64("lbd-scale", 0.0, "LBD bonus scale for VSIDS (default=0=adaptive: max(10, 200000/numVars))")
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
@@ -127,7 +128,9 @@ func run() int {
 	s.SetInitialDecay(*initialDecay)
 	s.SetMaxDecay(*maxDecay)
 	s.SetDecayRampup(*decayRampup)
-	s.SetLBDBonusScale(*lbdScale)
+	if *lbdScale > 0 {
+		s.SetLBDBonusScale(*lbdScale)
+	}
 	s.SetBumpAmount(*bumpAmount)
 	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
 
@@ -137,6 +140,7 @@ func run() int {
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
+	s.SetRandomPhaseRate(*randomPhaseRate)
 
 	start := time.Now()
 	var result solver.SolveResult
