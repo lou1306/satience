@@ -50,7 +50,7 @@ func run() int {
 	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
 	maxDecay := flag.Float64("max-decay", 0.999, "VSIDS maximum decay factor (default=0.999)")
 	decayRampup := flag.Int("decay-rampup", 5000, "Conflicts to reach max decay (default=5000)")
-	lbdScale := flag.Float64("lbd-scale", 2000.0, "LBD bonus scale for VSIDS (default=2000.0)")
+	lbdScale := flag.Float64("lbd-scale", 10.0, "LBD bonus scale for VSIDS (default=10.0)")
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")

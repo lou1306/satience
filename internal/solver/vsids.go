@@ -146,7 +146,7 @@ type VSIDS struct {
 	// Configurable parameters (exposed for tuning)
 	initialDecayFactor   float64 // Initial decay factor (default 0.95)
 	decayRampUpConflicts int     // Conflicts to reach max decay (default 10000)
-	lbdBonusScale        float64 // Scale factor for LBD bonus (default 2000.0)
+	lbdBonusScale        float64 // Scale factor for LBD bonus (default 10.0)
 	lbdBonusDecay        float64 // Decay factor for LBD bonus (default 0.999)
 	baseBumpAmount       float64 // Base bump amount for clauses (default 50.0)
 	recencyPenaltyScale  float64 // Scale for recency penalty (default 50.0)
@@ -185,7 +185,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
 		decayRampUpConflicts: 10000,
-		lbdBonusScale:        2000.0,
+		lbdBonusScale:        10.0,
 		lbdBonusDecay:        0.999,
 		baseBumpAmount:       50.0,
 		recencyPenaltyScale:  50.0,
