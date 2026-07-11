@@ -119,11 +119,8 @@ func (h *vsidsHeap) init(heapPos []int) {
 // - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
 	activity              []float64 // Activity score for each variable
-	conflictParticipation []int     // Number of conflicts each variable participates in
 	decayFactor           float64   // Current decay factor (initialDecay -> maxDecayFactor)
 	inverseDecay          float64   // 1/decay for efficiency
-	useLRB                bool      // Use LRB heuristic instead of pure VSIDS
-	lrbDecayInterval      int       // Decay every N conflicts for LRB
 	conflictCount         int       // Total conflicts for LRB decay timing
 	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
 	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
@@ -134,9 +131,6 @@ type VSIDS struct {
 	heapValid             bool      // True if heap is up-to-date
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
-	// Symmetry breaking: track activity momentum and decision recency
-	lastDecisionConflict   []int     // Last conflict where variable was decided (-1 if never)
-	decisionRecencyPenalty []float64 // Penalty for recently decided variables
 	// CHB (Conflict History Based) heuristic
 	useCHB            bool      // Use CHB instead of VSIDS for variable selection
 	conflictFrequency []float64 // Recent conflict frequency per variable (CHB)
@@ -149,12 +143,8 @@ type VSIDS struct {
 	lbdBonusScale        float64 // Scale factor for LBD bonus (default 10.0)
 	lbdBonusDecay        float64 // Decay factor for LBD bonus (default 0.999)
 	baseBumpAmount       float64 // Base bump amount for clauses (default 50.0)
-	recencyPenaltyScale  float64 // Scale for recency penalty (default 50.0)
-	recencyPenaltyDecay  float64 // Decay for recency penalty (default 0.9)
-	recencyWindow        int     // Window for recency penalty (default 5 conflicts)
 	clauseInitBaseWeight float64 // Base weight for clause initialization (default 10.0)
 	binaryClauseWeight   float64 // Weight for binary clauses (default 100.0)
-	activityResetScale   float64 // Scale for activity reset (default 0.5)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -164,11 +154,8 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	maxDecay := 0.999
 	v := &VSIDS{
 		activity:              make([]float64, numVars),
-		conflictParticipation: make([]int, numVars),
 		decayFactor:           initialDecay,
 		inverseDecay:          1.0 / initialDecay,
-		useLRB:                false,
-		lrbDecayInterval:      1024,
 		conflictCount:         0,
 		useLBD:                true,
 		lbdBonus:              make([]float64, numVars),
@@ -179,30 +166,20 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		heapValid:             false,
 		decayInterval:         DefaultDecayInterval,
 		randomSeed:            0,
-		// Symmetry breaking initialization
-		lastDecisionConflict:   make([]int, numVars),
-		decisionRecencyPenalty: make([]float64, numVars),
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
 		decayRampUpConflicts: 10000,
 		lbdBonusScale:        10.0,
 		lbdBonusDecay:        0.999,
 		baseBumpAmount:       50.0,
-		recencyPenaltyScale:  50.0,
-		recencyPenaltyDecay:  0.9,
-		recencyWindow:        5,
 		clauseInitBaseWeight: 10.0,
 		binaryClauseWeight:   100.0,
-		activityResetScale:   0.5,
 		// CHB initialization
 		useCHB:            false,
 		conflictFrequency: make([]float64, numVars),
 		chbDecayFactor:    0.75,
 		chbDecayInterval:  50,
 		chbWeight:         1.0,
-	}
-	for i := range v.lastDecisionConflict {
-		v.lastDecisionConflict[i] = -1
 	}
 	for i := range v.heapPos {
 		v.heapPos[i] = -1
@@ -251,11 +228,6 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heapValid = true
 }
 
-// EnableLRB enables LRB (Learning Rate Based) heuristic
-func (v *VSIDS) EnableLRB() {
-	v.useLRB = true
-}
-
 // EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
 func (v *VSIDS) EnableLBD() {
 	v.useLBD = true
@@ -271,25 +243,6 @@ func (v *VSIDS) EnableCHB() {
 // SetRandomSeed sets the seed for deterministic random noise in tie-breaking
 func (v *VSIDS) SetRandomSeed(seed uint64) {
 	v.randomSeed = seed
-}
-
-// TrackDecision records that a variable was decided on at the current conflict
-// This is used for symmetry breaking to avoid repeatedly deciding on the same variable
-func (v *VSIDS) TrackDecision(varIdx uint32, conflictCount int) {
-	if int(varIdx) < len(v.lastDecisionConflict) {
-		lastConflict := v.lastDecisionConflict[varIdx]
-		if lastConflict >= 0 {
-			recency := conflictCount - lastConflict
-			// Apply recency penalty if within recency window
-			if recency < v.recencyWindow {
-				v.decisionRecencyPenalty[varIdx] = v.recencyPenaltyScale / float64(recency+1)
-			} else {
-				// Decay penalty if outside recency window
-				v.decisionRecencyPenalty[varIdx] *= v.recencyPenaltyDecay
-			}
-		}
-		v.lastDecisionConflict[varIdx] = conflictCount
-	}
 }
 
 // SetDecayInterval sets the number of conflicts between activity decays
@@ -373,25 +326,6 @@ func (v *VSIDS) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 	v.clauseInitBaseWeight = baseWeight
 	v.binaryClauseWeight = binaryWeight
 }
-// ResetActivityPartial partially resets activity to escape local minima
-// scale: fraction of activity to keep (0.0-1.0)
-// Adds random noise to break ties and prevent immediate re-convergence
-func (v *VSIDS) ResetActivityPartial(scale float64) {
-	if scale < 0.0 {
-		scale = 0.0
-	}
-	if scale > 1.0 {
-		scale = 1.0
-	}
-	for i := range v.activity {
-		// Keep partial activity
-		v.activity[i] *= scale
-		// Add random noise (0-10% of original) to break ties
-		noise := float64(i%100) / 1000.0
-		v.activity[i] += noise
-	}
-	v.heapValid = false // Force heap rebuild
-}
 
 // onUnassign re-inserts a variable into the heap after it is unassigned
 // (e.g. by backtrack). If the variable is already in the heap (it was
@@ -454,7 +388,6 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 }
 
 // bumpClause increases activity for all variables in a clause
-// Also tracks conflict participation for LRB heuristic
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 	baseBump := v.baseBumpAmount
@@ -467,46 +400,15 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 	for _, lit := range literals {
 		v.bumpLarge(lit.Var(), bumpAmount)
 
-		// LRB/CHB bookkeeping — only when those heuristics are active.
-		// When useLRB/useCHB are false (the default), skip the per-variable
-		// conflictParticipation increment and the non-standard anti-lock-in
-		// reset (hard reset to 1.0 + decreaseKey when > 500), which are pure
-		// overhead serving no purpose under VSIDS-only selection.
-		if v.useLRB || v.useCHB {
-			v.conflictParticipation[lit.Var()]++
-			if v.conflictParticipation[lit.Var()] > 500 {
-				v.activity[lit.Var()] = 1.0
-				v.conflictParticipation[lit.Var()] = 0
-				score := 1.0 + v.lbdBonus[lit.Var()]
-				v.heap.decreaseKey(v.heapPos, lit.Var(), score)
-			}
-		}
-
 		if v.useCHB {
 			v.conflictFrequency[lit.Var()] += bumpAmount
 		}
 	}
 	v.conflictCount++
 
-	// Periodic decay for LRB scores
-	if v.useLRB && v.conflictCount%v.lrbDecayInterval == 0 {
-		v.decayLRB(assignments)
-	}
-
 	// CHB: Periodic decay for conflict frequency
 	if v.useCHB && v.conflictCount%v.chbDecayInterval == 0 {
 		v.decayCHB(assignments)
-	}
-}
-
-// decayLRB decays LRB conflict participation scores
-func (v *VSIDS) decayLRB(assignments []Assignment) {
-	for i := range v.conflictParticipation {
-		// Skip pre-assigned variables (level 0) - not selectable
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.conflictParticipation[i] = v.conflictParticipation[i] / 2
 	}
 }
 
@@ -549,9 +451,6 @@ func (v *VSIDS) decay(assignments []Assignment) {
 			continue
 		}
 		v.activity[i] *= v.decayFactor
-		if v.useLRB {
-			v.decisionRecencyPenalty[i] *= v.recencyPenaltyDecay
-		}
 	}
 
 	// Invalidate the heap. The heap key is activity + lbdBonus, and decay
@@ -623,15 +522,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 // Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity) with heap
 // Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
 func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
-	var bestVar uint32
-
-	// Use heap for fast selection when using standard VSIDS or LBD
-	if !v.useLRB {
-		bestVar = v.selectVariableWithHeap(assignments)
-	} else {
-		// Use linear scan for LRB (would need separate heap for conflict participation)
-		bestVar = v.selectVariable(assignments)
-	}
+	bestVar := v.selectVariableWithHeap(assignments)
 
 	// Use saved phase if available, otherwise default to true (positive literal)
 	phase := true

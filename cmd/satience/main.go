@@ -27,9 +27,7 @@ func run() int {
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
-	useLRB := flag.Bool("lrb", false, "Use LRB (Learning Rate Based) heuristic instead of VSIDS")
 	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
-	randomRate := flag.Float64("random-rate", 0.0, "Probability of random decision (0.0-1.0, default=0.0)")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	minimizeDepth := flag.Int("minimize-depth", 100, "Max recursion depth for recursive clause minimization (default=100, 0=disabled)")
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
@@ -40,13 +38,6 @@ func run() int {
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
 	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10 for PHP)")
-	restartKeepGlue := flag.Int("restart-keep-glue", 3, "Keep clauses with LBD ≤ this during restart (default=3)")
-	// Clause deletion parameters
-	clauseDelLBD := flag.Float64("clause-del-lbd", 200.0, "LBD score weight for clause deletion (default=200.0)")
-	clauseDelAge := flag.Float64("clause-del-age", 5.0, "Age score weight for clause deletion (default=5.0)")
-	clauseDelSize := flag.Float64("clause-del-size", 10.0, "Size score weight for clause deletion (default=10.0)")
-	clauseDelActivity := flag.Float64("clause-del-activity", 100.0, "Activity protection weight (default=100.0)")
-	clauseDelKeepRatio := flag.Float64("clause-del-keep-ratio", 0.5, "Ratio of clauses to keep during deletion (default=0.5)")
 	// VSIDS parameters
 	decayInterval := flag.Int("decay-interval", 10, "VSIDS decay interval - conflicts between activity decays (default=10)")
 	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
@@ -107,22 +98,13 @@ func run() int {
 	if *maxIter > 0 {
 		s.SetMaxIter(*maxIter)
 	}
-	if *useLRB {
-		s.EnableLRB()
-	}
 	if *useCHB {
 		s.EnableCHB()
-	}
-	if *randomRate > 0.0 {
-		s.SetRandomDecisionRate(*randomRate)
 	}
 	s.SetRandomSeed(*randomSeed)
 
 	// Configure restart policy
-	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin, *restartKeepGlue)
-
-	// Configure clause deletion policy
-	s.SetClauseDeletionParameters(*clauseDelLBD, *clauseDelAge, *clauseDelSize, *clauseDelActivity, *clauseDelKeepRatio)
+	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin)
 
 	// Configure VSIDS parameters
 	s.SetDecayInterval(*decayInterval)

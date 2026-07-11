@@ -59,20 +59,12 @@ type Clause struct {
 	Learned  bool
 }
 
-// ClauseMetadata packs all learned clause metadata into a single struct for cache efficiency
-// This reduces cache line misses during clause scoring and deletion (SoA -> AoS transformation)
-// Size: 4 ints + 2 float64s + 1 bool + 1 uint32 = 56 bytes on 64-bit (fits in 1 cache line)
-// (Offset/Size live in the separate LearnedClauseLoc packed struct, co-located with
-// nothing else needed here.)
+// ClauseMetadata packs learned clause metadata into a single struct for cache efficiency.
+// Only LBD and PropCount are read by the live deletion code; the other fields were
+// removed as dead computation (Activity/Score/ScoreDirty/UseCount/Age/ID were never read).
 type ClauseMetadata struct {
-	LBD        int     // LBD at time of learning
-	Age        int     // Age (conflicts since learning)
-	UseCount   int     // Times used in conflict analysis
-	PropCount  int     // Times caused propagation
-	Activity   float64 // Clause activity
-	Score      float64 // Cached deletion score
-	ScoreDirty bool    // True if score needs recomputation
-	ID         uint32  // Unique clause ID for tracking through swap-remove (debug)
+	LBD       int  // LBD at time of learning
+	PropCount int  // Times caused propagation
 }
 
 // CNF represents a CNF formula

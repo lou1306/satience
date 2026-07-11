@@ -48,11 +48,6 @@ const (
 	DefaultMaxLearnedBase   = 2000  // Base clause database limit
 	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
-	ClauseActivityDecay     = 0.95  // Clause activity decay factor
-	GlueLBDThreshold        = 2     // LBD ≤ 2 considered glue clauses (protected)
-	CoreGlueLBDThreshold    = 2     // LBD ≤ 2 are core glue (never delete)
-	MaxClauseAge            = 500   // Age threshold for forced deletion
-	LargeClauseSize         = 15    // Size threshold for forced deletion
 	IterationReportInterval = 10000 // Report progress every N iterations
 
 	// Clause minimization thresholds.
@@ -133,7 +128,6 @@ type CDCLSolver struct {
 	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
-	currentAge           int
 	verbose              bool
 	decisions            int
 	backjumpLevel        int
@@ -145,21 +139,10 @@ type CDCLSolver struct {
 	lubyIndex            int
 	lbdSum               int
 	lbdCount             int
-	lastConflictLBD      int
 	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
-	conflictsAtLevel     []int           // Track conflicts per decision level
-	lastRandomDecision   int             // Last conflict where we made random decision
-	randomDecisionRate   float64         // Probability of making a random decision (0.0 = never, 1.0 = always)
-	randomDecisionPeriod int             // Period for forced random decisions (default 0=disabled, causes O(n) overhead)
 	randomSeed           uint64          // Seed for deterministic random selection
-	lastDecisionVar      uint32          // Last variable chosen for decision
-	consecutiveFlips     int             // Count of consecutive decisions on same variable
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
-	// Exploration diversity tracking (IMPROVEMENT #3)
-	decidedVars               []uint32 // Variables decided during current search phase
-	decidedVarSet             []bool   // Fast lookup for decided variables
-	restartDecisionCount      int      // Decisions since last restart (for diversity reset)
 	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
@@ -198,9 +181,7 @@ type CDCLSolver struct {
 	tmpLevelSetUsed      []bool        // Track which levels are in tmpLevelSet
 	tmpResolved          []bool        // Track resolved variables in 1-UIP to prevent re-resolution cycles
 	tmpResolvedVars      []uint32      // Track which variables were resolved (for fast reset)
-	tmpFlippedVars       []bool        // Track flipped variables at level 1 to prevent infinite loops
 	tmpTouchedVars       []uint32      // Track which variables were modified (for fast reset)
-	tmpUnassignedVars    []uint32      // Reusable buffer for random variable selection (avoids allocation)
 	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
 	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
 	tmpMinimizedLits     []cnf.Literal // Reusable buffer for clause minimization (avoids allocation)
@@ -230,33 +211,11 @@ type CDCLSolver struct {
 	lastLearnedClauseIdx int // Index of most recently learned clause (-1 = none); for asserting literal propagation
 
 	// Configurable parameters (exposed for tuning)
-	preprocessingMinClauses  int     // Skip preprocessing if < N clauses (default 50)
 	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
 	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
-	clauseDeletionMinLBD     int     // Minimum LBD to consider for deletion (default 3)
-	glueClauseLBDThreshold   int     // LBD ≤ this are glue clauses (default 2)
-	coreGlueLBDThreshold     int     // LBD ≤ this are core glue (never delete, default 2)
-	largeClauseSizeThreshold int     // Size threshold for large clause detection (default 15)
-	maxClauseAgeThreshold    int     // Age threshold for forced deletion (default 500)
-	clauseActivityDecay      float64 // Clause activity decay factor (default 0.95)
 	// Restart policy parameters
 	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
-	restartKeepGlueLBD         int     // Keep clauses with LBD ≤ this during restart (default 2)
-	// Clause deletion scoring parameters
-	clauseDeletionLBDWeight      float64 // LBD score weight (default 200.0)
-	clauseDeletionAgeWeight      float64 // Age score weight (default 5.0)
-	clauseDeletionSizeWeight     float64 // Size score weight (default 10.0)
-	clauseDeletionActivityWeight float64 // Activity protection weight (default 100.0)
-	clauseDeletionUseCountHigh   int     // UseCount threshold for strong protection (default 5)
-	clauseDeletionUseCountLow    int     // UseCount threshold for light protection (default 0)
-	clauseDeletionPropCountHigh  int     // PropCount threshold for strong protection (default 15)
-	clauseDeletionPropCountLow   int     // PropCount threshold for light protection (default 0)
-	clauseDeletionHighLBD1       int     // LBD threshold for force deletion bonus 1 (default 8)
-	clauseDeletionHighLBD2       int     // LBD threshold for force deletion bonus 2 (default 12)
-	clauseDeletionHighLBDBonus1  float64 // Force deletion bonus for LBD > highLBD1 (default 2000.0)
-	clauseDeletionHighLBDBonus2  float64 // Force deletion bonus for LBD > highLBD2 (default 3000.0)
-	clauseDeletionKeepRatio      float64 // Ratio of clauses to keep during deletion (default 0.50)
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -309,7 +268,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
-		currentAge:           0,
 		verbose:              false,
 		decisions:            0,
 		backjumpLevel:        0,
@@ -321,15 +279,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lubyIndex:            0,
 		lbdSum:               0,
 		lbdCount:             0,
-		randomDecisionRate:   0.0,
-		randomDecisionPeriod: 0, // Default: DISABLED (causes 65% overhead with no measurable benefit)
 		randomSeed:           0,
-		lastConflictLBD:      0,
-		conflictsAtLevel:     make([]int, formula.NumVars+1),
-		decidedVars:          make([]uint32, 0, formula.NumVars),
-		decidedVarSet:        make([]bool, formula.NumVars),
-		restartDecisionCount: 0,
-		lastRandomDecision:   -1000,
 		// P1: Pre-allocate reusable buffers with generous capacity to avoid reallocation
 		tmpLiteralInClause:   make([]bool, formula.NumVars),
 		tmpSeenVar:           make([]bool, formula.NumVars),
@@ -341,9 +291,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLevelSetUsed:      make([]bool, formula.NumVars+1),
 		tmpResolved:          make([]bool, formula.NumVars),
 		tmpResolvedVars:      make([]uint32, 0, formula.NumVars),
-		tmpFlippedVars:       make([]bool, formula.NumVars),
 		tmpTouchedVars:       make([]uint32, 0, formula.NumVars),
-		tmpUnassignedVars:    make([]uint32, 0, formula.NumVars),
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:       make([]cnf.Literal, 0, 256),
 		tmpSortedLits:        make([]cnf.Literal, 0, 256),
@@ -371,31 +319,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		randomPhaseRate:       0,
 		restartPhaseFlipRate:  0,
 		// Configurable parameters with defaults
-		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
 		preprocessingMaxClauses:  500000,
-		clauseDeletionMinLBD:     3,
-		glueClauseLBDThreshold:   2,
-		coreGlueLBDThreshold:     2,
-		largeClauseSizeThreshold: 15,
-		maxClauseAgeThreshold:    500,
-		clauseActivityDecay:      0.95,
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
-		restartKeepGlueLBD:         2,   // Keep LBD≤2 glue clauses
-		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
-		clauseDeletionLBDWeight:      200.0,
-		clauseDeletionAgeWeight:      5.0,
-		clauseDeletionSizeWeight:     10.0,
-		clauseDeletionActivityWeight: 100.0,
-		clauseDeletionUseCountHigh:   5,
-		clauseDeletionPropCountHigh:  15,
-		clauseDeletionHighLBD1:       8,
-		clauseDeletionHighLBD2:       12,
-		clauseDeletionHighLBDBonus1:  2000.0,
-		clauseDeletionHighLBDBonus2:  3000.0,
-		clauseDeletionKeepRatio:      0.50,
 	}
 
 	// FIX: Initialize all assignments as unassigned (Level=-1)
@@ -428,72 +356,12 @@ func (s *CDCLSolver) SetVerbose(v bool) {
 	s.verbose = v
 }
 
-// SetRandomDecisionRate sets the probability of making a random decision
-// rate should be in [0.0, 1.0] where 0.0 = never random, 1.0 = always random
-// Recommended: 0.01-0.05 for most instances
-func (s *CDCLSolver) SetRandomDecisionRate(rate float64) {
-	if rate < 0.0 {
-		rate = 0.0
-	}
-	if rate > 1.0 {
-		rate = 1.0
-	}
-	s.randomDecisionRate = rate
-}
-
-// SetRandomDecisionPeriod sets the frequency of forced random decisions
-// period is the number of conflicts between random decisions (0 = disabled)
-// WARNING: Random decisions cause O(n) variable scan overhead
-// Profiling shows 65% overhead with no measurable benefit on standard benchmarks
-// Only enable for specific instance families that benefit from diversification
-func (s *CDCLSolver) SetRandomDecisionPeriod(period int) {
-	if period < 0 {
-		period = 0
-	}
-	s.randomDecisionPeriod = period
-}
-
 // SetRandomSeed sets the seed for deterministic random selection
 // Default seed is 0
 func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
 	s.vsids.SetRandomSeed(seed)
 }
-
-// SetPreprocessingThresholds sets the preprocessing size thresholds
-// minClauses: skip if < N clauses (default 50)
-// maxVars: skip if > N vars (default 50000)
-// maxClauses: skip if > N clauses (default 500000)
-func (s *CDCLSolver) SetPreprocessingThresholds(minClauses, maxVars, maxClauses int) {
-	if minClauses < 0 {
-		minClauses = 0
-	}
-	if maxVars < 0 {
-		maxVars = 0
-	}
-	if maxClauses < 0 {
-		maxClauses = 0
-	}
-	s.preprocessingMinClauses = minClauses
-	s.preprocessingMaxVars = maxVars
-	s.preprocessingMaxClauses = maxClauses
-}
-
-
-
-
-
-
-
-// SetClauseActivityDecay sets the clause activity decay factor (default 0.95)
-func (s *CDCLSolver) SetClauseActivityDecay(decay float64) {
-	if decay < 0.5 || decay > 1.0 {
-		decay = 0.95
-	}
-	s.clauseActivityDecay = decay
-}
-
-
 
 // SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
 // Higher values = fewer heap rebuilds but slower activity differentiation
@@ -542,11 +410,6 @@ func (s *CDCLSolver) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 	s.vsids.SetClauseInitWeights(baseWeight, binaryWeight)
 }
 
-// EnableLRB enables LRB (Learning Rate Based) heuristic
-func (s *CDCLSolver) EnableLRB() {
-	s.vsids.EnableLRB()
-}
-
 // EnableCHB enables CHB (Conflict History Based) heuristic
 // CHB tracks recent conflict frequency with aggressive decay instead of cumulative VSIDS activity
 func (s *CDCLSolver) EnableCHB() {
@@ -559,8 +422,7 @@ func (s *CDCLSolver) EnableCHB() {
 // base: Luby sequence base multiplier (default 20, range 1-1000)
 // glucoseRatio: Glucose restart when LBD > ratio × avg (default 1.5, range 1.0-5.0)
 // minConflicts: min conflicts before Glucose restarts activate (default 50)
-// keepGlueLBD: keep clauses with LBD ≤ this during restart (default 3)
-func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minConflicts, keepGlueLBD int) {
+func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minConflicts int) {
 	if base < 1 {
 		base = 1
 	}
@@ -581,43 +443,6 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 		minConflicts = 0
 	}
 	s.restartGlucoseMinConflicts = minConflicts
-
-	if keepGlueLBD < 2 {
-		keepGlueLBD = 2
-	}
-	s.restartKeepGlueLBD = keepGlueLBD
-}
-
-// SetClauseDeletionParameters configures clause deletion scoring parameters
-// lbdWeight: LBD score weight (default 200.0)
-// ageWeight: Age score weight (default 5.0)
-// sizeWeight: Size score weight (default 10.0)
-// activityWeight: Activity protection weight (default 100.0)
-// keepRatio: Ratio of clauses to keep during deletion (default 0.50)
-func (s *CDCLSolver) SetClauseDeletionParameters(
-	lbdWeight, ageWeight, sizeWeight, activityWeight, keepRatio float64,
-) {
-	if lbdWeight < 0 {
-		lbdWeight = 0
-	}
-	if ageWeight < 0 {
-		ageWeight = 0
-	}
-	if sizeWeight < 0 {
-		sizeWeight = 0
-	}
-	if activityWeight < 0 {
-		activityWeight = 0
-	}
-	if keepRatio < 0.1 || keepRatio > 0.9 {
-		keepRatio = 0.5
-	}
-
-	s.clauseDeletionLBDWeight = lbdWeight
-	s.clauseDeletionAgeWeight = ageWeight
-	s.clauseDeletionSizeWeight = sizeWeight
-	s.clauseDeletionActivityWeight = activityWeight
-	s.clauseDeletionKeepRatio = keepRatio
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -1995,17 +1820,6 @@ func (s *CDCLSolver) restart() bool {
 			s.numUnassigned++
 		}
 	}
-	// Reset conflicts at all levels
-	for i := range s.conflictsAtLevel {
-		s.conflictsAtLevel[i] = 0
-	}
-
-	// IMPROVEMENT #3: Reset exploration diversity tracking
-	s.decidedVars = s.decidedVars[:0]
-	for i := range s.decidedVarSet {
-		s.decidedVarSet[i] = false
-	}
-	s.restartDecisionCount = 0
 
 	// Reset restart counters
 	s.lubyIndex++
@@ -2013,14 +1827,6 @@ func (s *CDCLSolver) restart() bool {
 	s.lbdSum = 0
 	s.lbdCount = 0
 
-	// CRITICAL: Clear tmpFlippedVars on restart
-	// tmpFlippedVars tracks variables flipped at level 1 to detect exhaustion
-	// But it must be cleared on restart since all assignments are cleared
-	// Failure to clear causes false UNSAT (variable flipped in old context blocks new search)
-	for k := range s.tmpFlippedVars {
-		s.tmpFlippedVars[k] = false
-	}
-	s.lastConflictLBD = 0
 	s.emaLBD = 0
 
 	// Phase randomization: flip each saved phase with probability
@@ -2960,7 +2766,6 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				// Track propagation count for this learned clause
 				if learnedIdx < len(s.learnedMetadata) {
 					s.learnedMetadata[learnedIdx].PropCount++
-					s.learnedMetadata[learnedIdx].ScoreDirty = true
 				}
 				break
 			}
@@ -2975,32 +2780,6 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 	}
 
 	return false, nil
-}
-
-func (s *CDCLSolver) selectRandomUnassigned() uint32 {
-	// Reuse persistent buffer - no allocation!
-	s.tmpUnassignedVars = s.tmpUnassignedVars[:0]
-	for i := uint32(0); i < s.cnf.NumVars; i++ {
-		if s.assignments[i].Level < 0 {
-			s.tmpUnassignedVars = append(s.tmpUnassignedVars, i)
-		}
-	}
-
-	if len(s.tmpUnassignedVars) == 0 {
-		return 0
-	}
-
-	// Use XORShift64 PRNG for deterministic random selection
-	// Update seed: x ^= x << 13; x ^= x >> 7; x ^= x << 17
-	seed := s.randomSeed
-	seed ^= seed << 13
-	seed ^= seed >> 7
-	seed ^= seed << 17
-	s.randomSeed = seed
-
-	// Use lower bits to select index
-	idx := int(seed % uint64(len(s.tmpUnassignedVars)))
-	return s.tmpUnassignedVars[idx]
 }
 
 func (s *CDCLSolver) decide() bool {
@@ -3215,17 +2994,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay(s.assignments)
 	s.vsids.decayLBD()
-
-	// OPTIMIZATION 2A: Lazy clause activity decay
-	// Decay clause activity every 100 conflicts instead of every conflict
-	// This reduces GC pressure and CPU overhead while maintaining search quality
-	// Standard solvers (MiniSat, Glucose) use lazy decay for both variables and clauses
-	if s.conflicts%100 == 0 {
-		for i := range s.learnedMetadata {
-			s.learnedMetadata[i].Activity *= ClauseActivityDecay
-			s.learnedMetadata[i].ScoreDirty = true
-		}
-	}
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause
@@ -3681,7 +3449,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	s.lbdSum += lbd
 	s.lbdCount++
-	s.lastConflictLBD = lbd
 	s.emaLBD = 0.9*s.emaLBD + 0.1*float64(lbd)
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
@@ -3839,15 +3606,9 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		})
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
-			Age:        s.currentAge,
-			LBD:        lbd,
-			Activity:   0.0,
-			UseCount:   0,
-			PropCount:  0,
-			Score:      0.0,
-			ScoreDirty: true,
+			LBD:       lbd,
+			PropCount: 0,
 		})
-		s.currentAge++
 		s.learnedActiveCount++
 		s.learnedCapacity++
 
@@ -4610,11 +4371,6 @@ func (s *CDCLSolver) backtrack() bool {
 	s.qhead = decisionPoint
 	s.trailHead = s.trailHead[:bjLevel+1]
 	s.level = bjLevel
-
-	// Reset conflicts at levels > bjLevel since we're backtracking
-	for i := bjLevel + 1; i < len(s.conflictsAtLevel); i++ {
-		s.conflictsAtLevel[i] = 0
-	}
 
 	return true
 }
