@@ -175,6 +175,19 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 		return UNKNOWN
 	}
 
+	// Skip merging if the merge is insignificant (< 1% of variables).
+	// Small merges change the clause structure (and thus the search trajectory)
+	// without meaningful reduction. For example, daf59d67 (222406 vars, 200 merged)
+	// has a 0.09% merge rate — the trajectory shift causes SAT@13s → TIMEOUT.
+	// bb34f22f (7807 vars, 2790 merged = 35.7%) is well above the threshold.
+	// Note: the UNSAT check (l and ¬l in same SCC) already ran inside the SCC
+	// loop above, so we only skip the substitution, not the contradiction detection.
+	if mergedCount*100 < int(s.cnf.NumVars) {
+		s.Log("c [equiv] Skipping insignificant merge: %d < %d/100 (0.01%% threshold)\n",
+			mergedCount, s.cnf.NumVars)
+		return UNKNOWN
+	}
+
 	// Substitute literals in all clauses.
 	removed := make([]bool, s.cnf.NumClauses)
 	removedCount := 0

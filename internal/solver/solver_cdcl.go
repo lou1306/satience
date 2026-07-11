@@ -1178,6 +1178,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNSAT
 	}
 
+	// Classify structure and set restart/decay config BEFORE equiv.
+	// Equiv changes clause structure (merges variables, removes tautological clauses),
+	// so we classify on the original instance to get the true structure score.
+	// This ensures structured instances like bb34f22f (score 0.73 pre-equiv) get
+	// the structured config instead of being misclassified after equiv changes ratios.
+	config := s.getAdaptivePreprocessingConfig()
+
 	// SCC-based equivalence detection (all instances, sound).
 	// Runs before the size gate: O(V+E) and can significantly reduce instance
 	// size by merging equivalent variables.
@@ -1199,9 +1206,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 		return UNKNOWN
 	}
-
-	// Get adaptive preprocessing config based on instance structure
-	config := s.getAdaptivePreprocessingConfig()
 	initialClauses := s.cnf.NumClauses
 	maxPasses := config.MaxPasses
 
