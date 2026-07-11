@@ -166,6 +166,7 @@ type CDCLSolver struct {
 	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
 	randomPhaseRate       float64 // Probability of flipping the saved phase per decision (0=disabled)
+	restartPhaseFlipRate  float64 // Probability of flipping each saved phase on restart (0=disabled)
 	lbdScaleOverride      bool    // True if user explicitly set LBD scale via CLI (skip adaptive)
 	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
 	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
@@ -206,7 +207,6 @@ type CDCLSolver struct {
 	tmpMinSeenVars       []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
-	tmpIsGlue            []bool        // Bitmap for glue clause selection during restart (avoids allocation)
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpDeleted            []bool               // Bitmap for deleted clauses
@@ -242,7 +242,7 @@ type CDCLSolver struct {
 	// Restart policy parameters
 	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
-	restartKeepGlueLBD         int     // Keep clauses with LBD ≤ this during restart (default 3)
+	restartKeepGlueLBD         int     // Keep clauses with LBD ≤ this during restart (default 2)
 	// Clause deletion scoring parameters
 	clauseDeletionLBDWeight      float64 // LBD score weight (default 200.0)
 	clauseDeletionAgeWeight      float64 // Age score weight (default 5.0)
@@ -350,7 +350,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpMinimizedLits:     make([]cnf.Literal, 0, 256),
 		tmpMinSeenVars:       make([]uint32, 0, 256),
 		conflictLitsBuf:     make([]cnf.Literal, 0, 256),
-		tmpIsGlue:            make([]bool, maxLearned),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpDeleted:            make([]bool, maxLearned),
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
@@ -370,6 +369,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// instances solve before vivify ever triggers.
 		vivifyMinConflictGap: 20000,
 		randomPhaseRate:       0,
+		restartPhaseFlipRate:  0,
 		// Configurable parameters with defaults
 		preprocessingMinClauses:  10,
 		preprocessingMaxVars:     50000,
@@ -383,7 +383,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
-		restartKeepGlueLBD:         3,   // Keep LBD≤3 glue clauses
+		restartKeepGlueLBD:         2,   // Keep LBD≤2 glue clauses
 		// Clause deletion scoring defaults (LBD-primary, age/size secondary)
 		clauseDeletionLBDWeight:      200.0,
 		clauseDeletionAgeWeight:      5.0,
@@ -646,6 +646,13 @@ func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
 // 0 disables phase jitter. Default 0.01 (1%).
 func (s *CDCLSolver) SetRandomPhaseRate(r float64) {
 	s.randomPhaseRate = r
+}
+
+// SetRestartPhaseFlipRate sets the probability of flipping each saved phase on
+// restart. 0 disables (standard phase saving). Used to break fixed points on
+// binary-heavy instances where restart + phase saving re-enters the same cascade.
+func (s *CDCLSolver) SetRestartPhaseFlipRate(r float64) {
+	s.restartPhaseFlipRate = r
 }
 
 // GetStats returns solving statistics
@@ -1892,7 +1899,7 @@ func luby(i int) int {
 // 5. Run compaction if tombstones accumulated, vivification every Nth restart
 
 // Why Keep Glue Clauses?
-// Glue clauses (LBD ≤ 3) are the "backbone" of the search:
+// Glue clauses (LBD ≤ 2) are the "backbone" of the search:
 // - They connect few decision levels (highly general)
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
@@ -1962,32 +1969,13 @@ func (s *CDCLSolver) restart() bool {
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
 	glueCount := 0
-	
-	// Ensure tmpIsGlue buffer is large enough
-	if cap(s.tmpIsGlue) < len(s.learnedLoc) {
-		s.tmpIsGlue = make([]bool, len(s.learnedLoc))
-	}
-	isGlue := s.tmpIsGlue[:len(s.learnedLoc)]
-
-	// Clear buffer
-	for i := range isGlue {
-		isGlue[i] = false
-	}
-
 	for i := 0; i < len(s.learnedLoc); i++ {
-		lbd := s.learnedMetadata[i].LBD
-
-		// Keep glue clauses (configurable via restartKeepGlueLBD, default 3)
-		// LBD ≤ 2: core glue (most valuable)
-		// LBD = 3: near-glue (very valuable)
-		// LBD > restartKeepGlueLBD: delete (will be re-learned if needed)
-		if lbd <= s.restartKeepGlueLBD {
+		if s.learnedMetadata[i].LBD <= 2 {
 			glueCount++
-			isGlue[i] = true
 		}
 	}
 
-		s.Log("c [verbose] Restart: %d glue clauses (LBD≤%d), %d total active\n", glueCount, s.restartKeepGlueLBD, s.learnedActiveCount)
+	s.Log("c [verbose] Restart: %d glue clauses (LBD≤2), %d total active\n", glueCount, s.learnedActiveCount)
 
 	// NOTE: We don't delete clauses on restart - let deleteLearnedClauses handle memory management
 	// Restart is for escaping local minima, not for clause deletion
@@ -2034,6 +2022,23 @@ func (s *CDCLSolver) restart() bool {
 	}
 	s.lastConflictLBD = 0
 	s.emaLBD = 0
+
+	// Phase randomization: flip each saved phase with probability
+	// restartPhaseFlipRate. This breaks fixed points where phase saving
+	// + VSIDS preservation causes the solver to re-enter the same search
+	// region after every restart (e.g., binary-heavy instances where the
+	// same polarity cascade repeats). Default 0 = disabled (standard
+	// phase saving).
+	if s.restartPhaseFlipRate > 0 {
+		for i := range s.savedPhase {
+			s.randomSeed ^= s.randomSeed << 13
+			s.randomSeed ^= s.randomSeed >> 7
+			s.randomSeed ^= s.randomSeed << 17
+			if float64(s.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) < s.restartPhaseFlipRate {
+				s.savedPhase[i] = !s.savedPhase[i]
+			}
+		}
+	}
 	s.backjumpLevel = 0
 
 	// CRITICAL FIX: DO NOT reset VSIDS activity on restart
@@ -3842,8 +3847,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			Score:      0.0,
 			ScoreDirty: true,
 		})
-		if lbd > 3 {
-		}
 		s.currentAge++
 		s.learnedActiveCount++
 		s.learnedCapacity++
@@ -3910,7 +3913,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 //    - LBD = number of distinct decision levels in the clause
 //    - Lower LBD = better clause (spans fewer decision levels)
 //    - LBD=2: "Glue clauses" - most valuable, connect decision levels
-//    - LBD=3: Very good clauses
+//    - LBD=3: Good but deletable (pruned by PropCount when database grows)
 //    - LBD>5: Usually not useful long-term
 
 // 2. Age: SECONDARY FACTOR
@@ -3929,8 +3932,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 //    - High activity provides some protection against deletion
 
 // Protection Rules (clauses never/ rarely deleted):
-// - LBD=2 AND size≤4 AND age<100: Core glue, NEVER delete (score=-1000)
-// - LBD=3 AND size≤3 AND age<50: Very good, protect unless very old (score=-500)
+// - LBD≤2: Core glue, NEVER delete (permanently retained)
+// - LBD=3: Deletable by PropCount ranking when database exceeds limit
 
 // Deletion Trigger:
 // When learned clause count exceeds maxLearned (default 200), delete down to
@@ -4098,62 +4101,11 @@ func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
 	return true
 }
 
-// computeClauseScore calculates the deletion score for a clause
-// Higher score = more likely to delete
-// Used for incremental scoring optimization
-func (s *CDCLSolver) computeClauseScore(idx int) float64 {
-	lbd := s.learnedMetadata[idx].LBD
-	size := int(s.learnedLoc[idx].Size)
-	age := s.currentAge - s.learnedMetadata[idx].Age
-	activity := s.learnedMetadata[idx].Activity
-	useCount := s.learnedMetadata[idx].UseCount
-	propCount := s.learnedMetadata[idx].PropCount
-
-	// Calculate deletion score (higher = delete first)
-	score := float64(lbd) * s.clauseDeletionLBDWeight
-	score += float64(age) * s.clauseDeletionAgeWeight
-	score += float64(size) * s.clauseDeletionSizeWeight
-	score -= activity * s.clauseDeletionActivityWeight
-
-	if useCount > s.clauseDeletionUseCountHigh {
-		score -= float64(useCount) * 15.0
-	} else if useCount > 0 {
-		score -= float64(useCount) * 3.0
-	}
-	if propCount > s.clauseDeletionPropCountHigh {
-		score -= float64(propCount) * 8.0
-	} else if propCount > 0 {
-		score -= float64(propCount) * 2.0
-	}
-
-	// Protection for glue clauses and ALL unit clauses
-	if size == 1 {
-		// NEVER delete unit clauses - they are global constraints
-		score = -100000.0
-	} else if lbd <= s.coreGlueLBDThreshold {
-		score = -10000.0
-	} else if lbd == s.coreGlueLBDThreshold+1 {
-		score = -5000.0
-	} else if lbd == s.coreGlueLBDThreshold+2 && size <= 5 {
-		score = -1000.0
-	}
-
-	// Force deletion for high-LBD clauses
-	if lbd > s.clauseDeletionHighLBD1 {
-		score += s.clauseDeletionHighLBDBonus1
-	}
-	if lbd > s.clauseDeletionHighLBD2 {
-		score += s.clauseDeletionHighLBDBonus2
-	}
-
-	return score
-}
-
 // deleteLearnedClauses removes low-quality learned clauses to control memory usage
 func (s *CDCLSolver) deleteLearnedClauses() {
 	// LAZY LBD-BASED DELETION (Glucose-style)
 	// Key insight: LBD is the best predictor of clause usefulness
-	// - Keep all "glue" clauses (LBD ≤ 3) permanently
+	// - Keep all "glue" clauses (LBD ≤ 2) permanently
 	// - Delete clauses with high LBD when database grows too large
 	
 	// Count current active clauses
@@ -4228,14 +4180,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		deletedCount++
 	}
 
-	// Pass 2: lower threshold to LBD > 3
+	// Pass 2: lower threshold to LBD > 2 (glue clauses are LBD ≤ 2, never deleted)
 	if deletedCount < toDelete {
 		candidates = candidates[:0]
 		for i := 0; i < s.learnedCapacity; i++ {
 			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
 				continue
 			}
-			if s.learnedMetadata[i].LBD > 3 {
+			if s.learnedMetadata[i].LBD > 2 {
 				candidates = append(candidates, i)
 			}
 		}

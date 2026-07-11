@@ -188,7 +188,7 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 		return UNKNOWN
 	}
 
-	// Substitute literals in all clauses.
+	// Substitute literals in all clauses, deduping duplicates.
 	removed := make([]bool, s.cnf.NumClauses)
 	removedCount := 0
 	seenLit := make([]bool, numLits)
@@ -208,9 +208,11 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 				if seenLit[repIdx^1] {
 					isTautology = true
 				}
-			} else {
-				continue // duplicate after substitution
+				// Write non-duplicate substituted literal in-place.
+				lits[writeIdx] = cnf.IndexToLit(repIdx)
+				writeIdx++
 			}
+			// else: duplicate after substitution — skip
 		}
 
 		// Reset seenLit for touched entries.
@@ -222,14 +224,6 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 			removed[i] = true
 			removedCount++
 			continue
-		}
-
-		// Rewrite clause with substituted literals.
-		for _, lit := range lits {
-			litIdx := cnf.LitToIndex(lit)
-			repIdx := repLit[litIdx]
-			lits[writeIdx] = cnf.IndexToLit(repIdx)
-			writeIdx++
 		}
 
 		if writeIdx < len(lits) {

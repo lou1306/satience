@@ -35,6 +35,7 @@ func run() int {
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
+	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
@@ -141,6 +142,7 @@ func run() int {
 	s.SetVivifyPeriod(*vivifyPeriod)
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
 	s.SetRandomPhaseRate(*randomPhaseRate)
+	s.SetRestartPhaseFlipRate(*restartPhaseFlip)
 
 	start := time.Now()
 	var result solver.SolveResult
