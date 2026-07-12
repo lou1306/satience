@@ -1056,6 +1056,15 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return equivResult
 	}
 
+	// For large instances, bound preprocessing with literal-visit/resolvent budgets.
+	// Must be set BEFORE BVE and unit propagation so the budgets actually apply.
+	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
+		s.unitPropBudget = 5000000 // ~5M literal visits, bounded at ~50ms
+		s.veBudget = 2000000       // ~2M resolvents, bounded at ~200ms
+		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d, ve budget=%d\n",
+			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
+	}
+
 	// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
 	// pos=1 definitional variant). Eliminates variables by resolving all
 	// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
@@ -1068,15 +1077,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 	}
 
-	// For large instances, bound unit propagation with a literal-visit budget
-	// instead of skipping it entirely. Even partial unit propagation can find
-	// forced assignments that significantly reduce the search space.
-	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
-		s.unitPropBudget = 5000000 // ~5M literal visits, bounded at ~50ms
-		s.veBudget = 2000000       // ~2M resolvents, bounded at ~200ms
-		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d, ve budget=%d\n",
-			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
-	}
 	initialClauses := s.cnf.NumClauses
 	maxPasses := config.MaxPasses
 

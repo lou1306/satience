@@ -35,6 +35,16 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		return 0
 	}
 
+	numLits := numVars * 2
+
+	// Reusable allocations (hoisted outside the loop to avoid per-iteration GC pressure)
+	seenLit := make([]bool, numLits)
+	var touched []int
+
+	// removed[] accumulates across ALL iterations — compacted once at the end.
+	// Grows as new resolvents are added; new entries default to false.
+	removed := make([]bool, s.cnf.NumClauses)
+
 	totalResolvents := 0
 	eliminated := 0
 
@@ -44,6 +54,9 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		posOcc := make([][]int, numVars)
 		negOcc := make([][]int, numVars)
 		for i, clause := range s.cnf.Clauses {
+			if removed[i] {
+				continue
+			}
 			for _, lit := range clause.Literals {
 				v := lit.Var()
 				if lit.IsNegated() {
@@ -91,10 +104,6 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		}
 
 		// Generate resolvents
-		numLits := numVars * 2
-		seenLit := make([]bool, numLits)
-		var touched []int
-
 		var resolvents [][]cnf.Literal
 		for _, posCi := range posClauses {
 			posClause := s.cnf.Clauses[posCi].Literals
@@ -162,11 +171,6 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		// Clause-count gate: only eliminate if resolvents < old clauses
 		oldClauseCount := bestValidPos + bestValidNeg
 		if len(resolvents) >= oldClauseCount {
-			// Mark this variable as non-eliminatable by temporarily checking
-			// if it's already been eliminated. We can't efficiently skip it
-			// in the next iteration, so we just break if no progress.
-			// In practice, the cheapest variable failing the gate means
-			// all remaining variables will too (they're more expensive).
 			break
 		}
 
@@ -187,8 +191,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 			clauses: savedClauses,
 		})
 
-		// Remove old clauses: mark by setting Literals to nil, then compact
-		removed := make([]bool, len(s.cnf.Clauses))
+		// Mark old clauses as removed (batch — compacted once at the end)
 		for _, ci := range posClauses {
 			removed[ci] = true
 		}
@@ -196,29 +199,33 @@ func (s *CDCLSolver) boundedVarElimination() int {
 			removed[ci] = true
 		}
 
-		// Add resolvents to the clause database FIRST, then extend removed array
-		resolventStart := len(s.cnf.Clauses)
+		// Add resolvents to the clause database
 		for _, res := range resolvents {
 			resCopy := make([]cnf.Literal, len(res))
 			copy(resCopy, res)
 			s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: resCopy})
 			s.cnf.NumClauses++
+			removed = append(removed, false) // new clauses are NOT removed
 		}
-		// Extend removed to cover resolvents (they are NOT removed)
-		for i := len(removed); i < len(s.cnf.Clauses); i++ {
-			removed = append(removed, false)
-		}
-		_ = resolventStart
 
-		// Compact (removes marked clauses)
-		s.compactClauses(removed)
 		eliminated++
 	}
 
-	if eliminated > 0 {
-		s.cnf.RebuildLiteralPool()
-		s.Log("c [ve] Eliminated %d variables, %d resolvents added, budget=%d\n", eliminated, totalResolvents, s.veBudget)
+	// Clear seenLit for the last batch
+	for _, idx := range touched {
+		seenLit[idx] = false
 	}
+
+	if eliminated == 0 {
+		return 0
+	}
+
+	// Batch compaction: compact all removed clauses at once
+	s.compactClauses(removed)
+	s.cnf.RebuildLiteralPool()
+	s.originalUnitClauses = precomputeOriginalUnitClauses(s.cnf)
+
+	s.Log("c [ve] Eliminated %d variables, %d resolvents added, budget=%d\n", eliminated, totalResolvents, s.veBudget)
 	return eliminated
 }
 
