@@ -5,9 +5,9 @@ import (
 )
 
 // DefaultDecayInterval is the default number of conflicts between VSIDS activity decays
-// Value of 10 provides good balance: frequent decay keeps focus on recent conflicts
+// Value of 5 provides good balance: frequent decay keeps focus on recent conflicts
 // Lower values = more focus on recent conflicts, better for structured instances
-const DefaultDecayInterval = 10
+const DefaultDecayInterval = 5
 
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
@@ -178,7 +178,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		useCHB:            false,
 		conflictFrequency: make([]float64, numVars),
 		chbDecayFactor:    0.75,
-		chbDecayInterval:  50,
+		chbDecayInterval:  25,
 		chbWeight:         1.0,
 	}
 	for i := range v.heapPos {
@@ -427,10 +427,10 @@ func (v *VSIDS) decayCHB(assignments []Assignment) {
 // decay decays all activity scores periodically (MiniSat-style)
 // This creates strong differentiation between important and unimportant variables
 // Decay factor starts at 0.95 and increases toward max for focused search
-// Only decays every v.decayInterval conflicts to reduce overhead
+// Only decays every v.decayInterval conflicts to reduce overhead.
+// conflictCount is incremented in bumpClause (called before decay in handleConflict),
+// so decay must NOT increment it again.
 func (v *VSIDS) decay(assignments []Assignment) {
-	v.conflictCount++
-
 	// Lazy decay: only decay every decayInterval conflicts
 	if v.conflictCount%v.decayInterval != 0 {
 		return
@@ -455,7 +455,7 @@ func (v *VSIDS) decay(assignments []Assignment) {
 
 	// Invalidate the heap. The heap key is activity + lbdBonus, and decay
 	// only scales activity (not lbdBonus), so the relative ordering can change.
-	// Rebuilding every decayInterval (10) conflicts is O(n/10) per conflict —
+	// Rebuilding every decayInterval (5) conflicts is O(n/5) per conflict —
 	// far cheaper than the old O(n) per-conflict rebuild.
 	v.heapValid = false
 }

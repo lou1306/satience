@@ -41,7 +41,7 @@ func run() int {
 	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Restart when props/dec exceeds this (deep search escape, 0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.1, "Phase flip rate when props/dec is high (0=disabled)")
 	// VSIDS parameters
-	decayInterval := flag.Int("decay-interval", 10, "VSIDS decay interval - conflicts between activity decays (default=10)")
+	decayInterval := flag.Int("decay-interval", 5, "VSIDS decay interval - conflicts between activity decays (default=5)")
 	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
 	maxDecay := flag.Float64("max-decay", 0.999, "VSIDS maximum decay factor (default=0.999)")
 	decayRampup := flag.Int("decay-rampup", 5000, "Conflicts to reach max decay (default=5000)")
