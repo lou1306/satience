@@ -149,6 +149,8 @@ type CDCLSolver struct {
 	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 0=unlimited)
 	unitPropBudget     int      // Max literal visits for unit propagation preprocess (0=unlimited)
+	veBudget           int      // Max resolvents for variable elimination (0=unlimited)
+	eliminatedVars     []eliminatedVar // Variables eliminated by BVE (for model reconstruction)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
@@ -315,6 +317,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Unit propagation budget: 0 = unlimited (small instances use fixpoint cap).
 		// Large instances set this to bound preprocessing time.
 		unitPropBudget: 0,
+		// Variable elimination budget: 0 = unlimited (small instances).
+		// Large instances set this to bound resolvent generation.
+		veBudget: 0,
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:     50,
 		vivifyEnabled:    true,
@@ -1051,13 +1056,26 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return equivResult
 	}
 
+	// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
+	// pos=1 definitional variant). Eliminates variables by resolving all
+	// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
+	// when it reduces clause count. Model reconstruction by trying x=true/x=false.
+	if config.EnableUnitProp { // VE only for structured instances (not random)
+		veResult := s.boundedVarElimination()
+		if veResult < 0 {
+			s.printStats()
+			return UNSAT
+		}
+	}
+
 	// For large instances, bound unit propagation with a literal-visit budget
 	// instead of skipping it entirely. Even partial unit propagation can find
 	// forced assignments that significantly reduce the search space.
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
 		s.unitPropBudget = 5000000 // ~5M literal visits, bounded at ~50ms
-		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d\n",
-			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget)
+		s.veBudget = 2000000       // ~2M resolvents, bounded at ~200ms
+		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d, ve budget=%d\n",
+			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
 	}
 	initialClauses := s.cnf.NumClauses
 	maxPasses := config.MaxPasses
@@ -2282,6 +2300,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	result := s.cdclLoop()
 	if result == SAT {
 		s.extendModel()
+		s.reconstructEliminatedVars()
 	}
 	return result
 }
