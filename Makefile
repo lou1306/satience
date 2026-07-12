@@ -1,15 +1,21 @@
-.PHONY: all debug test clean
+.PHONY: all satience fuzz debug test test-verbose test-race vet lint bench clean install profile help
 
-# Default target: build release binary
-all: satience
+# Default target: build release binaries
+all: satience fuzz
+
+# --- Build targets ---
 
 # Release build with full optimizations and stripped debug code
 # -s -w: Strip symbol table and DWARF debug info
 # -trimpath: Remove file system paths for reproducible builds
 # -tags release: Enable release mode (excludes verbose debug output)
 # GOAMD64=v3: Enable AVX2/BMI2 optimizations for modern x86_64
-satience: cmd/satience/main.go
+satience:
 	GOAMD64=v3 go build -tags release -ldflags="-s -w -buildid=" -trimpath -o satience ./cmd/satience
+
+# Fuzzer binary (release build)
+fuzz:
+	GOAMD64=v3 go build -tags release -ldflags="-s -w -buildid=" -trimpath -o fuzz ./cmd/fuzz
 
 # Debug build with debug symbols and disabled optimizations
 # -gcflags="all=-N -l": Disable optimizations and inlining for debugging
@@ -17,7 +23,9 @@ satience: cmd/satience/main.go
 debug:
 	go build -tags debug -gcflags="all=-N -l" -o satience_debug ./cmd/satience
 
-# Run tests
+# --- Test / lint targets ---
+
+# Run all tests
 test:
 	go test ./...
 
@@ -29,14 +37,24 @@ test-verbose:
 test-race:
 	go test -race ./...
 
-# Benchmark
+# Run go vet (static analysis)
+vet:
+	go vet ./...
+
+# Alias for vet
+lint: vet
+
+# Run benchmarks
 bench:
 	go test -bench=. -benchmem ./...
+
+# --- Misc targets ---
 
 # Clean build artifacts
 clean:
 	rm -f satience satience_debug satience_bench satience_prof
-	rm -rf /tmp/*.prof
+	rm -f satience_baseline satience_new satience_old satience_stash
+	rm -f fuzz solver.test
 
 # Install to GOPATH/bin
 install:
@@ -51,14 +69,21 @@ profile: satience
 help:
 	@echo "Satience SAT Solver - Makefile Targets"
 	@echo ""
-	@echo "  make          - Build optimized release binary (default)"
-	@echo "                  Strips debug symbols, uses GOAMD64=v3 optimizations"
-	@echo "  make debug    - Build debug binary with symbols and no optimizations"
-	@echo "                  Enables verbose output and debug assertions"
-	@echo "  make test     - Run all tests"
+	@echo "Build:"
+	@echo "  make              - Build release binaries (satience + fuzz)"
+	@echo "  make satience     - Build optimized release solver"
+	@echo "  make fuzz         - Build fuzzer binary"
+	@echo "  make debug        - Build debug binary (symbols, no opts)"
+	@echo ""
+	@echo "Test / Lint:"
+	@echo "  make test         - Run all tests"
 	@echo "  make test-verbose - Run tests with verbose output"
-	@echo "  make test-race   - Run tests with race detector"
-	@echo "  make bench    - Run benchmarks"
-	@echo "  make clean    - Remove build artifacts"
-	@echo "  make install  - Install to GOPATH/bin"
+	@echo "  make test-race    - Run tests with race detector"
+	@echo "  make vet          - Run go vet (static analysis)"
+	@echo "  make lint         - Alias for vet"
+	@echo "  make bench        - Run benchmarks"
+	@echo ""
+	@echo "Misc:"
+	@echo "  make clean        - Remove build artifacts"
+	@echo "  make install      - Install satience to GOPATH/bin"
 	@echo "  make profile INSTANCE=file.cnf - Profile CPU usage"

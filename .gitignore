@@ -3,7 +3,18 @@ opencode.json
 
 # Binaries
 satience
+satience_debug
+satience_bench
+satience_prof
+satience_baseline
+satience_new
+satience_old
+satience_stash
+satience_v3
+satience_opt
+satience_preproc
 fuzz
+solver.test
 *.exe
 *.exe~
 *.dll
@@ -31,8 +42,3 @@ benchmark/*.txt
 # Logs
 *.log
 *.db
-satience_v3
-
-# Additional build artifacts
-satience_opt
-satience_preproc
