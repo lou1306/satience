@@ -309,7 +309,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedClauseBase:     int(formula.NumClauses),
 		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
-		minimizeMaxDepth: 100,
+		// 0 = unlimited (rely on DAG property for termination). MiniSat uses no cap.
+		minimizeMaxDepth: 0,
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:     50,
 		vivifyEnabled:    true,
@@ -3892,7 +3893,7 @@ func (s *CDCLSolver) recursiveTryRemove(v uint32) bool {
 // via the DAG property of the implication graph (reason clauses only reference
 // earlier trail literals, preventing cycles).
 func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
-	if depth > s.minimizeMaxDepth {
+	if s.minimizeMaxDepth > 0 && depth > s.minimizeMaxDepth {
 		return false
 	}
 	reasonLits := s.getReasonLitsForVar(v)
