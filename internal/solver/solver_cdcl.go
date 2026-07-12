@@ -58,6 +58,17 @@ const (
 
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
+
+	// Watch.ClauseIdx bit encoding:
+	//   Bit 31: 0 = original clause, 1 = learned clause (sign bit, so ClauseIdx < 0 = learned)
+	//   Bit 30: myPos — which watch position (0 or 1) this watch occupies in the clause
+	//   Bits 0-29: clause index (supports up to 1B clauses)
+	// Packing myPos into ClauseIdx eliminates the clauseLits[0] != falseLit cache miss
+	// that was the #1 hotspot in propagation (13-14% of CPU).
+	watchLearnedBit  uint32 = 0x80000000
+	watchMyPosBit    uint32 = 0x40000000
+	watchIdxMask     uint32 = 0x3FFFFFFF
+	watchMyPosMask   uint32 = 0xBFFFFFFF // bits 0-29 + bit 31 (clears myPos for identity comparison)
 )
 
 // calculateMaxLearned scales the clause database limit with instance size.
@@ -1337,6 +1348,8 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
+	// Pack myPos into ClauseIdx bit 30: watch on idx0 (lit0 at position 0) has myPos=0,
+	// watch on idx1 (lit1 at position 1) has myPos=1.
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
 		Blit:      uint32(lit1),
@@ -1344,7 +1357,7 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-		ClauseIdx: int32(clauseIdx),
+		ClauseIdx: int32(clauseIdx) | int32(watchMyPosBit),
 		Blit:      uint32(lit0),
 
 	})
@@ -1376,16 +1389,18 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	clauseIdx := int32(-learnedIdx - 1)
+	// Pack learned flag (bit 31) + myPos (bit 30) into ClauseIdx.
+	clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx))           // myPos=0
+	clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)                     // myPos=1
 
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
-		ClauseIdx: clauseIdx,
+		ClauseIdx: clauseIdx0,
 		Blit:      uint32(lit1),
 
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-		ClauseIdx: clauseIdx,
+		ClauseIdx: clauseIdx1,
 		Blit:      uint32(lit0),
 
 	})
@@ -1670,7 +1685,9 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 		return
 	}
 
-	clauseIdx := int32(-learnedIdx - 1)
+	// Clause identity for comparison: mask out myPos bit (bit 30) since the
+	// stored watches may have either myPos value.
+	clauseID := uint32(watchLearnedBit | uint32(learnedIdx))
 
 	idx0 := s.learnedWatchIdx0[learnedIdx]
 	idx1 := s.learnedWatchIdx1[learnedIdx]
@@ -1682,7 +1699,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	// Remove watch from lit0's watch list (swap-remove, no Blit update needed)
 	wl0 := s.watchLists[idx0]
 	for i := range wl0 {
-		if wl0[i].ClauseIdx == clauseIdx {
+		if uint32(wl0[i].ClauseIdx)&watchMyPosMask == clauseID {
 			lastIdx := len(wl0) - 1
 			if i != lastIdx {
 				wl0[i] = wl0[lastIdx]
@@ -1696,7 +1713,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	// Remove watch from lit1's watch list
 	wl1 := s.watchLists[idx1]
 	for i := range wl1 {
-		if wl1[i].ClauseIdx == clauseIdx {
+		if uint32(wl1[i].ClauseIdx)&watchMyPosMask == clauseID {
 			lastIdx := len(wl1) - 1
 			if i != lastIdx {
 				wl1[i] = wl1[lastIdx]
@@ -2549,14 +2566,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			watchIdx |= 1 // negated literal watches false when var is true
 		}
 
-		// The literal that became false (the one being watched). Used to derive
-		// myPos in the slow path: clauseLits[myPos] == falseLit, so myPos=0
-		// iff clauseLits[0] == falseLit.
-		falseLit := cnf.Literal(lit)
-		if value {
-			falseLit = cnf.Literal(lit | 0x80000000)
-		}
-
 		// Process watches for this literal using swap-with-last deletion
 		watchList := s.watchLists[watchIdx]
 		watchLitVar := watchIdx >> 1 // Constant for all watches on this list
@@ -2585,15 +2594,22 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
 
+			// Decode myPos from ClauseIdx bit 30 (packed at watch creation).
+			// This eliminates the clauseLits[0] != falseLit cache miss that was
+			// the #1 propagation hotspot (13-14% of CPU).
+			myPos := int((uint32(watch.ClauseIdx) >> 30) & 1)
+			blitPos := 1 - myPos
+
 			var clauseLits []cnf.Literal
 			if watch.ClauseIdx >= 0 {
-				if int(watch.ClauseIdx) >= numOriginalClauses {
+				origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+				if origIdx >= numOriginalClauses {
 					continue
 				}
-				clauseLits = originalClauses[watch.ClauseIdx].Literals
+				clauseLits = originalClauses[origIdx].Literals
 			} else {
-				learnedIdx := -watch.ClauseIdx - 1
-				if int(learnedIdx) >= len(s.learnedLoc) || s.learnedLoc[learnedIdx].Size == 0 {
+				learnedIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+				if learnedIdx >= len(s.learnedLoc) || s.learnedLoc[learnedIdx].Size == 0 {
 					continue
 				}
 				loc := s.learnedLoc[learnedIdx]
@@ -2601,17 +2617,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				size := int(loc.Size)
 				clauseLits = s.learnedLiterals[offset : offset+size]
 			}
-
-			// MiniSat-style: watched literals are at positions 0 and 1.
-			// Derive myPos from clause data: the watched literal at myPos is
-			// the one that became false (falseLit), so myPos=0 iff
-			// clauseLits[0]==falseLit. This avoids storing WatchPos (saves 4
-			// bytes per watch via padding elimination: 12→8 bytes).
-			myPos := 0
-			if clauseLits[0] != falseLit {
-				myPos = 1
-			}
-			blitPos := 1 - myPos
 
 			// Re-read the actual blocking literal from clause data (Blit may be stale).
 			// The fast-path Blit check already filtered out the true case; here we
@@ -2661,7 +2666,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// list after a watch move, leaving orphaned watches for tombstoned
 			// clauses).
 			if watch.ClauseIdx < 0 {
-				li := int(-watch.ClauseIdx - 1)
+				li := int(uint32(watch.ClauseIdx) & watchIdxMask)
 				if li < len(s.learnedWatchIdx0) {
 					if myPos == 0 {
 						s.learnedWatchIdx0[li] = newWatchIdx
@@ -2696,10 +2701,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if propLevel == 0 {
 					propLevel = 1
 				}
-				reasonIdx := int(watch.ClauseIdx)
-				if reasonIdx < 0 {
-					li := -reasonIdx - 1
-					reasonIdx = -li - 5
+				reasonIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+				if watch.ClauseIdx < 0 {
+					reasonIdx = -reasonIdx - 5
 				}
 				s.assignLiteralByClause(blitLit, propLevel, reasonIdx)
 				s.propagations++
@@ -2713,10 +2717,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				// Build conflict clause
 				var conflictClause *cnf.Clause
 				if watch.ClauseIdx >= 0 {
-					conflictClause = &s.cnf.Clauses[watch.ClauseIdx]
+					origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					conflictClause = &s.cnf.Clauses[origIdx]
 				} else {
-					li := -watch.ClauseIdx - 1
-					literals := s.getLearnedClauseLiterals(int(li))
+					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					literals := s.getLearnedClauseLiterals(li)
 					s.conflictLitsBuf = s.conflictLitsBuf[:0]
 					s.conflictLitsBuf = append(s.conflictLitsBuf, literals...)
 					s.conflictClauseBuf.Literals = s.conflictLitsBuf
@@ -3734,9 +3739,10 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				lit1 := literals[1]
 				idx0 = cnf.LitToIndex(lit0)
 				idx1 = cnf.LitToIndex(lit1)
-				clauseIdx := int32(-learnedIdx - 1)
-				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx, Blit: uint32(lit1)})
-				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx, Blit: uint32(lit0)})
+				clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx))
+				clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)
+				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx0, Blit: uint32(lit1)})
+				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx1, Blit: uint32(lit0)})
 			} else {
 				// Watches not yet initialized (preprocessing); store positions 0,1
 				// as placeholder — initWatches will choose correct positions later
@@ -4235,15 +4241,16 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		} else {
 			literals[1], literals[watch1] = lit1, literals[1]
 		}
-		clauseIdx := int32(-i - 1)
+		clauseIdx0 := int32(watchLearnedBit | uint32(i))
+		clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)
 
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
-			ClauseIdx: clauseIdx,
+			ClauseIdx: clauseIdx0,
 			Blit:      uint32(lit1),
 	
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
-			ClauseIdx: clauseIdx,
+			ClauseIdx: clauseIdx1,
 			Blit:      uint32(lit0),
 	
 		})
@@ -4308,7 +4315,7 @@ func (s *CDCLSolver) compactWatchLists() {
 			// Check if learned clause is deleted (tombstone)
 			shouldRemove := false
 			if watch.ClauseIdx < 0 {
-				learnedIdx := -watch.ClauseIdx - 1
+				learnedIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
 				if int(learnedIdx) < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 0 {
 					shouldRemove = true
 				}
