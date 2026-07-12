@@ -119,13 +119,15 @@ func (h *vsidsHeap) init(heapPos []int) {
 // - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
 	activity              []float64 // Activity score for each variable
+	varInc                float64   // O(1) decay: bump counter (grows as varInc /= decayFactor)
 	decayFactor           float64   // Current decay factor (initialDecay -> maxDecayFactor)
 	inverseDecay          float64   // 1/decay for efficiency
-	conflictCount         int       // Total conflicts for LRB decay timing
+	conflictCount         int       // Total conflicts for decay timing
 	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
 	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
+	lbdInc                float64   // O(1) decay: LBD bump counter (grows as lbdInc /= lbdBonusDecay)
 	maxDecayFactor        float64   // Maximum decay factor
-	decayIncrement        float64   // Increment per conflict
+	decayIncrement        float64   // Increment per decay fire
 	heap                  vsidsHeap // Activity heap for O(log n) selection
 	heapPos               []int     // Position of each variable in heap (-1 = not in heap)
 	heapValid             bool      // True if heap is up-to-date
@@ -135,43 +137,51 @@ type VSIDS struct {
 	useCHB            bool      // Use CHB instead of VSIDS for variable selection
 	conflictFrequency []float64 // Recent conflict frequency per variable (CHB)
 	chbDecayFactor    float64   // CHB decay factor (default 0.75 - aggressive decay)
-	chbDecayInterval  int       // CHB decay interval (default 50 conflicts)
+	chbDecayInterval  int       // CHB decay interval (default 25 conflicts)
 	chbWeight         float64   // Weight for CHB in hybrid scoring (default 1.0)
 	// Configurable parameters (exposed for tuning)
-	initialDecayFactor   float64 // Initial decay factor (default 0.95)
-	decayRampUpConflicts int     // Conflicts to reach max decay (default 10000)
+	initialDecayFactor   float64 // Initial decay factor (default 0.979)
+	decayRampUpConflicts int     // Conflicts to reach max decay (default 25000)
 	lbdBonusScale        float64 // Scale factor for LBD bonus (default 10.0)
-	lbdBonusDecay        float64 // Decay factor for LBD bonus (default 0.999)
-	baseBumpAmount       float64 // Base bump amount for clauses (default 50.0)
+	lbdBonusDecay        float64 // Decay factor for LBD bonus (default 0.9998)
+	baseBumpAmount       float64 // Base bump amount for clauses (default 25.0)
 	clauseInitBaseWeight float64 // Base weight for clause initialization (default 10.0)
 	binaryClauseWeight   float64 // Weight for binary clauses (default 100.0)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
 func NewVSIDS(numVars uint32) *VSIDS {
-	// Standard decay settings (MiniSat-style)
-	initialDecay := 0.95
-	maxDecay := 0.999
+	// O(1) decay: varInc grows as varInc /= decayFactor each conflict.
+	// Activities are bumped by varInc (not baseBumpAmount), so recent bumps
+	// are naturally larger than old ones — no O(n) scan needed.
+	// decayInterval=1 (decay every conflict) is free since decay is O(1).
+	// Parameters compensated for 5x more frequent decay vs old interval=5:
+	//   initialDecay: 0.90^(1/5) ≈ 0.9792, maxDecay: 0.999^(1/5) ≈ 0.9998
+	//   lbdBonusDecay: 0.999^(1/5) ≈ 0.9998, rampUp: 5000 × 5 = 25000
+	initialDecay := 0.9792
+	maxDecay := 0.9998
 	v := &VSIDS{
 		activity:              make([]float64, numVars),
+		varInc:                25.0, // Initial bump amount (matches baseBumpAmount)
 		decayFactor:           initialDecay,
 		inverseDecay:          1.0 / initialDecay,
 		conflictCount:         0,
 		useLBD:                true,
 		lbdBonus:              make([]float64, numVars),
+		lbdInc:                1.0,
 		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 10000.0,
+		decayIncrement:        (maxDecay - initialDecay) / 25000.0,
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapPos:               make([]int, numVars),
 		heapValid:             false,
-		decayInterval:         DefaultDecayInterval,
+		decayInterval:         1, // O(1) decay — fire every conflict
 		randomSeed:            0,
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
-		decayRampUpConflicts: 10000,
+		decayRampUpConflicts: 25000,
 		lbdBonusScale:        10.0,
-		lbdBonusDecay:        0.999,
-		baseBumpAmount:       50.0,
+		lbdBonusDecay:        0.9998,
+		baseBumpAmount:       25.0,
 		clauseInitBaseWeight: 10.0,
 		binaryClauseWeight:   100.0,
 		// CHB initialization
@@ -302,16 +312,17 @@ func (v *VSIDS) SetBaseBumpAmount(amount float64) {
 		amount = 1.0
 	}
 	v.baseBumpAmount = amount
+	v.varInc = amount // varInc starts at baseBumpAmount, grows via O(1) decay
 }
 // Much more aggressive decay to prevent any single variable from dominating
-// Decay every conflict (not every 10) with very low base (0.30→0.60)
+// With O(1) decay, decayInterval=1 is already the default.
 func (v *VSIDS) SetAggressiveDecay() {
 	v.initialDecayFactor = 0.30
 	v.maxDecayFactor = 0.60
 	v.decayFactor = 0.30
 	v.inverseDecay = 1.0 / v.decayFactor
 	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / 5000.0
-	v.decayInterval = 1 // Decay every conflict, not every 10
+	v.decayInterval = 1
 }
 // SetClauseInitWeights sets the initialization weights for clauses
 // baseWeight: base weight for all clauses (default 10.0)
@@ -339,15 +350,14 @@ func (v *VSIDS) onUnassign(varIdx uint32) {
 
 // bumpLBD adds LBD bonus to variables in a learned clause
 // Lower LBD = higher bonus (glue clauses are most important)
+// Uses lbdInc (grows over time via O(1) decay) as a multiplier
 func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 	if !v.useLBD {
 		return
 	}
 
-	// Bonus formula: bonus = lbdBonusScale / (lbd^2)
-	// LBD=2: bonus = lbdBonusScale/4
-	// LBD=3: bonus = lbdBonusScale/9
-	bonus := v.lbdBonusScale / float64(lbd*lbd)
+	// Bonus formula: bonus = lbdInc * lbdBonusScale / (lbd^2)
+	bonus := v.lbdInc * v.lbdBonusScale / float64(lbd*lbd)
 
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
@@ -357,19 +367,22 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 	}
 }
 
-// decayLBD decays LBD bonus scores.
-// Gated by decayInterval (same as activity decay) to avoid O(n) every conflict.
-// Called after decay() which increments conflictCount, so the gate check is valid.
+// decayLBD implements O(1) LBD bonus decay (varInc trick).
+// Grows lbdInc so new LBD bumps are relatively larger. The heap key
+// (activity + lbdBonus) doesn't change on decay, so the heap stays valid.
 func (v *VSIDS) decayLBD() {
 	if !v.useLBD {
 		return
 	}
-	if v.conflictCount%v.decayInterval != 0 {
-		return
-	}
+	v.lbdInc /= v.lbdBonusDecay
 
-	for i := range v.lbdBonus {
-		v.lbdBonus[i] *= v.lbdBonusDecay
+	if v.lbdInc > 1e100 {
+		scale := 1.0 / v.lbdInc
+		for i := range v.lbdBonus {
+			v.lbdBonus[i] *= scale
+		}
+		v.lbdInc = 1.0
+		v.heapValid = false
 	}
 }
 
@@ -389,10 +402,10 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 
 // bumpClause increases activity for all variables in a clause
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
+// Uses varInc (grows over time via O(1) decay) instead of fixed baseBumpAmount
 func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
-	baseBump := v.baseBumpAmount
-	bumpAmount := baseBump / float64(len(literals))
-	minBump := v.baseBumpAmount * 0.04 // 2.0 when baseBump=50.0
+	bumpAmount := v.varInc / float64(len(literals))
+	minBump := v.varInc * 0.04
 	if bumpAmount < minBump {
 		bumpAmount = minBump
 	}
@@ -424,18 +437,15 @@ func (v *VSIDS) decayCHB(assignments []Assignment) {
 	}
 }
 
-// decay decays all activity scores periodically (MiniSat-style)
-// This creates strong differentiation between important and unimportant variables
-// Decay factor starts at 0.95 and increases toward max for focused search
-// Only decays every v.decayInterval conflicts to reduce overhead.
-// conflictCount is incremented in bumpClause (called before decay in handleConflict),
-// so decay must NOT increment it again.
+// decay implements O(1) activity decay (MiniSat varInc trick).
+// Instead of scaling all activity[i] by decayFactor (O(n) scan + O(n) heap
+// rebuild), we grow varInc: varInc /= decayFactor. Bumps add varInc, so
+// recent bumps are naturally larger than old ones. The heap key
+// (activity + lbdBonus) doesn't change on decay, so the heap stays valid.
+// Periodic rescaling prevents varInc from overflowing float64 precision.
+// conflictCount is incremented in bumpClause (called before decay in
+// handleConflict), so decay must NOT increment it again.
 func (v *VSIDS) decay(assignments []Assignment) {
-	// Lazy decay: only decay every decayInterval conflicts
-	if v.conflictCount%v.decayInterval != 0 {
-		return
-	}
-
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {
 		v.decayFactor += v.decayIncrement
@@ -445,19 +455,21 @@ func (v *VSIDS) decay(assignments []Assignment) {
 		v.inverseDecay = 1.0 / v.decayFactor
 	}
 
-	// OPTIMIZATION: Skip pre-assigned variables (level 0) - they're not selectable
-	for i := range v.activity {
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.activity[i] *= v.decayFactor
-	}
+	// O(1) decay: grow varInc so new bumps are relatively larger
+	v.varInc /= v.decayFactor
 
-	// Invalidate the heap. The heap key is activity + lbdBonus, and decay
-	// only scales activity (not lbdBonus), so the relative ordering can change.
-	// Rebuilding every decayInterval (5) conflicts is O(n/5) per conflict —
-	// far cheaper than the old O(n) per-conflict rebuild.
-	v.heapValid = false
+	// Rescale when varInc gets too large to prevent float precision loss.
+	// This fires rarely (~every 500K conflicts). Scales all activities and
+	// varInc by the same factor, preserving relative ordering — the heap
+	// key ratios are unchanged, so no rebuild needed.
+	if v.varInc > 1e100 {
+		scale := 1.0 / v.varInc
+		for i := range v.activity {
+			v.activity[i] *= scale
+		}
+		v.varInc = 1.0
+		v.heapValid = false
+	}
 }
 
 // selectVariableWithHeap returns the unassigned variable with highest activity.
