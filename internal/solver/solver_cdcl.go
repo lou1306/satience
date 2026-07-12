@@ -1892,11 +1892,17 @@ func (s *CDCLSolver) restart() bool {
 	// phase-saving + VSIDS-preservation fixed point where the solver re-enters
 	// the same cascade after every restart. When the search is productive
 	// (low props/dec), disable flipping to preserve good phase information.
+	// Hysteresis: enable at >120% of limit, disable at <80% of limit. The 40%
+	// dead zone prevents small trajectory shifts near the threshold from
+	// toggling the phase flip on/off, which amplifies into completely different
+	// search trajectories.
 	if s.adaptivePhaseFlipRate > 0 && s.decisions > 10 {
 		propsPerDec := float64(s.propagations) / float64(s.decisions)
-		if propsPerDec > float64(s.restartPropsDecLimit) {
+		enableThreshold := float64(s.restartPropsDecLimit) * 12 / 10
+		disableThreshold := float64(s.restartPropsDecLimit) * 8 / 10
+		if propsPerDec > enableThreshold {
 			s.restartPhaseFlipRate = s.adaptivePhaseFlipRate
-		} else if propsPerDec < 20 {
+		} else if propsPerDec < disableThreshold {
 			s.restartPhaseFlipRate = 0
 		}
 	}
@@ -2138,6 +2144,9 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 
 	// Occurrence-based activity bonus: variables in more remaining clauses are
 	// more constrained and should be selected earlier.
+	// COMBINED with clause-length weight (not overwriting it): the clause-weighted
+	// init produces fewer exact ties, reducing trajectory sensitivity to
+	// clause ordering changes.
 	occurrences := make([]int, s.cnf.NumVars)
 	for _, clause := range s.cnf.Clauses {
 		for _, lit := range clause.Literals {
@@ -2146,7 +2155,7 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 	}
 	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
-			s.vsids.activity[i] = 1.0 + float64(occurrences[i])*0.5
+			s.vsids.activity[i] += 1.0 + float64(occurrences[i])*0.5
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild

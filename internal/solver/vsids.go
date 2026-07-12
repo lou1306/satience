@@ -21,20 +21,26 @@ type vsidsHeapItem struct {
 type vsidsHeap []vsidsHeapItem
 
 // up sifts the item at position i upward to restore the heap property.
+// Tie-breaking: when scores are equal, lower varIdx wins. This makes heap
+// ordering independent of insertion order, reducing trajectory sensitivity
+// to clause ordering changes.
 func (h *vsidsHeap) up(heapPos []int, i int) {
 	for i > 0 {
 		parent := (i - 1) / 2
-		if (*h)[i].score <= (*h)[parent].score {
+		c := (*h)[i]
+		p := (*h)[parent]
+		if c.score < p.score || (c.score == p.score && c.varIdx >= p.varIdx) {
 			break
 		}
-		(*h)[i], (*h)[parent] = (*h)[parent], (*h)[i]
-		heapPos[(*h)[i].varIdx] = i
-		heapPos[(*h)[parent].varIdx] = parent
+		(*h)[i], (*h)[parent] = p, c
+		heapPos[c.varIdx] = parent
+		heapPos[p.varIdx] = i
 		i = parent
 	}
 }
 
 // down sifts the item at position i downward to restore the heap property.
+// Tie-breaking: when scores are equal, lower varIdx is preferred.
 func (h *vsidsHeap) down(heapPos []int, i int) {
 	n := len(*h)
 	for {
@@ -44,15 +50,21 @@ func (h *vsidsHeap) down(heapPos []int, i int) {
 		}
 		right := left + 1
 		largest := left
-		if right < n && (*h)[right].score > (*h)[left].score {
-			largest = right
+		if right < n {
+			l := (*h)[left]
+			r := (*h)[right]
+			if r.score > l.score || (r.score == l.score && r.varIdx < l.varIdx) {
+				largest = right
+			}
 		}
-		if (*h)[i].score >= (*h)[largest].score {
+		cur := (*h)[i]
+		best := (*h)[largest]
+		if cur.score > best.score || (cur.score == best.score && cur.varIdx <= best.varIdx) {
 			break
 		}
-		(*h)[i], (*h)[largest] = (*h)[largest], (*h)[i]
-		heapPos[(*h)[i].varIdx] = i
-		heapPos[(*h)[largest].varIdx] = largest
+		(*h)[i], (*h)[largest] = best, cur
+		heapPos[cur.varIdx] = largest
+		heapPos[best.varIdx] = i
 		i = largest
 	}
 }
