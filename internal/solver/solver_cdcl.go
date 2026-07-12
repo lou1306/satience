@@ -147,7 +147,8 @@ type CDCLSolver struct {
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
 	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 100)
+	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 0=unlimited)
+	unitPropBudget     int      // Max literal visits for unit propagation preprocess (0=unlimited)
 	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
@@ -311,6 +312,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
 		// 0 = unlimited (rely on DAG property for termination). MiniSat uses no cap.
 		minimizeMaxDepth: 0,
+		// Unit propagation budget: 0 = unlimited (small instances use fixpoint cap).
+		// Large instances set this to bound preprocessing time.
+		unitPropBudget: 0,
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:     50,
 		vivifyEnabled:    true,
@@ -1047,18 +1051,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return equivResult
 	}
 
-	// Skip on VERY large instances - preprocessing too slow
+	// For large instances, bound unit propagation with a literal-visit budget
+	// instead of skipping it entirely. Even partial unit propagation can find
+	// forced assignments that significantly reduce the search space.
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
-			s.Log("c [verbose] Skipping preprocessing: instance too large (%d vars, %d clauses)\n",
-			s.cnf.NumVars, s.cnf.NumClauses)
-		s.cnf.RebuildLiteralPool()
-		s.initWatches()
-		// Still need to propagate original unit clauses + activate watches
-		if s.propagateOriginalUnitsAndActivateWatches() {
-			s.printStats()
-			return UNSAT
-		}
-		return UNKNOWN
+		s.unitPropBudget = 5000000 // ~5M literal visits, bounded at ~50ms
+		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d\n",
+			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget)
 	}
 	initialClauses := s.cnf.NumClauses
 	maxPasses := config.MaxPasses
@@ -1981,9 +1980,17 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 
 	changed := true
 	pass := 0
+	totalVisits := 0
 	for changed {
 		if pass >= maxPasses {
 			s.Log("c [unit prop] Pass cap reached (%d) before fixpoint — unexpected\n", maxPasses)
+			break
+		}
+
+		// Budget check: stop if we've visited too many literals (large instance guard).
+		// Stopping early is sound — fewer assignments, not wrong ones.
+		if s.unitPropBudget > 0 && totalVisits >= s.unitPropBudget {
+			s.Log("c [unit prop] Budget reached (%d visits) after %d passes\n", totalVisits, pass)
 			break
 		}
 
@@ -2000,6 +2007,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 			var unassignedLit cnf.Literal
 
 			for _, lit := range clause.Literals {
+				totalVisits++
 				varIdx := lit.Var()
 				if s.assignments[varIdx].Level >= 0 {
 					assign := s.assignments[varIdx]
