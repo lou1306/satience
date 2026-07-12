@@ -45,36 +45,43 @@ func (s *CDCLSolver) boundedVarElimination() int {
 	// Grows as new resolvents are added; new entries default to false.
 	removed := make([]bool, s.cnf.NumClauses)
 
+	// Build occurrence lists ONCE — maintained incrementally across eliminations.
+	// Occurrence lists contain stale entries (removed clauses); these are filtered
+	// by checking removed[ci] during resolvent generation. posCount/negCount track
+	// active (non-removed) counts for O(1) cheapest-variable scanning.
+	posOcc := make([][]int, numVars)
+	negOcc := make([][]int, numVars)
+	posCount := make([]int, numVars)
+	negCount := make([]int, numVars)
+	for i, clause := range s.cnf.Clauses {
+		for _, lit := range clause.Literals {
+			v := lit.Var()
+			if lit.IsNegated() {
+				negOcc[v] = append(negOcc[v], i)
+				negCount[v]++
+			} else {
+				posOcc[v] = append(posOcc[v], i)
+				posCount[v]++
+			}
+		}
+	}
+
+	// Track eliminated variables to skip in the cheapest scan.
+	eliminatedFlag := make([]bool, numVars)
+
 	totalResolvents := 0
 	eliminated := 0
 
 	for {
-		// Rebuild occurrence lists each iteration (correct but O(n) per variable).
-		// This ensures resolvents from prior eliminations are included.
-		posOcc := make([][]int, numVars)
-		negOcc := make([][]int, numVars)
-		for i, clause := range s.cnf.Clauses {
-			if removed[i] {
-				continue
-			}
-			for _, lit := range clause.Literals {
-				v := lit.Var()
-				if lit.IsNegated() {
-					negOcc[v] = append(negOcc[v], i)
-				} else {
-					posOcc[v] = append(posOcc[v], i)
-				}
-			}
-		}
-
-		// Find the cheapest eliminatable variable.
+		// Find the cheapest eliminatable variable using cached counts (O(numVars)).
 		bestVar := uint32(0)
 		bestCost := -1
-		bestValidPos := 0
-		bestValidNeg := 0
 		for v := uint32(0); v < uint32(numVars); v++ {
-			pc := len(posOcc[v])
-			nc := len(negOcc[v])
+			if eliminatedFlag[v] {
+				continue
+			}
+			pc := posCount[v]
+			nc := negCount[v]
 			if pc == 0 || nc == 0 {
 				continue
 			}
@@ -85,8 +92,6 @@ func (s *CDCLSolver) boundedVarElimination() int {
 			if bestCost < 0 || cost < bestCost {
 				bestCost = cost
 				bestVar = v
-				bestValidPos = pc
-				bestValidNeg = nc
 			}
 		}
 
@@ -95,12 +100,23 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		}
 
 		v := bestVar
-		posClauses := posOcc[v]
-		negClauses := negOcc[v]
 
 		// Budget check
 		if s.veBudget > 0 && totalResolvents >= s.veBudget {
 			break
+		}
+
+		// Collect active clauses for v (skip removed entries).
+		var posClauses, negClauses []int
+		for _, ci := range posOcc[v] {
+			if !removed[ci] {
+				posClauses = append(posClauses, ci)
+			}
+		}
+		for _, ci := range negOcc[v] {
+			if !removed[ci] {
+				negClauses = append(negClauses, ci)
+			}
 		}
 
 		// Generate resolvents
@@ -169,7 +185,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		}
 
 		// Clause-count gate: only eliminate if resolvents < old clauses
-		oldClauseCount := bestValidPos + bestValidNeg
+		oldClauseCount := len(posClauses) + len(negClauses)
 		if len(resolvents) >= oldClauseCount {
 			break
 		}
@@ -191,23 +207,58 @@ func (s *CDCLSolver) boundedVarElimination() int {
 			clauses: savedClauses,
 		})
 
-		// Mark old clauses as removed (batch — compacted once at the end)
+		// Mark old clauses as removed and decrement counts for their variables.
 		for _, ci := range posClauses {
 			removed[ci] = true
+			for _, lit := range s.cnf.Clauses[ci].Literals {
+				lv := lit.Var()
+				if lv == v {
+					continue
+				}
+				if lit.IsNegated() {
+					negCount[lv]--
+				} else {
+					posCount[lv]--
+				}
+			}
 		}
 		for _, ci := range negClauses {
 			removed[ci] = true
+			for _, lit := range s.cnf.Clauses[ci].Literals {
+				lv := lit.Var()
+				if lv == v {
+					continue
+				}
+				if lit.IsNegated() {
+					negCount[lv]--
+				} else {
+					posCount[lv]--
+				}
+			}
 		}
 
-		// Add resolvents to the clause database
+		// Add resolvents to the clause database + occurrence lists
 		for _, res := range resolvents {
 			resCopy := make([]cnf.Literal, len(res))
 			copy(resCopy, res)
+			newCi := len(s.cnf.Clauses)
 			s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: resCopy})
 			s.cnf.NumClauses++
-			removed = append(removed, false) // new clauses are NOT removed
+			removed = append(removed, false)
+			// Update occurrence lists + counts for the resolvent's variables
+			for _, lit := range resCopy {
+				lv := lit.Var()
+				if lit.IsNegated() {
+					negOcc[lv] = append(negOcc[lv], newCi)
+					negCount[lv]++
+				} else {
+					posOcc[lv] = append(posOcc[lv], newCi)
+					posCount[lv]++
+				}
+			}
 		}
 
+		eliminatedFlag[v] = true
 		eliminated++
 	}
 
