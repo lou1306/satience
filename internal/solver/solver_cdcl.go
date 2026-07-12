@@ -140,6 +140,9 @@ type CDCLSolver struct {
 	lbdSum               int
 	lbdCount             int
 	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
+	restartPropsDecLimit  int     // Props/dec threshold for restart (0=disabled, default 100)
+	adaptivePhaseFlipRate float64 // Phase flip rate when props/dec is high (0=disabled, default 0.1)
+	propsDecRestartGap    int     // Min conflicts between props/dec-bounded restarts (default 100)
 	randomSeed           uint64          // Seed for deterministic random selection
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
@@ -324,6 +327,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
+		restartPropsDecLimit:       100, // Restart when props/dec > 100 (deep search pathology)
+		adaptivePhaseFlipRate:      0.1, // Flip 10% of phases when props/dec is high
+		propsDecRestartGap:         100, // Min 100 conflicts between props/dec restarts
 	}
 
 	// FIX: Initialize all assignments as unassigned (Level=-1)
@@ -445,6 +451,20 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 	s.restartGlucoseMinConflicts = minConflicts
 }
 
+func (s *CDCLSolver) SetRestartPropsDecLimit(limit int) {
+	s.restartPropsDecLimit = limit
+}
+
+func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
+	if rate < 0 {
+		rate = 0
+	}
+	if rate > 1 {
+		rate = 1
+	}
+	s.adaptivePhaseFlipRate = rate
+}
+
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
 // minimization (safety/cost cap). The natural DAG bound of the implication
 // graph already terminates recursion; this is a defensive limit.
@@ -553,8 +573,9 @@ func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
 func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
 	reasonClauseIdx := s.implication[v]
 	if reasonClauseIdx >= 0 {
-		if int(reasonClauseIdx) < len(s.cnf.Clauses) {
-			return s.cnf.Clauses[reasonClauseIdx].Literals
+		clauses := s.cnf.Clauses
+		if int(reasonClauseIdx) < len(clauses) {
+			return clauses[reasonClauseIdx].Literals
 		}
 		return nil
 	}
@@ -1132,7 +1153,7 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 		lit := clause.Literals[0]
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level >= 0 {
-			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			litTrue := lit.IsNegated() != s.assignments[varIdx].Value
 			if !litTrue {
 				return true // Conflict with unit clause - UNSAT
 			}
@@ -1249,7 +1270,7 @@ func (s *CDCLSolver) chooseWatchPositions(literals []cnf.Literal) (int, int) {
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level >= 0 {
 			// Assigned - check if true
-			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			litTrue := lit.IsNegated() != s.assignments[varIdx].Value
 			if !litTrue {
 				// False - skip unless we have no other choice
 				if watch0 < 0 {
@@ -1396,7 +1417,7 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 
 		// If already assigned (permanent or trial), check if clause is satisfied.
 		if s.assignments[varIdx].Level >= 0 {
-			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			litTrue := lit.IsNegated() != s.assignments[varIdx].Value
 			if litTrue {
 				// Clause is satisfied — no vivification possible.
 				s.cancelUntil(0)
@@ -1752,6 +1773,25 @@ func (s *CDCLSolver) shouldRestart() bool {
 		return true
 	}
 
+	// Props/dec-bounded restart: if the solver is going too deep per decision
+	// (unproductive binary cascade), restart to escape the trajectory. This
+	// catches the "deep search" pathology where props/dec >> 100 (e.g.,
+	// binary-heavy instances where each decision cascades through hundreds of
+	// binary clauses for a single conflict). The Glucose EMA criterion doesn't
+	// fire here because binary cascades produce low-LBD glue clauses, making
+	// the search look productive by LBD metrics when it's actually going nowhere.
+	// Only fires after the first few restarts (lubyIndex >= 3) and requires a
+	// minimum conflict gap to prevent thrashing (the solver needs time to
+	// explore between restarts, and the phase flip needs time to take effect).
+	if s.restartPropsDecLimit > 0 && s.lubyIndex >= 3 && s.decisions > 10 &&
+		s.conflicts-s.restartCount >= s.propsDecRestartGap {
+		propsPerDec := float64(s.propagations) / float64(s.decisions)
+		if propsPerDec > float64(s.restartPropsDecLimit) {
+			s.Log("c [restart] Props/dec %.1f > %d\n", propsPerDec, s.restartPropsDecLimit)
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -1828,6 +1868,20 @@ func (s *CDCLSolver) restart() bool {
 	s.lbdCount = 0
 
 	s.emaLBD = 0
+
+	// Adaptive phase flip: when the search is unproductive (high props/dec,
+	// indicating deep binary cascades), enable phase flipping to break the
+	// phase-saving + VSIDS-preservation fixed point where the solver re-enters
+	// the same cascade after every restart. When the search is productive
+	// (low props/dec), disable flipping to preserve good phase information.
+	if s.adaptivePhaseFlipRate > 0 && s.decisions > 10 {
+		propsPerDec := float64(s.propagations) / float64(s.decisions)
+		if propsPerDec > float64(s.restartPropsDecLimit) {
+			s.restartPhaseFlipRate = s.adaptivePhaseFlipRate
+		} else if propsPerDec < 20 {
+			s.restartPhaseFlipRate = 0
+		}
+	}
 
 	// Phase randomization: flip each saved phase with probability
 	// restartPhaseFlipRate. This breaks fixed points where phase saving
@@ -1948,7 +2002,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				varIdx := lit.Var()
 				if s.assignments[varIdx].Level >= 0 {
 					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					isTrue := lit.IsNegated() != assign.Value
 					if isTrue {
 						satisfied = true
 						break
@@ -2099,8 +2153,8 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 				if s.decisions > 0 {
 					propsPerDec = float64(s.propagations) / float64(s.decisions)
 				}
-				s.Log("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n",
-					s.conflicts, s.level, s.learnedActiveCount, s.decisions, s.propagations, propsPerDec)
+			s.Log("c [verbose] Conflict %d, level %d, learned %d, decisions %d, propagations %d, props/dec %.1f\n",
+				s.conflicts, s.level, s.learnedActiveCount, s.decisions, s.propagations, propsPerDec)
 			}
 			if s.conflicts%1000 == 0 && s.verbose {
 				s.logDiagnostics()
@@ -2290,7 +2344,7 @@ func (s *CDCLSolver) verifyModel() bool {
 			if assign.Level < 0 {
 				continue // Unassigned - clause not satisfied by this literal
 			}
-			litTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+			litTrue := lit.IsNegated() != assign.Value
 			if litTrue {
 				clauseSat = true
 				break
@@ -2432,6 +2486,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// constructor), so the cached header stays valid for the whole call.
 	assignments := s.assignments
 
+	// Cache original-clause slice header + length. Original clauses are never
+	// deleted (only learned clauses are tombstoned), so the bounds check at the
+	// slow-path entry never fires — but the compiler reloads s.cnf.Clauses (a
+	// pointer chase through s → s.cnf → .Clauses) on every watch. Caching the
+	// header eliminates that per-watch pointer chase.
+	originalClauses := s.cnf.Clauses
+	numOriginalClauses := len(originalClauses)
+
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 
@@ -2477,7 +2539,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitNegated := blitLit.IsNegated()
 			blitAsg := assignments[blitVarIdx]
 			if blitAsg.Level >= 0 {
-				blitLitTrue := (!blitNegated && blitAsg.Value) || (blitNegated && !blitAsg.Value)
+				blitLitTrue := blitNegated != blitAsg.Value
 				if blitLitTrue {
 					continue
 				}
@@ -2485,12 +2547,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
+
 			var clauseLits []cnf.Literal
 			if watch.ClauseIdx >= 0 {
-				if int(watch.ClauseIdx) >= len(s.cnf.Clauses) {
+				if int(watch.ClauseIdx) >= numOriginalClauses {
 					continue
 				}
-				clauseLits = s.cnf.Clauses[watch.ClauseIdx].Literals
+				clauseLits = originalClauses[watch.ClauseIdx].Literals
 			} else {
 				learnedIdx := -watch.ClauseIdx - 1
 				if int(learnedIdx) >= len(s.learnedLoc) || s.learnedLoc[learnedIdx].Size == 0 {
@@ -2534,7 +2597,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseAsg := assignments[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
 				if clauseAsg.Level >= 0 {
-					litTrue := (!litNegated && clauseAsg.Value) || (litNegated && !clauseAsg.Value)
+					litTrue := litNegated != clauseAsg.Value
 					if !litTrue {
 						continue
 					}
@@ -2607,7 +2670,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// Re-check blit value
-			blitTrue := (!blitNegated && blitAsg.Value) || (blitNegated && !blitAsg.Value)
+			blitTrue := blitNegated != blitAsg.Value
 
 			if !blitTrue {
 				// Build conflict clause
@@ -2681,7 +2744,7 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 				} else {
 					assign := s.assignments[varIdx]
 					// Inlined literalIsTrue check (avoids function call)
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					isTrue := lit.IsNegated() != assign.Value
 					if isTrue {
 						satisfiedCount++
 					} else {
@@ -2741,7 +2804,7 @@ func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
 					unassignedLit = lit
 				} else {
 					assign := s.assignments[varIdx]
-					isTrue := (!lit.IsNegated() && assign.Value) || (lit.IsNegated() && !assign.Value)
+					isTrue := lit.IsNegated() != assign.Value
 					if isTrue {
 						satisfiedCount++
 					} else {
@@ -4265,7 +4328,7 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 			}
 			unassignedLit = lit
 		} else {
-			litTrue := (!lit.IsNegated() && s.assignments[varIdx].Value) || (lit.IsNegated() && !s.assignments[varIdx].Value)
+			litTrue := lit.IsNegated() != s.assignments[varIdx].Value
 			if litTrue {
 				return // clause satisfied — no propagation needed
 			}

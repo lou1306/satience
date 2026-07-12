@@ -1,7 +1,7 @@
 #!/bin/bash
 
 BINARY="../satience_bench"
-EXTRA_FLAGS=""
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 TIMEOUT_SEC=30
 MAX_PARALLEL=4
 INSTANCE_FILE="minisat_fast_suite/instances.txt"
@@ -64,6 +64,7 @@ wait
 SAT=0
 UNSAT=0
 TIMEOUT_COUNT=0
+PAR2_SUM=0
 
 for i in "${!INSTANCE_LIST[@]}"; do
     num=$((i + 1))
@@ -79,12 +80,16 @@ for i in "${!INSTANCE_LIST[@]}"; do
 
     if [ "$EXIT_CODE" -eq 10 ]; then
         VERDICT="SAT"; SAT=$((SAT + 1)); SYMBOL="✓"
+        PAR2_SUM=$(echo "$PAR2_SUM + $DURATION" | bc)
     elif [ "$EXIT_CODE" -eq 20 ]; then
         VERDICT="UNSAT"; UNSAT=$((UNSAT + 1)); SYMBOL="✗"
+        PAR2_SUM=$(echo "$PAR2_SUM + $DURATION" | bc)
     elif [ "$EXIT_CODE" -eq 124 ]; then
         VERDICT="TIMEOUT"; TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1)); SYMBOL="⊠"
+        PAR2_SUM=$(echo "$PAR2_SUM + 2 * $TIMEOUT_SEC" | bc)
     else
         VERDICT="ERROR (exit=$EXIT_CODE)"; SYMBOL="?"
+        PAR2_SUM=$(echo "$PAR2_SUM + 2 * $TIMEOUT_SEC" | bc)
     fi
 
     echo "[$num/$TOTAL] $SYMBOL $instance (${VARS}v, ${CLAUSES}c) - $VERDICT (${DURATION}s)" | tee -a "$RESULTS_FILE"
@@ -97,3 +102,4 @@ echo "SAT: $SAT" | tee -a "$RESULTS_FILE"
 echo "UNSAT: $UNSAT" | tee -a "$RESULTS_FILE"
 echo "TIMEOUT: $TIMEOUT_COUNT" | tee -a "$RESULTS_FILE"
 echo "Solve Rate: $(echo "scale=1; ($SAT + $UNSAT) * 100 / $TOTAL" | bc)%" | tee -a "$RESULTS_FILE"
+echo "PAR2: $(echo "scale=2; $PAR2_SUM / $TOTAL" | bc)s" | tee -a "$RESULTS_FILE"

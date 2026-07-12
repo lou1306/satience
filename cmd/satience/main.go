@@ -38,6 +38,8 @@ func run() int {
 	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
 	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10 for PHP)")
+	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Restart when props/dec exceeds this (deep search escape, 0=disabled)")
+	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.1, "Phase flip rate when props/dec is high (0=disabled)")
 	// VSIDS parameters
 	decayInterval := flag.Int("decay-interval", 10, "VSIDS decay interval - conflicts between activity decays (default=10)")
 	initialDecay := flag.Float64("initial-decay", 0.90, "VSIDS initial decay factor (default=0.90)")
@@ -105,6 +107,8 @@ func run() int {
 
 	// Configure restart policy
 	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin)
+	s.SetRestartPropsDecLimit(*restartPropsDecLimit)
+	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters
 	s.SetDecayInterval(*decayInterval)
