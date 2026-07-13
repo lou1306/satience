@@ -29,7 +29,7 @@ func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
-	minimizeDepth := flag.Int("minimize-depth", 100, "Max recursion depth for recursive clause minimization (default=100, 0=disabled)")
+	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")

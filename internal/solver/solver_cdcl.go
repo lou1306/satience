@@ -96,8 +96,14 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 	}
 	
 	// Absolute bounds
-	if baseLimit < 300 {
-		baseLimit = 300  // Minimum for tiny instances
+	// Floor scales with numVars: small instances need enough clauses to form
+	// implication chains. max(300, numVars*10) ensures 132v → 1320, 300v → 3000.
+	varFloor := int(numVars) * 10
+	if varFloor < 300 {
+		varFloor = 300
+	}
+	if baseLimit < varFloor {
+		baseLimit = varFloor
 	}
 	if baseLimit > 100000 {
 		baseLimit = 100000
@@ -788,10 +794,18 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	
 	binaryScore := structure.BinaryRatio
 	longScore := structure.LongClauseRatio
-	
+	// Ternary-heavy structured instances (e.g., graph coloring) score low on
+	// binary/long signals but are still structured — they need unit propagation
+	// and Glucose restarts, not the aggressive random-config decay/restart.
+	// Weight at 0.5: pure ternary is weaker evidence than binary or long-clause.
+	ternaryScore := structure.TernaryRatio * 0.5
+
 	sizeScore := binaryScore
 	if longScore > sizeScore {
 		sizeScore = longScore
+	}
+	if ternaryScore > sizeScore {
+		sizeScore = ternaryScore
 	}
 	
 	densityScore := 0.0
@@ -854,6 +868,16 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 
 	// Highly structured (score >= 0.7): unit propagation only
 		s.Log("c [preprocessing] Highly structured instance (score=%.2f) - enabling unit propagation only\n", structure.StructuredScore)
+
+	// Adaptive restart base for binary-heavy instances. Binary cascades produce
+	// low-LBD glue clauses that prevent the Glucose restart criterion from firing
+	// (EMA never exceeds avg×1.5). More frequent Luby restarts help escape
+	// these cascades. MiniSat restarts 5-10x more on binary-heavy instances.
+	if structure.BinaryRatio > 0.5 {
+		s.restartBase = 20
+		s.Log("c [preprocessing] Binary-heavy (%.0f%%) — restartBase=20\n", structure.BinaryRatio*100)
+	}
+
 	return PreprocessingConfig{
 		EnableUnitProp: true,
 		MaxPasses:      1,
