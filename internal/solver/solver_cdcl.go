@@ -4019,8 +4019,21 @@ func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
 		if s.tmpSeenVar[rv] {
 			continue
 		}
+		// Level-0 literals are globally assigned (forced during preprocessing,
+		// never cleared by backjump). A level-0 literal in a reason clause is
+		// permanently false, so it is automatically "covered" — skip it without
+		// failing. Returning false here (the old behavior) devastated long-clause
+		// instances: reason clauses averaging 50-150 literals almost always contain
+		// a level-0 literal, causing ~99% of minimization attempts to fail. Skipping
+		// matches Cadical/MiniSat (`if (!level(tmp)) continue;`). Soundness holds:
+		// the reason clause still propagates v after backjump because the level-0
+		// literal remains false. No marking needed (nothing is pushed to
+		// tmpMinSeenVars), so the snapshot/rollback in recursiveTryRemove is
+		// unaffected. Level-0 literals are still protected from *removal* in
+		// minimizeLearnedClause (line 3931) — this only affects whether a reason
+		// clause *containing* a level-0 literal blocks removability of another var.
 		if s.assignments[rv].Level == 0 {
-			return false
+			continue
 		}
 		if s.implication[rv] == -1 {
 			return false
