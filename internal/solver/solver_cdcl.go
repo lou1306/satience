@@ -233,6 +233,13 @@ type CDCLSolver struct {
 	// Restart policy parameters
 	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
+
+	// litTrue caches whether each literal is assigned-and-true, indexed by
+	// LitToIndex(lit) = varIdx*2 + negated. Updated on assign/unassign. The blit
+	// fast path reads this instead of decoding the literal + loading assignments[],
+	// eliminating 5 ops per watch. On unassign, both polarities are set to false
+	// (unassigned ≠ false-assigned). Trajectory-neutral: same truth values, just cached.
+	litTrue []bool
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -351,6 +358,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartPropsDecLimit:       100, // Restart when props/dec > 100 (deep search pathology)
 		adaptivePhaseFlipRate:      0.1, // Flip 10% of phases when props/dec is high
 		propsDecRestartGap:         100, // Min 100 conflicts between props/dec restarts
+		litTrue:                     make([]bool, int(formula.NumVars)*2),
 	}
 
 	// FIX: Initialize all assignments as unassigned (Level=-1)
@@ -1660,6 +1668,8 @@ func (s *CDCLSolver) runVivification() bool {
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
 			s.assignments[i] = Assignment{Level: -1}
+			s.litTrue[i*2] = false
+			s.litTrue[i*2+1] = false
 			s.implication[i] = -1
 			s.numUnassigned++
 		}
@@ -1847,6 +1857,8 @@ func (s *CDCLSolver) cancelUntil(level int) {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{Level: -1}
+		s.litTrue[int(varIdx)*2] = false
+		s.litTrue[int(varIdx)*2+1] = false
 		s.implication[varIdx] = -1
 		s.numUnassigned++
 	}
@@ -1891,6 +1903,8 @@ func (s *CDCLSolver) restart() bool {
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
 			s.assignments[i] = Assignment{Level: -1}
+			s.litTrue[i*2] = false
+			s.litTrue[i*2+1] = false
 			s.implication[i] = -1
 			s.numUnassigned++
 		}
@@ -2316,10 +2330,15 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	}
 
 	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
+	// Also initialize litTrue cache from preprocessing assignments.
 	s.numUnassigned = 0
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
 		if s.assignments[i].Level < 0 {
 			s.numUnassigned++
+		} else {
+			v := s.assignments[i].Value
+			s.litTrue[i*2] = v
+			s.litTrue[i*2+1] = !v
 		}
 	}
 
@@ -2478,6 +2497,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.Log("c [UNIT PROP] var=%d, value=%v, level=%d (s.level=%d)\n", varIdx+1, litValue, propLevel, s.level)
 		}
 			s.assignments[varIdx] = Assignment{Value: litValue, Level: int32(propLevel)}
+			s.litTrue[int(varIdx)*2] = litValue
+			s.litTrue[int(varIdx)*2+1] = !litValue
 			s.trail = append(s.trail, int(varIdx))
 			s.numUnassigned--
 			// Store learned clause index as negative: -learnedIdx-5
@@ -2570,28 +2591,34 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		watchList := s.watchLists[watchIdx]
 		watchLitVar := watchIdx >> 1 // Constant for all watches on this list
 
+		// Cache litValue slice header (same reason as assignments — compiler
+		// can't prove non-aliasing across method calls).
+		litValue := s.litTrue
+
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 
-			// FAST PATH: Check the cached blocking literal (Blit) before
-			// accessing clause data. If Blit is true, the clause is satisfied
-			// and we can skip it entirely — no need to dereference clauseLits
-			// (which may cause a cache miss to random memory). Blit may be
-			// stale (if the other watch was moved), but a stale-true Blit is
-			// sound: the literal it references is still assigned and true, so
-			// the clause is still satisfied.
+			// FAST PATH: Check the cached blocking literal (Blit) via litValue
+			// cache. If Blit is assigned-and-true, the clause is satisfied and
+			// we can skip it entirely — no need to decode the literal or load
+			// the 8-byte Assignment struct. Blit may be stale (if the other
+			// watch was moved), but a stale-true Blit is sound: the literal it
+			// references is still assigned and true, so the clause is still
+			// satisfied. litValue is set to false for both polarities on unassign,
+			// so unassigned blits correctly fall through to the slow path.
+			// Convert Blit (Literal encoding: bit 31 = negated) to litTrue index
+			// (varIdx*2 + negated) inline.
+			blitIdx := int(watch.Blit&0x7FFFFFFF)<<1 | int(watch.Blit>>31)
+			if litValue[blitIdx] {
+				continue
+			}
+
+			// SLOW PATH: Blocking literal is not true (or unassigned).
+			// Decode blit for the slow path (need Var, IsNegated, Level, Value).
 			blitLit := cnf.Literal(watch.Blit)
 			blitVarIdx := int(blitLit.Var())
 			blitNegated := blitLit.IsNegated()
 			blitAsg := assignments[blitVarIdx]
-			if blitAsg.Level >= 0 {
-				blitLitTrue := blitNegated != blitAsg.Value
-				if blitLitTrue {
-					continue
-				}
-			}
-
-			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
 
 			// Decode myPos from ClauseIdx bit 30 (packed at watch creation).
@@ -2628,6 +2655,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			// Look for replacement watch
 			foundReplacement := false
+			var trueReplacementLit uint32 // 0 = none found; else a true literal to cache as Blit
 			for j := 2; j < len(clauseLits); j++ {
 				clauseLit := clauseLits[j]
 				clauseLitVar := int(clauseLit.Var())
@@ -2643,6 +2671,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					if !litTrue {
 						continue
 					}
+					// Found a true literal — cache it as the blit for the new watch.
+					// A stale-true blit is sound (falls through to slow path if it
+					// becomes false later). This improves the blit hit rate because
+					// the cached literal is known-true at cache-write time.
+					trueReplacementLit = uint32(clauseLit)
 				}
 				// Found replacement - swap into myPos and add new watch
 				newWatchIdx := clauseLitVar << 1
@@ -2653,9 +2686,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Swap replacement literal into position myPos
 			clauseLits[myPos], clauseLits[j] = clauseLit, clauseLits[myPos]
 
-			// The blocking literal (at 1-myPos) hasn't changed — cache it in Blit
-			// so future propagations can skip clause data access when it's true.
-			newBlit := uint32(clauseLits[1-myPos])
+			// Cache the true literal as Blit if found; otherwise cache the other
+			// watched literal (at 1-myPos) as before.
+			var newBlit uint32
+			if trueReplacementLit != 0 {
+				newBlit = trueReplacementLit
+			} else {
+				newBlit = uint32(clauseLits[1-myPos])
+			}
 
 			s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
 				ClauseIdx: watch.ClauseIdx,
@@ -2969,6 +3007,8 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 		Value: value,
 		Level: int32(level),
 	}
+	s.litTrue[int(varIdx)*2] = value
+	s.litTrue[int(varIdx)*2+1] = !value
 	s.trail = append(s.trail, int(varIdx))
 	s.implication[varIdx] = clauseIdx
 	s.savedPhase[varIdx] = lit.IsNegated()
@@ -3008,6 +3048,8 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 		Value: value,
 		Level: int32(level),
 	}
+	s.litTrue[int(varIdx)*2] = value
+	s.litTrue[int(varIdx)*2+1] = !value
 	s.trail = append(s.trail, int(varIdx))
 	s.numUnassigned--
 
@@ -4470,6 +4512,8 @@ func (s *CDCLSolver) backtrack() bool {
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := uint32(s.trail[i])
 		s.assignments[varIdx] = Assignment{Level: -1}
+		s.litTrue[int(varIdx)*2] = false
+		s.litTrue[int(varIdx)*2+1] = false
 		s.implication[varIdx] = -1
 		s.vsids.onUnassign(varIdx)
 		s.numUnassigned++
