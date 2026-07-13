@@ -1,6 +1,7 @@
 package solver
 
 import (
+	"math"
 	"satience/internal/cnf"
 )
 
@@ -143,6 +144,7 @@ type VSIDS struct {
 	heap                  vsidsHeap // Activity heap for O(log n) selection
 	heapPos               []int     // Position of each variable in heap (-1 = not in heap)
 	heapValid             bool      // True if heap is up-to-date
+	refreshInterval       int       // Conflicts between heap rebuilds (fixes deeply stale entries)
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
 	// CHB (Conflict History Based) heuristic
@@ -186,6 +188,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapPos:               make([]int, numVars),
 		heapValid:             false,
+		refreshInterval:       2000,
 		decayInterval:         1, // O(1) decay — fire every conflict
 		randomSeed:            0,
 		// Default parameter values
@@ -231,20 +234,27 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 }
 
 // buildHeap rebuilds the activity heap from current activity scores.
-// Only includes unassigned variables. Called on init and after restart.
+// ALL variables are included: unassigned at their real score, assigned at
+// -Inf (sunk to bottom). This ensures the heap never empties during search,
+// eliminating frequent O(n) rebuilds. Assigned entries are sunk lazily during
+// selection and restored on unassign.
 func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heap = v.heap[:0]
 	for i := range v.heapPos {
 		v.heapPos[i] = -1
 	}
 	for i, act := range v.activity {
+		var score float64
 		if assignments[i].Level < 0 {
-			v.heap = append(v.heap, vsidsHeapItem{
-				varIdx: uint32(i),
-				score:  act + v.lbdBonus[i],
-			})
-			v.heapPos[i] = len(v.heap) - 1
+			score = act + v.lbdBonus[i]
+		} else {
+			score = math.Inf(-1)
 		}
+		v.heap = append(v.heap, vsidsHeapItem{
+			varIdx: uint32(i),
+			score:  score,
+		})
+		v.heapPos[i] = len(v.heap) - 1
 	}
 	v.heap.init(v.heapPos)
 	v.heapValid = true
@@ -354,9 +364,16 @@ func (v *VSIDS) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 // (e.g. by backtrack). If the variable is already in the heap (it was
 // propagated, not yet popped), this is a no-op.
 func (v *VSIDS) onUnassign(varIdx uint32) {
-	if v.heapPos[varIdx] < 0 {
-		score := v.activity[varIdx] + v.lbdBonus[varIdx]
-		v.heap.insert(v.heapPos, varIdx, score)
+	pos := v.heapPos[varIdx]
+	if pos < 0 {
+		return
+	}
+	// Restore real score if the entry was sunk (assigned → -Inf).
+	// If not sunk (assigned but never reached the heap root), the stored
+	// score may be stale but will be fixed lazily on selection.
+	if v.heap[pos].score == math.Inf(-1) {
+		v.heap[pos].score = v.activity[varIdx] + v.lbdBonus[varIdx]
+		v.heap.up(v.heapPos, pos)
 	}
 }
 
@@ -373,9 +390,7 @@ func (v *VSIDS) bumpLBD(literals []cnf.Literal, lbd int) {
 
 	for _, lit := range literals {
 		v.lbdBonus[lit.Var()] += bonus
-		// Incrementally update heap position.
-		score := v.activity[lit.Var()] + v.lbdBonus[lit.Var()]
-		v.heap.increaseKey(v.heapPos, lit.Var(), score)
+		// Lazy heap: don't call increaseKey. Score fixed on selection/unassign.
 	}
 }
 
@@ -404,12 +419,12 @@ func (v *VSIDS) bump(varIdx uint32) {
 }
 
 // bumpLarge increases the activity of a variable by a larger amount
-// Used for variables in conflict clauses to make them more likely to be chosen
+// Used for variables in conflict clauses to make them more likely to be chosen.
+// Lazy heap: does NOT call increaseKey. The heap entry's stored score becomes
+// stale (stored < actual). The stale entry is fixed lazily when it reaches the
+// root of the heap during selection (if unassigned) or on unassign (if sunk).
 func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 	v.activity[varIdx] += amount
-	// Incrementally update heap position (O(log n)) instead of invalidating.
-	score := v.activity[varIdx] + v.lbdBonus[varIdx]
-	v.heap.increaseKey(v.heapPos, varIdx, score)
 }
 
 // bumpClause increases activity for all variables in a clause
@@ -430,6 +445,13 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 		}
 	}
 	v.conflictCount++
+
+	// Periodic heap refresh: rebuild the heap to fix deeply stale entries
+	// (variables bumped many times but never reached the heap root). The
+	// rebuild is O(n) but only fires every refreshInterval conflicts.
+	if v.conflictCount%v.refreshInterval == 0 {
+		v.heapValid = false
+	}
 
 	// CHB: Periodic decay for conflict frequency
 	if v.useCHB && v.conflictCount%v.chbDecayInterval == 0 {
@@ -485,21 +507,48 @@ func (v *VSIDS) decay(assignments []Assignment) {
 }
 
 // selectVariableWithHeap returns the unassigned variable with highest activity.
-// Uses an incremental heap: pop the max, skip assigned (discard them — they'll
-// be re-inserted on backtrack via onUnassign). The selected variable is NOT
-// re-inserted (it's about to be assigned); it will be re-inserted on backtrack.
+// Lazy heap with sink approach:
+// - Peek at the root. If assigned, sink it to -Inf (it stays in the heap but
+//   drops to the bottom). If unassigned but stale (activity was bumped since
+//   last heap update), fix the score in-place. If unassigned and current,
+//   return it (without removeMax — decide() will assign it, and the next
+//   select will sink it).
+// - The heap never empties (entries are sunk, not removed), eliminating
+//   frequent O(n) buildHeap calls.
+// - onUnassign restores sunk entries' real scores and sifts them up.
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	if !v.heapValid || len(v.heap) == 0 {
 		v.buildHeap(assignments)
 	}
 
 	for len(v.heap) > 0 {
-		item := v.heap.removeMax(v.heapPos)
+		item := v.heap[0]
 		varIdx := item.varIdx
 
-		if int(varIdx) >= len(assignments) || assignments[varIdx].Level >= 0 {
-			continue // assigned — discard, re-inserted on backtrack
+		if int(varIdx) >= len(assignments) {
+			v.heap.removeMax(v.heapPos)
+			continue
 		}
+
+		if assignments[varIdx].Level >= 0 {
+			// Assigned — sink to bottom so it doesn't reappear at the root.
+			v.heap[0].score = math.Inf(-1)
+			v.heap.down(v.heapPos, 0)
+			continue
+		}
+
+		// Unassigned — check if score is stale (activity was bumped).
+		actualScore := v.activity[varIdx] + v.lbdBonus[varIdx]
+		if item.score != actualScore {
+			// Stale — update score. Bumps only increase activity, so
+			// actualScore > stored score. At the root, sift-up is a no-op,
+			// so the entry stays at position 0 with the updated score.
+			v.heap[0].score = actualScore
+			continue
+		}
+
+		// Unassigned and up-to-date — return it. Don't remove from heap;
+		// decide() will assign it, and the next select will sink it.
 		return varIdx
 	}
 

@@ -1933,6 +1933,10 @@ func (s *CDCLSolver) restart() bool {
 			s.numUnassigned++
 		}
 	}
+	// Restart clears all search assignments. Sunk heap entries (at -Inf) are
+	// NOT restored by onUnassign (restart doesn't call it). Force a rebuild
+	// to fix all entries with current scores.
+	s.vsids.heapValid = false
 
 	// Reset restart counters
 	s.lubyIndex++
@@ -2203,14 +2207,26 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 	// init produces fewer exact ties, reducing trajectory sensitivity to
 	// clause ordering changes.
 	occurrences := make([]int, s.cnf.NumVars)
+	posCount := make([]int, s.cnf.NumVars)
+	negCount := make([]int, s.cnf.NumVars)
 	for _, clause := range s.cnf.Clauses {
 		for _, lit := range clause.Literals {
 			occurrences[lit.Var()]++
+			if lit.IsNegated() {
+				negCount[lit.Var()]++
+			} else {
+				posCount[lit.Var()]++
+			}
 		}
 	}
 	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
 			s.vsids.activity[i] += 1.0 + float64(occurrences[i])*0.5
+			if negCount[i] > posCount[i] {
+				s.savedPhase[i] = true
+			} else if posCount[i] > negCount[i] {
+				s.savedPhase[i] = false
+			}
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
