@@ -360,17 +360,19 @@ func (v *VSIDS) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 	v.binaryClauseWeight = binaryWeight
 }
 
-// onUnassign re-inserts a variable into the heap after it is unassigned
-// (e.g. by backtrack). If the variable is already in the heap (it was
-// propagated, not yet popped), this is a no-op.
+// onUnassign restores a variable's heap entry after it is unassigned (e.g. by
+// backtrack). If the entry was sunk (assigned → -Inf), restore its real score
+// and sift up. If the entry was not sunk (assigned but never reached the heap
+// root), leave it stale — the score will be fixed by the periodic refresh
+// (every refreshInterval conflicts) or lazily on selection if it reaches the
+// root. Always sifting up on every unassign is too expensive: deep backtracks
+// unassign hundreds of variables, each costing O(log n). The periodic refresh
+// handles stale entries in bulk at O(n) every 2000 conflicts.
 func (v *VSIDS) onUnassign(varIdx uint32) {
 	pos := v.heapPos[varIdx]
 	if pos < 0 {
 		return
 	}
-	// Restore real score if the entry was sunk (assigned → -Inf).
-	// If not sunk (assigned but never reached the heap root), the stored
-	// score may be stale but will be fixed lazily on selection.
 	if v.heap[pos].score == math.Inf(-1) {
 		v.heap[pos].score = v.activity[varIdx] + v.lbdBonus[varIdx]
 		v.heap.up(v.heapPos, pos)
