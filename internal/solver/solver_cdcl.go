@@ -2609,6 +2609,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	originalClauses := s.cnf.Clauses
 	numOriginalClauses := len(originalClauses)
 
+	// Cache watchLists outer slice header. The outer slice is allocated once in
+	// initWatches and never grows (length is always 2*numVars). Only inner slices
+	// grow via append, and the cached header shares the backing array, so inner-
+	// slice updates are visible to s.watchLists automatically. This eliminates
+	// the s → s.watchLists pointer chase on every append (930ms) and write-back
+	// (370ms) in the hot loop.
+	watchLists := s.watchLists
+
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 
@@ -2628,7 +2636,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		}
 
 		// Process watches for this literal using swap-with-last deletion
-		watchList := s.watchLists[watchIdx]
+		watchList := watchLists[watchIdx]
 		watchLitVar := watchIdx >> 1 // Constant for all watches on this list
 
 		// Cache litValue slice header (same reason as assignments — compiler
@@ -2735,7 +2743,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				newBlit = uint32(clauseLits[1-myPos])
 			}
 
-			s.watchLists[newWatchIdx] = append(s.watchLists[newWatchIdx], cnf.Watch{
+			watchLists[newWatchIdx] = append(watchLists[newWatchIdx], cnf.Watch{
 				ClauseIdx: watch.ClauseIdx,
 				Blit:      newBlit,
 			})
@@ -2766,7 +2774,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					readIdx--
 				}
 				watchList = watchList[:lastIdx]
-				s.watchLists[watchIdx] = watchList
+				watchLists[watchIdx] = watchList
 				continue
 			}
 
@@ -4278,39 +4286,25 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		}
 	}
 
-	// REBUILD ALL WATCH LISTS FROM SCRATCH (correct and simple)
-	// CRITICAL: use chooseWatchPositions (via addOriginalClauseToWatches /
-	// addLearnedClauseToWatches) so watched literals are chosen to NOT both
-	// be false under the current assignment. Watching literals[0]/[1]
-	// blindly violates the watched-literal invariant and causes missed
-	// propagations/conflicts (soundness bug).
-	s.watchLists = make([][]cnf.Watch, len(s.watchLists))
-
-	// Pre-allocate watch lists with estimated capacity to avoid reallocations
-	// (same logic as initWatches). Without this, every append grows from nil,
-	// causing many small reallocations during the rebuild.
-	totalClauses := s.cnf.NumClauses + s.learnedActiveCount
-	avgWatchesPerLit := (totalClauses * 2) / len(s.watchLists)
-	if avgWatchesPerLit < 32 {
-		avgWatchesPerLit = 32
-	}
-	if avgWatchesPerLit > 256 {
-		avgWatchesPerLit = 256
-	}
-	for i := range s.watchLists {
-		s.watchLists[i] = make([]cnf.Watch, 0, avgWatchesPerLit)
-	}
-
-	// First, add original clauses
-	for i := 0; i < len(s.cnf.Clauses); i++ {
-		clause := &s.cnf.Clauses[i]
-		if len(clause.Literals) < 2 {
-			continue
+	// REBUILD WATCH LISTS — keep original-clause watches, replace learned.
+	// Original clauses don't move during learned-clause compaction, so their
+	// watches (ClauseIdx >= 0) are still valid. Only learned-clause watches
+	// (ClauseIdx < 0) have stale indices after the clauseIndexMap remapping.
+	// Removing the O(total original literals) re-scan of chooseWatchPositions
+	// that the old full-rebuild did on every compaction.
+	for litIdx := range s.watchLists {
+		wl := s.watchLists[litIdx]
+		writeIdx := 0
+		for _, watch := range wl {
+			if watch.ClauseIdx >= 0 {
+				wl[writeIdx] = watch
+				writeIdx++
+			}
 		}
-		s.addOriginalClauseToWatches(i, clause, clause.Literals)
+		s.watchLists[litIdx] = wl[:writeIdx]
 	}
 
-	// Then, add learned clauses (and store the chosen watch literal indices)
+	// Re-add learned clauses (with freshly chosen watch positions)
 	for i := 0; i < writeIdx; i++ {
 		if s.learnedLoc[i].Size < 2 {
 			continue
@@ -4342,12 +4336,12 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 			ClauseIdx: clauseIdx0,
 			Blit:      uint32(lit1),
-	
+
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 			ClauseIdx: clauseIdx1,
 			Blit:      uint32(lit0),
-	
+
 		})
 
 		// Update stored watch indices to the chosen literals
