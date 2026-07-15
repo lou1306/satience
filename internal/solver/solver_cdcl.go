@@ -915,8 +915,9 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	// Ternary-heavy structured instances (e.g., graph coloring) score low on
 	// binary/long signals but are still structured — they need unit propagation
 	// and Glucose restarts, not the aggressive random-config decay/restart.
-	// Weight at 0.5: pure ternary is weaker evidence than binary or long-clause.
-	ternaryScore := structure.TernaryRatio * 0.5
+	// Weight at 0.65: pure ternary (0.65) + density + mixed → ~0.75, above the
+	// 0.70 threshold. 88% ternary + 11% binary (69d72f81) → 0.74, was 0.66.
+	ternaryScore := structure.TernaryRatio * 0.65
 
 	sizeScore := binaryScore
 	if longScore > sizeScore {
@@ -2901,6 +2902,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// (370ms) in the hot loop.
 	watchLists := s.watchLists
 
+	// Cache implication and savedPhase arrays (allocated once, never reallocated)
+	// to eliminate s → s.implication and s → s.savedPhase pointer chases in the
+	// inlined propagation path.
+	implication := s.implication
+	savedPhase := s.savedPhase
+	// litTrue cache: backing array never reallocated, writes through local visible
+	// to s.litTrue automatically. Eliminates per-trail-entry s → s.litTrue chase.
+	litValue := s.litTrue
+
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
 
@@ -2921,10 +2931,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		// Process watches for this literal using swap-with-last deletion
 		watchList := watchLists[watchIdx]
-
-		// Cache litValue slice header (same reason as assignments — compiler
-		// can't prove non-aliasing across method calls).
-		litValue := s.litTrue
 
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
@@ -3120,16 +3126,25 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			blitAsg = assignments[blitVarIdx]
 
 			if blitAsg.Level < 0 {
-				// Unassigned blit - propagate it
-				propLevel := s.level
-				if propLevel == 0 {
-					propLevel = 1
+				// Unassigned blit - propagate it (inlined assignLiteralByClause)
+				if implication[blitVarIdx] == -1 {
+					propLevel := s.level
+					if propLevel == 0 {
+						propLevel = 1
+					}
+					reasonIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					if watch.ClauseIdx < 0 {
+						reasonIdx = -reasonIdx - 5
+					}
+					blitValue := !blitNegated
+					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel)}
+					litValue[blitVarIdx*2] = blitValue
+					litValue[blitVarIdx*2+1] = !blitValue
+					s.trail = append(s.trail, blitVarIdx)
+					s.numUnassigned--
+					implication[blitVarIdx] = reasonIdx
+					savedPhase[blitVarIdx] = blitNegated
 				}
-				reasonIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if watch.ClauseIdx < 0 {
-					reasonIdx = -reasonIdx - 5
-				}
-				s.assignLiteralByClause(blitLit, propLevel, reasonIdx)
 				s.propagations++
 				continue
 			}
