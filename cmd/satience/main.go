@@ -42,9 +42,9 @@ func run() int {
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.1, "Phase flip rate when props/dec is high (0=disabled)")
 	// VSIDS parameters
 	decayInterval := flag.Int("decay-interval", 1, "VSIDS decay interval - conflicts between activity decays (default=1, O(1) decay)")
-	initialDecay := flag.Float64("initial-decay", 0.9792, "VSIDS initial decay factor (default=0.9792)")
-	maxDecay := flag.Float64("max-decay", 0.9998, "VSIDS maximum decay factor (default=0.9998)")
-	decayRampup := flag.Int("decay-rampup", 25000, "Conflicts to reach max decay (default=25000)")
+	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
+	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
+	decayRampup := flag.Int("decay-rampup", 100, "Conflicts to reach max decay (default=100, minimal since initial==max)")
 	lbdScale := flag.Float64("lbd-scale", 0.0, "LBD bonus scale for VSIDS (default=0=adaptive: max(10, 200000/numVars))")
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")

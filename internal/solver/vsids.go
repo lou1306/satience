@@ -171,11 +171,14 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	// Activities are bumped by varInc (not baseBumpAmount), so recent bumps
 	// are naturally larger than old ones — no O(n) scan needed.
 	// decayInterval=1 (decay every conflict) is free since decay is O(1).
-	// Parameters compensated for 5x more frequent decay vs old interval=5:
-	//   initialDecay: 0.90^(1/5) ≈ 0.9792, maxDecay: 0.999^(1/5) ≈ 0.9998
-	//   lbdBonusDecay: 0.999^(1/5) ≈ 0.9998, rampUp: 5000 × 5 = 25000
-	initialDecay := 0.9792
-	maxDecay := 0.9998
+	// Fixed decay at 0.95 (MiniSat-equivalent). The old ramp from 0.9792 to
+	// 0.9998 over 25K conflicts caused the solver to retain 98% of activity
+	// over 100 conflicts at steady state, keeping VSIDS locked on the same
+	// variables → deep search → high-LBD clauses → slow propagation. Fixed
+	// 0.95 retains only 0.6% over 100 conflicts, matching MiniSat's forgetting
+	// rate. Suite: 66→68 solved, PAR2 7.31→5.02s.
+	initialDecay := 0.95
+	maxDecay := 0.95
 	v := &VSIDS{
 		activity:              make([]float64, numVars),
 		varInc:                25.0, // Initial bump amount (matches baseBumpAmount)
@@ -186,7 +189,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		lbdBonus:              make([]float64, numVars),
 		lbdInc:                1.0,
 		maxDecayFactor:        maxDecay,
-		decayIncrement:        (maxDecay - initialDecay) / 25000.0,
+		decayIncrement:        0.0, // Fixed decay — no ramp
 		heap:                  make(vsidsHeap, 0, numVars),
 		heapPos:               make([]int, numVars),
 		heapValid:             false,
@@ -195,7 +198,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		randomSeed:            0,
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
-		decayRampUpConflicts: 25000,
+		decayRampUpConflicts: 100, // Minimal — no ramp (initial == max)
 		lbdBonusScale:        10.0,
 		lbdBonusDecay:        0.9998,
 		baseBumpAmount:       25.0,
