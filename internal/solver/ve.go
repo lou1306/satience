@@ -69,37 +69,67 @@ func (s *CDCLSolver) boundedVarElimination() int {
 	// Track eliminated variables to skip in the cheapest scan.
 	eliminatedFlag := make([]bool, numVars)
 
+	// Bucket queue: buckets[cost] = list of vars with that cost.
+	// cost = posCount[v] * negCount[v], bounded by maxVEPairCost.
+	// Lazy deletion: stale entries (eliminated or cost changed) are skipped on pop.
+	// When counts change, push new entries to the appropriate bucket.
+	buckets := make([][]uint32, maxVEPairCost+1)
+	for v := uint32(0); v < uint32(numVars); v++ {
+		pc := posCount[v]
+		nc := negCount[v]
+		if pc > 0 && nc > 0 {
+			cost := pc * nc
+			if cost <= maxVEPairCost {
+				buckets[cost] = append(buckets[cost], v)
+			}
+		}
+	}
+
+	// Reusable scratch space for deduplicating affected variables after count updates
+	seenVar := make([]bool, numVars)
+	var touchedVars []int
+
 	totalResolvents := 0
 	eliminated := 0
 
 	for {
-		// Find the cheapest eliminatable variable using cached counts (O(numVars)).
-		bestVar := uint32(0)
-		bestCost := -1
-		for v := uint32(0); v < uint32(numVars); v++ {
-			if eliminatedFlag[v] {
-				continue
+		// Find the cheapest eliminatable variable using the bucket queue.
+		// Scan from bucket 1 upward; pop from the end, skipping stale entries.
+		v := uint32(0)
+		found := false
+		for c := 1; c <= maxVEPairCost; c++ {
+			for len(buckets[c]) > 0 {
+				cand := buckets[c][len(buckets[c])-1]
+				buckets[c] = buckets[c][:len(buckets[c])-1]
+
+				if eliminatedFlag[cand] {
+					continue
+				}
+				pc := posCount[cand]
+				nc := negCount[cand]
+				if pc == 0 || nc == 0 {
+					continue
+				}
+				actualCost := pc * nc
+				if actualCost != c {
+					// Stale entry — reinsert to correct bucket if still eligible
+					if actualCost <= maxVEPairCost {
+						buckets[actualCost] = append(buckets[actualCost], cand)
+					}
+					continue
+				}
+				v = cand
+				found = true
+				break
 			}
-			pc := posCount[v]
-			nc := negCount[v]
-			if pc == 0 || nc == 0 {
-				continue
-			}
-			cost := pc * nc
-			if cost > maxVEPairCost {
-				continue
-			}
-			if bestCost < 0 || cost < bestCost {
-				bestCost = cost
-				bestVar = v
+			if found {
+				break
 			}
 		}
 
-		if bestCost < 0 {
+		if !found {
 			break // no eliminatable variables
 		}
-
-		v := bestVar
 
 		// Budget check
 		if s.veBudget > 0 && totalResolvents >= s.veBudget {
@@ -208,6 +238,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 		})
 
 		// Mark old clauses as removed and decrement counts for their variables.
+		// Collect affected variables for bucket queue updates.
 		for _, ci := range posClauses {
 			removed[ci] = true
 			for _, lit := range s.cnf.Clauses[ci].Literals {
@@ -219,6 +250,10 @@ func (s *CDCLSolver) boundedVarElimination() int {
 					negCount[lv]--
 				} else {
 					posCount[lv]--
+				}
+				if !eliminatedFlag[lv] && !seenVar[lv] {
+					seenVar[lv] = true
+					touchedVars = append(touchedVars, int(lv))
 				}
 			}
 		}
@@ -233,6 +268,10 @@ func (s *CDCLSolver) boundedVarElimination() int {
 					negCount[lv]--
 				} else {
 					posCount[lv]--
+				}
+				if !eliminatedFlag[lv] && !seenVar[lv] {
+					seenVar[lv] = true
+					touchedVars = append(touchedVars, int(lv))
 				}
 			}
 		}
@@ -255,8 +294,26 @@ func (s *CDCLSolver) boundedVarElimination() int {
 					posOcc[lv] = append(posOcc[lv], newCi)
 					posCount[lv]++
 				}
+				if !eliminatedFlag[lv] && !seenVar[lv] {
+					seenVar[lv] = true
+					touchedVars = append(touchedVars, int(lv))
+				}
 			}
 		}
+
+		// Push affected variables to new buckets based on updated counts
+		for _, lv := range touchedVars {
+			pc := posCount[lv]
+			nc := negCount[lv]
+			if pc > 0 && nc > 0 {
+				cost := pc * nc
+				if cost <= maxVEPairCost {
+					buckets[cost] = append(buckets[cost], uint32(lv))
+				}
+			}
+			seenVar[lv] = false
+		}
+		touchedVars = touchedVars[:0]
 
 		eliminatedFlag[v] = true
 		eliminated++
