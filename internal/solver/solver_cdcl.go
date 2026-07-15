@@ -76,31 +76,18 @@ const (
 // calculateMaxLearned scales the clause database limit with instance size.
 // MiniSat-style: base limit proportional to variables, grows with conflicts
 func calculateMaxLearned(numVars uint32, numClauses int) int {
-	// DYNAMIC LIMIT: Based on both variables AND clauses
-	// Key insight: Learned clause database should scale with instance size
-	// - Small instances (<1000 clauses): Need room to learn (min 300)
-	// - Medium instances: 10-20% of original clause count
-	// - Large instances: Cap to prevent memory explosion
-	
-	// Base: percentage of original clauses (primary factor)
-	baseLimit := int(float64(numClauses) * 0.15)  // 15% of original clauses
+	// Learned clause limit: max(numClauses/3, min(numVars*10, 5000)).
+	// - numClauses/3: MiniSat-style base, keeps database proportional to instance.
+	// - min(numVars*10, 5000): Floor for small instances (need room to learn),
+	//   capped at 5000 to prevent excessive database size on large instances
+	//   (e.g. 7807v → 5000 instead of 78070, which caused 100K+ clause databases
+	//   and 6x slower propagation).
+	baseLimit := numClauses / 3
 
-	// Scale with density for very sparse/dense instances
-	if numVars > 0 {
-		density := float64(numClauses) / float64(numVars)
-		if density > 10.0 {
-			// Dense instance: can handle more learned clauses
-			baseLimit = int(float64(baseLimit) * 1.3)
-		} else if density < 3.0 {
-			// Sparse instance: be conservative
-			baseLimit = int(float64(baseLimit) * 0.8)
-		}
-	}
-	
-	// Absolute bounds
-	// Floor scales with numVars: small instances need enough clauses to form
-	// implication chains. max(300, numVars*10) ensures 132v → 1320, 300v → 3000.
 	varFloor := int(numVars) * 10
+	if varFloor > 5000 {
+		varFloor = 5000
+	}
 	if varFloor < 300 {
 		varFloor = 300
 	}
@@ -1001,8 +988,14 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// Unit propagation on random/mixed instances causes 76x more conflicts
 	if structure.StructuredScore < 0.7 {
 			s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
-		// Use standard VSIDS decay and restart config (same as structured instances).
-		// Minisat uses the same 0.95 decay and Luby base=100 for all instances.
+		// Aggressive VSIDS decay for random-like instances: these instances
+		// benefit from rapid activity forgetting (0.30→0.60) to avoid getting
+		// stuck on the same variables. Structured instances prefer gentle decay
+		// (0.95) to maintain learned clause guidance.
+		s.vsids.SetAggressiveDecay()
+		s.restartBase = 5
+		s.restartGlucoseRatio = 100.0
+		s.restartGlucoseMinConflicts = 1000000
 		return PreprocessingConfig{
 			EnableUnitProp: false,
 			MaxPasses:      0,
@@ -3542,9 +3535,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	}
 
 	// Delete learned clauses when database exceeds dynamic limit
-	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
-	// Formula: base + conflicts/50 (MiniSat uses similar growth rate)
-	// Trigger deletion at 150% of limit (MiniSat-style)
+	// Formula: base + conflicts/50, trigger at 150% of limit
 	dynamicLimit := s.maxLearned + s.conflicts/50
 	if s.learnedActiveCount > dynamicLimit+dynamicLimit/2 {
 		s.deleteLearnedClauses()
@@ -4470,8 +4461,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// Key insight: LBD is the best predictor of clause usefulness
 	// - Keep all "glue" clauses (LBD ≤ 2) permanently
 	// - Delete clauses with high LBD when database grows too large
-	
-	// Count current active clauses
+
 	dynamicLimit := s.maxLearned + s.conflicts/50
 	targetCount := dynamicLimit
 	
@@ -4617,7 +4607,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		s.compactPending = true
 	}
 
-		s.Log("c [verbose] Deleted %d learned clauses via LBD, kept %d active (tombstones=%d, ratio=%.1f%%)\n",
+	s.Log("c [verbose] Deleted %d learned clauses via LBD, kept %d active (tombstones=%d, ratio=%.1f%%)\n",
 		deletedCount, activeCount, tombstoneCount, tombstoneRatio*100)
 }
 
