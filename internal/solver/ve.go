@@ -381,3 +381,161 @@ func (s *CDCLSolver) reconstructEliminatedVars() {
 		}
 	}
 }
+
+// subsumptionPass performs forward subsumption and self-subsumption (strengthening)
+// on the original clause database. Forward subsumption removes clause C if some other
+// clause D ⊆ C exists (D subsumes C). Self-subsumption removes literal l from C if
+// C\{l} subsumes some other clause (strengthening C). Both are sound simplifications
+// that reduce clause count and length without changing satisfiability.
+//
+// Uses occurrence lists with the shortest-literal entry point for efficiency.
+// Returns (subsumedCount, strengthenedCount).
+func (s *CDCLSolver) subsumptionPass() (int, int) {
+	numVars := int(s.cnf.NumVars)
+	if numVars == 0 || s.cnf.NumClauses == 0 {
+		return 0, 0
+	}
+	numLits := numVars * 2
+
+	// Build occurrence lists: for each literal index, which clauses contain it.
+	occ := make([][]int, numLits)
+	for i, clause := range s.cnf.Clauses {
+		for _, lit := range clause.Literals {
+			idx := cnf.LitToIndex(lit)
+			occ[idx] = append(occ[idx], i)
+		}
+	}
+
+	removed := make([]bool, len(s.cnf.Clauses))
+	subsumed := 0
+	strengthened := 0
+
+	seenLit := make([]bool, numLits)
+	var touched []int
+
+	for ci, clause := range s.cnf.Clauses {
+		if removed[ci] {
+			continue
+		}
+		clauseLits := clause.Literals
+
+		// Mark C's literals for subsumption checking
+		for _, lit := range clauseLits {
+			idx := cnf.LitToIndex(lit)
+			if !seenLit[idx] {
+				seenLit[idx] = true
+				touched = append(touched, idx)
+			}
+		}
+
+		// Find the literal with the fewest occurrences (best entry point for scanning)
+		bestIdx := -1
+		bestCount := int(^uint(0) >> 1)
+		for _, lit := range clauseLits {
+			idx := cnf.LitToIndex(lit)
+			count := len(occ[idx])
+			if count < bestCount {
+				bestCount = count
+				bestIdx = idx
+			}
+		}
+
+		// Forward subsumption: check if C is subsumed by any D (|D| <= |C|, D ⊆ C)
+		isSubsumed := false
+		for _, di := range occ[bestIdx] {
+			if di == ci || removed[di] {
+				continue
+			}
+			dLits := s.cnf.Clauses[di].Literals
+			if len(dLits) > len(clauseLits) {
+				continue
+			}
+			allIn := true
+			for _, lit := range dLits {
+				idx := cnf.LitToIndex(lit)
+				if !seenLit[idx] {
+					allIn = false
+					break
+				}
+			}
+			if allIn {
+				isSubsumed = true
+				break
+			}
+		}
+
+		if isSubsumed {
+			removed[ci] = true
+			subsumed++
+			// Cleanup and continue to next clause
+			for _, idx := range touched {
+				seenLit[idx] = false
+			}
+			touched = touched[:0]
+			continue
+		}
+
+		// Self-subsumption (strengthening): for each literal l in C, check if
+		// some clause D contains ¬l and D\{¬l} ⊆ C. If so, the resolvent of
+		// C and D on l is (C\{l} ∪ D\{¬l}) = D\{¬l} (since D\{¬l} ⊆ C ⊇ C\{l}),
+		// which subsumes C. Removing l from C is sound because C ∧ D ⊨ resolvent
+		// and resolvent subsumes C.
+		for _, lit := range clauseLits {
+			lIdx := cnf.LitToIndex(lit)
+			negIdx := lIdx ^ 1 // complement of l
+
+			// Check if any clause D containing ¬l has D\{¬l} ⊆ C
+			for _, di := range occ[negIdx] {
+				if di == ci || removed[di] {
+					continue
+				}
+				dLits := s.cnf.Clauses[di].Literals
+				// Check D\{¬l} ⊆ C: every literal in D except ¬l must be in C
+				allIn := true
+				for _, dlit := range dLits {
+					dIdx := cnf.LitToIndex(dlit)
+					if dIdx == negIdx {
+						continue // skip ¬l
+					}
+					if !seenLit[dIdx] {
+						allIn = false
+						break
+					}
+				}
+				if allIn {
+					// Remove l from C (strengthen C)
+					clauseLits = removeLiteral(clauseLits, lit)
+					s.cnf.Clauses[ci].Literals = clauseLits
+					strengthened++
+					break
+				}
+			}
+		}
+
+		// Cleanup
+		for _, idx := range touched {
+			seenLit[idx] = false
+		}
+		touched = touched[:0]
+	}
+
+	if subsumed > 0 {
+		s.compactClauses(removed)
+	}
+
+	if subsumed > 0 || strengthened > 0 {
+		s.cnf.RebuildLiteralPool()
+	}
+
+	return subsumed, strengthened
+}
+
+// removeLiteral returns a new slice with the first occurrence of lit removed.
+func removeLiteral(lits []cnf.Literal, lit cnf.Literal) []cnf.Literal {
+	for i, l := range lits {
+		if l == lit {
+			return append(lits[:i], lits[i+1:]...)
+		}
+	}
+	return lits
+}

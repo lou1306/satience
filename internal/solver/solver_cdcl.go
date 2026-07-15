@@ -1259,39 +1259,51 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
 	}
 
-	// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
-	// pos=1 definitional variant). Eliminates variables by resolving all
-	// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
-	// when it reduces clause count. Model reconstruction by trying x=true/x=false.
-	if config.EnableUnitProp { // VE only for structured instances (not random)
-		veResult := s.boundedVarElimination()
-		if veResult < 0 {
-			s.printStats()
-			return UNSAT
-		}
+	// Iterative simplification loop: subsumption → BVE → unit propagation.
+	// Each pass creates new opportunities for the others (e.g., subsumption
+	// shrinks clauses → BVE eliminates variables → new subsumptions appear).
+	// MiniSat/CaDiCaL iterate until fixpoint; we bound at 3 passes for time.
+	simplificationPasses := 3
+	if s.cnf.NumClauses > 100000 {
+		simplificationPasses = 1 // Large instances: one pass only (subsumption is O(n²))
 	}
+	for pass := 0; pass < simplificationPasses; pass++ {
+		passChanged := false
 
-	initialClauses := s.cnf.NumClauses
-	maxPasses := config.MaxPasses
+		// Subsumption pass (forward subsumption + self-subsumption/strengthening).
+		if config.EnableUnitProp {
+			subSubsumed, subStrengthened := s.subsumptionPass()
+			if subSubsumed > 0 || subStrengthened > 0 {
+				s.Log("c [preprocessing] Subsumption pass %d: %d clauses subsumed, %d strengthened\n", pass+1, subSubsumed, subStrengthened)
+				passChanged = true
+			}
+		}
 
-	// Increase to 5 passes for more thorough preprocessing
-	// Modern solvers (CaDiCaL) use 10+ passes
-	// Safeguards: time limits in each technique prevent explosion
-	for pass := 0; pass < maxPasses; pass++ {
-			s.Log("c [verbose] Preprocessing pass %d/%d: %d clauses\n", pass+1, maxPasses, s.cnf.NumClauses)
+		// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
+		// pos=1 definitional variant). Eliminates variables by resolving all
+		// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
+		// when it reduces clause count. Model reconstruction by trying x=true/x=false.
+		if config.EnableUnitProp {
+			veResult := s.boundedVarElimination()
+			if veResult < 0 {
+				s.printStats()
+				return UNSAT
+			}
+			if veResult > 0 {
+				passChanged = true
+			}
+		}
 
-		// Run unit propagation first to catch any existing units
+		// Unit propagation
 		if config.EnableUnitProp {
 			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
 				return unitResult
 			}
 		}
 
-		// Stop if no progress made for 2 consecutive passes
-		if s.cnf.NumClauses == initialClauses && pass >= 1 {
-			break
+		if !passChanged {
+			break // Fixpoint reached
 		}
-		initialClauses = s.cnf.NumClauses
 	}
 
 	s.Log("c [verbose] After preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
