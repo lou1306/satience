@@ -59,11 +59,13 @@ type Clause struct {
 }
 
 // ClauseMetadata packs learned clause metadata into a single struct for cache efficiency.
-// Only LBD and PropCount are read by the live deletion code; the other fields were
-// removed as dead computation (Activity/Score/ScoreDirty/UseCount/Age/ID were never read).
+// LBD and PropCount are int32 (values are small: LBD ≤ clause size, PropCount ≤ ~2B).
+// SearchHint caches the last-known replacement position for the watched-literal
+// replacement scan (probe-then-scan optimization). 0 = no hint (scan from pos 2).
 type ClauseMetadata struct {
-	LBD       int  // LBD at time of learning
-	PropCount int  // Times caused propagation
+	LBD        int32 // LBD at time of learning
+	PropCount  int32 // Times caused propagation
+	SearchHint int32 // Last-known replacement position in clause (0 = no hint)
 }
 
 // CNF represents a CNF formula

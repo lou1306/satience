@@ -49,6 +49,9 @@ func run() int {
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
+	statsInterval := flag.Int("stats", 0, "Print stats every N conflicts (0=disabled, bypasses verbose gate)")
+	restartLevelCap := flag.Int("restart-level-cap", 40, "Force restart when conflict level exceeds this on long-clause instances (0=disabled)")
+	levelRestartGap := flag.Int("restart-level-gap", 100, "Min conflicts between level-capped restarts")
 	flag.Parse()
 
 	// -verify implies -model
@@ -129,6 +132,9 @@ func run() int {
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
 	s.SetRandomPhaseRate(*randomPhaseRate)
 	s.SetRestartPhaseFlipRate(*restartPhaseFlip)
+	s.SetStatsInterval(*statsInterval)
+	s.SetRestartLevelCap(*restartLevelCap)
+	s.SetLevelRestartGap(*levelRestartGap)
 
 	start := time.Now()
 	var result solver.SolveResult

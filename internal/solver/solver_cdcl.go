@@ -22,6 +22,8 @@
 package solver
 
 import (
+	"fmt"
+	"os"
 	"runtime"
 	"satience/internal/cnf"
 	"sort"
@@ -146,6 +148,7 @@ type CDCLSolver struct {
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
 	verbose              bool
+	statsInterval        int // Print stats every N conflicts (0=disabled, bypasses verbose gate)
 	decisions            int
 	backjumpLevel        int
 	maxLearned           int
@@ -157,9 +160,24 @@ type CDCLSolver struct {
 	lbdSum               int
 	lbdCount             int
 	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
+	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
+	// Used to detect consistently high-LBD instances and shrink the clause DB.
+	totalLbdSum          uint64
+	totalLbdCount        uint64
+	maxLearnedShrunk     bool // True if maxLearned has been shrunk (one-way, no grow-back)
 	restartPropsDecLimit  int     // Props/dec threshold for restart (0=disabled, default 100)
 	adaptivePhaseFlipRate float64 // Phase flip rate when props/dec is high (0=disabled, default 0.1)
 	propsDecRestartGap    int     // Min conflicts between props/dec-bounded restarts (default 100)
+	// B1: Level-capped restart for long-clause instances. Long-clause instances
+	// produce high-LBD clauses consistently, so the Glucose EMA criterion never
+	// fires (EMA ≈ avg). Deep search produces high-LBD clauses with no propagation
+	// guidance, creating a deep-search → high-LBD → no-guidance → deep-search cycle.
+	// This breaks the cycle by restarting when conflict level exceeds the cap.
+	// Gated on LongClauseRatio > 0.8 (binary-heavy instances have the props/dec restart).
+	lastConflictLevel    int     // Level at which the last conflict occurred (captured in handleConflict)
+	longClauseRatio      float64 // Cached LongClauseRatio from classifier (for B1 gate)
+	restartLevelCap      int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
+	levelRestartGap      int     // Min conflicts between level-capped restarts (anti-thrashing)
 	randomSeed           uint64          // Seed for deterministic random selection
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
@@ -180,11 +198,37 @@ type CDCLSolver struct {
 	equivRep           []uint32 // Representative variable for each variable (identity if not merged)
 	equivNeg           []bool   // Whether variable is equivalent to negation of its representative
 	hasEquivalences    bool     // True if detectEquivalences found and merged any equivalences
+	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
+	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
+	// occurrence-based phase is trajectory-sensitive and helps some instances
+	// while hurting others with near-identical structure, so the classifier
+	// score alone cannot predict benefit. The PolarityImbalance metric (mean
+	// per-variable |pos-neg|/(pos+neg)) is stored as a secondary signal.
+	structureScore      float64 // Cached StructuredScore from analyzeInstanceStructure
+	polarityImbalance   float64 // Mean per-variable polarity imbalance (0=balanced, 1=pure)
+	// skipPolarityPhase is set by the classifier for dense binary instances
+	// (binaryRatio > 0.9 AND density > 35) where the default phase propagates
+	// to a solution quickly via the highly-connected BIG, and the occurrence-
+	// based override fights the implication structure.
+	skipPolarityPhase   bool
+	// Binary implication graph (BIG): bigAdj[litIdx] lists forward successors m
+	// such that binary clause (¬litIdx ∨ m) exists (i.e., litIdx → m in the
+	// implication graph). Built once from original binary clauses in buildBIG.
+	// Used for transitive BIG-based clause minimization (see bigReachableInClause).
+	bigAdj [][]int
+	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
+	// avoid re-zeroing the visited array on each minimization call (epoch just
+	// increments). The queue is reused across calls (sliced to [:0]).
+	bigBfsVisited []uint32
+	bigBfsEpoch   uint32
+	bigBfsQueue   []int
 	// Diagnostic counters for learned-clause minimization (always-on; reported in
 	// printStats and a periodic solve-loop log). Pure instrumentation — no behavior.
 	minimizeCalls       uint64 // recursive self-subsumption invocations (clauses >2 lits)
 	minimizeLiteralsIn  uint64 // literals seen by minimizer across all calls
 	minimizeLiteralsOut uint64 // literals remaining after minimization across all calls
+	bigMinimizeCalls    uint64 // BIG minimization attempts
+	bigMinimizeHits     uint64 // BIG minimization successes
 	vivifyRoundsRun     uint64 // vivification rounds actually executed
 	vivifyClausesChecked uint64 // clauses passed to vivifyClause
 	vivifyClausesModified uint64 // clauses shortened by vivify
@@ -223,6 +267,7 @@ type CDCLSolver struct {
 	watchInitialized    bool          // True if watches have been initialized
 	learnedClauseBase   int           // Base ID for learned clause watches (fixed at initialization)
 	originalUnitClauses []int         // Precomputed indices of original unit clauses (for restart re-propagation)
+	originalSearchHint  []int32        // Per-original-clause search hint for replacement scan (0=no hint)
 
 	// LBD-based learned clause ordering for propagation prioritization
 
@@ -314,6 +359,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLiteralInClause:   make([]bool, formula.NumVars),
 		tmpSeenVar:           make([]bool, formula.NumVars),
 		tmpLiteralIsNegated:  make([]bool, formula.NumVars),
+		bigBfsVisited:        make([]uint32, int(formula.NumVars)*2),
+		bigBfsQueue:          make([]int, 0, 256),
 		tmpLevelCount:        make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:    make([]bool, formula.NumVars+1),
 		tmpCandidates:        make([]resolveCandidate, 0, 200),  // Increased from 100
@@ -364,6 +411,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartPropsDecLimit:       100, // Restart when props/dec > 100 (deep search pathology)
 		adaptivePhaseFlipRate:      0.1, // Flip 10% of phases when props/dec is high
 		propsDecRestartGap:         100, // Min 100 conflicts between props/dec restarts
+		restartLevelCap:            40,  // Force restart when conflict level > 40 on long-clause instances
+		levelRestartGap:            100, // Min 100 conflicts between level-capped restarts
 		litTrue:                     make([]bool, int(formula.NumVars)*2),
 	}
 
@@ -395,6 +444,13 @@ func (s *CDCLSolver) SetMaxIter(limit int) {
 // SetVerbose enables/disables verbose output
 func (s *CDCLSolver) SetVerbose(v bool) {
 	s.verbose = v
+}
+
+// SetStatsInterval sets the conflict interval for periodic stats printing.
+// 0 disables. When >0, stats are printed every N conflicts directly to stderr,
+// bypassing the verbose gate (no arg-boxing overhead on hot paths).
+func (s *CDCLSolver) SetStatsInterval(n int) {
+	s.statsInterval = n
 }
 
 // SetRandomSeed sets the seed for deterministic random selection
@@ -498,6 +554,16 @@ func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
 		rate = 1
 	}
 	s.adaptivePhaseFlipRate = rate
+}
+
+// SetRestartLevelCap sets the conflict level threshold for level-capped restarts
+// on long-clause instances (0=disabled).
+func (s *CDCLSolver) SetRestartLevelCap(n int) {
+	s.restartLevelCap = n
+}
+
+func (s *CDCLSolver) SetLevelRestartGap(n int) {
+	s.levelRestartGap = n
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -721,21 +787,56 @@ func (s *CDCLSolver) logDiagnostics() {
 	if s.minimizeLiteralsIn > 0 {
 		minRate = float64(minRemoved) * 100.0 / float64(s.minimizeLiteralsIn)
 	}
-	s.Log("c [diag] minimize: calls=%d in=%d out=%d removed=%d (%.1f%%) | vivify: rounds=%d checked=%d modified=%d removed=%d | hist=[%d %d %d %d %d %d] max=%d\n",
+	s.Log("c [diag] minimize: calls=%d in=%d out=%d removed=%d (%.1f%%) | BIG: calls=%d hits=%d | vivify: rounds=%d checked=%d modified=%d removed=%d | hist=[%d %d %d %d %d %d] max=%d\n",
 		s.minimizeCalls, s.minimizeLiteralsIn, s.minimizeLiteralsOut, minRemoved, minRate,
+		s.bigMinimizeCalls, s.bigMinimizeHits,
 		s.vivifyRoundsRun, s.vivifyClausesChecked, s.vivifyClausesModified, s.vivifyLiteralsRemoved,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5], s.maxLearnedClauseSize)
 }
 
+// printPeriodicStats writes a one-line stats summary directly to stderr,
+// bypassing the verbose-gated s.Log. This enables diagnosing timeout instances
+// without the 20-30% overhead of -verbose (arg boxing at every s.Log call site
+// plus runtime.ReadMemStats STW calls). Does NOT call ReadMemStats.
+func (s *CDCLSolver) printPeriodicStats() {
+	minRemoved := s.minimizeLiteralsIn - s.minimizeLiteralsOut
+	minRate := 0.0
+	if s.minimizeLiteralsIn > 0 {
+		minRate = float64(minRemoved) * 100.0 / float64(s.minimizeLiteralsIn)
+	}
+	avgLBD := 0.0
+	if s.lbdCount > 0 {
+		avgLBD = float64(s.lbdSum) / float64(s.lbdCount)
+	}
+	totalAvgLBD := 0.0
+	if s.totalLbdCount > 0 {
+		totalAvgLBD = float64(s.totalLbdSum) / float64(s.totalLbdCount)
+	}
+	propsPerDec := 0.0
+	if s.decisions > 0 {
+		propsPerDec = float64(s.propagations) / float64(s.decisions)
+	}
+	shrunk := ""
+	if s.maxLearnedShrunk {
+		shrunk = " [DB shrunk]"
+	}
+	fmt.Fprintf(os.Stderr, "c [stats] conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
+		s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
+		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
+		minRate,
+		s.bigMinimizeHits, s.bigMinimizeCalls)
+}
+
 // InstanceStructure captures metrics about CNF structure for adaptive preprocessing
 type InstanceStructure struct {
-	Density          float64 // clauses / vars
-	BinaryRatio      float64 // binary clauses / total
-	TernaryRatio     float64 // 3-literal clauses / total
-	LongClauseRatio  float64 // clauses with >3 literals / total
-	SmallClauseRatio float64 // (binary + ternary) / total
-	StructuredScore  float64 // 0.0 = random, 1.0 = highly structured
+	Density            float64 // clauses / vars
+	BinaryRatio        float64 // binary clauses / total
+	TernaryRatio       float64 // 3-literal clauses / total
+	LongClauseRatio    float64 // clauses with >3 literals / total
+	SmallClauseRatio   float64 // (binary + ternary) / total
+	StructuredScore    float64 // 0.0 = random, 1.0 = highly structured
+	PolarityImbalance  float64 // mean per-variable |pos-neg|/(pos+neg); 0=balanced, 1=pure
 }
 
 // PreprocessingConfig controls which preprocessing techniques are enabled
@@ -755,14 +856,16 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		structure.Density = float64(s.cnf.NumClauses) / float64(s.cnf.NumVars)
 	}
 
-	// Clause size distribution
+	// Clause size distribution and polarity counts (single pass over clauses).
 	binaryCount := 0
 	ternaryCount := 0
 	longCount := 0
 	smallCount := 0
+	posCount := make([]int, s.cnf.NumVars)
+	negCount := make([]int, s.cnf.NumVars)
 
 	for i := 0; i < s.cnf.NumClauses; i++ {
-		_, size := s.cnf.GetOriginalClauseInfo(i)
+		offset, size := s.cnf.GetOriginalClauseInfo(i)
 		if size == 2 {
 			binaryCount++
 			smallCount++
@@ -772,6 +875,14 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		} else if size > 3 {
 			longCount++
 		}
+		lits := s.cnf.GetLiteralPool()[offset : offset+size]
+		for _, lit := range lits {
+			if lit.IsNegated() {
+				negCount[lit.Var()]++
+			} else {
+				posCount[lit.Var()]++
+			}
+		}
 	}
 
 	if s.cnf.NumClauses > 0 {
@@ -779,6 +890,26 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		structure.TernaryRatio = float64(ternaryCount) / float64(s.cnf.NumClauses)
 		structure.LongClauseRatio = float64(longCount) / float64(s.cnf.NumClauses)
 		structure.SmallClauseRatio = float64(smallCount) / float64(s.cnf.NumClauses)
+	}
+
+	// Polarity imbalance: mean per-variable |pos-neg|/(pos+neg).
+	// 0 = perfectly balanced (occurrence-based polarity is noise), 1 = pure
+	// (one polarity absent). Used to gate the polarity-based initial phase.
+	imbSum := 0.0
+	imbCount := 0
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		t := posCount[i] + negCount[i]
+		if t > 0 {
+			diff := float64(posCount[i] - negCount[i])
+			if diff < 0 {
+				diff = -diff
+			}
+			imbSum += diff / float64(t)
+			imbCount++
+		}
+	}
+	if imbCount > 0 {
+		structure.PolarityImbalance = imbSum / float64(imbCount)
 	}
 
 	// Structured score: weighted combination of metrics
@@ -838,12 +969,32 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	structure := s.analyzeInstanceStructure()
 
-	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f\n",
+	// Cache classifier output for downstream consumers (initVSIDSOccurrenceBonus
+	// gates the polarity-based initial phase on these metrics).
+	s.structureScore = structure.StructuredScore
+	s.polarityImbalance = structure.PolarityImbalance
+	s.longClauseRatio = structure.LongClauseRatio
+
+	// Dense binary instances: the BIG is highly connected, so the default phase
+	// propagates to a solution quickly (0 conflicts observed on 32baec6a, a
+	// 2500v/49-density/100%-binary instance). The occurrence-based polarity
+	// override fights the implication structure and sends the search into
+	// thousands of conflicts. Skip it. Sparse binary instances (e.g. 8202af80,
+	// density 24.5) still benefit from the override, so the density threshold
+	// (35) separates the two regimes.
+	s.skipPolarityPhase = structure.BinaryRatio > 0.9 && structure.Density > 35.0
+
+	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
 			structure.Density,
 			structure.BinaryRatio*100,
 			structure.TernaryRatio*100,
 			structure.LongClauseRatio*100,
-			structure.StructuredScore)
+			structure.StructuredScore,
+			structure.PolarityImbalance)
+	if s.skipPolarityPhase {
+		s.Log("c [structure] Dense binary instance (density=%.1f, binary=%.1f%%) - skipping polarity phase\n",
+			structure.Density, structure.BinaryRatio*100)
+	}
 
 
 	// Random-like instances (StructuredScore < 0.7): NO preprocessing
@@ -1307,6 +1458,10 @@ func (s *CDCLSolver) initWatches() {
 	// This flag controls whether propagateWatched() is used instead of linear propagation
 	s.watchInitialized = true
 
+	// Initialize per-original-clause search hints (0 = no hint, scan from pos 2).
+	// Allocated after preprocessing is complete (clause count is final).
+	s.originalSearchHint = make([]int32, s.cnf.NumClauses)
+
 	if s.verbose {
 		totalWatches := 0
 		for _, wl := range s.watchLists {
@@ -1654,8 +1809,11 @@ func (s *CDCLSolver) runVivification() bool {
 		// from being deleted as high-LBD.
 		newSize := len(r.newLits)
 		if newSize < int(s.learnedMetadata[r.idx].LBD) {
-			s.learnedMetadata[r.idx].LBD = newSize
+			s.learnedMetadata[r.idx].LBD = int32(newSize)
 		}
+		// Reset search hint — vivification rewrites clause literals and
+		// rebuilds watches, invalidating any position-based hint.
+		s.learnedMetadata[r.idx].SearchHint = 0
 		// Rebuild watches
 		if len(r.newLits) >= 2 {
 			lits := s.learnedLiterals[offset : offset+len(r.newLits)]
@@ -1859,6 +2017,23 @@ func (s *CDCLSolver) shouldRestart() bool {
 			s.Log("c [restart] Props/dec %.1f > %d\n", propsPerDec, s.restartPropsDecLimit)
 			return true
 		}
+	}
+
+	// Level-capped restart: on long-clause instances, force a restart when the
+	// conflict level is excessively deep. Long-clause instances produce high-LBD
+	// clauses consistently, so the Glucose EMA criterion (emaLBD > avg*ratio)
+	// never fires (EMA ≈ avg). Deep search produces high-LBD clauses with no
+	// propagation guidance, creating a deep-search → high-LBD → no-guidance →
+	// deep-search cycle. This breaks the cycle by restarting when level > cap.
+	// Gated on LongClauseRatio > 0.8 (binary-heavy instances have the props/dec
+	// restart instead). Anti-thrashing: lubyIndex >= 3, decisions > 10, min-conflict gap.
+	if s.restartLevelCap > 0 && s.longClauseRatio > 0.8 &&
+		s.lubyIndex >= 3 && s.decisions > 10 &&
+		s.conflicts-s.restartCount >= s.levelRestartGap &&
+		s.lastConflictLevel > s.restartLevelCap {
+		s.Log("c [restart] Level-capped: conflict level %d > %d (long-clause instance)\n",
+			s.lastConflictLevel, s.restartLevelCap)
+		return true
 	}
 
 	return false
@@ -2222,14 +2397,120 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
 			s.vsids.activity[i] += 1.0 + float64(occurrences[i])*0.5
-			if negCount[i] > posCount[i] {
-				s.savedPhase[i] = true
-			} else if posCount[i] > negCount[i] {
-				s.savedPhase[i] = false
+			// Polarity-based initial phase: set savedPhase to the more frequent
+			// polarity (satisfy more clauses with the first assignment).
+			//
+			// Trajectory sensitivity: the polarity phase helps most instances but
+			// hurts some. No static metric cleanly predicts benefit — two
+			// near-identical 100%-binary instances (8202af80 gained, 32baec6a
+			// hurt, both near-pure with ~0.96 imbalance) respond oppositely.
+			// The one discriminating signal is density: for DENSE binary
+			// instances (binaryRatio > 0.9 AND density > 35), the BIG is highly
+			// connected and the default phase propagates to a solution quickly
+			// (32baec6a solves in 0 conflicts with the default phase). The
+			// override fights the implication structure → skip it. For sparse
+			// binary instances (8202af80, density 24.5), the BIG is less
+			// connected and the override provides useful guidance → keep it.
+			// Non-binary instances are unaffected (the polarity signal is
+			// orthogonal to the clause structure).
+			if !s.skipPolarityPhase {
+				if negCount[i] > posCount[i] {
+					s.savedPhase[i] = true
+				} else if posCount[i] > negCount[i] {
+					s.savedPhase[i] = false
+				}
 			}
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
+}
+
+// buildBIG builds the binary implication graph from original binary clauses.
+// For each binary clause (a ∨ b), edges ¬a→b and ¬b→a are added.
+// bigAdj[litIdx] lists literals m such that binary clause (¬lit ∨ m) exists.
+// Used for BIG-based clause minimization (Kissat-style).
+func (s *CDCLSolver) buildBIG() {
+	numLits := int(s.cnf.NumVars) * 2
+	s.bigAdj = make([][]int, numLits)
+	for i := range s.cnf.Clauses {
+		lits := s.cnf.Clauses[i].Literals
+		if len(lits) != 2 {
+			continue
+		}
+		a := cnf.LitToIndex(lits[0])
+		b := cnf.LitToIndex(lits[1])
+		if a == b || a == b^1 {
+			continue
+		}
+		s.bigAdj[a^1] = append(s.bigAdj[a^1], b)
+		s.bigAdj[b^1] = append(s.bigAdj[b^1], a)
+	}
+}
+
+// bigReachableInClause returns true if lit can reach, via forward BIG edges
+// (binary clauses), some literal m that is currently in the learned clause
+// (tmpLiteralInClause with matching polarity) and m != lit (any polarity).
+//
+// Soundness: a forward BIG path lit → m1 → ... → mk with mk currently in the
+// clause yields a valid resolution derivation of C\{lit} from C — resolve C
+// with (¬lit ∨ m1) on lit, then with (¬m1 ∨ m2) on m1, ..., until mk (already
+// in C) is absorbed back to rest. Each resolvent is a consequence of C and
+// the binary clauses (all in the formula), so C\{lit} is a consequence of C
+// in the formula, i.e. at least as strong as C. The derivation uses only
+// binary clauses, so intermediate literals need NOT be assigned (no
+// reason-clause / trail dependency, unlike recursive minimization).
+// Intermediate resolvents may become tautological if ¬mi happens to be in C,
+// but tautological resolvents are still valid consequences and only the final
+// non-tautological C\{lit} matters.
+//
+// The success test excludes lit's own variable (mVar != litVar): a cycle
+// lit → ... → lit does not make lit removable (resolving around a cycle
+// returns to C, not C\{lit}), and reaching ¬lit would imply C is tautological
+// (never the case for a learned clause). The check uses tmpLiteralInClause
+// (correctly cleared on every removal) rather than a stale "covered" set.
+//
+// Budget-limited (maxBigBfsVisited); the limit only reduces effectiveness
+// (fewer removals found), never soundness.
+func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
+	litIdx := cnf.LitToIndex(lit)
+	if litIdx >= len(s.bigAdj) {
+		return false
+	}
+	s.bigBfsEpoch++
+	ep := s.bigBfsEpoch
+	litVar := lit.Var()
+	visited := s.bigBfsVisited
+	tmpInClause := s.tmpLiteralInClause
+	tmpIsNeg := s.tmpLiteralIsNegated
+
+	visited[litIdx] = ep
+	q := s.bigBfsQueue[:0]
+	q = append(q, litIdx)
+	head := 0
+	found := false
+	const maxBigBfsVisited = 16
+	visitedCount := 0
+	for head < len(q) && !found {
+		cur := q[head]
+		head++
+		for _, m := range s.bigAdj[cur] {
+			if m >= len(visited) || visited[m] == ep {
+				continue
+			}
+			visited[m] = ep
+			visitedCount++
+			mVar := uint32(m >> 1)
+			if mVar != litVar && tmpInClause[mVar] && tmpIsNeg[mVar] == ((m&1) == 1) {
+				found = true
+				break
+			}
+			if visitedCount < maxBigBfsVisited {
+				q = append(q, m)
+			}
+		}
+	}
+	s.bigBfsQueue = q
+	return found
 }
 
 // cdclLoop runs the main CDCL search loop until SAT, UNSAT, or UNKNOWN is
@@ -2265,6 +2546,9 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			}
 			if s.conflicts%1000 == 0 && s.verbose {
 				s.logDiagnostics()
+			}
+			if s.statsInterval > 0 && s.conflicts%s.statsInterval == 0 {
+				s.printPeriodicStats()
 			}
 			if !s.backtrack() {
 				s.printStats()
@@ -2339,6 +2623,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	}
 
 	s.initVSIDSOccurrenceBonus()
+	s.buildBIG()
 
 	// Size- and structure-adaptive LBD bonus scale.
 	// Binary-heavy small instances benefit from strong LBD guidance (glue
@@ -2407,6 +2692,7 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 		return UNSAT
 	}
 	s.initVSIDSOccurrenceBonus()
+	s.buildBIG()
 	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
 	s.numUnassigned = 0
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
@@ -2608,6 +2894,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// header eliminates that per-watch pointer chase.
 	originalClauses := s.cnf.Clauses
 	numOriginalClauses := len(originalClauses)
+	originalSearchHint := s.originalSearchHint
 
 	// Cache watchLists outer slice header. The outer slice is allocated once in
 	// initWatches and never grows (length is always 2*numVars). Only inner slices
@@ -2637,7 +2924,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 		// Process watches for this literal using swap-with-last deletion
 		watchList := watchLists[watchIdx]
-		watchLitVar := watchIdx >> 1 // Constant for all watches on this list
 
 		// Cache litValue slice header (same reason as assignments — compiler
 		// can't prove non-aliasing across method calls).
@@ -2704,66 +2990,121 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Look for replacement watch
 			foundReplacement := false
 			var trueReplacementLit uint32 // 0 = none found; else a true literal to cache as Blit
-			for j := 2; j < len(clauseLits); j++ {
-				clauseLit := clauseLits[j]
-				clauseLitVar := int(clauseLit.Var())
+			foundJ := -1
+			var newWatchIdx int
 
-				if clauseLitVar == watchLitVar || clauseLitVar == blitVarIdx {
-					continue
+			// Probe the search hint first (probe-then-scan). The hint caches the
+			// position where a replacement was found last time. After a backjump,
+			// the old watched literal at that position may be unassigned → O(1)
+			// replacement without scanning from position 2. The probe always
+			// verifies the literal's assignment — a miss falls through to the
+			// full scan, so soundness is preserved.
+			var hint int32
+			if watch.ClauseIdx >= 0 {
+				origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+				if origIdx < len(originalSearchHint) {
+					hint = originalSearchHint[origIdx]
 				}
-
+			} else {
+				li := int(uint32(watch.ClauseIdx) & watchIdxMask)
+				if li < len(s.learnedMetadata) {
+					hint = s.learnedMetadata[li].SearchHint
+				}
+			}
+			if hint >= 2 && int(hint) < len(clauseLits) {
+				clauseLit := clauseLits[hint]
+				clauseLitVar := int(clauseLit.Var())
 				clauseAsg := assignments[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
-				if clauseAsg.Level >= 0 {
+				if clauseAsg.Level < 0 {
+					// Unassigned — usable as replacement
+					foundJ = int(hint)
+					newWatchIdx = clauseLitVar << 1
+					if litNegated {
+						newWatchIdx |= 1
+					}
+				} else if clauseAsg.Level >= 0 {
 					litTrue := litNegated != clauseAsg.Value
-					if !litTrue {
-						continue
-					}
-					// Found a true literal — cache it as the blit for the new watch.
-					// A stale-true blit is sound (falls through to slow path if it
-					// becomes false later). This improves the blit hit rate because
-					// the cached literal is known-true at cache-write time.
-					trueReplacementLit = uint32(clauseLit)
-				}
-				// Found replacement - swap into myPos and add new watch
-				newWatchIdx := clauseLitVar << 1
-				if litNegated {
-					newWatchIdx |= 1
-				}
-
-			// Swap replacement literal into position myPos
-			clauseLits[myPos], clauseLits[j] = clauseLit, clauseLits[myPos]
-
-			// Cache the true literal as Blit if found; otherwise cache the other
-			// watched literal (at 1-myPos) as before.
-			var newBlit uint32
-			if trueReplacementLit != 0 {
-				newBlit = trueReplacementLit
-			} else {
-				newBlit = uint32(clauseLits[1-myPos])
-			}
-
-			watchLists[newWatchIdx] = append(watchLists[newWatchIdx], cnf.Watch{
-				ClauseIdx: watch.ClauseIdx,
-				Blit:      newBlit,
-			})
-			// Update learnedWatchIdx to track the new watch list (fixes stale
-			// index bug where removeLearnedClauseWatches would search the wrong
-			// list after a watch move, leaving orphaned watches for tombstoned
-			// clauses).
-			if watch.ClauseIdx < 0 {
-				li := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if li < len(s.learnedWatchIdx0) {
-					if myPos == 0 {
-						s.learnedWatchIdx0[li] = newWatchIdx
-					} else {
-						s.learnedWatchIdx1[li] = newWatchIdx
+					if litTrue {
+						// Assigned-and-true — usable as replacement, cache as blit
+						trueReplacementLit = uint32(clauseLit)
+						foundJ = int(hint)
+						newWatchIdx = clauseLitVar << 1
+						if litNegated {
+							newWatchIdx |= 1
+						}
 					}
 				}
 			}
+
+			if foundJ < 0 {
+				for j := 2; j < len(clauseLits); j++ {
+					clauseLit := clauseLits[j]
+					clauseLitVar := int(clauseLit.Var())
+
+					clauseAsg := assignments[clauseLitVar]
+					litNegated := clauseLit.IsNegated()
+					if clauseAsg.Level >= 0 {
+						litTrue := litNegated != clauseAsg.Value
+						if !litTrue {
+							continue
+						}
+						trueReplacementLit = uint32(clauseLit)
+					}
+					foundJ = j
+					newWatchIdx = clauseLitVar << 1
+					if litNegated {
+						newWatchIdx |= 1
+					}
+					break
+				}
+			}
+
+			if foundJ >= 0 {
+				// Swap replacement literal into position myPos
+				clauseLits[myPos], clauseLits[foundJ] = clauseLits[foundJ], clauseLits[myPos]
+
+				// Cache the true literal as Blit if found; otherwise cache the other
+				// watched literal (at 1-myPos) as before.
+				var newBlit uint32
+				if trueReplacementLit != 0 {
+					newBlit = trueReplacementLit
+				} else {
+					newBlit = uint32(clauseLits[1-myPos])
+				}
+
+				watchLists[newWatchIdx] = append(watchLists[newWatchIdx], cnf.Watch{
+					ClauseIdx: watch.ClauseIdx,
+					Blit:      newBlit,
+				})
+				if watch.ClauseIdx < 0 {
+					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					if li < len(s.learnedWatchIdx0) {
+						if myPos == 0 {
+							s.learnedWatchIdx0[li] = newWatchIdx
+						} else {
+							s.learnedWatchIdx1[li] = newWatchIdx
+						}
+					}
+				}
+
+				// Update the search hint to the found position. After the swap,
+				// position foundJ holds the old false watched literal. Next time
+				// this clause's watch fires, the hint probe checks if that literal
+				// is now non-false (e.g., unassigned after a backjump) → O(1) repl.
+				if watch.ClauseIdx >= 0 {
+					origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					if origIdx < len(originalSearchHint) {
+						originalSearchHint[origIdx] = int32(foundJ)
+					}
+				} else {
+					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
+					if li < len(s.learnedMetadata) {
+						s.learnedMetadata[li].SearchHint = int32(foundJ)
+					}
+				}
 
 				foundReplacement = true
-				break
 			}
 
 		if foundReplacement {
@@ -3107,6 +3448,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 }
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
+	s.lastConflictLevel = s.level
 
 	// If empty clause was already detected (e.g., during propagation), skip learning
 	if s.emptyClauseFound {
@@ -3176,6 +3518,24 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
+
+	// B2: Adaptively shrink clause DB when average LBD is consistently high.
+	// High-LBD clauses rarely propagate; a smaller DB keeps only the lowest-LBD
+	// clauses. One-way shrink (don't grow back) to avoid oscillation.
+	if !s.maxLearnedShrunk && s.totalLbdCount > 1000 {
+		avgLbd := s.totalLbdSum / s.totalLbdCount
+		if avgLbd > 10 {
+			newFloor := int(s.cnf.NumVars) * 3
+			if newFloor < 300 {
+				newFloor = 300
+			}
+			if s.maxLearned > newFloor {
+				s.maxLearned = newFloor
+				s.Log("c [clause-db] Shrunk maxLearned to %d (avg LBD=%d > 10)\n", s.maxLearned, avgLbd)
+			}
+			s.maxLearnedShrunk = true
+		}
+	}
 
 	// Delete learned clauses when database exceeds dynamic limit
 	// MiniSat-style: limit grows with conflicts to allow more learning on hard instances
@@ -3645,6 +4005,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.lbdSum += lbd
 	s.lbdCount++
 	s.emaLBD = 0.9*s.emaLBD + 0.1*float64(lbd)
+	s.totalLbdSum += uint64(lbd)
+	s.totalLbdCount++
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
 	// SPECIAL CASE: If learned clause is unit (1 literal) at current level, backjump to level 0
@@ -3801,7 +4163,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		})
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
-			LBD:       lbd,
+			LBD:       int32(lbd),
 			PropCount: 0,
 		})
 		s.learnedActiveCount++
@@ -3958,6 +4320,33 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		// Skip decisions (no reason clause to resolve against).
 		if s.implication[v] == -1 {
 			continue
+		}
+		// BIG fast-path: check if lit is removable via a chain of binary
+		// clauses. A forward BIG path lit → m1 → ... → mk with mk currently in
+		// the clause yields a valid resolution derivation of C\{lit} from C
+		// (resolve C with each (¬mi ∨ mi+1) on the path), so lit is removable.
+		// Soundness does NOT require the intermediate literals to be assigned:
+		// the derivation uses only the binary clauses, which are in the formula.
+		// Intermediate tautologies in the resolvent are harmless — only the
+		// final clause (C\{lit}) matters, and it is non-tautological.
+		if s.bigAdj != nil {
+			s.bigMinimizeCalls++
+			if s.bigReachableInClause(lit) {
+				s.bigMinimizeHits++
+				s.tmpLiteralInClause[v] = false
+				// CRITICAL: Do NOT leave tmpSeenVar[v]=true for BIG-removed literals.
+				// Recursive minimization treats tmpSeenVar as a "covered" set (literal
+				// is removable, so can be skipped in reason clauses). But BIG removal
+				// is only valid while the BFS target remains in the clause. If recursive
+				// later removes the target, the BIG removal becomes invalid. Leaving
+				// tmpSeenVar[v]=true creates a circular dependency: lit1 is "covered"
+				// (BIG, depends on lit2), and lit2 is removable because lit1 is "covered".
+				// This circular reasoning produces unsound minimization → false UNSAT.
+				// Clearing tmpSeenVar[v] forces recursive to re-examine v independently.
+				s.tmpSeenVar[v] = false
+				reductionAchieved++
+				continue
+			}
 		}
 		if s.recursiveTryRemove(v) {
 			s.tmpLiteralInClause[v] = false
@@ -4347,6 +4736,9 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		// Update stored watch indices to the chosen literals
 		s.learnedWatchIdx0[i] = idx0
 		s.learnedWatchIdx1[i] = idx1
+		// Reset search hint — compaction re-ran chooseWatchPositions which
+		// reordered literals, invalidating any position-based hint.
+		s.learnedMetadata[i].SearchHint = 0
 	}
 	
 	// Mark watches as initialized
