@@ -1001,16 +1001,8 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// Unit propagation on random/mixed instances causes 76x more conflicts
 	if structure.StructuredScore < 0.7 {
 			s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
-		// Configure aggressive VSIDS decay for random instances
-		s.vsids.SetAggressiveDecay()
-		// Keep aggressive Luby base (5) — frequent restarts help random instances
-		// escape local minima. Disable Glucose criterion (ratio=100 effectively
-		// never fires): with Luby base=5 already restarting every 5-20 conflicts,
-		// additional Glucose restarts change the search trajectory and can cause
-		// regressions on specific instances (e.g. 0f4576a6 SAT→TIMEOUT).
-		s.restartBase = 5
-		s.restartGlucoseRatio = 100.0
-		s.restartGlucoseMinConflicts = 1000000
+		// Use standard VSIDS decay and restart config (same as structured instances).
+		// Minisat uses the same 0.95 decay and Luby base=100 for all instances.
 		return PreprocessingConfig{
 			EnableUnitProp: false,
 			MaxPasses:      0,
