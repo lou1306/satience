@@ -493,16 +493,41 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 		// C and D on l is (C\{l} ∪ D\{¬l}) = D\{¬l} (since D\{¬l} ⊆ C ⊇ C\{l}),
 		// which subsumes C. Removing l from C is sound because C ∧ D ⊨ resolvent
 		// and resolvent subsumes C.
-		for _, lit := range clauseLits {
+		//
+		// SOUNDNESS:
+		// - seenLit is built from C's original literals. After removing l from C,
+		//   we clear seenLit[lIdx] so subsequent checks for other literals l'
+		//   correctly see l ∉ C (prevents D\{¬l'} ⊆ C from passing when D
+		//   contains the removed l).
+		// - Occurrence lists are stale after any strengthening (D may have had
+		//   ¬l removed by a prior strengthening). We verify D actually contains
+		//   ¬l before using it.
+		// - Index-based loop: after removing l at position i, the next literal
+		//   shifts to position i, so we don't increment i (re-check position i).
+		i := 0
+		for i < len(clauseLits) {
+			lit := clauseLits[i]
 			lIdx := cnf.LitToIndex(lit)
 			negIdx := lIdx ^ 1 // complement of l
 
-			// Check if any clause D containing ¬l has D\{¬l} ⊆ C
+			strengthenedHere := false
 			for _, di := range occ[negIdx] {
 				if di == ci || removed[di] {
 					continue
 				}
 				dLits := s.cnf.Clauses[di].Literals
+				// Verify D actually contains ¬l (occ may be stale after
+				// strengthening D removed ¬l from it)
+				containsNegL := false
+				for _, dlit := range dLits {
+					if cnf.LitToIndex(dlit) == negIdx {
+						containsNegL = true
+						break
+					}
+				}
+				if !containsNegL {
+					continue
+				}
 				// Check D\{¬l} ⊆ C: every literal in D except ¬l must be in C
 				allIn := true
 				for _, dlit := range dLits {
@@ -519,9 +544,14 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 					// Remove l from C (strengthen C)
 					clauseLits = removeLiteral(clauseLits, lit)
 					s.cnf.Clauses[ci].Literals = clauseLits
+					seenLit[lIdx] = false
 					strengthened++
+					strengthenedHere = true
 					break
 				}
+			}
+			if !strengthenedHere {
+				i++
 			}
 		}
 
