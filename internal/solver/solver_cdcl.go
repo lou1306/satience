@@ -48,7 +48,7 @@ const (
 const (
 	// Base clause database size - scaled with instance size by calculateMaxLearned()
 	DefaultMaxLearnedBase   = 2000  // Base clause database limit
-	DefaultRestartBase      = 100   // Base for Luby restart sequence (MiniSat-style)
+	DefaultRestartBase      = 200   // Base for Luby restart sequence (MiniSat-style)
 	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
 	IterationReportInterval = 10000 // Report progress every N iterations
 
@@ -72,6 +72,14 @@ const (
 	watchIdxMask     uint32 = 0x3FFFFFFF
 	watchMyPosMask   uint32 = 0xBFFFFFFF // bits 0-29 + bit 31 (clears myPos for identity comparison)
 )
+
+// litToBlit converts a Literal to a litTrue index for storage in Watch.Blit.
+// litTrue index = varIdx*2 + negated, matching the litValue array layout.
+// Storing the index directly eliminates bit manipulation in the fast path.
+func litToBlit(lit cnf.Literal) uint32 {
+	l := uint32(lit)
+	return (l&0x7FFFFFFF)<<1 | (l >> 31)
+}
 
 // calculateMaxLearned scales the clause database limit with instance size.
 // MiniSat-style: base limit proportional to variables, grows with conflicts
@@ -129,6 +137,7 @@ type CDCLSolver struct {
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals      []cnf.Literal         // All learned clause literals in one contiguous slice
 	learnedLoc           []LearnedClauseLoc    // Packed (Offset, Size) per learned clause; Size=0 means tombstone
+	learnedAlive         []byte                 // 1 = clause alive, 0 = tombstone (cache-friendly bitmap for tombstone check)
 	learnedMetadata      []cnf.ClauseMetadata  // OPTIMIZATION: Packed metadata (LBD, age, activity, useCount, propCount, score)
 	learnedWatchIdx0     []int                 // First watched literal index (for fast watch removal)
 	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
@@ -327,6 +336,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedMetadata:      make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedWatchIdx0:     make([]int, 0, maxLearned), // Watched literal indices
 		learnedWatchIdx1:     make([]int, 0, maxLearned),
+		learnedAlive:         make([]byte, 0, maxLearned),
 		learnedActiveCount:   0,
 		learnedCapacity:      0,
 		unitLearnedList:      make([]int, 0, 64), // Pre-allocate for unit clause tracking
@@ -377,7 +387,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		unitPropBudget: 0,
 		// Variable elimination budget: 0 = unlimited (small instances).
 		// Large instances set this to bound resolvent generation.
-		veBudget: 0,
+		veBudget: 5000000, // 5M resolvents default; large instances override to 2M
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:     50,
 		vivifyEnabled:    true,
@@ -1537,13 +1547,13 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	// watch on idx1 (lit1 at position 1) has myPos=1.
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: int32(clauseIdx),
-		Blit:      uint32(lit1),
+		Blit:      litToBlit(lit1),
 
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: int32(clauseIdx) | int32(watchMyPosBit),
-		Blit:      uint32(lit0),
+		Blit:      litToBlit(lit0),
 
 	})
 }
@@ -1580,13 +1590,13 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 
 	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 		ClauseIdx: clauseIdx0,
-		Blit:      uint32(lit1),
+		Blit:      litToBlit(lit1),
 
 	})
 
 	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 		ClauseIdx: clauseIdx1,
-		Blit:      uint32(lit0),
+		Blit:      litToBlit(lit0),
 
 	})
 
@@ -2910,6 +2920,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// litTrue cache: backing array never reallocated, writes through local visible
 	// to s.litTrue automatically. Eliminates per-trail-entry s → s.litTrue chase.
 	litValue := s.litTrue
+	// Cache scalar counters as locals — incremented/decremented on every propagation,
+	// writing through s pointer each time. Write back at returns.
+	propagations := s.propagations
+	numUnassigned := s.numUnassigned
+	// Cache learned clause arrays — accessed on every slow-path watch check
+	// (tombstone check + literal load). Eliminates s → s.learnedLoc and
+	// s → s.learnedLiterals pointer chases.
+	learnedLoc := s.learnedLoc
+	learnedLiterals := s.learnedLiterals
+	learnedAlive := s.learnedAlive
 
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
@@ -2935,27 +2955,12 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		for readIdx := 0; readIdx < len(watchList); readIdx++ {
 			watch := watchList[readIdx]
 
-			// FAST PATH: Check the cached blocking literal (Blit) via litValue
-			// cache. If Blit is assigned-and-true, the clause is satisfied and
-			// we can skip it entirely — no need to decode the literal or load
-			// the 8-byte Assignment struct. Blit may be stale (if the other
-			// watch was moved), but a stale-true Blit is sound: the literal it
-			// references is still assigned and true, so the clause is still
-			// satisfied. litValue is set to false for both polarities on unassign,
-			// so unassigned blits correctly fall through to the slow path.
-			// Convert Blit (Literal encoding: bit 31 = negated) to litTrue index
-			// (varIdx*2 + negated) inline.
-			blitIdx := int(watch.Blit&0x7FFFFFFF)<<1 | int(watch.Blit>>31)
-			if litValue[blitIdx] {
+			// FAST PATH: Blit stores the litTrue index directly (varIdx*2 + negated).
+			if litValue[watch.Blit] {
 				continue
 			}
 
 			// SLOW PATH: Blocking literal is not true (or unassigned).
-			// Decode blit for the slow path (need Var, IsNegated, Level, Value).
-			blitLit := cnf.Literal(watch.Blit)
-			blitVarIdx := int(blitLit.Var())
-			blitNegated := blitLit.IsNegated()
-			blitAsg := assignments[blitVarIdx]
 			// Access clause data for replacement search / conflict detection.
 
 			// Decode myPos from ClauseIdx bit 30 (packed at watch creation).
@@ -2973,26 +2978,26 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLits = originalClauses[origIdx].Literals
 			} else {
 				learnedIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if learnedIdx >= len(s.learnedLoc) || s.learnedLoc[learnedIdx].Size == 0 {
+				if learnedIdx >= len(learnedAlive) || learnedAlive[learnedIdx] == 0 {
 					continue
 				}
-				loc := s.learnedLoc[learnedIdx]
+				loc := learnedLoc[learnedIdx]
 				offset := int(loc.Offset)
 				size := int(loc.Size)
-				clauseLits = s.learnedLiterals[offset : offset+size]
+				clauseLits = learnedLiterals[offset : offset+size]
 			}
 
 			// Re-read the actual blocking literal from clause data (Blit may be stale).
 			// The fast-path Blit check already filtered out the true case; here we
 			// need the actual literal for the replacement guard, propagation, and
 			// conflict detection.
-			blitLit = clauseLits[blitPos]
-			blitVarIdx = int(blitLit.Var())
-			blitNegated = blitLit.IsNegated()
+			blitLit := clauseLits[blitPos]
+			blitVarIdx := int(blitLit.Var())
+			blitNegated := blitLit.IsNegated()
 
 			// Look for replacement watch
 			foundReplacement := false
-			var trueReplacementLit uint32 // 0 = none found; else a true literal to cache as Blit
+			var trueReplacementLit uint32 // 0 = none found; else litTrue index of true literal to cache as Blit
 			foundJ := -1
 			var newWatchIdx int
 
@@ -3030,8 +3035,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					litTrue := litNegated != clauseAsg.Value
 					if litTrue {
 						// Assigned-and-true — usable as replacement, cache as blit
-						trueReplacementLit = uint32(clauseLit)
-						foundJ = int(hint)
+					trueReplacementLit = litToBlit(clauseLit)
+					foundJ = int(hint)
 						newWatchIdx = clauseLitVar << 1
 						if litNegated {
 							newWatchIdx |= 1
@@ -3052,7 +3057,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						if !litTrue {
 							continue
 						}
-						trueReplacementLit = uint32(clauseLit)
+						trueReplacementLit = litToBlit(clauseLit)
 					}
 					foundJ = j
 					newWatchIdx = clauseLitVar << 1
@@ -3073,7 +3078,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if trueReplacementLit != 0 {
 					newBlit = trueReplacementLit
 				} else {
-					newBlit = uint32(clauseLits[1-myPos])
+					newBlit = litToBlit(clauseLits[1-myPos])
 				}
 
 				watchLists[newWatchIdx] = append(watchLists[newWatchIdx], cnf.Watch{
@@ -3123,7 +3128,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			// No replacement found - check if we can propagate or have conflict
-			blitAsg = assignments[blitVarIdx]
+			blitAsg := assignments[blitVarIdx]
 
 			if blitAsg.Level < 0 {
 				// Unassigned blit - propagate it (inlined assignLiteralByClause)
@@ -3141,11 +3146,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					litValue[blitVarIdx*2] = blitValue
 					litValue[blitVarIdx*2+1] = !blitValue
 					s.trail = append(s.trail, blitVarIdx)
-					s.numUnassigned--
+					numUnassigned--
 					implication[blitVarIdx] = reasonIdx
 					savedPhase[blitVarIdx] = blitNegated
 				}
-				s.propagations++
+				propagations++
 				continue
 			}
 
@@ -3170,12 +3175,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if s.level == 0 {
 				s.emptyClauseFound = true
+					s.propagations = propagations
+					s.numUnassigned = numUnassigned
 					return true, conflictClause
 				}
 				if s.verbose {
 					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
 						watchIdx, watch.ClauseIdx, s.level)
 				}
+				s.propagations = propagations
+				s.numUnassigned = numUnassigned
 				return true, conflictClause
 			}
 		}
@@ -3183,6 +3192,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 	// Update qhead to end of trail
 	s.qhead = len(s.trail)
+	s.propagations = propagations
+	s.numUnassigned = numUnassigned
 
 	return false, nil
 }
@@ -4171,6 +4182,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			Offset: int32(offset),
 			Size:   int32(len(s.tmpLearnedLits)),
 		})
+		s.learnedAlive = append(s.learnedAlive, 1)
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
 			LBD:       int32(lbd),
@@ -4203,8 +4215,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				idx1 = cnf.LitToIndex(lit1)
 				clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx))
 				clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)
-				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx0, Blit: uint32(lit1)})
-				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx1, Blit: uint32(lit0)})
+				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)})
+				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx1, Blit: litToBlit(lit0)})
 			} else {
 				// Watches not yet initialized (preprocessing); store positions 0,1
 				// as placeholder — initWatches will choose correct positions later
@@ -4581,6 +4593,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			s.removeLearnedClauseWatches(i)
 			// Mark as tombstone
 			s.learnedLoc[i].Size = 0
+			s.learnedAlive[i] = 0
 			s.learnedWatchIdx0[i] = -1
 			s.learnedWatchIdx1[i] = -1
 			tombstoneCount++
@@ -4660,6 +4673,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		newStart := nextOffset
 
 		s.learnedLoc[writeIdx] = LearnedClauseLoc{Offset: int32(newStart), Size: int32(oldSize)}
+		s.learnedAlive[writeIdx] = 1
 		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
 		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
 		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
@@ -4733,12 +4747,12 @@ func (s *CDCLSolver) compactLearnedClauses() {
 
 		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
 			ClauseIdx: clauseIdx0,
-			Blit:      uint32(lit1),
+			Blit:      litToBlit(lit1),
 
 		})
 		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
 			ClauseIdx: clauseIdx1,
-			Blit:      uint32(lit0),
+			Blit:      litToBlit(lit0),
 
 		})
 
@@ -4756,6 +4770,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	// Truncate arrays to new capacity
 	s.learnedLiterals = s.learnedLiterals[:nextOffset]
 	s.learnedLoc = s.learnedLoc[:writeIdx]
+	s.learnedAlive = s.learnedAlive[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
 	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
 	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]

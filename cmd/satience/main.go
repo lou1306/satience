@@ -35,8 +35,8 @@ func run() int {
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	// Restart policy parameters
-	restartBase := flag.Int("restart-base", 100, "Luby restart sequence base multiplier (default=100)")
-	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 1.5, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
+	restartBase := flag.Int("restart-base", 200, "Luby restart sequence base multiplier (default=200)")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
 	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10 for PHP)")
 	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Restart when props/dec exceeds this (deep search escape, 0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.1, "Phase flip rate when props/dec is high (0=disabled)")
