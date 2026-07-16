@@ -46,17 +46,8 @@ const (
 // These defaults balance performance and memory usage for typical instances.
 // Tuning may be beneficial for specific instance families.
 const (
-	// Base clause database size - scaled with instance size by calculateMaxLearned()
-	DefaultMaxLearnedBase   = 2000  // Base clause database limit
-	DefaultRestartBase      = 200   // Base for Luby restart sequence (MiniSat-style)
-	VSIDSDecayFactor        = 0.95  // VSIDS activity decay factor
+	DefaultRestartBase       = 200   // Base for Luby restart sequence (MiniSat-style)
 	IterationReportInterval = 10000 // Report progress every N iterations
-
-	// Clause minimization thresholds.
-	// Set to extremely high values to enable aggressive minimization on ALL clauses.
-	MinimizationMaxSize       = 10000 // Minimize clauses up to 10K literals (effectively all)
-	MinimizationMaxLBD        = 10000 // Minimize clauses up to LBD 10K (effectively all)
-	MinimizationMaxReasonSize = 100   // Allow reason clauses up to 100 literals (more aggressive)
 
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
@@ -261,7 +252,6 @@ type CDCLSolver struct {
 	// Watched literals infrastructure
 	watchLists          [][]cnf.Watch // watchLists[lit] = clauses watching lit
 	watchInitialized    bool          // True if watches have been initialized
-	learnedClauseBase   int           // Base ID for learned clause watches (fixed at initialization)
 	originalUnitClauses []int         // Precomputed indices of original unit clauses (for restart re-propagation)
 	originalSearchHint  []int32        // Per-original-clause search hint for replacement scan (0=no hint)
 
@@ -377,7 +367,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
 		tmpClauseIndexMap:     make([]int, maxLearned),
 		tmpDeletionCandidates: make([]int, 0, maxLearned),
-		learnedClauseBase:     int(formula.NumClauses),
 		originalUnitClauses:   precomputeOriginalUnitClauses(formula),
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
 		// 0 = unlimited (rely on DAG property for termination). MiniSat uses no cap.
@@ -1449,8 +1438,6 @@ func (s *CDCLSolver) initWatches() {
 		clause := &s.cnf.Clauses[clauseID]
 		s.addOriginalClauseToWatches(clauseID, clause, clause.Literals)
 	}
-
-	// learnedClauseBase is already set in NewCDCLSolver to the original NumClauses value
 
 	for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
 		if s.learnedLoc[learnedIdx].Size == 0 {
@@ -4793,60 +4780,6 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	// watches, unit list) are consistent after the rebuild. No-op in release.
 	verifyClauseIndices(s)
 }
-// compactWatchLists removes watches for deleted learned clauses (tombstones)
-// This is called after deleteLearnedClauses to clean up watch lists
-// 
-// Why needed: When learned clauses are deleted (marked as tombstones), their watches
-// remain in watch lists, causing unnecessary iteration during propagation.
-// This removes watches for clauses with size=0 (permanently deleted).
-func (s *CDCLSolver) compactWatchLists() {
-	s.Log("c [compact] Compacting watch lists: removing deleted clause watches\n")
-
-	
-	removedCount := 0
-	
-	// Scan each watch list and remove watches for deleted learned clauses
-	for litIdx := range s.watchLists {
-		watchList := s.watchLists[litIdx]
-		if len(watchList) == 0 {
-			continue
-		}
-		
-		// Compact in-place: move active watches forward
-		writeIdx := 0
-		for readIdx := range watchList {
-			watch := watchList[readIdx]
-			
-			// Check if learned clause is deleted (tombstone)
-			shouldRemove := false
-			if watch.ClauseIdx < 0 {
-				learnedIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if int(learnedIdx) < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 0 {
-					shouldRemove = true
-				}
-			}
-			// Note: We never remove original clauses from watch lists
-			
-			// Keep watch if clause is still active
-			if !shouldRemove {
-				if writeIdx != readIdx {
-					watchList[writeIdx] = watch
-				}
-				writeIdx++
-			} else {
-				removedCount++
-			}
-		}
-		
-		// Truncate watch list
-		if writeIdx < len(watchList) {
-			s.watchLists[litIdx] = watchList[:writeIdx]
-		}
-	}
-	
-	s.Log("c [compact] Watch list compaction: removed %d watches for deleted clauses\n", removedCount)
-
-}
 
 // propagateAssertingLiteral propagates the UIP (asserting literal) from the
 // most recently learned clause after a backjump. With qhead=decisionPoint,
@@ -4988,8 +4921,9 @@ func (s *CDCLSolver) backtrack() bool {
 
 	return true
 }
+
 func (s *CDCLSolver) SolveDPLL() SolveResult {
-		s.Log("c Using plain DPLL algorithm (no clause learning)\n")
+	s.Log("c Using plain DPLL algorithm (no clause learning)\n")
 
 	// Create a simple DPLL solver
 	dpll := NewSolver(s.cnf)
@@ -5004,24 +4938,3 @@ func (s *CDCLSolver) SolveDPLL() SolveResult {
 	}
 	return UNSAT
 }
-
-// PropagateBenchmark exposes propagate for benchmarking
-func (s *CDCLSolver) PropagateBenchmark() {
-	s.propagate()
-}
-
-// Trail returns the trail for benchmarking
-func (s *CDCLSolver) Trail() []int {
-	return s.trail
-}
-
-// ResetTrail resets the trail for benchmarking
-func (s *CDCLSolver) ResetTrail() {
-	s.trail = s.trail[:0]
-	s.level = 0
-	for i := range s.assignments {
-		s.assignments[i].Level = 0
-	}
-}
-
-

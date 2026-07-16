@@ -5,11 +5,6 @@ import (
 	"satience/internal/cnf"
 )
 
-// DefaultDecayInterval is the default number of conflicts between VSIDS activity decays
-// Value of 5 provides good balance: frequent decay keeps focus on recent conflicts
-// Lower values = more focus on recent conflicts, better for structured instances
-const DefaultDecayInterval = 5
-
 // vsidsHeapItem represents a variable in the activity heap
 type vsidsHeapItem struct {
 	varIdx uint32
