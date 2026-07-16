@@ -23,7 +23,7 @@ All 6 timeout instances are solvable by minisat in <30s. Root causes: throughput
 
 #### B. Search Quality (medium risk, high potential gains)
 
-- **B4. Target/best phase saving**: Track the "best" phase per variable (phase that led to most propagations or shallowest conflict). Use best phase instead of last phase for some decisions. Kissat-style. General search improvement.
+- **B4. Target/best phase saving** (REGRESSION — do not retry this variant): Tried Kissat-style best-phase saving. Recorded a decision's trial phase as `bestPhase[var]` when the resulting conflict was shallow (backjump level ≤ 10, conflict at the decision's own level). `decide()` preferred `bestPhase` over `savedPhase` when set. Result: PAR-2 regressed +36.4% (455s → 621s), 3 instances went solved→timeout (`30eb4ef4`, `8d58ca18`, `de2b584e`), only 1 improved (`69d72f81`). Hypothesis was wrong: `savedPhase` (updated on every propagation) already captures useful phase info; overriding it with a stale "best" phase sends the search into worse branches. The "shallow conflict = good phase" signal is too noisy. Ban applies to the shallow-conflict-trigger variant; other best-phase strategies (e.g. most-propagations) are unexplored.
 
 #### C. Throughput Deep Dives (higher effort)
 
@@ -36,6 +36,7 @@ All 6 timeout instances are solvable by minisat in <30s. Root causes: throughput
 
 ### Caveat
 - Always run `benchmark/cross_check_minisat.sh` after propagation changes. O(1) VSIDS decay (`varInc /= decayFactor`) uses compensated decay factors (decayInterval=1, so factors are `^(1/5)` of MiniSat's). Changing decay arithmetic shifts the search trajectory.
+- **Regression-check protocol for hot-path changes**: Any change to `decide()`, `propagateWatched()`, `handleConflict()`, `learnClause()`, or the VSIDS selection path MUST be validated with a PAR-2 before/after comparison on the MiniSat Fast Suite (use a git worktree for the "before" binary — never `git checkout` with unstaged files). Unit tests + fuzzer only prove soundness, NOT performance. B4 looked correct and passed all tests but regressed PAR-2 by +36%; without a before/after benchmark it would have shipped as an "improvement."
 
 ## Architecture
 
