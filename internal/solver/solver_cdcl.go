@@ -141,19 +141,6 @@ type CDCLSolver struct {
 	maxLearned           int
 	minLearned           int // Minimum clauses to keep (aggressive deletion target)
 	savedPhase           []bool
-	// Best-phase saving (Kissat-style): tracks the trial phase that led to a
-	// shallow conflict. Preferred over savedPhase in decide() when set, because
-	// savedPhase is overwritten by every assignment (decisions AND propagations)
-	// and may record a phase that led to a deep-search cycle. bestPhase only
-	// records phases from decisions whose conflict was shallow (level ≤ bestPhaseLevel),
-	// indicating the phase was a good starting guess. Persists across restarts
-	// (like VSIDS activity) — the recorded "good" phase is search memory.
-	bestPhase             []bool
-	bestPhaseSet          []bool
-	bestPhaseLevel        int    // Max conflict level considered "shallow" (0=disabled, default 10)
-	decisionVar           uint32 // Variable being decided in current branch (captured in decide, read in handleConflict)
-	decisionPhase         bool   // Trial phase of current decision (captured in decide, read in handleConflict)
-	decisionLevel         int    // Level at which decisionVar was decided (validates decisionVar is current in handleConflict)
 	restartBase          int
 	restartCount         int
 	lubyIndex            int
@@ -358,9 +345,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		maxLearned:           maxLearned,
 		minLearned:           minLearned,
 		savedPhase:           make([]bool, formula.NumVars),
-		bestPhase:            make([]bool, formula.NumVars),
-		bestPhaseSet:         make([]bool, formula.NumVars),
-		bestPhaseLevel:       10, // conflicts at level ≤ this are "shallow" → record phase
 		restartBase:          restartBase,
 		restartCount:         0,
 		lubyIndex:            0,
@@ -3216,13 +3200,8 @@ func (s *CDCLSolver) decide() bool {
 	var phase bool
 	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
 
-	// Use best phase if available (Kissat-style target phase saving),
-	// otherwise fall back to saved phase (last assigned phase). bestPhase records
-	// a phase that led to a shallow conflict; savedPhase is overwritten by every
-	// assignment and may reflect a deep-search cycle.
-	if int(varIdx) < len(s.bestPhaseSet) && s.bestPhaseSet[varIdx] {
-		phase = s.bestPhase[varIdx]
-	} else if int(varIdx) < len(s.savedPhase) {
+	// Use saved phase (phase saving heuristic).
+	if int(varIdx) < len(s.savedPhase) {
 		phase = s.savedPhase[varIdx]
 	} else {
 		phase = false // Default to positive phase (variable = true)
@@ -3235,9 +3214,7 @@ func (s *CDCLSolver) decide() bool {
 		for i := uint32(0); i < s.cnf.NumVars; i++ {
 			if s.assignments[i].Level < 0 {
 				varIdx = i
-				if int(varIdx) < len(s.bestPhaseSet) && s.bestPhaseSet[varIdx] {
-					phase = s.bestPhase[varIdx]
-				} else if int(varIdx) < len(s.savedPhase) {
+				if int(varIdx) < len(s.savedPhase) {
 					phase = s.savedPhase[varIdx]
 				} else {
 					phase = false
@@ -3265,12 +3242,6 @@ func (s *CDCLSolver) decide() bool {
 
 	s.level++
 	s.trailHead = append(s.trailHead, len(s.trail))
-	// Capture decision info for best-phase recording in handleConflict.
-	// decisionLevel == s.level confirms the conflict is at the same level as
-	// this decision (not a stale decision from before a backjump).
-	s.decisionVar = varIdx
-	s.decisionPhase = phase
-	s.decisionLevel = s.level
 	s.assignLiteral(cnf.NewLiteral(varIdx, phase), s.level, -1) // -1 = decision
 	s.decisions++
 	if s.verbose && s.conflicts <= 10 {
@@ -3417,18 +3388,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
-
-	// B4: Best-phase saving (Kissat-style). If this conflict is shallow
-	// (backjump level ≤ bestPhaseLevel) and at the same level as the most
-	// recent decision, the decision's trial phase was productive — it led to
-	// a low-LBD learned clause quickly. Record it as the best phase for this
-	// variable so future decisions prefer it over savedPhase (which is
-	// overwritten by every propagation and may reflect a deep-search cycle).
-	if s.bestPhaseLevel > 0 && bjLevel <= s.bestPhaseLevel &&
-		s.lastConflictLevel == s.decisionLevel {
-		s.bestPhase[s.decisionVar] = s.decisionPhase
-		s.bestPhaseSet[s.decisionVar] = true
-	}
 
 	// B2: Adaptively shrink clause DB when average LBD is consistently high.
 	// High-LBD clauses rarely propagate; a smaller DB keeps only the lowest-LBD
