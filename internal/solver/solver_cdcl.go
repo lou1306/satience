@@ -3162,17 +3162,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if s.level == 0 {
 				s.emptyClauseFound = true
-					s.propagations = propagations
-					s.numUnassigned = numUnassigned
-					return true, conflictClause
-				}
-				if s.verbose {
-					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
-						watchIdx, watch.ClauseIdx, s.level)
-				}
-				s.propagations = propagations
-				s.numUnassigned = numUnassigned
-				return true, conflictClause
+			}
+			if s.verbose {
+				s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
+					watchIdx, watch.ClauseIdx, s.level)
+			}
+			s.propagations = propagations
+			s.numUnassigned = numUnassigned
+			return true, conflictClause
 			}
 		}
 	}
@@ -3517,11 +3514,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 
 	// Get the conflicting clause literals directly
 	conflictLits := conflictClause.Literals
-
-	// Bump activity for learned clause involved in conflict
-	if conflictClause.Learned {
-		// Find matching clause by comparing literals (expensive, so skip for now)
-	}
 
 	s.vsids.bumpClause(conflictLits, s.assignments)
 
