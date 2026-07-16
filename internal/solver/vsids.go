@@ -47,22 +47,22 @@ func (h *vsidsHeap) down(heapPos []int, i int) {
 			break
 		}
 		right := left + 1
+		l := s[left]
 		largest := left
 		if right < n {
-			l := s[left]
 			r := s[right]
 			if r.score > l.score || (r.score == l.score && r.varIdx < l.varIdx) {
 				largest = right
+				l = r
 			}
 		}
 		cur := s[i]
-		best := s[largest]
-		if cur.score > best.score || (cur.score == best.score && cur.varIdx <= best.varIdx) {
+		if cur.score > l.score || (cur.score == l.score && cur.varIdx <= l.varIdx) {
 			break
 		}
-		s[i], s[largest] = best, cur
+		s[i], s[largest] = l, cur
 		heapPos[cur.varIdx] = largest
-		heapPos[best.varIdx] = i
+		heapPos[l.varIdx] = i
 		i = largest
 	}
 }

@@ -2924,6 +2924,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	learnedLoc := s.learnedLoc
 	learnedLiterals := s.learnedLiterals
 	learnedAlive := s.learnedAlive
+	learnedMetadata := s.learnedMetadata
 
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
 		lit := s.trail[trailIndex]
@@ -2957,25 +2958,25 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
 
-			// Decode myPos from ClauseIdx bit 30 (packed at watch creation).
-			// This eliminates the clauseLits[0] != falseLit cache miss that was
-			// the #1 propagation hotspot (13-14% of CPU).
-			myPos := int((uint32(watch.ClauseIdx) >> 30) & 1)
+			// Decode ClauseIdx once (was decoded 5+ times per watch iteration).
+			// Bit 31: learned flag, bit 30: myPos, bits 0-29: clause index.
+			clauseIdxRaw := uint32(watch.ClauseIdx)
+			isLearned := clauseIdxRaw&watchLearnedBit != 0
+			clauseID := int(clauseIdxRaw & watchIdxMask)
+			myPos := int((clauseIdxRaw >> 30) & 1)
 			blitPos := 1 - myPos
 
 			var clauseLits []cnf.Literal
-			if watch.ClauseIdx >= 0 {
-				origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if origIdx >= numOriginalClauses {
+			if !isLearned {
+				if clauseID >= numOriginalClauses {
 					continue
 				}
-				clauseLits = originalClauses[origIdx].Literals
+				clauseLits = originalClauses[clauseID].Literals
 			} else {
-				learnedIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if learnedIdx >= len(learnedAlive) || learnedAlive[learnedIdx] == 0 {
+				if clauseID >= len(learnedAlive) || learnedAlive[clauseID] == 0 {
 					continue
 				}
-				loc := learnedLoc[learnedIdx]
+				loc := learnedLoc[clauseID]
 				offset := int(loc.Offset)
 				size := int(loc.Size)
 				clauseLits = learnedLiterals[offset : offset+size]
@@ -3002,15 +3003,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// verifies the literal's assignment — a miss falls through to the
 			// full scan, so soundness is preserved.
 			var hint int32
-			if watch.ClauseIdx >= 0 {
-				origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if origIdx < len(originalSearchHint) {
-					hint = originalSearchHint[origIdx]
+			if !isLearned {
+				if clauseID < len(originalSearchHint) {
+					hint = originalSearchHint[clauseID]
 				}
 			} else {
-				li := int(uint32(watch.ClauseIdx) & watchIdxMask)
-				if li < len(s.learnedMetadata) {
-					hint = s.learnedMetadata[li].SearchHint
+				if clauseID < len(learnedMetadata) {
+					hint = learnedMetadata[clauseID].SearchHint
 				}
 			}
 			if hint >= 2 && int(hint) < len(clauseLits) {
@@ -3079,30 +3078,27 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					ClauseIdx: watch.ClauseIdx,
 					Blit:      newBlit,
 				})
-				if watch.ClauseIdx < 0 {
-					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					if li < len(s.learnedWatchIdx0) {
-						if myPos == 0 {
-							s.learnedWatchIdx0[li] = newWatchIdx
-						} else {
-							s.learnedWatchIdx1[li] = newWatchIdx
-						}
+			if isLearned {
+				if clauseID < len(s.learnedWatchIdx0) {
+					if myPos == 0 {
+						s.learnedWatchIdx0[clauseID] = newWatchIdx
+					} else {
+						s.learnedWatchIdx1[clauseID] = newWatchIdx
 					}
 				}
+			}
 
 				// Update the search hint to the found position. After the swap,
 				// position foundJ holds the old false watched literal. Next time
 				// this clause's watch fires, the hint probe checks if that literal
 				// is now non-false (e.g., unassigned after a backjump) → O(1) repl.
-				if watch.ClauseIdx >= 0 {
-					origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					if origIdx < len(originalSearchHint) {
-						originalSearchHint[origIdx] = int32(foundJ)
+				if !isLearned {
+					if clauseID < len(originalSearchHint) {
+						originalSearchHint[clauseID] = int32(foundJ)
 					}
 				} else {
-					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					if li < len(s.learnedMetadata) {
-						s.learnedMetadata[li].SearchHint = int32(foundJ)
+					if clauseID < len(learnedMetadata) {
+						learnedMetadata[clauseID].SearchHint = int32(foundJ)
 					}
 				}
 
@@ -3131,9 +3127,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					if propLevel == 0 {
 						propLevel = 1
 					}
-					reasonIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					if watch.ClauseIdx < 0 {
-						reasonIdx = -reasonIdx - 5
+					reasonIdx := clauseID
+					if isLearned {
+						reasonIdx = -clauseID - 5
 					}
 					blitValue := !blitNegated
 					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel)}
@@ -3154,12 +3150,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			if !blitTrue {
 				// Build conflict clause
 				var conflictClause *cnf.Clause
-				if watch.ClauseIdx >= 0 {
-					origIdx := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					conflictClause = &s.cnf.Clauses[origIdx]
+				if !isLearned {
+					conflictClause = &s.cnf.Clauses[clauseID]
 				} else {
-					li := int(uint32(watch.ClauseIdx) & watchIdxMask)
-					literals := s.getLearnedClauseLiterals(li)
+					literals := s.getLearnedClauseLiterals(clauseID)
 					s.conflictLitsBuf = s.conflictLitsBuf[:0]
 					s.conflictLitsBuf = append(s.conflictLitsBuf, literals...)
 					s.conflictClauseBuf.Literals = s.conflictLitsBuf
@@ -3171,8 +3165,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				s.emptyClauseFound = true
 			}
 			if s.verbose {
-				s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
-					watchIdx, watch.ClauseIdx, s.level)
+			s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
+				watchIdx, clauseID, s.level)
 			}
 			s.propagations = propagations
 			s.numUnassigned = numUnassigned

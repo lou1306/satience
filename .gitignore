@@ -45,3 +45,4 @@ satience_fast_suite_results_*.txt
 # Logs
 *.log
 *.db
+internal/solver/*.orig
