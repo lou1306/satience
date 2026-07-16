@@ -4479,13 +4479,8 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	dynamicLimit := s.maxLearned + s.conflicts/50
 	targetCount := dynamicLimit
 	
-	currentActive := 0
-	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedLoc[i].Size > 0 {
-			currentActive++
-		}
-	}
-	
+	currentActive := s.learnedActiveCount
+
 	toDelete := currentActive - targetCount
 	if toDelete <= 0 {
 		return // Nothing to delete
@@ -4588,12 +4583,7 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	}
 
 	// Update active count (excludes tombstones)
-	activeCount := 0
-	for i := 0; i < s.learnedCapacity; i++ {
-		if s.learnedLoc[i].Size > 0 {
-			activeCount++
-		}
-	}
+	activeCount := currentActive - deletedCount
 	s.learnedActiveCount = activeCount
 
 	// Rebuild unit clause list from scratch

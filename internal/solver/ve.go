@@ -174,14 +174,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 					}
 					seenLit[idx] = true
 					touched = append(touched, idx)
-					if seenLit[idx^1] {
-						isTautology = true
-						break
-					}
 					resolvent = append(resolvent, lit)
-				}
-				if isTautology {
-					continue
 				}
 				for _, lit := range negClause {
 					if lit.Var() == v {
