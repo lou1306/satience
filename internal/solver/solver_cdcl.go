@@ -243,6 +243,9 @@ type CDCLSolver struct {
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
 
+	// Reusable buffer for vivification results (avoid per-round allocation)
+	tmpVivifyResults []vivifyResult
+
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpDeleted            []bool               // Bitmap for deleted clauses
 	tmpClauseUsedAsReason []bool               // Track clauses used as implications
@@ -283,6 +286,12 @@ type CDCLSolver struct {
 type resolveCandidate struct {
 	varIdx     uint32
 	reasonSize int // Size of reason clause (for optional sorting heuristics)
+}
+
+// vivifyResult holds a vivified clause's new literals pending application
+type vivifyResult struct {
+	idx     int
+	newLits []cnf.Literal
 }
 
 // precomputeOriginalUnitClauses returns clause indices of original unit clauses (1 literal).
@@ -362,6 +371,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpMinimizedLits:     make([]cnf.Literal, 0, 256),
 		tmpMinSeenVars:       make([]uint32, 0, 256),
 		conflictLitsBuf:     make([]cnf.Literal, 0, 256),
+		tmpVivifyResults:    make([]vivifyResult, 0, 64),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpDeleted:            make([]bool, maxLearned),
 		tmpClauseUsedAsReason: make([]bool, maxLearned),
@@ -1736,11 +1746,7 @@ func (s *CDCLSolver) runVivification() bool {
 
 	modifiedCount := 0
 	checkedCount := 0
-	type vivifyResult struct {
-		idx   int
-		newLits []cnf.Literal
-	}
-	results := make([]vivifyResult, 0, 64)
+	results := s.tmpVivifyResults[:0]
 
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size <= 2 {
@@ -1780,6 +1786,9 @@ func (s *CDCLSolver) runVivification() bool {
 			return true
 		}
 	}
+
+	// Save results backing array (may have grown if cap was exceeded)
+	s.tmpVivifyResults = results
 
 	// Restore solver state (vivification may have left trail in a weird state).
 	s.cancelUntil(0)
@@ -1913,17 +1922,19 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 }
 
 func luby(i int) int {
-	k := 1
 	for {
-		ki := 1 << uint(k)
-		if i == ki-1 {
-			return 1 << uint(k-1)
+		k := 1
+		for {
+			ki := 1 << uint(k)
+			if i == ki-1 {
+				return 1 << uint(k - 1)
+			}
+			if ki-1 > i {
+				i -= (1 << uint(k-1)) - 1
+				break
+			}
+			k++
 		}
-		if ki-1 > i {
-			prevKi := 1 << uint(k-1)
-			return luby(i - (prevKi - 1))
-		}
-		k++
 	}
 }
 
@@ -3639,16 +3650,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.tmpTouchedVars = append(s.tmpTouchedVars, varIdx)
 			lvl := int(s.assignments[varIdx].Level)
 			if lvl >= 0 && lvl <= s.level {
-				// Ensure arrays are large enough for this level
-				if lvl >= len(s.tmpLevelCountUsed) {
-					newSize := lvl + 1
-					newCountUsed := make([]bool, newSize)
-					newLevelCount := make([]int, newSize)
-					copy(newCountUsed, s.tmpLevelCountUsed)
-					copy(newLevelCount, s.tmpLevelCount)
-					s.tmpLevelCountUsed = newCountUsed
-					s.tmpLevelCount = newLevelCount
-				}
 				if !s.tmpLevelCountUsed[lvl] {
 					s.tmpLevelCountUsed[lvl] = true
 					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
@@ -3910,13 +3911,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := int(s.assignments[varIdx].Level)
 			if lvl > 0 {
-				// Ensure arrays are large enough for this level
-				if lvl >= len(s.tmpLevelSetUsed) {
-					newSize := lvl + 1
-					newSetUsed := make([]bool, newSize)
-					copy(newSetUsed, s.tmpLevelSetUsed)
-					s.tmpLevelSetUsed = newSetUsed
-				}
 				if !s.tmpLevelSetUsed[lvl] {
 					s.tmpLevelSetUsed[lvl] = true
 					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
@@ -3981,11 +3975,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			varIdx := lit.Var()
 			lvl := int(s.assignments[varIdx].Level)
 			if lvl >= 0 {
-				if lvl >= len(s.tmpLevelSetUsed) {
-					newSize := lvl + 1
-					newSetUsed := make([]bool, newSize)
-					s.tmpLevelSetUsed = newSetUsed
-				}
 				if !s.tmpLevelSetUsed[lvl] {
 					s.tmpLevelSetUsed[lvl] = true
 					lbd++
