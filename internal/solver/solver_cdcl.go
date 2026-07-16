@@ -1459,8 +1459,8 @@ func (s *CDCLSolver) initWatches() {
 		s.addLearnedClauseToWatches(learnedIdx, tmpClause, literals)
 	}
 
-	// CRITICAL: Set watchInitialized AFTER all clauses are watched
-	// This flag controls whether propagateWatched() is used instead of linear propagation
+	// CRITICAL: Set watchInitialized AFTER all clauses are watched.
+	// Guards initWatches() idempotency (re-init after preprocessing resets it to false).
 	s.watchInitialized = true
 
 	// Initialize per-original-clause search hints (0 = no hint, scan from pos 2).
@@ -2538,8 +2538,8 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			return UNKNOWN
 		}
 
-		// Propagate all clauses (unit learned clauses handled in propagate())
-		conflict, conflictClause := s.propagate()
+		// Propagate all clauses (unit learned clauses handled in propagateWatched)
+		conflict, conflictClause := s.propagateWatched()
 		if conflict {
 			s.handleConflict(conflictClause)
 			if s.conflicts%50 == 0 && s.verbose {
@@ -2786,10 +2786,6 @@ func (s *CDCLSolver) verifyModel() bool {
 // so skipped elements were already processed before the conflict.
 
 func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
-	if !s.watchInitialized {
-		return s.propagate()
-	}
-
 	if s.verbose && s.conflicts <= 10 {
 		s.Log("c [PROPAGATE] qhead=%d, trail len=%d, level=%d\n", s.qhead, len(s.trail), s.level)
 	}
@@ -3189,145 +3185,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	s.qhead = len(s.trail)
 	s.propagations = propagations
 	s.numUnassigned = numUnassigned
-
-	return false, nil
-}
-
-func (s *CDCLSolver) propagate() (bool, *cnf.Clause) {
-	// Use watched literals propagation if enabled
-	if s.watchInitialized {
-		return s.propagateWatched()
-	}
-
-	// Fallback to linear propagation
-	trailIndex := s.trailHead[s.level]
-
-	firstPass := true
-	for firstPass || trailIndex < len(s.trail) {
-		firstPass = false
-		unitPropagated := false
-
-		// Optimized propagation for original clauses using contiguous literal pool
-		numOriginalClauses := s.cnf.NumOriginalClauses()
-		for clauseIdx := 0; clauseIdx < numOriginalClauses; clauseIdx++ {
-			clause := &s.cnf.Clauses[clauseIdx]
-			offset, size := s.cnf.GetOriginalClauseInfo(clauseIdx)
-			pool := s.cnf.GetLiteralPool()
-
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-
-			// Inline literal iteration (avoids range overhead)
-		for i := 0; i < size; i++ {
-			lit := pool[offset+i]
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel < 0 {
-					// Unassigned
-					unassignedCount++
-					unassignedLit = lit
-				} else {
-					assign := s.assignments[varIdx]
-					// Inlined literalIsTrue check (avoids function call)
-					isTrue := lit.IsNegated() != assign.Value
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
-				}
-			}
-
-			if satisfiedCount > 0 {
-				continue
-			}
-
-			if unassignedCount == 0 && falseCount > 0 {
-				return true, clause
-			}
-
-			if unassignedCount == 1 && falseCount == size-1 {
-				// CRITICAL FIX: Propagate at level 1 if s.level=0 (after restart)
-				// This prevents search propagations from being confused with preprocessing assignments
-				propLevel := s.level
-				if propLevel == 0 {
-					propLevel = 1
-				}
-				s.assignLiteralByClause(unassignedLit, propLevel, clauseIdx)
-				unitPropagated = true
-				break
-			}
-		}
-
-		if unitPropagated {
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
-
-		// CRITICAL: Must check learned clauses during propagation!
-		// Disabling this causes infinite loops: learned clauses don't prevent same conflict
-
-		// Simple linear scanning of learned clauses (O(n) but correct)
-		for learnedIdx := 0; learnedIdx < s.learnedCapacity; learnedIdx++ {
-			if s.learnedLoc[learnedIdx].Size == 0 {
-				continue // Skip tombstones
-			}
-			literals := s.getLearnedClauseLiterals(learnedIdx)
-			clauseSize := int(s.learnedLoc[learnedIdx].Size)
-
-			satisfiedCount := 0
-			falseCount := 0
-			unassignedCount := 0
-			var unassignedLit cnf.Literal
-
-			for _, lit := range literals {
-				varIdx := lit.Var()
-				litLevel := s.assignments[varIdx].Level
-				if litLevel < 0 {
-					// Unassigned
-					unassignedCount++
-					unassignedLit = lit
-				} else {
-					assign := s.assignments[varIdx]
-					isTrue := lit.IsNegated() != assign.Value
-					if isTrue {
-						satisfiedCount++
-					} else {
-						falseCount++
-					}
-				}
-			}
-
-			if satisfiedCount > 0 {
-				continue
-			}
-
-			if unassignedCount == 0 && falseCount > 0 {
-				tmpClause := &cnf.Clause{Literals: literals, Learned: true}
-				return true, tmpClause
-			}
-
-			if unassignedCount == 1 && falseCount == clauseSize-1 {
-			// Store learned clause index as negative: -learnedIdx-5 (offset by 4, see implication comment)
-			s.assignLiteralByClause(unassignedLit, s.level, -learnedIdx-5)
-				unitPropagated = true
-				// Track propagation count for this learned clause
-				if learnedIdx < len(s.learnedMetadata) {
-					s.learnedMetadata[learnedIdx].PropCount++
-				}
-				break
-			}
-		}
-
-		if unitPropagated {
-			trailIndex = s.trailHead[s.level]
-			continue
-		}
-
-		trailIndex++
-	}
 
 	return false, nil
 }
