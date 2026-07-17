@@ -8,7 +8,7 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 - SAT Competition 2026 output format (exit 10=SAT, 20=UNSAT, 0=UNKNOWN)
 
 ## Status
-Sound and complete. 51/51 unit tests, CNFgen soundness suite (22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling) — 0 false SAT, 0 false UNSAT, all SAT models verified.
+Sound and complete. 51/51 unit tests, CNFgen soundness suite (110 known-answer instances across 6 families: PHP, Tseitin, ordering, counting, parity, pebbling; 6 parallel workers) — 0 false SAT, 0 false UNSAT, all SAT models verified.
 MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)**, PAR-2 4.48s (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
 
 ### Potential Next Steps (July 2026)
@@ -109,5 +109,5 @@ These capture the *why* behind choices that aren't obvious from the code.
 - Go 1.22+, GOAMD64=v3 for AVX2/BMI2
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
 - GBD download: `https://benchmark-database.de/file/<hash>`
-- Soundness eval: `bash benchmark/cnfgen_fuzz.sh` (22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling; verifies SAT models)
+- Soundness eval: `bash benchmark/cnfgen_fuzz.sh` (110 known-answer instances across 6 families: PHP, Tseitin, ordering, counting, parity, pebbling; runs 6 parallel workers; verifies SAT models)
 - Soundness eval: `benchmark/eval_small_random.sh [n]`

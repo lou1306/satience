@@ -127,7 +127,7 @@ Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 m
 - **Solved**: 71/72 instances (98.6%)
 - **PAR-2**: 4.48s average per instance
 - **Soundness**: 100% — 0 false SAT, 0 false UNSAT
-- **CNFgen suite**: 22/22 known-answer instances pass (PHP, Tseitin, ordering, counting, parity, pebbling)
+- **CNFgen suite**: 110/110 known-answer instances pass (PHP, Tseitin, ordering, counting, parity, pebbling)
 
 **Memory (learned-clause compaction on large instances):**
 - GC cycles: 606 → 26 (23× reduction)
@@ -143,7 +143,7 @@ go test ./internal/solver -v
 go test -race ./internal/solver
 
 # Run the CNFgen soundness suite (requires: pipx install cnfgen)
-# 22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling
+# 110 known-answer instances across 6 families, 6 parallel workers
 bash benchmark/cnfgen_fuzz.sh
 ```
 
