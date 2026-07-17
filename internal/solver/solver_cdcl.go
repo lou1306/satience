@@ -220,6 +220,18 @@ type CDCLSolver struct {
 	vivifyClausesChecked uint64 // clauses passed to vivifyClause
 	vivifyClausesModified uint64 // clauses shortened by vivify
 	vivifyLiteralsRemoved  uint64 // literals removed by vivify
+	// Learned-clause subsumption (forward subsumption + self-subsumption
+	// strengthening). Runs at level-0 restart boundaries like vivification,
+	// using binary learned clauses as the subsumers. Self-gating: the occ
+	// build early-returns when no binary learned clauses exist (random
+	// instances produce none), so it is effectively free there.
+	subsumptionPeriod         int    // Run subsumption every Nth restart (0=disabled, default 50)
+	subsumptionMinConflictGap int    // Min conflicts between subsumption rounds (0=restart-based only)
+	conflictsAtLastSubsumption int   // conflict count at last subsumption round (for gap gate)
+	subsumptionRoundsRun       uint64 // subsumption rounds actually executed
+	subsumptionClausesChecked uint64 // non-binary learned clauses scanned
+	subsumptionClausesSubsumed  uint64 // clauses deleted by forward subsumption
+	subsumptionClausesStrengthened uint64 // literals removed by self-subsumption
 	// Histogram of final learned-clause sizes (post-minimization, at learn time).
 	// Buckets: [<=2, 3-5, 6-10, 11-20, 21-50, >50].
 	learnedLenHist     [6]uint64
@@ -396,6 +408,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// fires on genuinely hard instances (those exceeding ~20K conflicts); easy
 		// instances solve before vivify ever triggers.
 		vivifyMinConflictGap: 20000,
+		// Learned-clause subsumption: same gating cadence as vivification.
+		// Self-gating via early-return on no binary learned clauses means it
+		// is effectively free on random instances, so it is always enabled.
+		subsumptionPeriod:         50,
+		subsumptionMinConflictGap: 20000,
 		randomPhaseRate:       0,
 		restartPhaseFlipRate:  0,
 		// Configurable parameters with defaults
@@ -582,6 +599,19 @@ func (s *CDCLSolver) SetVivifyPeriod(p int) {
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
 	s.vivifyMinConflictGap = g
+}
+
+// SetSubsumptionPeriod sets how often learned-clause subsumption runs (every
+// Nth restart). 0 disables subsumption entirely.
+func (s *CDCLSolver) SetSubsumptionPeriod(p int) {
+	s.subsumptionPeriod = p
+}
+
+// SetSubsumptionMinConflictGap sets the minimum number of conflicts that must
+// occur between two subsumption rounds. 0 disables the gap gate (restart-based
+// only).
+func (s *CDCLSolver) SetSubsumptionMinConflictGap(g int) {
+	s.subsumptionMinConflictGap = g
 }
 
 // SetRandomPhaseRate sets the probability of flipping the saved phase per decision.
@@ -783,10 +813,11 @@ func (s *CDCLSolver) logDiagnostics() {
 	if s.minimizeLiteralsIn > 0 {
 		minRate = float64(minRemoved) * 100.0 / float64(s.minimizeLiteralsIn)
 	}
-	s.Log("c [diag] minimize: calls=%d in=%d out=%d removed=%d (%.1f%%) | BIG: calls=%d hits=%d | vivify: rounds=%d checked=%d modified=%d removed=%d | hist=[%d %d %d %d %d %d] max=%d\n",
+	s.Log("c [diag] minimize: calls=%d in=%d out=%d removed=%d (%.1f%%) | BIG: calls=%d hits=%d | vivify: rounds=%d checked=%d modified=%d removed=%d | subsump: rounds=%d checked=%d sub=%d str=%d | hist=[%d %d %d %d %d %d] max=%d\n",
 		s.minimizeCalls, s.minimizeLiteralsIn, s.minimizeLiteralsOut, minRemoved, minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits,
 		s.vivifyRoundsRun, s.vivifyClausesChecked, s.vivifyClausesModified, s.vivifyLiteralsRemoved,
+		s.subsumptionRoundsRun, s.subsumptionClausesChecked, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5], s.maxLearnedClauseSize)
 }
@@ -2211,6 +2242,18 @@ func (s *CDCLSolver) restart() bool {
 		if s.runVivification() {
 			return true // UNSAT detected
 		}
+	}
+
+	// Run learned-clause subsumption (forward subsumption + strengthening)
+	// after vivification, at the same level-0 safety boundary. Self-gating:
+	// early-returns when no binary learned clauses exist, so effectively free
+	// on random instances.
+	if s.subsumptionPeriod > 0 && s.lubyIndex > 0 && s.lubyIndex%s.subsumptionPeriod == 0 &&
+		(s.subsumptionMinConflictGap <= 0 || s.conflicts-s.conflictsAtLastSubsumption >= s.subsumptionMinConflictGap) {
+		if s.runLearnedSubsumption() {
+			return true // UNSAT detected
+		}
+		s.conflictsAtLastSubsumption = s.conflicts
 	}
 
 	return false // No UNSAT detected

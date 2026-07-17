@@ -575,3 +575,271 @@ func removeLiteral(lits []cnf.Literal, lit cnf.Literal) []cnf.Literal {
 	}
 	return lits
 }
+
+// subsumptionResult records a single clause modification from
+// runLearnedSubsumption. newLits == nil means forward subsumed (delete);
+// non-nil means strengthened (rewrite literals + rebuild watches).
+type subsumptionResult struct {
+	idx     int
+	newLits []cnf.Literal
+}
+
+// runLearnedSubsumption performs forward subsumption and self-subsumption
+// (strengthening) on the learned clause database, using binary learned clauses
+// as the subsumers. Runs at level-0 restart boundaries (same safety conditions
+// as compactLearnedClauses and runVivification).
+//
+// Forward subsumption: a non-binary learned clause C is deleted if some binary
+// learned clause D is a subset of C (both of D's literals are in C).
+//
+// Self-subsumption (strengthening): a literal l is removed from C if some binary
+// learned clause (not-l or m) exists where m is also in C. The resolvent of C
+// and (not-l or m) on l is (C minus l plus m) = C minus l (since m is in C),
+// which subsumes C.
+//
+// Both operations are sound simplifications that reduce clause count and length
+// without changing satisfiability. Strengthening also lowers LBD (updated to
+// min(oldLBD, newSize)), potentially turning high-LBD clauses into glue clauses.
+//
+// Returns true if UNSAT was detected (not currently possible -- subsumption
+// never derives empty clauses, but the return is kept for consistency with
+// runVivification).
+func (s *CDCLSolver) runLearnedSubsumption() bool {
+	if s.learnedActiveCount == 0 {
+		return false
+	}
+
+	numVars := int(s.cnf.NumVars)
+	if numVars == 0 {
+		return false
+	}
+	numLits := numVars * 2
+
+	// Build occurrence lists from binary learned clauses only.
+	// occ[litIdx] = list of learned clause indices of binary clauses containing litIdx.
+	occ := make([][]int, numLits)
+	binaryCount := 0
+	for i := 0; i < s.learnedCapacity; i++ {
+		if s.learnedLoc[i].Size != 2 {
+			continue
+		}
+		lits := s.getLearnedClauseLiterals(i)
+		idx0 := cnf.LitToIndex(lits[0])
+		idx1 := cnf.LitToIndex(lits[1])
+		occ[idx0] = append(occ[idx0], i)
+		occ[idx1] = append(occ[idx1], i)
+		binaryCount++
+	}
+
+	if binaryCount == 0 {
+		return false
+	}
+
+	s.subsumptionRoundsRun++
+
+	// Mark protected clauses (used as reasons). At level 0 after restart, no
+	// learned clause is in use as a reason, so this is all false. Built for
+	// safety in case the function is ever called at a non-level-0 state.
+	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
+		s.tmpClauseUsedAsReason = make([]bool, s.learnedCapacity)
+	}
+	protected := s.tmpClauseUsedAsReason[:s.learnedCapacity]
+	for i := range protected {
+		protected[i] = false
+	}
+	for _, impIdx := range s.implication {
+		if impIdx <= -5 {
+			learnedIdx := -impIdx - 5
+			if int(learnedIdx) < s.learnedCapacity {
+				protected[learnedIdx] = true
+			}
+		}
+	}
+
+	seenLit := make([]bool, numLits)
+	var touched []int
+
+	const maxCheckPerRound = 2000
+	checkedCount := 0
+	var results []subsumptionResult
+
+	for i := 0; i < s.learnedCapacity; i++ {
+		size := int(s.learnedLoc[i].Size)
+		if size <= 2 {
+			continue
+		}
+		if protected[i] {
+			continue
+		}
+		if checkedCount >= maxCheckPerRound {
+			break
+		}
+		checkedCount++
+		s.subsumptionClausesChecked++
+
+		lits := s.getLearnedClauseLiterals(i)
+
+		// Mark C's literals in seenLit for subsumption checking.
+		for _, lit := range lits {
+			idx := cnf.LitToIndex(lit)
+			if !seenLit[idx] {
+				seenLit[idx] = true
+				touched = append(touched, idx)
+			}
+		}
+
+		// Forward subsumption: find binary D that is a subset of C.
+		// Use the literal with fewest occurrences as the entry point (standard
+		// optimization -- the rarest literal is the most selective filter).
+		bestIdx := -1
+		bestCount := int(^uint(0) >> 1)
+		for _, lit := range lits {
+			idx := cnf.LitToIndex(lit)
+			count := len(occ[idx])
+			if count < bestCount {
+				bestCount = count
+				bestIdx = idx
+			}
+		}
+
+		isSubsumed := false
+		if bestIdx >= 0 {
+			for _, di := range occ[bestIdx] {
+				if di == i {
+					continue
+				}
+				if s.learnedLoc[di].Size != 2 {
+					continue // tombstoned since occ was built
+				}
+				dLits := s.getLearnedClauseLiterals(di)
+				d0 := cnf.LitToIndex(dLits[0])
+				var otherIdx int
+				if d0 == bestIdx {
+					otherIdx = cnf.LitToIndex(dLits[1])
+				} else {
+					otherIdx = d0
+				}
+				if seenLit[otherIdx] {
+					isSubsumed = true
+					break
+				}
+			}
+		}
+
+		if isSubsumed {
+			results = append(results, subsumptionResult{idx: i})
+			s.subsumptionClausesSubsumed++
+			for _, idx := range touched {
+				seenLit[idx] = false
+			}
+			touched = touched[:0]
+			continue
+		}
+
+		// Self-subsumption (strengthening): for each literal l in C, scan
+		// occ[not-l] for binary clause (not-l or m) where m is in C. If found,
+		// remove l from C (the resolvent C-minus-l subsumes C). After removing
+		// l, the next literal shifts to position j, so re-check position j.
+		newLits := make([]cnf.Literal, len(lits))
+		copy(newLits, lits)
+
+		j := 0
+		for j < len(newLits) {
+			lit := newLits[j]
+			lIdx := cnf.LitToIndex(lit)
+			negLIdx := lIdx ^ 1
+
+			strengthenedHere := false
+			for _, di := range occ[negLIdx] {
+				if di == i {
+					continue
+				}
+				if s.learnedLoc[di].Size != 2 {
+					continue
+				}
+				dLits := s.getLearnedClauseLiterals(di)
+				d0 := cnf.LitToIndex(dLits[0])
+				var otherIdx int
+				if d0 == negLIdx {
+					otherIdx = cnf.LitToIndex(dLits[1])
+				} else {
+					otherIdx = d0
+				}
+				// Guard against tautological binary clause (¬l ∨ l): the
+				// resolvent of C and (¬l ∨ l) on l is C itself, not a
+				// subsumption, so removing l would be unsound. Learned
+				// clauses should never be tautologies, but defend anyway.
+				if otherIdx == lIdx {
+					continue
+				}
+				if seenLit[otherIdx] {
+					newLits = append(newLits[:j], newLits[j+1:]...)
+					seenLit[lIdx] = false
+					strengthenedHere = true
+					s.subsumptionClausesStrengthened++
+					break
+				}
+			}
+			if !strengthenedHere {
+				j++
+			}
+		}
+
+		if len(newLits) < len(lits) && len(newLits) >= 2 {
+			results = append(results, subsumptionResult{idx: i, newLits: newLits})
+		}
+
+		// Cleanup seenLit
+		for _, idx := range touched {
+			seenLit[idx] = false
+		}
+		touched = touched[:0]
+	}
+
+	if len(results) == 0 {
+		return false
+	}
+
+	// Apply results: deletions (tombstone + remove watches) and strengthenings
+	// (remove watches, rewrite literals, update LBD, rebuild watches).
+	// Same pattern as runVivification's apply phase.
+	for _, r := range results {
+		if r.newLits == nil {
+			// Forward subsumed -- delete
+			s.removeLearnedClauseWatches(r.idx)
+			s.learnedLoc[r.idx].Size = 0
+			s.learnedAlive[r.idx] = 0
+			s.learnedWatchIdx0[r.idx] = -1
+			s.learnedWatchIdx1[r.idx] = -1
+			s.learnedActiveCount--
+		} else {
+			// Strengthened
+			offset := int(s.learnedLoc[r.idx].Offset)
+			oldSize := int(s.learnedLoc[r.idx].Size)
+			s.removeLearnedClauseWatches(r.idx)
+			copy(s.learnedLiterals[offset:offset+oldSize], r.newLits)
+			s.learnedLoc[r.idx].Size = int32(len(r.newLits))
+			newSize := len(r.newLits)
+			if newSize < int(s.learnedMetadata[r.idx].LBD) {
+				s.learnedMetadata[r.idx].LBD = int32(newSize)
+			}
+			s.learnedMetadata[r.idx].SearchHint = 0
+			if newSize >= 2 {
+				lits := s.learnedLiterals[offset : offset+newSize]
+				tmpClause := &cnf.Clause{Literals: lits, Learned: true}
+				idx0, idx1 := s.addLearnedClauseToWatches(r.idx, tmpClause, lits)
+				if r.idx < len(s.learnedWatchIdx0) {
+					s.learnedWatchIdx0[r.idx] = idx0
+					s.learnedWatchIdx1[r.idx] = idx1
+				}
+			}
+		}
+	}
+
+	s.compactPending = true
+
+	s.Log("c [subsumption] Subsumed %d, strengthened %d/%d clauses\n",
+		s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened, checkedCount)
+
+	return false
+}

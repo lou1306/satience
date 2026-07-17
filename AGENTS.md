@@ -9,17 +9,18 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 
 ## Status
 Sound and complete. 51/51 unit tests, 100% soundness on 4000+ fuzzer iterations.
-MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)** (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
+MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)**, PAR-2 4.48s (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
 
 ### Potential Next Steps (July 2026)
 
 Profiled on `BenchmarkRealInstanceLogAlloc` (post-A1+A2). CPU breakdown: `propagateWatched` 33.6%, `vsidsHeap.down` 13.2%, `learnClause` 11.9%, `backtrack` 7.1%, `onUnassign` 5.3%, `minimizeLearnedClause` 4.6%. `mallocgc` eliminated from top 20 (was 6.1% pre-A2).
 
-All 6 timeout instances are solvable by minisat in <30s. Root causes: throughput (Go vs C, ~5-10x slower) and search quality (deep search → high-LBD clauses → no propagation guidance → deep search cycle).
+All remaining timeout instances are solvable by minisat in <30s. Root causes: throughput (Go vs C, ~5-10x slower) and search quality (deep search → high-LBD clauses → no propagation guidance → deep search cycle).
 
 #### A. Throughput Quick Wins (low risk, guaranteed speedup)
 
 - **A3. Skip watch-list write-back for deletion-only path** (INFEASIBLE): Investigated and found infeasible. `watchLists[watchIdx] = watchList` (line 2963) is needed because `watchList = watchList[:lastIdx]` (line 2962) changes the slice length from `lastIdx+1` to `lastIdx`. Without the write-back, future calls to `propagateWatched` would load the stale (longer) slice and re-process deleted watch entries. The swap-with-last deletion DOES change the slice header — the original plan's claim "in-place, header unchanged" was incorrect.
+- **C1. Precompute ClauseIdx decode + cache learnedMetadata + optimize heap down** (DONE, -7.45% PAR-2): `propagateWatched` decoded `watch.ClauseIdx` 5+ times per watch iteration (isLearned check + clauseID mask + myPos shift). Now decoded once into `isLearned`/`clauseID`/`myPos` at the top of the slow path. `learnedMetadata` cached as local (was `s.learnedMetadata` pointer chase per watch). `vsidsHeap.down` eliminated redundant `s[largest]` load by reusing already-fetched child struct. Result: PAR-2 6.31s → 5.84s avg (-7.45%), `44092fcc` went TIMEOUT→SOLVED (28.9s), 70/72 solved (was 69/72), no regressions. Skipped optimization #2 (use Blit for blitVarIdx/blitNegated) — UNSOUND: Blit goes stale when a sibling watch replacement swaps clause literals at position `myPos`, which is the other watch's `blitPos`. The stale literal is still in the clause (at a different position), so the fast-path `litValue[Blit]` check is sound (true → clause satisfied → skip correct). But using stale Blit for `blitVarIdx`/`blitNegated` in the slow path would propagate the wrong variable.
 
 #### B. Search Quality (medium risk, high potential gains)
 
@@ -27,8 +28,9 @@ All 6 timeout instances are solvable by minisat in <30s. Root causes: throughput
 
 #### C. Throughput Deep Dives (higher effort)
 
+- **C0. Learned-clause subsumption** (DONE, -3.5% PAR-2): Forward subsumption + self-subsumption (strengthening) on the learned clause DB, using binary learned clauses as the subsumers. Runs at level-0 restart boundaries (same safety conditions as `compactLearnedClauses`/`runVivification`), gated by `subsumptionPeriod=50` restarts + `subsumptionMinConflictGap=20000`. Self-gating: early-returns when no binary learned clauses exist (random instances produce none), so effectively free there. Forward subsumption deletes a non-binary learned clause C if some binary learned D ⊆ C. Strengthening removes literal l from C when a binary learned (¬l ∨ m) exists with m ∈ C (resolvent C∖{l} subsumes C); LBD updated to `min(oldLBD, newSize)`. Deterministic budget `maxCheckPerRound=2000` clauses. Result: PAR-2 4.66s → 4.48s avg (-3.5%), no solve-count change, no new timeouts, biggest wins on medium-hard instances (`4dd5ed7b` -1.04s, `de2b584e` -0.86s, `30eb4ef4` -0.72s). Sound variant of the previously-banned buggy subsumption: forward subsumption (literal subset check) was always sound — the ban was on the buggy implementation, not the algorithm.
 - **C2. Propagation loop micro-optimization**: Investigate bounds check elimination via `unsafe` for the inner watch loop. Consider cache-line alignment of `Watch` structs. Potential 10-15% propagation speedup.
-- **C3. Inprocessing: variable elimination for large instances**: Standard Davis-Putnam VE (sound per soundness rules — ban is on the "pos=1" definitional variant, not standard VE). Could reduce 29K vars / 708K clauses significantly on de2b584e. Risky to implement (previous subsumption was buggy), but high impact for large instances.
+- **C3. Inprocessing: variable elimination for large instances**: Standard Davis-Putnam VE (sound per soundness rules — ban is on the "pos=1" definitional variant, not standard VE). Could reduce 29K vars / 708K clauses significantly on de2b584e. (Learned-clause subsumption is now re-implemented soundly — see C0; the earlier ban was on the buggy subset-check implementation, not the algorithm.)
 
 #### Deferred (require test changes)
 
@@ -96,7 +98,7 @@ These capture the *why* behind choices that aren't obvious from the code.
 ## Soundness Bugs to Never Re-introduce
 
 - **pos=1 variable elimination**: Removed (~800 lines). The "pos=1 elimination" variant assumes positive clauses are *definitions* of a variable and reconstructs the eliminated variable's value from that assumption. In PHP instances, positive clauses are *constraints*, not definitions → returned SAT instead of UNSAT on php_6p_5h_unsat. Standard Davis-Putnam VE (resolve all (x∨A)×(¬x∨B) pairs, reconstruct by trying x=true then x=false) is sound — the ban is on the definitional variant, not standard VE.
-- **Buggy subset-check subsumption elimination**: Removed (296 lines). The clause-subsumption check was implemented incorrectly — it determined clause A was subsumed by B when it wasn't, removing necessary clauses → false SAT. Forward subsumption (literal subset check) is sound — the ban is on the buggy implementation, not the algorithm.
+- **Buggy subset-check subsumption elimination**: Removed (296 lines). The clause-subsumption check was implemented incorrectly — it determined clause A was subsumed by B when it wasn't, removing necessary clauses → false SAT. Forward subsumption (literal subset check) is sound — the ban is on the buggy implementation, not the algorithm. Re-implemented soundly as `subsumptionPass()` (original clauses, preprocessing) and `runLearnedSubsumption()` (learned clauses, restart boundaries — see C0).
 - **Pattern-matching equivalence detection**: Disabled. The detection used ad-hoc pattern matching on binary clause pairs and produced false equivalences (claimed a↔b when variables were not equivalent). SCC-based equivalence detection (Tarjan's SCC on the binary implication graph) is sound — the ban is on the pattern-matching variant, not SCC-based detection.
 - **Blocked clause elimination (BCE)**: Disabled — was removing ALL clauses from arg_chain instances. Safe per-clause in isolation but unsound when applied aggressively (removes interacting constraints).
 - **Unit-prop inprocessing at restart**: Removed (34-228% slowdown, no benefit).
