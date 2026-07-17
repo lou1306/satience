@@ -198,6 +198,12 @@ type CDCLSolver struct {
 	// to a solution quickly via the highly-connected BIG, and the occurrence-
 	// based override fights the implication structure.
 	skipPolarityPhase   bool
+	// skipBVE is set by the classifier for dense binary instances
+	// (binaryRatio > 0.95 AND density > 10) where BVE hits the resolvent budget
+	// eliminating only 7-14% of variables while spending 4-15s on resolvent
+	// generation + post-BVE rebuild. These instances' highly-connected BIGs are
+	// navigated in <2s by watch-based propagation alone, so VE is pure overhead.
+	skipBVE             bool
 	// Binary implication graph (BIG): bigAdj[litIdx] lists forward successors m
 	// such that binary clause (¬litIdx ∨ m) exists (i.e., litIdx → m in the
 	// implication graph). Built once from original binary clauses in buildBIG.
@@ -1012,6 +1018,14 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// (35) separates the two regimes.
 	s.skipPolarityPhase = structure.BinaryRatio > 0.9 && structure.Density > 35.0
 
+	// BVE is pure overhead on dense binary instances: it hits the resolvent
+	// budget eliminating only 7-14% of variables while spending 4-15s on
+	// resolvent generation + post-BVE rebuild. The highly-connected BIG is
+	// navigated in <2s by watch-based propagation alone. 8202af80 (density
+	// 24.5, 99.8% binary): 16.7s→1.4s. bb34f22f (density 3.12, 67% binary) is
+	// NOT gated (density ≤ 10) — it's the instance VE was tuned for.
+	s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
+
 	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
 			structure.Density,
 			structure.BinaryRatio*100,
@@ -1050,7 +1064,11 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// low-LBD glue clauses that prevent the Glucose restart criterion from firing
 	// (EMA never exceeds avg×1.5). More frequent Luby restarts help escape
 	// these cascades. MiniSat restarts 5-10x more on binary-heavy instances.
-	if structure.BinaryRatio > 0.5 {
+	// Skipped for dense binary instances (skipBVE): without BVE reshaping the
+	// clause DB, restartBase=20 sends the search into a bad trajectory (de2b584e
+	// times out). The default 200 matches the -no-preprocess behavior that
+	// solves these instances in <2s.
+	if structure.BinaryRatio > 0.5 && !s.skipBVE {
 		s.restartBase = 20
 		s.Log("c [preprocessing] Binary-heavy (%.0f%%) — restartBase=20\n", structure.BinaryRatio*100)
 	}
@@ -1309,7 +1327,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// pos=1 definitional variant). Eliminates variables by resolving all
 		// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
 		// when it reduces clause count. Model reconstruction by trying x=true/x=false.
-		if config.EnableUnitProp {
+		// Skipped on dense binary instances (skipBVE) where it is pure overhead.
+		if config.EnableUnitProp && !s.skipBVE {
 			veResult := s.boundedVarElimination()
 			if veResult < 0 {
 				s.printStats()
