@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"satience/internal/cnf"
 	"sort"
+	"time"
 )
 
 // SolveResult represents the result of SAT solving.
@@ -136,6 +137,7 @@ type CDCLSolver struct {
 	learnedCapacity      int                   // Total capacity including tombstones
 	verbose              bool
 	statsInterval        int // Print stats every N conflicts (0=disabled, bypasses verbose gate)
+	solveStartNs         int64 // Wall-clock start (UnixNano) of the public Solve entry; for elapsed in stats
 	decisions            int
 	backjumpLevel        int
 	maxLearned           int
@@ -807,6 +809,50 @@ func (s *CDCLSolver) printStats() {
 	}
 	s.logDiagnostics()
 	s.Log("c \n")
+
+	// When -stats is enabled without -verbose, emit a compact final summary to
+	// stderr. This gives a terminal stats line at SAT/UNSAT/UNKNOWN exits without
+	// the 20-30% overhead of -verbose (every s.Log call site boxes args even when
+	// the gate is false). Mirrors printPeriodicStats so a run with -stats N shows
+	// both periodic progress lines and a matching final line.
+	if s.statsInterval > 0 && !s.verbose {
+		s.printFinalStats()
+	}
+}
+
+// printFinalStats writes a compact one-line final summary to stderr, tagged
+// [final] to distinguish from the periodic [stats] lines. Bypasses the
+// verbose gate so -stats produces a closing summary even without -verbose.
+func (s *CDCLSolver) printFinalStats() {
+	minRemoved := s.minimizeLiteralsIn - s.minimizeLiteralsOut
+	minRate := 0.0
+	if s.minimizeLiteralsIn > 0 {
+		minRate = float64(minRemoved) * 100.0 / float64(s.minimizeLiteralsIn)
+	}
+	avgLBD := 0.0
+	if s.lbdCount > 0 {
+		avgLBD = float64(s.lbdSum) / float64(s.lbdCount)
+	}
+	totalAvgLBD := 0.0
+	if s.totalLbdCount > 0 {
+		totalAvgLBD = float64(s.totalLbdSum) / float64(s.totalLbdCount)
+	}
+	propsPerDec := 0.0
+	if s.decisions > 0 {
+		propsPerDec = float64(s.propagations) / float64(s.decisions)
+	}
+	shrunk := ""
+	if s.maxLearnedShrunk {
+		shrunk = " [DB shrunk]"
+	}
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | hist=[%d %d %d %d %d %d]\n",
+		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec,
+		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
+		minRate,
+		s.vivifyRoundsRun,
+		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
+		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
+		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5])
 }
 
 // logDiagnostics prints a compact one-line summary of learned-clause
@@ -854,11 +900,20 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.maxLearnedShrunk {
 		shrunk = " [DB shrunk]"
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
-		s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
+		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		minRate,
 		s.bigMinimizeHits, s.bigMinimizeCalls)
+}
+
+// elapsedSec returns seconds since the public Solve entry set solveStartNs.
+// Returns 0 if no solve has started (e.g. stats printed before solve).
+func (s *CDCLSolver) elapsedSec() float64 {
+	if s.solveStartNs == 0 {
+		return 0.0
+	}
+	return float64(time.Now().UnixNano()-s.solveStartNs) / 1e9
 }
 
 // InstanceStructure captures metrics about CNF structure for adaptive preprocessing
@@ -2682,6 +2737,7 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 //
 // The solver maintains internal state; create a new solver for each formula.
 func (s *CDCLSolver) SolveWithResult() SolveResult {
+	s.solveStartNs = time.Now().UnixNano()
 	// Adaptive preprocessing: structure analysis selects techniques and
 	// tunes VSIDS/restart parameters. See preprocessAggressive.
 	preprocResult := s.preprocessAggressive()
@@ -2748,6 +2804,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 // loop after minimal setup. Intended as a debug escape hatch (the -no-preprocess
 // CLI flag); production code should use SolveWithResult.
 func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
+	s.solveStartNs = time.Now().UnixNano()
 	if s.hasEmptyClause() {
 		s.printStats()
 		return UNSAT
@@ -4807,6 +4864,7 @@ func (s *CDCLSolver) backtrack() bool {
 }
 
 func (s *CDCLSolver) SolveDPLL() SolveResult {
+	s.solveStartNs = time.Now().UnixNano()
 	s.Log("c Using plain DPLL algorithm (no clause learning)\n")
 
 	// Create a simple DPLL solver
