@@ -1,7 +1,7 @@
 .PHONY: all satience fuzz debug test test-verbose test-race vet lint bench clean install profile help
 
-# Default target: build release binaries
-all: satience fuzz
+# Default target: build release solver binary
+all: satience
 
 # --- Build targets ---
 
@@ -13,9 +13,9 @@ all: satience fuzz
 satience:
 	GOAMD64=v3 go build -tags release -ldflags="-s -w -buildid=" -trimpath -o satience ./cmd/satience
 
-# Fuzzer binary (release build)
+# Run CNFgen soundness suite (requires: pipx install cnfgen)
 fuzz:
-	GOAMD64=v3 go build -tags release -ldflags="-s -w -buildid=" -trimpath -o fuzz ./cmd/fuzz
+	bash benchmark/cnfgen_fuzz.sh
 
 # Debug build with debug symbols and disabled optimizations
 # -gcflags="all=-N -l": Disable optimizations and inlining for debugging
@@ -54,7 +54,7 @@ bench:
 clean:
 	rm -f satience satience_debug satience_bench satience_prof
 	rm -f satience_baseline satience_new satience_old satience_stash
-	rm -f fuzz solver.test
+	rm -f solver.test
 
 # Install to GOPATH/bin
 install:
@@ -70,9 +70,9 @@ help:
 	@echo "Satience SAT Solver - Makefile Targets"
 	@echo ""
 	@echo "Build:"
-	@echo "  make              - Build release binaries (satience + fuzz)"
+	@echo "  make              - Build optimized release solver"
 	@echo "  make satience     - Build optimized release solver"
-	@echo "  make fuzz         - Build fuzzer binary"
+	@echo "  make fuzz         - Run CNFgen soundness suite (requires cnfgen)"
 	@echo "  make debug        - Build debug binary (symbols, no opts)"
 	@echo ""
 	@echo "Test / Lint:"
