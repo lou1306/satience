@@ -8,7 +8,7 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 - SAT Competition 2026 output format (exit 10=SAT, 20=UNSAT, 0=UNKNOWN)
 
 ## Status
-Sound and complete. 51/51 unit tests, 100% soundness on 4000+ fuzzer iterations.
+Sound and complete. 51/51 unit tests, CNFgen soundness suite (22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling) — 0 false SAT, 0 false UNSAT, all SAT models verified.
 MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)**, PAR-2 4.48s (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
 
 ### Potential Next Steps (July 2026)
@@ -38,7 +38,7 @@ All remaining timeout instances are solvable by minisat in <30s. Root causes: th
 
 ### Caveat
 - Always run `benchmark/cross_check_minisat.sh` after propagation changes. O(1) VSIDS decay (`varInc /= decayFactor`) uses compensated decay factors (decayInterval=1, so factors are `^(1/5)` of MiniSat's). Changing decay arithmetic shifts the search trajectory.
-- **Regression-check protocol for hot-path changes**: Any change to `decide()`, `propagateWatched()`, `handleConflict()`, `learnClause()`, or the VSIDS selection path MUST be validated with a PAR-2 before/after comparison on the MiniSat Fast Suite (use a git worktree for the "before" binary — never `git checkout` with unstaged files). Unit tests + fuzzer only prove soundness, NOT performance. B4 looked correct and passed all tests but regressed PAR-2 by +36%; without a before/after benchmark it would have shipped as an "improvement." PAR-2 = per-instance score summed (time if solved, 2×timeout if not), then averaged over the 72 instances; with a 30s timeout each instance scores at most 60s, so PAR-2 is in [0, 60]s. Report the average (sum/72) as the headline number; keep the raw sum for the detailed table.
+- **Regression-check protocol for hot-path changes**: Any change to `decide()`, `propagateWatched()`, `handleConflict()`, `learnClause()`, or the VSIDS selection path MUST be validated with a PAR-2 before/after comparison on the MiniSat Fast Suite (use a git worktree for the "before" binary — never `git checkout` with unstaged files). Unit tests + CNFgen suite only prove soundness, NOT performance. B4 looked correct and passed all tests but regressed PAR-2 by +36%; without a before/after benchmark it would have shipped as an "improvement." PAR-2 = per-instance score summed (time if solved, 2×timeout if not), then averaged over the 72 instances; with a 30s timeout each instance scores at most 60s, so PAR-2 is in [0, 60]s. Report the average (sum/72) as the headline number; keep the raw sum for the detailed table.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ All remaining timeout instances are solvable by minisat in <30s. Root causes: th
 - `internal/solver/solver_cdcl.go`: CDCL solver (1-UIP, backjumping, restarts, deletion+compaction, vivification)
 - `internal/solver/vsids.go`: VSIDS/LRB/CHB variable selection with incremental activity heap
 - `internal/cnf/cnf.go`: Core types (Literal, Clause, CNF, Watch — 8 bytes, no WatchPos)
-- `cmd/satience/main.go`: CLI; `cmd/fuzz/main.go`: Fuzzer
+- `cmd/satience/main.go`: CLI; `benchmark/cnfgen_fuzz.sh`: CNFgen soundness harness
 
 ## Key Design Decisions
 
@@ -109,5 +109,5 @@ These capture the *why* behind choices that aren't obvious from the code.
 - Go 1.22+, GOAMD64=v3 for AVX2/BMI2
 - CLI flag order: `-model file.cnf` works, `file.cnf -model` does not
 - GBD download: `https://benchmark-database.de/file/<hash>`
-- Fuzzer: `./fuzz -n 100 -mode random` (modes: random, structured, pigeonhole; verifies SAT models)
+- Soundness eval: `bash benchmark/cnfgen_fuzz.sh` (22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling; verifies SAT models)
 - Soundness eval: `benchmark/eval_small_random.sh [n]`

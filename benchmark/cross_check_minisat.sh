@@ -8,8 +8,10 @@
 # minisat on instances that satience solved (not timeouts).
 #
 # This catches false UNSAT (satience=UNSAT, minisat=SAT) and false SAT
-# (satience=SAT, minisat=UNSAT) that the fuzzer cannot detect (the fuzzer
-# only verifies SAT models, not UNSAT correctness).
+# (satience=SAT, minisat=UNSAT) on real GBD instances. The CNFgen soundness
+# suite (benchmark/cnfgen_fuzz.sh) covers the same failure modes on
+# proof-complexity formula families with mathematically guaranteed answers;
+# this cross-check complements it on real-world instances.
 
 set -e
 

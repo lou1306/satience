@@ -45,9 +45,12 @@ cd satience
 
 # Build the solver (GOAMD64=v3 enables AVX2/BMI2)
 GOAMD64=v3 go build -o satience ./cmd/satience
+```
 
-# Build the fuzzer
-GOAMD64=v3 go build -o fuzz ./cmd/fuzz
+The soundness harness additionally requires [CNFgen](https://massimolauria.net/cnfgen/):
+
+```bash
+pipx install cnfgen
 ```
 
 ## Usage
@@ -124,7 +127,7 @@ Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 m
 - **Solved**: 71/72 instances (98.6%)
 - **PAR-2**: 4.48s average per instance
 - **Soundness**: 100% — 0 false SAT, 0 false UNSAT
-- **Fuzzer**: 100% soundness on 4000+ iterations (random + structured modes)
+- **CNFgen suite**: 22/22 known-answer instances pass (PHP, Tseitin, ordering, counting, parity, pebbling)
 
 **Memory (learned-clause compaction on large instances):**
 - GC cycles: 606 → 26 (23× reduction)
@@ -139,10 +142,9 @@ go test ./internal/solver -v
 # Run with race detector
 go test -race ./internal/solver
 
-# Build and run the fuzzer (modes: random, structured, pigeonhole)
-go build -o fuzz ./cmd/fuzz
-./fuzz -n 100 -mode random
-./fuzz -n 100 -mode structured
+# Run the CNFgen soundness suite (requires: pipx install cnfgen)
+# 22 known-answer instances: PHP, Tseitin, ordering, counting, parity, pebbling
+bash benchmark/cnfgen_fuzz.sh
 ```
 
 **Test Status:** 51/51 unit tests passing.
@@ -152,13 +154,12 @@ go build -o fuzz ./cmd/fuzz
 ```
 satience/
 ├── cmd/
-│   ├── satience/          # CLI application
-│   └── fuzz/              # Fuzzer for soundness testing
+│   └── satience/          # CLI application
 ├── internal/
 │   ├── cnf/               # CNF data structures (Literal, Clause, Watch)
 │   ├── parser/            # DIMACS CNF parser (byte-level, single-pass)
 │   └── solver/            # CDCL solver + VSIDS/CHB + preprocessing
-├── benchmark/             # Benchmark infrastructure + minisat cross-check
+├── benchmark/             # Benchmark infrastructure + CNFgen suite + minisat cross-check
 └── AGENTS.md              # Development notes
 ```
 
