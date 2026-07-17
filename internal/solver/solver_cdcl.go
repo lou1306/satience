@@ -1054,12 +1054,27 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	return structure
 }
 
-// getAdaptivePreprocessingConfig returns preprocessing config based on instance structure
-func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
+// classifyInstance analyzes the formula structure and caches classifier output
+// (structureScore, polarityImbalance, longClauseRatio, skipPolarityPhase,
+// skipBVE) plus sets search parameters (VSIDS decay, restartBase, Glucose
+// restart gating) that depend only on instance structure — NOT on the
+// preprocessing decision.
+//
+// This is split from getAdaptivePreprocessingConfig so that the search-parameter
+// tuning is available even when preprocessing is skipped (SolveWithoutPreprocessing).
+// Previously -no-preprocess skipped BOTH preprocessing AND adaptive tuning,
+// making it a polluted diagnostic axis. classifyInstance is read-only on s.cnf.
+//
+// Must be called once, before search begins, in every solve entry point that
+// runs the CDCL loop (SolveWithResult, SolveWithoutPreprocessing). It is NOT
+// called by SolveDPLL (the legacy escape hatch) since DPLL uses none of the
+// classifier outputs (no VSIDS, no restarts, no polarity phase, no BVE).
+func (s *CDCLSolver) classifyInstance() {
 	structure := s.analyzeInstanceStructure()
 
 	// Cache classifier output for downstream consumers (initVSIDSOccurrenceBonus
-	// gates the polarity-based initial phase on these metrics).
+	// gates the polarity-based initial phase on these metrics; the level-capped
+	// restart gate reads longClauseRatio).
 	s.structureScore = structure.StructuredScore
 	s.polarityImbalance = structure.PolarityImbalance
 	s.longClauseRatio = structure.LongClauseRatio
@@ -1082,38 +1097,33 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
 
 	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
-			structure.Density,
-			structure.BinaryRatio*100,
-			structure.TernaryRatio*100,
-			structure.LongClauseRatio*100,
-			structure.StructuredScore,
-			structure.PolarityImbalance)
+		structure.Density,
+		structure.BinaryRatio*100,
+		structure.TernaryRatio*100,
+		structure.LongClauseRatio*100,
+		structure.StructuredScore,
+		structure.PolarityImbalance)
 	if s.skipPolarityPhase {
 		s.Log("c [structure] Dense binary instance (density=%.1f, binary=%.1f%%) - skipping polarity phase\n",
 			structure.Density, structure.BinaryRatio*100)
 	}
 
-
-	// Random-like instances (StructuredScore < 0.7): NO preprocessing
-	// Unit propagation on random/mixed instances causes 76x more conflicts
+	// Random-like instances (StructuredScore < 0.7): aggressive VSIDS decay and
+	// frequent Luby restarts. Unit propagation on random/mixed instances causes
+	// 76x more conflicts, so preprocessing is disabled in getAdaptivePreprocessingConfig.
+	// Aggressive decay (0.30→0.60) prevents the search from getting stuck on the
+	// same variables; structured instances prefer gentle decay (0.95) to maintain
+	// learned clause guidance.
 	if structure.StructuredScore < 0.7 {
-			s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", structure.StructuredScore)
-		// Aggressive VSIDS decay for random-like instances: these instances
-		// benefit from rapid activity forgetting (0.30→0.60) to avoid getting
-		// stuck on the same variables. Structured instances prefer gentle decay
-		// (0.95) to maintain learned clause guidance.
+		s.Log("c [classification] Random-like instance (score=%.2f) - aggressive decay, restartBase=5\n", structure.StructuredScore)
 		s.vsids.SetAggressiveDecay()
 		s.restartBase = 5
 		s.restartGlucoseRatio = 100.0
 		s.restartGlucoseMinConflicts = 1000000
-		return PreprocessingConfig{
-			EnableUnitProp: false,
-			MaxPasses:      0,
-		}
+		return
 	}
 
-	// Highly structured (score >= 0.7): unit propagation only
-		s.Log("c [preprocessing] Highly structured instance (score=%.2f) - enabling unit propagation only\n", structure.StructuredScore)
+	s.Log("c [classification] Structured instance (score=%.2f)\n", structure.StructuredScore)
 
 	// Adaptive restart base for binary-heavy instances. Binary cascades produce
 	// low-LBD glue clauses that prevent the Glucose restart criterion from firing
@@ -1125,9 +1135,21 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// solves these instances in <2s.
 	if structure.BinaryRatio > 0.5 && !s.skipBVE {
 		s.restartBase = 20
-		s.Log("c [preprocessing] Binary-heavy (%.0f%%) — restartBase=20\n", structure.BinaryRatio*100)
+		s.Log("c [classification] Binary-heavy (%.0f%%) - restartBase=20\n", structure.BinaryRatio*100)
 	}
+}
 
+// getAdaptivePreprocessingConfig returns preprocessing config based on the
+// cached structureScore (set by classifyInstance, which must have run first).
+func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
+	if s.structureScore < 0.7 {
+		s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", s.structureScore)
+		return PreprocessingConfig{
+			EnableUnitProp: false,
+			MaxPasses:      0,
+		}
+	}
+	s.Log("c [preprocessing] Structured instance (score=%.2f) - enabling unit propagation only\n", s.structureScore)
 	return PreprocessingConfig{
 		EnableUnitProp: true,
 		MaxPasses:      1,
@@ -2738,6 +2760,14 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 // The solver maintains internal state; create a new solver for each formula.
 func (s *CDCLSolver) SolveWithResult() SolveResult {
 	s.solveStartNs = time.Now().UnixNano()
+	// Classify structure and set search parameters (VSIDS decay, restartBase,
+	// Glucose gating) BEFORE preprocessing. classifyInstance is read-only on
+	// s.cnf; preprocessAggressive reads the cached structureScore to decide
+	// EnableUnitProp. Splitting classification from preprocessing ensures the
+	// search-parameter tuning is available even when preprocessing is skipped
+	// (SolveWithoutPreprocessing), so -no-preprocess is a clean search-quality
+	// diagnostic axis rather than also disabling adaptive tuning.
+	s.classifyInstance()
 	// Adaptive preprocessing: structure analysis selects techniques and
 	// tunes VSIDS/restart parameters. See preprocessAggressive.
 	preprocResult := s.preprocessAggressive()
@@ -2805,6 +2835,14 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 // CLI flag); production code should use SolveWithResult.
 func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	s.solveStartNs = time.Now().UnixNano()
+	// Classify structure and set search parameters even when preprocessing is
+	// skipped. Previously -no-preprocess skipped adaptive tuning entirely,
+	// running random 3-SAT with decay 0.95 + restartBase=200 instead of the
+	// aggressive decay 0.30 + restartBase=5 the classifier prescribes. This made
+	// -no-preprocess a polluted diagnostic that conflated "no preprocessing" with
+	// "no adaptive tuning". classifyInstance is read-only on s.cnf, so it cannot
+	// change the search trajectory the way forced unit propagation does.
+	s.classifyInstance()
 	if s.hasEmptyClause() {
 		s.printStats()
 		return UNSAT
