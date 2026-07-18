@@ -59,12 +59,11 @@ type Clause struct {
 }
 
 // ClauseMetadata packs learned clause metadata into a single struct for cache efficiency.
-// LBD and PropCount are int32 (values are small: LBD ≤ clause size, PropCount ≤ ~2B).
+// LBD is int32 (values are small: LBD ≤ clause size).
 // SearchHint caches the last-known replacement position for the watched-literal
 // replacement scan (probe-then-scan optimization). 0 = no hint (scan from pos 2).
 type ClauseMetadata struct {
 	LBD        int32 // LBD at time of learning
-	PropCount  int32 // Times caused propagation
 	SearchHint int32 // Last-known replacement position in clause (0 = no hint)
 }
 

@@ -26,7 +26,6 @@ import (
 	"os"
 	"runtime"
 	"satience/internal/cnf"
-	"sort"
 	"time"
 )
 
@@ -130,7 +129,7 @@ type CDCLSolver struct {
 	learnedLiterals      []cnf.Literal         // All learned clause literals in one contiguous slice
 	learnedLoc           []LearnedClauseLoc    // Packed (Offset, Size) per learned clause; Size=0 means tombstone
 	learnedAlive         []byte                 // 1 = clause alive, 0 = tombstone (cache-friendly bitmap for tombstone check)
-	learnedMetadata      []cnf.ClauseMetadata  // OPTIMIZATION: Packed metadata (LBD, age, activity, useCount, propCount, score)
+	learnedMetadata      []cnf.ClauseMetadata  // Per-clause metadata (LBD, SearchHint)
 	learnedWatchIdx0     []int                 // First watched literal index (for fast watch removal)
 	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
@@ -146,6 +145,7 @@ type CDCLSolver struct {
 	restartBase          int
 	restartCount         int
 	lubyIndex            int
+	lubyThresholdCap     int // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	lbdSum               int
 	lbdCount             int
 	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
@@ -168,6 +168,7 @@ type CDCLSolver struct {
 	restartLevelCap      int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
 	levelRestartGap      int     // Min conflicts between level-capped restarts (anti-thrashing)
 	randomSeed           uint64          // Seed for deterministic random selection
+	rndInitNoise         float64 // Magnitude of random noise added to initial VSIDS activity (0=disabled)
 	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
 	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
 	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
@@ -293,6 +294,7 @@ type CDCLSolver struct {
 	// Restart policy parameters
 	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
+	glucoseGap                 int     // Min conflicts between Glucose restarts (anti-thrashing, default 100)
 
 	// litTrue caches whether each literal is assigned-and-true, indexed by
 	// LitToIndex(lit) = varIdx*2 + negated. Updated on assign/unassign. The blit
@@ -368,6 +370,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartBase:          restartBase,
 		restartCount:         0,
 		lubyIndex:            0,
+		lubyThresholdCap:     0, // Disabled by default; enabled for structured instances in classifyInstance
 		lbdSum:               0,
 		lbdCount:             0,
 		randomSeed:           0,
@@ -429,6 +432,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
+		glucoseGap:                 100, // Min 100 conflicts between Glucose restarts
 		restartPropsDecLimit:       100, // Restart when props/dec > 100 (deep search pathology)
 		adaptivePhaseFlipRate:      0.1, // Flip 10% of phases when props/dec is high
 		propsDecRestartGap:         100, // Min 100 conflicts between props/dec restarts
@@ -479,6 +483,14 @@ func (s *CDCLSolver) SetStatsInterval(n int) {
 func (s *CDCLSolver) SetRandomSeed(seed uint64) {
 	s.randomSeed = seed
 	s.vsids.SetRandomSeed(seed)
+}
+
+// SetRndInitNoise sets the magnitude of random noise added to initial VSIDS
+// activity. 0 = disabled (deterministic init). When >0, each variable's
+// initial activity is perturbed by (rand[0,1) - 0.5) * noise, breaking exact
+// ties at decision 1 without per-conflict overhead. Deterministic given -seed.
+func (s *CDCLSolver) SetRndInitNoise(noise float64) {
+	s.rndInitNoise = noise
 }
 
 // SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
@@ -552,8 +564,8 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 	if glucoseRatio < 1.0 {
 		glucoseRatio = 1.0
 	}
-	if glucoseRatio > 5.0 {
-		glucoseRatio = 5.0
+	if glucoseRatio > 100.0 {
+		glucoseRatio = 100.0
 	}
 	s.restartGlucoseRatio = glucoseRatio
 
@@ -1124,6 +1136,20 @@ func (s *CDCLSolver) classifyInstance() {
 	}
 
 	s.Log("c [classification] Structured instance (score=%.2f)\n", structure.StructuredScore)
+
+	// Cap Luby threshold growth to prevent Luby exhaustion on very long-clause
+	// instances. The Luby sequence grows unboundedly; without a cap, the
+	// threshold eventually exceeds the conflict budget and Luby restarts stop.
+	// Gated on longClauseRatio > 0.95: instances with >95% long clauses (e.g.
+	// 274099073, 99.4% long) benefit from the cap's frequent small restarts
+	// (+48% faster). Instances at 80-95% long (e.g. 822378be, 83.9%) are hurt
+	// by the disruption — their level-capped restarts inflate lubyIndex, causing
+	// the cap to fire and reset to 0, triggering spurious frequent Luby restarts
+	// that disrupt the search. Random instances (handled above, early return)
+	// are exempt — their Luby growth aids convergence.
+	if s.longClauseRatio > 0.95 {
+		s.lubyThresholdCap = 10000
+	}
 
 	// Adaptive restart base for binary-heavy instances. Binary cascades produce
 	// low-LBD glue clauses that prevent the Glucose restart criterion from firing
@@ -2100,7 +2126,10 @@ func luby(i int) int {
 // 1. Clear the trail (all search assignments; preprocessing vars preserved on preprocessTrail)
 // 2. Keep ALL learned clauses (deletion is handled by deleteLearnedClauses based on
 //    database size, NOT by restart)
-// 3. Reset LBD statistics for fresh measurement
+// 3. Reset lbdSum/lbdCount for fresh per-restart average. emaLBD is NOT reset —
+//    it tracks the LBD trend across restart boundaries (B5 fix). The glucoseGap
+//    field (default 100 conflicts) prevents double-restarts from the persistent
+//    EMA carrying high pre-restart values vs low post-restart avgLBD.
 // 4. Continue search with same VSIDS scores (activity preserved across restarts)
 // 5. Run compaction if tombstones accumulated, vivification every Nth restart
 
@@ -2110,8 +2139,14 @@ func luby(i int) int {
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
 func (s *CDCLSolver) shouldRestart() bool {
-	// Check Glucose-style adaptive restart first (if past min conflicts)
-	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 {
+	// Check Glucose-style adaptive restart first (if past min conflicts).
+	// The gap gate (conflicts - restartCount >= glucoseGap) prevents double-
+	// restarts: with a persistent EMA (B5 fix), the EMA carries high pre-
+	// restart LBD values while avgLBD is low right after a restart (fresh
+	// good clauses), so the criterion could fire immediately. The gap lets
+	// avgLBD stabilize first.
+	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 &&
+		s.conflicts-s.restartCount >= s.glucoseGap {
 		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
 
 		// Glucose criterion: restart when the EMA of recent LBDs exceeds
@@ -2125,12 +2160,27 @@ func (s *CDCLSolver) shouldRestart() bool {
 		}
 	}
 
-	// Fall back to Luby sequence (configurable base)
+	// Fall back to Luby sequence (configurable base).
+	// The Luby sequence grows unboundedly (1, 1, 2, 1, 1, 2, 4, ..., 2^k, ...).
+	// Without a cap, the threshold (lubyValue × restartBase) eventually exceeds
+	// the conflict budget, and Luby restarts effectively stop — leaving the
+	// solver without periodic diversification for the rest of the solve.
+	// Fix: when the threshold exceeds lubyThresholdCap, reset lubyIndex to 0 —
+	// re-running the Luby sequence from the start. This keeps the restart
+	// cadence in the productive range indefinitely. CaDiCaL and Kissat use
+	// similar bounded restart sequences. Disabled for random instances
+	// (lubyThresholdCap=0) where Luby growth aids convergence.
 	lubyValue := luby(s.lubyIndex + 1)
 	threshold := lubyValue * s.restartBase
 
 	if s.conflicts-s.restartCount >= threshold {
 		return true
+	}
+
+	// If the threshold exceeds the cap, reset the index so the sequence
+	// restarts from the beginning on the next restart.
+	if s.lubyThresholdCap > 0 && threshold > s.lubyThresholdCap {
+		s.lubyIndex = 0
 	}
 
 	// Props/dec-bounded restart: if the solver is going too deep per decision
@@ -2252,7 +2302,12 @@ func (s *CDCLSolver) restart() bool {
 	s.lbdSum = 0
 	s.lbdCount = 0
 
-	s.emaLBD = 0
+	// emaLBD is NOT reset here. The EMA tracks the LBD trend across restart
+	// boundaries; resetting it to 0 would destroy the trend memory and make
+	// the Glucose criterion (emaLBD > avgLBD × ratio) unable to detect
+	// cross-restart search degradation. lbdSum/lbdCount (per-restart average)
+	// ARE reset — that's the intended design (compare persistent EMA against
+	// the current restart's average).
 
 	// Adaptive phase flip: when the search is unproductive (high props/dec,
 	// indicating deep binary cascades), enable phase flipping to break the
@@ -2565,6 +2620,25 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 					s.savedPhase[i] = false
 				}
 			}
+		}
+	}
+	// Optional initial-activity noise (MiniSat -rnd-init analog). Perturbs
+	// each variable's activity by (rand[0,1) - 0.5) * noise, breaking exact
+	// ties at decision 1 (where the deterministic lowest-varIdx tiebreak
+	// otherwise dominates). Deterministic given -seed. Applied AFTER the
+	// clause-length + occurrence bonus so the activity hierarchy is preserved
+	// while ties are broken.
+	if s.rndInitNoise > 0 {
+		seed := s.randomSeed
+		if seed == 0 {
+			seed = 0x2545F4914F6CDD1D // same fallback as SolveWithResult
+		}
+		for i := range s.vsids.activity {
+			seed ^= seed << 13
+			seed ^= seed >> 7
+			seed ^= seed << 17
+			r := float64(seed&0xFFFFFFFF) / float64(0xFFFFFFFF)
+			s.vsids.activity[i] += (r - 0.5) * s.rndInitNoise
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
@@ -4161,8 +4235,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.learnedAlive = append(s.learnedAlive, 1)
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
-			LBD:       int32(lbd),
-			PropCount: 0,
+			LBD: int32(lbd),
 		})
 		s.learnedActiveCount++
 		s.learnedCapacity++
@@ -4220,46 +4293,20 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	return backjumpLevel
 }
 
-// deleteLearnedClauses removes low-quality learned clauses to control memory usage
-
-// Clause Database Management Strategy:
-// Learned clauses can grow unbounded, causing memory explosion and slowing down
-// propagation. We use a quality-based deletion scheme that considers:
-
-// 1. LBD (Literal Block Distance): PRIMARY QUALITY METRIC
-//    - LBD = number of distinct decision levels in the clause
-//    - Lower LBD = better clause (spans fewer decision levels)
-//    - LBD=2: "Glue clauses" - most valuable, connect decision levels
-//    - LBD=3: Good but deletable (pruned by PropCount when database grows)
-//    - LBD>5: Usually not useful long-term
-
-// 2. Age: SECONDARY FACTOR
-//    - Old clauses may become irrelevant as search progresses
-//    - Even good LBD clauses can become stale after hundreds of conflicts
-//    - Force deletion of clauses older than 500 conflicts
-
-// 3. Size: TERTIARY FACTOR
-//    - Large clauses (>15 literals) are rarely useful
-//    - Small clauses are more general and propagate more often
-//    - Force deletion of clauses larger than 15 literals
-
-// 4. Activity: PROTECTION FACTOR
-//    - Clauses involved in recent conflicts are more relevant
-//    - Activity decays over time (like VSIDS)
-//    - High activity provides some protection against deletion
-
-// Protection Rules (clauses never/ rarely deleted):
-// - LBD≤2: Core glue, NEVER delete (permanently retained)
-// - LBD=3: Deletable by PropCount ranking when database exceeds limit
-
-// Deletion Trigger:
-// When learned clause count exceeds maxLearned (default 200), delete down to
-// minLearned (default 100) - aggressive 50% reduction (MiniSat-style).
-
-// Scoring Formula:
-// score = age*10 + LBD*50 + size*5 - activity*20 + bonuses/penalties
-// Higher score = more likely to delete
-
+// deleteLearnedClauses removes low-quality learned clauses to control memory usage.
+//
+// Strategy: two-pass LBD-tiered deletion.
+//   - Pass 1: delete LBD > 5 candidates first (lowest quality).
+//   - Pass 2: if still over budget, delete LBD > 2 candidates.
+//   - Glue clauses (LBD ≤ 2) are NEVER deleted.
+//   - Reason clauses (currently used in the implication graph) are protected.
+//   - Within a tier, candidates are in ascending clause-index order, so deletion
+//     is FIFO (oldest learned first). This is deterministic and simple; a
+//     decayed-activity sort was tested (B9) and regressed +33% PAR-2.
+//
+// Deletion trigger: when learnedActiveCount > 150% of dynamicLimit
+// (dynamicLimit = maxLearned + conflicts/50). Target after deletion: dynamicLimit.
+//
 // minimizeLearnedClause reduces the size of a learned clause via recursive
 // self-subsumption (MiniSat/Bier-style). A literal is removable if every other
 // literal in its reason clause is itself either already in the learned clause
@@ -4505,13 +4552,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	deletedCount := 0
 
-	// Usage-aware deletion: within each LBD tier, delete clauses with the
-	// lowest PropCount first (least useful = least propagated). This keeps
-	// high-traffic clauses that frequently cause propagations and deletes
-	// clauses that were learned but never contributed to search.
+	// Two-pass LBD-tiered deletion. Within each tier, candidates are in
+	// ascending clause-index order (oldest learned first), so deletion is
+	// FIFO within a tier. Glue clauses (LBD ≤ 2) are never deleted.
 	candidates := s.tmpDeletionCandidates[:0]
 
-	// Pass 1: collect LBD > 5 candidates, sort by PropCount, delete lowest
+	// Pass 1: collect LBD > 5 candidates (lowest quality), delete oldest first
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size == 0 || protected[i] {
 			continue
@@ -4520,9 +4566,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			candidates = append(candidates, i)
 		}
 	}
-	sort.Slice(candidates, func(a, b int) bool {
-		return s.learnedMetadata[candidates[a]].PropCount < s.learnedMetadata[candidates[b]].PropCount
-	})
 	for _, idx := range candidates {
 		if deletedCount >= toDelete {
 			break
@@ -4542,9 +4585,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 				candidates = append(candidates, i)
 			}
 		}
-		sort.Slice(candidates, func(a, b int) bool {
-			return s.learnedMetadata[candidates[a]].PropCount < s.learnedMetadata[candidates[b]].PropCount
-		})
 		for _, idx := range candidates {
 			if deletedCount >= toDelete {
 				break
