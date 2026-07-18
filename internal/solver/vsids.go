@@ -5,33 +5,39 @@ import (
 	"satience/internal/cnf"
 )
 
-// vsidsHeapItem represents a variable in the activity heap
-type vsidsHeapItem struct {
-	varIdx uint32
-	score  float64
-}
-
-// vsidsHeap is a max-heap of vsidsHeapItem.
+// vsidsHeap is a max-heap of variable activities, stored as parallel arrays
+// for cache density: the comparison path (up/down) only touches scores (8B
+// per element), while varIdxs (4B per element) is only touched on swap.
 // A separate heapPos array (owned by VSIDS) maps variable → heap index for
 // O(log n) increaseKey/decreaseKey without full rebuilds.
-type vsidsHeap []vsidsHeapItem
+type vsidsHeap struct {
+	scores  []float64
+	varIdxs []uint32
+}
 
 // up sifts the item at position i upward to restore the heap property.
 // Tie-breaking: when scores are equal, lower varIdx wins. This makes heap
 // ordering independent of insertion order, reducing trajectory sensitivity
 // to clause ordering changes.
 func (h *vsidsHeap) up(heapPos []int, i int) {
-	s := *h
+	scores := h.scores
+	varIdxs := h.varIdxs
 	for i > 0 {
 		parent := (i - 1) / 2
-		c := s[i]
-		p := s[parent]
-		if c.score < p.score || (c.score == p.score && c.varIdx >= p.varIdx) {
+		cScore := scores[i]
+		pScore := scores[parent]
+		if cScore < pScore {
 			break
 		}
-		s[i], s[parent] = p, c
-		heapPos[c.varIdx] = parent
-		heapPos[p.varIdx] = i
+		cVar := varIdxs[i]
+		pVar := varIdxs[parent]
+		if cScore == pScore && cVar >= pVar {
+			break
+		}
+		scores[i], scores[parent] = pScore, cScore
+		varIdxs[i], varIdxs[parent] = pVar, cVar
+		heapPos[cVar] = parent
+		heapPos[pVar] = i
 		i = parent
 	}
 }
@@ -39,56 +45,66 @@ func (h *vsidsHeap) up(heapPos []int, i int) {
 // down sifts the item at position i downward to restore the heap property.
 // Tie-breaking: when scores are equal, lower varIdx is preferred.
 func (h *vsidsHeap) down(heapPos []int, i int) {
-	s := *h
-	n := len(s)
+	scores := h.scores
+	varIdxs := h.varIdxs
+	n := len(scores)
 	for {
 		left := 2*i + 1
 		if left >= n {
 			break
 		}
 		right := left + 1
-		l := s[left]
 		largest := left
+		lScore := scores[left]
+		lVar := varIdxs[left]
 		if right < n {
-			r := s[right]
-			if r.score > l.score || (r.score == l.score && r.varIdx < l.varIdx) {
+			rScore := scores[right]
+			if rScore > lScore || (rScore == lScore && varIdxs[right] < lVar) {
 				largest = right
-				l = r
+				lScore = rScore
+				lVar = varIdxs[right]
 			}
 		}
-		cur := s[i]
-		if cur.score > l.score || (cur.score == l.score && cur.varIdx <= l.varIdx) {
+		curScore := scores[i]
+		if curScore > lScore || (curScore == lScore && varIdxs[i] <= lVar) {
 			break
 		}
-		s[i], s[largest] = l, cur
-		heapPos[cur.varIdx] = largest
-		heapPos[l.varIdx] = i
+		// Swap i and largest in both arrays
+		curVar := varIdxs[i]
+		scores[i], scores[largest] = lScore, curScore
+		varIdxs[i], varIdxs[largest] = lVar, curVar
+		heapPos[curVar] = largest
+		heapPos[lVar] = i
 		i = largest
 	}
 }
 
 // insert adds a variable to the heap with the given score.
 func (h *vsidsHeap) insert(heapPos []int, varIdx uint32, score float64) {
-	pos := len(*h)
-	*h = append(*h, vsidsHeapItem{varIdx: varIdx, score: score})
+	pos := len(h.scores)
+	h.scores = append(h.scores, score)
+	h.varIdxs = append(h.varIdxs, varIdx)
 	heapPos[varIdx] = pos
 	h.up(heapPos, pos)
 }
 
-// removeMax removes and returns the maximum element (root).
-func (h *vsidsHeap) removeMax(heapPos []int) vsidsHeapItem {
-	n := len(*h)
-	item := (*h)[0]
-	heapPos[item.varIdx] = -1
+// removeMax removes the maximum element (root). Return value is unused by
+// callers; kept minimal.
+func (h *vsidsHeap) removeMax(heapPos []int) {
+	n := len(h.scores)
+	rootVar := h.varIdxs[0]
+	heapPos[rootVar] = -1
 	if n > 1 {
-		(*h)[0] = (*h)[n-1]
-		heapPos[(*h)[0].varIdx] = 0
-		*h = (*h)[:n-1]
+		h.scores[0] = h.scores[n-1]
+		h.varIdxs[0] = h.varIdxs[n-1]
+		heapPos[h.varIdxs[0]] = 0
+		h.scores = h.scores[:n-1]
+		h.varIdxs = h.varIdxs[:n-1]
 		h.down(heapPos, 0)
 	} else {
-		*h = (*h)[:0]
+		h.scores = h.scores[:0]
+		h.varIdxs = h.varIdxs[:0]
 	}
-	return item
 }
 
 // increaseKey updates the score of varIdx (must be in heap) and sifts up.
@@ -97,7 +113,7 @@ func (h *vsidsHeap) increaseKey(heapPos []int, varIdx uint32, score float64) {
 	if pos < 0 {
 		return
 	}
-	(*h)[pos].score = score
+	h.scores[pos] = score
 	h.up(heapPos, pos)
 }
 
@@ -107,13 +123,13 @@ func (h *vsidsHeap) decreaseKey(heapPos []int, varIdx uint32, score float64) {
 	if pos < 0 {
 		return
 	}
-	(*h)[pos].score = score
+	h.scores[pos] = score
 	h.down(heapPos, pos)
 }
 
-// init builds a heap from an unsorted slice in O(n) time.
+// init builds a heap from unsorted arrays in O(n) time.
 func (h *vsidsHeap) init(heapPos []int) {
-	n := len(*h)
+	n := len(h.scores)
 	for i := n/2 - 1; i >= 0; i-- {
 		h.down(heapPos, i)
 	}
@@ -177,7 +193,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		lbdInc:                1.0,
 		maxDecayFactor:        maxDecay,
 		decayIncrement:        0.0, // Fixed decay — no ramp
-		heap:                  make(vsidsHeap, 0, numVars),
+		heap:                  vsidsHeap{scores: make([]float64, 0, numVars), varIdxs: make([]uint32, 0, numVars)},
 		heapPos:               make([]int, numVars),
 		heapValid:             false,
 		refreshInterval:       2000,
@@ -225,7 +241,8 @@ func (v *VSIDS) InitializeFromClauses(clauses []cnf.Clause) {
 // eliminating frequent O(n) rebuilds. Assigned entries are sunk lazily during
 // selection and restored on unassign.
 func (v *VSIDS) buildHeap(assignments []Assignment) {
-	v.heap = v.heap[:0]
+	v.heap.scores = v.heap.scores[:0]
+	v.heap.varIdxs = v.heap.varIdxs[:0]
 	for i := range v.heapPos {
 		v.heapPos[i] = -1
 	}
@@ -236,11 +253,9 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 		} else {
 			score = math.Inf(-1)
 		}
-		v.heap = append(v.heap, vsidsHeapItem{
-			varIdx: uint32(i),
-			score:  score,
-		})
-		v.heapPos[i] = len(v.heap) - 1
+		v.heap.scores = append(v.heap.scores, score)
+		v.heap.varIdxs = append(v.heap.varIdxs, uint32(i))
+		v.heapPos[i] = len(v.heap.scores) - 1
 	}
 	v.heap.init(v.heapPos)
 	v.heapValid = true
@@ -350,8 +365,8 @@ func (v *VSIDS) onUnassign(varIdx uint32) {
 	if pos < 0 {
 		return
 	}
-	if v.heap[pos].score == math.Inf(-1) {
-		v.heap[pos].score = v.activity[varIdx] + v.lbdBonus[varIdx]
+	if v.heap.scores[pos] == math.Inf(-1) {
+		v.heap.scores[pos] = v.activity[varIdx] + v.lbdBonus[varIdx]
 		v.heap.up(v.heapPos, pos)
 	}
 }
@@ -469,13 +484,13 @@ func (v *VSIDS) decay(assignments []Assignment) {
 //   frequent O(n) buildHeap calls.
 // - onUnassign restores sunk entries' real scores and sifts them up.
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
-	if !v.heapValid || len(v.heap) == 0 {
+	if !v.heapValid || len(v.heap.scores) == 0 {
 		v.buildHeap(assignments)
 	}
 
-	for len(v.heap) > 0 {
-		item := v.heap[0]
-		varIdx := item.varIdx
+	for len(v.heap.scores) > 0 {
+		varIdx := v.heap.varIdxs[0]
+		rootScore := v.heap.scores[0]
 
 		if int(varIdx) >= len(assignments) {
 			v.heap.removeMax(v.heapPos)
@@ -484,18 +499,18 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 
 		if assignments[varIdx].Level >= 0 {
 			// Assigned — sink to bottom so it doesn't reappear at the root.
-			v.heap[0].score = math.Inf(-1)
+			v.heap.scores[0] = math.Inf(-1)
 			v.heap.down(v.heapPos, 0)
 			continue
 		}
 
 		// Unassigned — check if score is stale (activity was bumped).
 		actualScore := v.activity[varIdx] + v.lbdBonus[varIdx]
-		if item.score != actualScore {
+		if rootScore != actualScore {
 			// Stale — update score. Bumps only increase activity, so
 			// actualScore > stored score. At the root, sift-up is a no-op,
 			// so the entry stays at position 0 with the updated score.
-			v.heap[0].score = actualScore
+			v.heap.scores[0] = actualScore
 			continue
 		}
 
