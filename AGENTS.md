@@ -9,9 +9,19 @@ Build a sound and complete CDCL SAT solver in Go with DIMACS CNF support, benchm
 
 ## Status
 Sound and complete. 51/51 unit tests, CNFgen soundness suite (110 known-answer instances across 6 families: PHP, Tseitin, ordering, counting, parity, pebbling; 6 parallel workers) — 0 false SAT, 0 false UNSAT, all SAT models verified.
-MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)**, PAR-2 3.11s (July 2026). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
+MiniSat Fast Suite (30s timeout): **71/72 solved (98.6%)**, PAR-2 2.96s (July 2026, within noise of 3.11s baseline). Verified sound via minisat cross-check (`benchmark/cross_check_minisat.sh`): 0 mismatches.
 
 ### Potential Next Steps (July 2026)
+
+### Completed (July 2026)
+
+- **Batch 1: Dead code + redundant checks** (DONE, no behavior change): Removed unused `VSIDS.inverseDecay` field + 4 write sites; `VSIDS.bump()` func (never called); `CDCLSolver.minLearned` field + local + init (never read); `CDCLSolver.tmpSortedLits` + `tmpMinimizedLits` fields + allocs (never used); `VSIDS.hasUnassigned()` func (never called; `numUnassigned` is O(1)); gated `glueCount` loop behind `verbose` (count only consumed by `s.Log`). Two redundancy fixes: `propagateWatched` `else if clauseAsg.Level >= 0` → `else` (already in `else` branch; also fixed pre-existing indentation bug on `trueReplacementLit` line); `decide()` dropped redundant phase re-read + dead `else`, trusting the phase returned by `selectVariableWithPhase`.
+
+- **Batch 2: Deprecate CHB entirely** (DONE, no behavior change): CHB (Conflict History Based) was an opt-in branching heuristic (`-chb` flag) tracking per-variable conflict frequency with aggressive decay. Never enabled by default, never used in benchmarking. Removed: `useCHB`/`conflictFrequency`/`chbDecayFactor`/`chbDecayInterval`/`chbWeight` fields + inits; `EnableCHB()`/`decayCHB()` funcs; `if v.useCHB` branches in `bumpClause` + `selectVariable`; `CDCLSolver.EnableCHB()` wrapper; `-chb` CLI flag; now-unused `assignments` param from `VSIDS.bumpClause`; `benchmark/chb_vs_minisat.py`; README/AGENTS CHB references. -564 lines net.
+
+- **Batch 3a: Remove dead hasUnassigned guard** (DONE, no behavior change): The O(reasonLen) guard in the 1-UIP conflict analysis loop skipped resolving a variable if its reason clause contained unassigned literals. Instrumented with a fire counter and ran the full MiniSat Fast Suite (72 instances): **0 fires**. This is expected — a reason clause caused a propagation, so all its literals were assigned (falsified except the propagated one). An unassigned literal in a reason clause would mean the clause shouldn't have propagated. Removed the guard (12 lines).
+
+- **Batch 3b: Parallel-array VSIDS heap** (DONE, PAR-2 neutral): Refactored `vsidsHeap` from `[]vsidsHeapItem` (16B/element: uint32+padding+float64) to parallel arrays `[]float64` scores (8B) + `[]uint32` varIdxs (4B). The comparison path in `up`/`down` only touches the 8B scores array, doubling cache density; `varIdxs` is only touched on swap. PAR-2 before/after (30s timeout, 72 instances): 2.9536s → 2.9595s avg (+0.2%, within noise), same 71/72 solved, same `bb34f22f` timeout. Per-instance deltas mixed (566f366c/5a65b281/66e6fea6 improved ~0.5-0.6s; daf59d67/8d58ca18 regressed ~0.4-1.0s) — typical trajectory noise, no systematic regression. `removeMax` return value dropped (unused by callers).
 
 Profiled on `BenchmarkRealInstanceLogAlloc` (post-A1+A2). CPU breakdown: `propagateWatched` 33.6%, `vsidsHeap.down` 13.2%, `learnClause` 11.9%, `backtrack` 7.1%, `onUnassign` 5.3%, `minimizeLearnedClause` 4.6%. `mallocgc` eliminated from top 20 (was 6.1% pre-A2).
 
@@ -60,7 +70,7 @@ All remaining timeout instances are solvable by minisat in <30s. Root causes: th
 - **Watch**: 8 bytes (`ClauseIdx int32` + `Blit uint32`). `ClauseIdx` bit encoding: bit 31=learned flag, bit 30=myPos (which watch position 0/1), bits 0-29=clause index. `Blit` = litTrue index (`varIdx*2 + negated`) cached for fast-path skip via direct array index (no shift needed). Sentinel Blit=0 means "none found" but is also valid for var 0 positive — accepted as rare missed cache hit.
 - **Implication array encoding** (`s.implication`): `>=0` original clause; `<=-5` learned (`-learnedIdx-5`); `-1` decision; `-2` unit-prop preprocess; `-3` pure-literal; `-4` reserved. The 4-slot offset frees `-1..-4` as sentinels so learned-clause decode can't misread preprocessing sentinels (was a soundness bug). `Watch.ClauseIdx` uses a separate encoding (`-learnedIdx-1`); `propagateWatched` translates watch→implication at the assign site.
 - **Learned clauses**: Contiguous literal pool with packed `LearnedClauseLoc` (`Offset int32` + `Size int32`) replacing separate offset/size arrays. Deletion uses tombstones (`learnedLoc[i].Size=0`); `compactLearnedClauses()` reclaims gaps at the next restart (level 0) when tombstones exceed ~33% of capacity. `learnedAlive` `[]byte` bitmap alongside `learnedLoc` for 1-byte hot-path tombstone check (vs 8-byte struct access).
-- **Hot-path slice caching**: `propagateWatched` and `vsidsHeap.down`/`up` cache outer slices (`watchLists`, `assignments`, `*h`) as locals to eliminate pointer-to-slice indirection. Valid because these slices never grow during the cached scope.
+- **Hot-path slice caching**: `propagateWatched` caches `watchLists`/`assignments` as locals; `vsidsHeap.down`/`up` cache `h.scores`/`h.varIdxs` (parallel arrays, post-Batch 3b) as locals to eliminate pointer-to-struct indirection. Valid because these slices never grow during the cached scope.
 
 ### Key Files
 - `internal/solver/solver_cdcl.go`: CDCL solver (1-UIP, backjumping, restarts, deletion+compaction, vivification)
@@ -104,6 +114,7 @@ These capture the *why* behind choices that aren't obvious from the code.
 
 ### VSIDS Heap
 - Lazy heap with sink approach: `bumpLarge`/`bumpLBD` don't call `increaseKey` (O(1) bump). `selectVariableWithHeap` peeks at root; if assigned, sinks to -Inf (stays in heap, drops to bottom). `onUnassign` restores sunk entries' real scores and sifts up. `buildHeap` includes ALL variables (assigned at -Inf, unassigned at real score) — heap never empties, eliminating frequent O(n) rebuilds. Periodic refresh every 2000 conflicts fixes deeply stale entries. `restart()` forces a rebuild.
+- **Parallel-array storage** (Batch 3b): `vsidsHeap` stores scores (`[]float64`) and varIdxs (`[]uint32`) as parallel arrays (was `[]vsidsHeapItem` struct slice, 16B/element). The comparison path in `up`/`down` only touches the 8B scores array, doubling cache density; `varIdxs` is only touched on swap. `removeMax` return value dropped (unused by callers).
 - O(1) decay via `varInc /= decayFactor` (MiniSat varInc trick). `decay()` does NOT touch the heap (relative ratios preserved). Rescale at `varInc > 1e100` sets `heapValid = false`.
 - **Phase saving**: `savedPhase` initialized from occurrence counts (more frequent polarity wins). Updated in both `assignLiteral` (decisions) and `assignLiteralByClause` (propagations) via `s.savedPhase[varIdx] = lit.IsNegated()`.
 - **LBD bonus scale**: Adaptive `max(10, 200000 × binaryRatio / numVars)`. Binary-heavy small instances get ~2000, long-clause or large instances get 10. CLI: `-lbd-scale N` (non-zero overrides adaptive; default=0=adaptive).
