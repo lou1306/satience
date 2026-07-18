@@ -64,7 +64,7 @@ All remaining timeout instances are solvable by minisat in <30s. Root causes: th
 
 ### Key Files
 - `internal/solver/solver_cdcl.go`: CDCL solver (1-UIP, backjumping, restarts, deletion+compaction, vivification)
-- `internal/solver/vsids.go`: VSIDS/LRB/CHB variable selection with incremental activity heap
+- `internal/solver/vsids.go`: VSIDS variable selection with incremental activity heap
 - `internal/cnf/cnf.go`: Core types (Literal, Clause, CNF, Watch — 8 bytes, no WatchPos)
 - `cmd/satience/main.go`: CLI; `benchmark/cnfgen_fuzz.sh`: CNFgen soundness harness
 

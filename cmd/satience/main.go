@@ -27,7 +27,6 @@ func run() int {
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
-	useCHB := flag.Bool("chb", false, "Use CHB (Conflict History Based) heuristic instead of VSIDS")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	rndInit := flag.Float64("rnd-init", 0.0, "Magnitude of random noise added to initial VSIDS activity (MiniSat-style, default=0=disabled)")
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
@@ -103,9 +102,6 @@ func run() int {
 	s.SetVerbose(*verbose)
 	if *maxIter > 0 {
 		s.SetMaxIter(*maxIter)
-	}
-	if *useCHB {
-		s.EnableCHB()
 	}
 	s.SetRandomSeed(*randomSeed)
 	s.SetRndInitNoise(*rndInit)

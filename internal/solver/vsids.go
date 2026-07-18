@@ -143,12 +143,6 @@ type VSIDS struct {
 	refreshInterval       int       // Conflicts between heap rebuilds (fixes deeply stale entries)
 	decayInterval         int       // Number of conflicts between activity decays
 	randomSeed            uint64    // Seed for deterministic random noise (default 0)
-	// CHB (Conflict History Based) heuristic
-	useCHB            bool      // Use CHB instead of VSIDS for variable selection
-	conflictFrequency []float64 // Recent conflict frequency per variable (CHB)
-	chbDecayFactor    float64   // CHB decay factor (default 0.75 - aggressive decay)
-	chbDecayInterval  int       // CHB decay interval (default 25 conflicts)
-	chbWeight         float64   // Weight for CHB in hybrid scoring (default 1.0)
 	// Configurable parameters (exposed for tuning)
 	initialDecayFactor   float64 // Initial decay factor (default 0.979)
 	decayRampUpConflicts int     // Conflicts to reach max decay (default 25000)
@@ -197,12 +191,6 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		baseBumpAmount:       25.0,
 		clauseInitBaseWeight: 10.0,
 		binaryClauseWeight:   100.0,
-		// CHB initialization
-		useCHB:            false,
-		conflictFrequency: make([]float64, numVars),
-		chbDecayFactor:    0.75,
-		chbDecayInterval:  25,
-		chbWeight:         1.0,
 	}
 	for i := range v.heapPos {
 		v.heapPos[i] = -1
@@ -261,13 +249,6 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 // EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
 func (v *VSIDS) EnableLBD() {
 	v.useLBD = true
-}
-
-// EnableCHB enables CHB (Conflict History Based) heuristic
-// CHB tracks recent conflict frequency with aggressive decay (default 0.75 every 50 conflicts)
-// This focuses search on variables involved in recent conflicts rather than cumulative activity
-func (v *VSIDS) EnableCHB() {
-	v.useCHB = true
 }
 
 // SetRandomSeed sets the seed for deterministic random noise in tie-breaking
@@ -423,7 +404,7 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 // bumpClause increases activity for all variables in a clause
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 // Uses varInc (grows over time via O(1) decay) instead of fixed baseBumpAmount
-func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
+func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 	bumpAmount := v.varInc / float64(len(literals))
 	minBump := v.varInc * 0.04
 	if bumpAmount < minBump {
@@ -432,10 +413,6 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 
 	for _, lit := range literals {
 		v.bumpLarge(lit.Var(), bumpAmount)
-
-		if v.useCHB {
-			v.conflictFrequency[lit.Var()] += bumpAmount
-		}
 	}
 	v.conflictCount++
 
@@ -444,23 +421,6 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal, assignments []Assignment) {
 	// rebuild is O(n) but only fires every refreshInterval conflicts.
 	if v.conflictCount%v.refreshInterval == 0 {
 		v.heapValid = false
-	}
-
-	// CHB: Periodic decay for conflict frequency
-	if v.useCHB && v.conflictCount%v.chbDecayInterval == 0 {
-		v.decayCHB(assignments)
-	}
-}
-
-// decayCHB decays CHB conflict frequency scores (aggressive decay)
-// CHB uses much more aggressive decay than VSIDS to focus on recent conflicts
-func (v *VSIDS) decayCHB(assignments []Assignment) {
-	for i := range v.conflictFrequency {
-		// Skip pre-assigned variables (level 0) - not selectable
-		if assignments[i].Level == 0 {
-			continue
-		}
-		v.conflictFrequency[i] *= v.chbDecayFactor
 	}
 }
 
@@ -551,7 +511,6 @@ func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 // selectVariable returns the unassigned variable with highest activity (linear scan)
 // Uses effective activity (activity + LBD bonus) for selection
 // Adds randomization to break ties and avoid variable lock-in on random instances
-// CHB: Uses conflict frequency instead of VSIDS activity when enabled
 func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 	bestVar := uint32(0)
 	bestEffectiveActivity := -1.0
@@ -563,14 +522,7 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 			v.randomSeed ^= v.randomSeed << 17
 			noise := (float64(v.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) - 0.5) * 0.01
 
-			// CHB: Use conflict frequency instead of VSIDS activity
-			var baseActivity float64
-			if v.useCHB {
-				baseActivity = v.conflictFrequency[i]
-			} else {
-				baseActivity = v.activity[i]
-			}
-
+			baseActivity := v.activity[i]
 			effectiveActivity := baseActivity + v.lbdBonus[i] + noise*(baseActivity+v.lbdBonus[i])
 			if effectiveActivity > bestEffectiveActivity {
 				bestEffectiveActivity = effectiveActivity

@@ -533,12 +533,6 @@ func (s *CDCLSolver) SetClauseInitWeights(baseWeight, binaryWeight float64) {
 	s.vsids.SetClauseInitWeights(baseWeight, binaryWeight)
 }
 
-// EnableCHB enables CHB (Conflict History Based) heuristic
-// CHB tracks recent conflict frequency with aggressive decay instead of cumulative VSIDS activity
-func (s *CDCLSolver) EnableCHB() {
-	s.vsids.EnableCHB()
-}
-
 
 
 // SetRestartParameters configures restart policy parameters
@@ -3596,7 +3590,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Get the conflicting clause literals directly
 	conflictLits := conflictClause.Literals
 
-	s.vsids.bumpClause(conflictLits, s.assignments)
+	s.vsids.bumpClause(conflictLits)
 
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
