@@ -140,7 +140,6 @@ type CDCLSolver struct {
 	decisions            int
 	backjumpLevel        int
 	maxLearned           int
-	minLearned           int // Minimum clauses to keep (aggressive deletion target)
 	savedPhase           []bool
 	restartBase          int
 	restartCount         int
@@ -258,8 +257,6 @@ type CDCLSolver struct {
 	tmpResolvedVars      []uint32      // Track which variables were resolved (for fast reset)
 	tmpTouchedVars       []uint32      // Track which variables were modified (for fast reset)
 	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
-	tmpSortedLits        []cnf.Literal // Temporary buffer for canonical clause sorting
-	tmpMinimizedLits     []cnf.Literal // Reusable buffer for clause minimization (avoids allocation)
 	tmpMinSeenVars       []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
@@ -330,7 +327,6 @@ func precomputeOriginalUnitClauses(formula *cnf.CNF) []int {
 
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	maxLearned := calculateMaxLearned(formula.NumVars, formula.NumClauses)
-	minLearned := maxLearned / 2
 	restartBase := DefaultRestartBase
 
 	// Ensure literal pool is built for efficient propagation
@@ -365,7 +361,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decisions:            0,
 		backjumpLevel:        0,
 		maxLearned:           maxLearned,
-		minLearned:           minLearned,
 		savedPhase:           make([]bool, formula.NumVars),
 		restartBase:          restartBase,
 		restartCount:         0,
@@ -390,8 +385,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpTouchedVars:       make([]uint32, 0, formula.NumVars),
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:       make([]cnf.Literal, 0, 256),
-		tmpSortedLits:        make([]cnf.Literal, 0, 256),
-		tmpMinimizedLits:     make([]cnf.Literal, 0, 256),
 		tmpMinSeenVars:       make([]uint32, 0, 256),
 		conflictLitsBuf:     make([]cnf.Literal, 0, 256),
 		tmpVivifyResults:    make([]vivifyResult, 0, 64),
@@ -2262,14 +2255,16 @@ func (s *CDCLSolver) restart() bool {
 
 	// Use stored LBD values (calculated at learning time) instead of recalculating
 	// Recalculating during restart gives wrong values since assignments change
-	glueCount := 0
-	for i := 0; i < len(s.learnedLoc); i++ {
-		if s.learnedMetadata[i].LBD <= 2 {
-			glueCount++
+	// Gated on verbose — the count is only consumed by the s.Log call below.
+	if s.verbose {
+		glueCount := 0
+		for i := 0; i < len(s.learnedLoc); i++ {
+			if s.learnedMetadata[i].LBD <= 2 {
+				glueCount++
+			}
 		}
+		s.Log("c [verbose] Restart: %d glue clauses (LBD≤2), %d total active\n", glueCount, s.learnedActiveCount)
 	}
-
-	s.Log("c [verbose] Restart: %d glue clauses (LBD≤2), %d total active\n", glueCount, s.learnedActiveCount)
 
 	// NOTE: We don't delete clauses on restart - let deleteLearnedClauses handle memory management
 	// Restart is for escaping local minima, not for clause deletion
@@ -3248,25 +3243,25 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseLitVar := int(clauseLit.Var())
 				clauseAsg := assignments[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
-				if clauseAsg.Level < 0 {
-					// Unassigned — usable as replacement
+			if clauseAsg.Level < 0 {
+				// Unassigned — usable as replacement
+				foundJ = int(hint)
+				newWatchIdx = clauseLitVar << 1
+				if litNegated {
+					newWatchIdx |= 1
+				}
+			} else {
+				litTrue := litNegated != clauseAsg.Value
+				if litTrue {
+					// Assigned-and-true — usable as replacement, cache as blit
+					trueReplacementLit = litToBlit(clauseLit)
 					foundJ = int(hint)
 					newWatchIdx = clauseLitVar << 1
 					if litNegated {
 						newWatchIdx |= 1
 					}
-				} else if clauseAsg.Level >= 0 {
-					litTrue := litNegated != clauseAsg.Value
-					if litTrue {
-						// Assigned-and-true — usable as replacement, cache as blit
-					trueReplacementLit = litToBlit(clauseLit)
-					foundJ = int(hint)
-						newWatchIdx = clauseLitVar << 1
-						if litNegated {
-							newWatchIdx |= 1
-						}
-					}
 				}
+			}
 			}
 
 			if foundJ < 0 {
@@ -3424,13 +3419,6 @@ func (s *CDCLSolver) decide() bool {
 	var varIdx uint32
 	var phase bool
 	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
-
-	// Use saved phase (phase saving heuristic).
-	if int(varIdx) < len(s.savedPhase) {
-		phase = s.savedPhase[varIdx]
-	} else {
-		phase = false // Default to positive phase (variable = true)
-	}
 
 	// SAFETY CHECK: Ensure variable is unassigned before deciding.
 	// A stale heap entry can slip through; fall back to linear scan.

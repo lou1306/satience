@@ -131,7 +131,6 @@ type VSIDS struct {
 	activity              []float64 // Activity score for each variable
 	varInc                float64   // O(1) decay: bump counter (grows as varInc /= decayFactor)
 	decayFactor           float64   // Current decay factor (initialDecay -> maxDecayFactor)
-	inverseDecay          float64   // 1/decay for efficiency
 	conflictCount         int       // Total conflicts for decay timing
 	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
 	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
@@ -178,7 +177,6 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		activity:              make([]float64, numVars),
 		varInc:                25.0, // Initial bump amount (matches baseBumpAmount)
 		decayFactor:           initialDecay,
-		inverseDecay:          1.0 / initialDecay,
 		conflictCount:         0,
 		useLBD:                true,
 		lbdBonus:              make([]float64, numVars),
@@ -296,7 +294,6 @@ func (v *VSIDS) SetInitialDecayFactor(factor float64) {
 	}
 	v.initialDecayFactor = factor
 	v.decayFactor = factor
-	v.inverseDecay = 1.0 / factor
 }
 
 // SetMaxDecayFactor sets the maximum decay factor (default 0.999)
@@ -342,7 +339,6 @@ func (v *VSIDS) SetAggressiveDecay() {
 	v.initialDecayFactor = 0.30
 	v.maxDecayFactor = 0.60
 	v.decayFactor = 0.30
-	v.inverseDecay = 1.0 / v.decayFactor
 	v.decayIncrement = (v.maxDecayFactor - v.initialDecayFactor) / 5000.0
 	v.decayInterval = 1
 }
@@ -415,11 +411,6 @@ func (v *VSIDS) decayLBD() {
 	}
 }
 
-// bump increases the activity of a variable
-func (v *VSIDS) bump(varIdx uint32) {
-	v.activity[varIdx] += 1.0
-}
-
 // bumpLarge increases the activity of a variable by a larger amount
 // Used for variables in conflict clauses to make them more likely to be chosen.
 // Lazy heap: does NOT call increaseKey. The heap entry's stored score becomes
@@ -488,7 +479,6 @@ func (v *VSIDS) decay(assignments []Assignment) {
 		if v.decayFactor > v.maxDecayFactor {
 			v.decayFactor = v.maxDecayFactor
 		}
-		v.inverseDecay = 1.0 / v.decayFactor
 	}
 
 	// O(1) decay: grow varInc so new bumps are relatively larger
@@ -606,14 +596,4 @@ func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []b
 	}
 
 	return bestVar, phase
-}
-
-// hasUnassigned checks if there are unassigned variables
-func (v *VSIDS) hasUnassigned(assignments []Assignment, numVars uint32) bool {
-	for i := uint32(0); i < numVars; i++ {
-		if assignments[i].Level < 0 {
-			return true
-		}
-	}
-	return false
 }
