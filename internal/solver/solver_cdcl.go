@@ -3787,18 +3787,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			s.Log("0\n")
 		}
 
-		// Skip reason clauses with unassigned literals (invalid conflict clauses)
-		hasUnassigned := false
-		for _, lit := range reasonLits {
-			if s.assignments[lit.Var()].Level < 0 {
-				hasUnassigned = true
-				break
-			}
-		}
-		if hasUnassigned {
-			continue
-		}
-
 		// Resolve: remove varIdx, add reason literals
 		s.tmpLiteralInClause[varIdx] = false
 		s.tmpResolved[varIdx] = true
