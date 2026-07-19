@@ -15,7 +15,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 	for varIdx, impIdx := range s.implication {
 		if impIdx <= -5 {
 			learnedIdx := -impIdx - 5
-			if learnedIdx >= s.learnedCapacity {
+			if int(learnedIdx) >= s.learnedCapacity {
 				fmt.Printf("c [VERIFY ERROR] Implication var %d -> clause %d (>= learnedCapacity %d)\n",
 					varIdx+1, learnedIdx, s.learnedCapacity)
 				errors++

@@ -121,7 +121,7 @@ type CDCLSolver struct {
 	level        int
 	vsids        *VSIDS
 	conflicts    int
-	implication  []int // Reason clause: >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal preprocess; -4 reserved
+	implication  []int32 // Reason clause: >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal preprocess; -4 reserved
 	iterations   int
 	propagations int // Total propagations (assignments by unit propagation)
 	maxIter      int
@@ -353,7 +353,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		level:                0,
 		vsids:                NewVSIDS(formula.NumVars),
 		conflicts:            0,
-		implication:          make([]int, formula.NumVars), // -1 = decision (no clause)
+		implication:          make([]int32, formula.NumVars), // -1 = decision (no clause)
 		iterations:           0,
 		maxIter:              0,
 		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
@@ -3089,7 +3089,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Store learned clause index as negative: -learnedIdx-5
 			// Offset by 4 so clause 0 maps to -5, freeing -1/-2/-3/-4 as sentinels
 			// (-1 decision, -2 unit-prop preprocess, -3 pure-literal preprocess, -4 reserved)
-			s.implication[varIdx] = -learnedIdx - 5
+			s.implication[varIdx] = int32(-learnedIdx - 5)
 			s.propagations++
 		} else if s.assignments[varIdx].Value != litValue {
 			// Conflict: unit learned clause conflicts with existing assignment
@@ -3104,7 +3104,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Existing assignment is from propagation (not decision) - UNSAT!
 			if existingIdx <= -5 {
 				existingLearnedIdx := -existingIdx - 5
-					existingLits := s.getLearnedClauseLiterals(existingLearnedIdx)
+					existingLits := s.getLearnedClauseLiterals(int(existingLearnedIdx))
 				if s.verbose {
 					s.Log("c   Existing from learned clause %d: ", existingLearnedIdx)
 					for _, l := range existingLits {
@@ -3394,7 +3394,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					litValue[blitVarIdx*2+1] = !blitValue
 					s.trail = append(s.trail, uint32(blitVarIdx))
 					numUnassigned--
-					implication[blitVarIdx] = reasonIdx
+					implication[blitVarIdx] = int32(reasonIdx)
 					savedPhase[blitVarIdx] = blitNegated
 				}
 				propagations++
@@ -3518,7 +3518,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	s.litTrue[int(varIdx)*2] = value
 	s.litTrue[int(varIdx)*2+1] = !value
 	s.trail = append(s.trail, varIdx)
-	s.implication[varIdx] = clauseIdx
+	s.implication[varIdx] = int32(clauseIdx)
 	s.savedPhase[varIdx] = lit.IsNegated()
 	s.numUnassigned--
 
@@ -3562,7 +3562,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 	s.numUnassigned--
 
 	// Store clause index
-	s.implication[varIdx] = clauseIdx
+	s.implication[varIdx] = int32(clauseIdx)
 	s.savedPhase[varIdx] = lit.IsNegated()
 }
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
@@ -3591,12 +3591,12 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 				if impIdx <= -5 {
 					// Learned clause
 					learnedIdx := -impIdx - 5
-						if learnedIdx < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 1 {
+						if int(learnedIdx) < s.learnedCapacity && s.learnedLoc[learnedIdx].Size == 1 {
 							isUnit = true
 						}
 				} else {
 					// Original clause (guard against preprocessing sentinels -2/-3/-4)
-					if impIdx >= 0 && impIdx < len(s.cnf.Clauses) && len(s.cnf.Clauses[impIdx].Literals) == 1 {
+					if impIdx >= 0 && int(impIdx) < len(s.cnf.Clauses) && len(s.cnf.Clauses[impIdx].Literals) == 1 {
 							isUnit = true
 						}
 					}
@@ -4546,12 +4546,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	for _, impIdx := range s.implication {
 		if impIdx <= -5 {
 			learnedIdx := -impIdx - 5
-			if learnedIdx < s.learnedCapacity {
+			if int(learnedIdx) < s.learnedCapacity {
 				protected[learnedIdx] = true
 			}
 		}
 	}
-	
+
 	// Use tmp buffer for deletion marks
 	if cap(s.tmpDeleted) < s.learnedCapacity {
 		s.tmpDeleted = make([]bool, s.learnedCapacity)
@@ -4706,9 +4706,9 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	for varIdx := range s.implication {
 		if s.implication[varIdx] <= -5 {
 			learnedIdx := -s.implication[varIdx] - 5
-			if learnedIdx < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
-				s.implication[varIdx] = -clauseIndexMap[learnedIdx] - 5
-			} else if learnedIdx < len(clauseIndexMap) {
+			if int(learnedIdx) < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
+				s.implication[varIdx] = int32(-clauseIndexMap[learnedIdx] - 5)
+			} else if int(learnedIdx) < len(clauseIndexMap) {
 				// Clause was deleted - reset to decision
 				s.implication[varIdx] = -1
 			}
