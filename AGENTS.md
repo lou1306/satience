@@ -16,6 +16,8 @@ MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 2.44s (July 202
 
 ### Completed (July 2026)
 
+- **C5. Dense-instance subsumption gate** (DONE, PAR-2 neutral, fixes 5 cnfgen divergent families): Gated `subsumptionPass()` off via `skipSubsumption` for very dense instances (density > 60). The O(clauses × occurrences × clause-length) subsumption is pure overhead on dense instances where the search is trivially fast without it. Found via `benchmark/cnfgen_divergence.sh` (15-family cnfgen probe comparing satience vs minisat): `ramlb_6_6` (density 149, 44856 clauses) spent ~5s in subsumption strengthening 47636 clauses while the instance solves in 0.03s without it (0 conflicts, 47 decisions). `ramlb_7_7` (density 279): 16.5s→0.143s. `kcliquebin_6` (density 298): 1.98s→0.023s. `ramlb_5_5` (density 74): 0.354s→0.017s. All four now beat minisat. The threshold of 60 is above the highest-density MiniSat Fast Suite instance (32baec6a, density 49) so no suite instance is gated. Result: PAR-2 2.354s→2.365s (neutral, within noise — no suite instance affected), 72/72 solved, 110/110 cnfgen soundness, 0 mismatches.
+
 - **D2. Pure k-SAT adaptive split** (DONE, -3.6% PAR-2): Split the `StructuredScore < 0.7` branch in `classifyInstance` by `binaryRatio`: pure k-SAT instances (`binaryRatio == 0 AND density > 4.5`) use default decay 0.95 + `restartBase=5` + Glucose active (CLI defaults); mixed-binary instances keep the aggressive decay (0.30→0.60) + `restartBase=5` + Glucose disabled config. The pure k-SAT config matches minisat's behavior on phase-transition random 3-SAT: `566f366c` (300v/1649c, score 0.65) went 11.94s→0.37s (32x, was 346x slower than minisat), `46b70d0c` 0.62s→0.32s. The `density > 4.5` gate excludes `30eb4ef4` (density 4.20, phase-transition pure ternary) which regresses to TIMEOUT under default decay (confirmed by D1). `restartBase=5` (not 100) is critical: with `restartBase=100`, `566f366c` only reached 7.7s; `restartBase=5` reaches 0.37s. Result: PAR-2 2.528s→2.437s (-3.6%), SAT -9.8%, UNSAT +3.6% (noise — regressors are all structured/mixed instances unaffected by the change), 72/72 solved, 0 new timeouts.
 
 - **DPLL removal** (DONE, net -397 lines): Removed legacy `solver.go` DPLL solver (`Solver` struct, `NewSolver`, `Solve`, `propagate`, `checkClause`, `literalIsTrue`, `assignLiteral`, `decide`, `backtrack`, `clauseResult` consts), `SolveDPLL()` bridge in `solver_cdcl.go`, `-dpll` CLI flag + dispatch in `main.go`, 7 DPLL tests + 1 stale disabled comment block in `solver_test.go`. Preserved `Assignment`/`LearnedClauseLoc` structs in `solver.go` (used by CDCL). Trimmed stale "called by SolveDPLL" comment in `classifyInstance`. Educational comments comparing CDCL to chronological DPLL backtracking (solver_cdcl.go ~4819/4881) kept. Test count 51→44. Not a hot-path change — no PAR-2 needed.
@@ -66,7 +68,7 @@ MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 2.44s (July 202
 - `internal/solver/solver_cdcl.go`: CDCL solver (1-UIP, backjumping, restarts, deletion+compaction, vivification)
 - `internal/solver/vsids.go`: VSIDS variable selection with incremental activity heap
 - `internal/cnf/cnf.go`: Core types (Literal, Clause, CNF, Watch — 8 bytes, no WatchPos)
-- `cmd/satience/main.go`: CLI; `benchmark/cnfgen_fuzz.sh`: CNFgen soundness harness
+- `cmd/satience/main.go`: CLI; `benchmark/cnfgen_fuzz.sh`: CNFgen soundness harness; `benchmark/cnfgen_divergence.sh`: CNFgen divergence probe (satience vs minisat ratio, 15 families)
 
 ## Key Design Decisions
 

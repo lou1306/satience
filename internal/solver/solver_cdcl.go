@@ -206,6 +206,16 @@ type CDCLSolver struct {
 	// generation + post-BVE rebuild. These instances' highly-connected BIGs are
 	// navigated in <2s by watch-based propagation alone, so VE is pure overhead.
 	skipBVE             bool
+	// skipSubsumption is set by the classifier for very dense instances
+	// (density > 60) where the O(clauses × occurrences × clause-length) subsumption
+	// pass is pure overhead. On ramlb_6_6 (density 149, 44856 clauses) subsumption
+	// strengthens 47636 clauses in ~5s while the instance solves in 0.03s without
+	// it. On ramlb_5_5 (density 74, 11180 clauses) it strengthens 11244 clauses in
+	// ~0.4s while the instance solves in 0.01s without it. The threshold of 60 is
+	// above the highest-density MiniSat Fast Suite instance (32baec6a, density 49)
+	// but catches the divergent cnfgen instances (ramlb density 74-279,
+	// kcliquebin density 298).
+	skipSubsumption     bool
 	// Binary implication graph (BIG): bigAdj[litIdx] lists forward successors m
 	// such that binary clause (¬litIdx ∨ m) exists (i.e., litIdx → m in the
 	// implication graph). Built once from original binary clauses in buildBIG.
@@ -1093,6 +1103,15 @@ func (s *CDCLSolver) classifyInstance() {
 	// NOT gated (density ≤ 10) — it's the instance VE was tuned for.
 	s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
 
+	// Subsumption is O(clauses × occurrences × clause-length). On very dense
+	// instances (density > 60) the occurrence lists are huge, making each pass
+	// take seconds while the instance often solves in <0.1s without it.
+	// ramlb_6_6 (density 149): subsumption 5s, search 0.03s. kcliquebin_6
+	// (density 298): subsumption 2s, search 0.01s. ramlb_5_5 (density 74):
+	// subsumption 0.4s, search 0.01s. The threshold of 60 is above the
+	// highest-density suite instance (32baec6a, density 49).
+	s.skipSubsumption = structure.Density > 60.0
+
 	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
 		structure.Density,
 		structure.BinaryRatio*100,
@@ -1421,7 +1440,9 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		passChanged := false
 
 		// Subsumption pass (forward subsumption + self-subsumption/strengthening).
-		if config.EnableUnitProp {
+		// Skipped on very dense instances (skipSubsumption) where O(n²) cost is
+		// pure overhead — the instance solves faster without it.
+		if config.EnableUnitProp && !s.skipSubsumption {
 			subSubsumed, subStrengthened := s.subsumptionPass()
 			if subSubsumed > 0 || subStrengthened > 0 {
 				s.Log("c [preprocessing] Subsumption pass %d: %d clauses subsumed, %d strengthened\n", pass+1, subSubsumed, subStrengthened)
