@@ -3763,9 +3763,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount := s.tmpLevelCount[s.level]
 
-	// Build candidate list from trail (most recent first)
+	// Build candidate list from trail (most recent first). Only the current
+	// decision level's trail slice can contain level==s.level literals (the
+	// level starts at trailHead[s.level]), so scan that slice only — O(current-
+	// level trail) instead of O(total trail) per conflict.
 	s.tmpCandidates = s.tmpCandidates[:0]
-	for i := len(s.trail) - 1; i >= 0; i-- {
+	startIdx := s.trailHead[s.level]
+	for i := len(s.trail) - 1; i >= startIdx; i-- {
 		varIdx := uint32(s.trail[i])
 		if s.assignments[varIdx].Level == int32(s.level) && s.tmpLiteralInClause[varIdx] {
 			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx})
