@@ -1105,14 +1105,32 @@ func (s *CDCLSolver) classifyInstance() {
 			structure.Density, structure.BinaryRatio*100)
 	}
 
-	// Random-like instances (StructuredScore < 0.7): aggressive VSIDS decay and
-	// frequent Luby restarts. Unit propagation on random/mixed instances causes
-	// 76x more conflicts, so preprocessing is disabled in getAdaptivePreprocessingConfig.
-	// Aggressive decay (0.30→0.60) prevents the search from getting stuck on the
-	// same variables; structured instances prefer gentle decay (0.95) to maintain
-	// learned clause guidance.
+	// Random-like instances (StructuredScore < 0.7). Split into two sub-branches
+	// by binaryRatio because they need opposite decay schedules:
+	//   - Pure k-SAT (binaryRatio == 0, density > 4.5): default decay 0.95,
+	//     restartBase=5, Glucose active. Matches the minisat config that solves
+	//     566f366c (300v random 3-SAT) in ~0.04s; the aggressive-decay branch
+	//     took ~12s (346x). Aggressive decay (0.30->0.60) gives only ~3-5
+	//     conflict memory vs minisat's ~50-100, causing 118x more conflicts on
+	//     phase-transition random 3-SAT. The density > 4.5 gate excludes
+	//     30eb4ef4 (density 4.20, phase-transition pure ternary) which regresses
+	//     to TIMEOUT under default decay (see D1).
+	//   - Mixed (binaryRatio > 0): aggressive decay (0.30->0.60) + restartBase=5
+	//     + Glucose disabled. The aggressive decay was tuned for this cluster
+	//     (score<0.7 with 23-34% binary); removing it regressed 15+ instances
+	//     (+30% PAR-2, see D1).
+	// Unit propagation on random/mixed instances causes 76x more conflicts, so
+	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
-		s.Log("c [classification] Random-like instance (score=%.2f) - aggressive decay, restartBase=5\n", structure.StructuredScore)
+		if structure.BinaryRatio == 0 && structure.Density > 4.5 {
+			s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=5\n",
+				structure.StructuredScore, structure.Density)
+			s.restartBase = 5
+			// Glucose restart policy stays at CLI defaults (ratio=10.0, min=10):
+			// active as a safety net. decay stays at 0.95 (default).
+			return
+		}
+		s.Log("c [classification] Random-like mixed instance (score=%.2f) - aggressive decay, restartBase=5\n", structure.StructuredScore)
 		s.vsids.SetAggressiveDecay()
 		s.restartBase = 5
 		s.restartGlucoseRatio = 100.0
