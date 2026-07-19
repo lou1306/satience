@@ -4814,12 +4814,17 @@ func (s *CDCLSolver) compactLearnedClauses() {
 // propagateAssertingLiteral propagates the UIP (asserting literal) from the
 // most recently learned clause after a backjump. With qhead=decisionPoint,
 // the learned clause's watched literals sit at trail positions < decisionPoint
-// and would otherwise never be re-checked by the propagation loop. This is a
-// cheap O(clause-size) scan that assigns the UIP true when the clause is unit
-// (exactly one unassigned literal, all others false). It is a no-op when the
-// clause is not unit (e.g., some literals were unassigned by the backjump and
-// will be re-propagated by the watch system) or satisfied (e.g., the flipped
-// decision satisfies it).
+// and would otherwise never be re-checked by the propagation loop.
+//
+// The asserting-clause invariant (established by learnClause and trusted by
+// the watch system) guarantees position 0 (UIP) is unassigned and all others
+// are false after backjump: the UIP is the only literal at s.level (> bjLevel),
+// all others are at levels <= bjLevel and retain their conflict-time (false)
+// values. So we assign literals[0] directly — O(1) instead of O(clause-size).
+//
+// In debug builds, verifyAssertingInvariant runs the full O(clause-size) scan
+// and panics if the invariant is violated, catching any bug in learnClause
+// or backtrack that would corrupt the invariant.
 func (s *CDCLSolver) propagateAssertingLiteral() {
 	if s.lastLearnedClauseIdx < 0 || s.lastLearnedClauseIdx >= s.learnedCapacity {
 		return
@@ -4829,30 +4834,14 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 		return // unit clauses are handled via unitLearnedList
 	}
 	literals := s.getLearnedClauseLiterals(learnedIdx)
-	var unassignedLit cnf.Literal
-	unassignedCount := 0
-	for _, lit := range literals {
-		varIdx := lit.Var()
-		if s.assignments[varIdx].Level < 0 {
-			unassignedCount++
-			if unassignedCount > 1 {
-				return // not unit — let the watch system handle it
-			}
-			unassignedLit = lit
-		} else {
-			litTrue := lit.IsNegated() != s.assignments[varIdx].Value
-			if litTrue {
-				return // clause satisfied — no propagation needed
-			}
-		}
+
+	verifyAssertingInvariant(s, learnedIdx, literals)
+
+	propLevel := s.level
+	if propLevel == 0 {
+		propLevel = 1
 	}
-	if unassignedCount == 1 {
-		propLevel := s.level
-		if propLevel == 0 {
-			propLevel = 1
-		}
-		s.assignLiteralByClause(unassignedLit, propLevel, -learnedIdx-5)
-	}
+	s.assignLiteralByClause(literals[0], propLevel, -learnedIdx-5)
 }
 
 // backtrack backtracks (or backjumps) to a lower decision level
