@@ -115,8 +115,8 @@ func calculateMaxLearned(numVars uint32, numClauses int) int {
 type CDCLSolver struct {
 	cnf             *cnf.CNF
 	assignments     []Assignment
-	trail           []int
-	preprocessTrail []int // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	trail           []uint32
+	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
 	trailHead       []int
 	level        int
 	vsids        *VSIDS
@@ -345,8 +345,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 	solver := &CDCLSolver{
 		cnf:                  formula,
 		assignments:          make([]Assignment, formula.NumVars),
-		trail:                make([]int, 0, formula.NumVars),
-		preprocessTrail:      make([]int, 0, formula.NumVars),
+		trail:                make([]uint32, 0, formula.NumVars),
+		preprocessTrail:      make([]uint32, 0, formula.NumVars),
 		trailHead:            make([]int, 1),
 		qhead:                0,
 		lastLearnedClauseIdx: -1,
@@ -1341,7 +1341,7 @@ func (s *CDCLSolver) pureLiteralElimination() int {
 
 		if isPure[v] {
 			s.assignments[v] = Assignment{Value: pureValue[v], Level: 0}
-			s.preprocessTrail = append(s.preprocessTrail, int(v))
+			s.preprocessTrail = append(s.preprocessTrail, uint32(v))
 			s.implication[v] = -3 // pure literal preprocessing
 			assignedCount++
 		}
@@ -1515,7 +1515,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	s.preprocessTrail = s.preprocessTrail[:0]
 	for i := range s.assignments {
 		if s.assignments[i].Level == 0 {
-			s.preprocessTrail = append(s.preprocessTrail, int(i))
+			s.preprocessTrail = append(s.preprocessTrail, uint32(i))
 		}
 	}
 	s.trail = s.trail[:0]
@@ -1557,7 +1557,7 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 		}
 		value := !lit.IsNegated()
 		s.assignments[varIdx] = Assignment{Value: value, Level: 0}
-		s.preprocessTrail = append(s.preprocessTrail, int(varIdx))
+		s.preprocessTrail = append(s.preprocessTrail, varIdx)
 		s.implication[varIdx] = -2
 	}
 
@@ -2261,7 +2261,7 @@ func (s *CDCLSolver) cancelUntil(level int) {
 		decisionPoint = len(s.trail)
 	}
 	for i := decisionPoint; i < len(s.trail); i++ {
-		varIdx := uint32(s.trail[i])
+		varIdx := s.trail[i]
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.litTrue[int(varIdx)*2] = false
 		s.litTrue[int(varIdx)*2+1] = false
@@ -2535,7 +2535,7 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 					Value: value,
 					Level: 0,  // Unit propagations at level 0
 				}
-				s.trail = append(s.trail, int(varIdx))
+				s.trail = append(s.trail, varIdx)
 				// FIX: Set implication to prevent re-propagation during search
 				// Use -2 to indicate "assigned by preprocessing unit propagation"
 				s.implication[varIdx] = -2
@@ -3084,7 +3084,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			s.assignments[varIdx] = Assignment{Value: litValue, Level: int32(propLevel)}
 			s.litTrue[int(varIdx)*2] = litValue
 			s.litTrue[int(varIdx)*2+1] = !litValue
-			s.trail = append(s.trail, int(varIdx))
+			s.trail = append(s.trail, varIdx)
 			s.numUnassigned--
 			// Store learned clause index as negative: -learnedIdx-5
 			// Offset by 4 so clause 0 maps to -5, freeing -1/-2/-3/-4 as sentinels
@@ -3392,7 +3392,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel)}
 					litValue[blitVarIdx*2] = blitValue
 					litValue[blitVarIdx*2+1] = !blitValue
-					s.trail = append(s.trail, blitVarIdx)
+					s.trail = append(s.trail, uint32(blitVarIdx))
 					numUnassigned--
 					implication[blitVarIdx] = reasonIdx
 					savedPhase[blitVarIdx] = blitNegated
@@ -3517,7 +3517,7 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 	}
 	s.litTrue[int(varIdx)*2] = value
 	s.litTrue[int(varIdx)*2+1] = !value
-	s.trail = append(s.trail, int(varIdx))
+	s.trail = append(s.trail, varIdx)
 	s.implication[varIdx] = clauseIdx
 	s.savedPhase[varIdx] = lit.IsNegated()
 	s.numUnassigned--
@@ -3558,7 +3558,7 @@ func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx
 	}
 	s.litTrue[int(varIdx)*2] = value
 	s.litTrue[int(varIdx)*2+1] = !value
-	s.trail = append(s.trail, int(varIdx))
+	s.trail = append(s.trail, varIdx)
 	s.numUnassigned--
 
 	// Store clause index
@@ -3770,7 +3770,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.tmpCandidates = s.tmpCandidates[:0]
 	startIdx := s.trailHead[s.level]
 	for i := len(s.trail) - 1; i >= startIdx; i-- {
-		varIdx := uint32(s.trail[i])
+		varIdx := s.trail[i]
 		if s.assignments[varIdx].Level == int32(s.level) && s.tmpLiteralInClause[varIdx] {
 			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx})
 		}
@@ -3947,7 +3947,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		for _, varIdx := range s.tmpTouchedVars {
 			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
 				for ti := len(s.trail) - 1; ti >= 0; ti-- {
-					if uint32(s.trail[ti]) == varIdx {
+					if s.trail[ti] == varIdx {
 						if uipTrailPos < 0 || ti > uipTrailPos {
 							uipTrailPos = ti
 							uipVar = varIdx
@@ -4936,7 +4936,7 @@ func (s *CDCLSolver) backtrack() bool {
 	// Clear all assignments above bjLevel.
 	// No preprocessing check needed — preprocessing vars are on preprocessTrail (not s.trail).
 	for i := decisionPoint; i < len(s.trail); i++ {
-		varIdx := uint32(s.trail[i])
+		varIdx := s.trail[i]
 		s.assignments[varIdx] = Assignment{Level: -1}
 		s.litTrue[int(varIdx)*2] = false
 		s.litTrue[int(varIdx)*2+1] = false
