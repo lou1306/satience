@@ -1065,9 +1065,7 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 // making it a polluted diagnostic axis. classifyInstance is read-only on s.cnf.
 //
 // Must be called once, before search begins, in every solve entry point that
-// runs the CDCL loop (SolveWithResult, SolveWithoutPreprocessing). It is NOT
-// called by SolveDPLL (the legacy escape hatch) since DPLL uses none of the
-// classifier outputs (no VSIDS, no restarts, no polarity phase, no BVE).
+// runs the CDCL loop (SolveWithResult, SolveWithoutPreprocessing).
 func (s *CDCLSolver) classifyInstance() {
 	structure := s.analyzeInstanceStructure()
 
@@ -4909,22 +4907,4 @@ func (s *CDCLSolver) backtrack() bool {
 	s.level = bjLevel
 
 	return true
-}
-
-func (s *CDCLSolver) SolveDPLL() SolveResult {
-	s.solveStartNs = time.Now().UnixNano()
-	s.Log("c Using plain DPLL algorithm (no clause learning)\n")
-
-	// Create a simple DPLL solver
-	dpll := NewSolver(s.cnf)
-
-	// Run DPLL
-	if dpll.Solve() {
-		// Copy DPLL assignments to CDCL solver for model extraction
-		for i := range dpll.assignments {
-			s.assignments[i] = dpll.assignments[i]
-		}
-		return SAT
-	}
-	return UNSAT
 }
