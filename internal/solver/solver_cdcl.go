@@ -26,6 +26,7 @@ import (
 	"os"
 	"runtime"
 	"satience/internal/cnf"
+	"sort"
 	"time"
 )
 
@@ -73,17 +74,21 @@ func litToBlit(lit cnf.Literal) uint32 {
 }
 
 // calculateMaxLearned scales the clause database limit with instance size.
-// MiniSat-style: base limit proportional to variables, grows with conflicts
-func calculateMaxLearned(numVars uint32, numClauses int) int {
-	// Learned clause limit: max(numClauses/3, min(numVars*10, 5000)).
+// MiniSat-style: base limit proportional to variables, grows with conflicts.
+// maxLearnedMult overrides the numVars multiplier (default 0 = use built-in 10).
+func calculateMaxLearned(numVars uint32, numClauses int, maxLearnedMult float64) int {
+	// Learned clause limit: max(numClauses/3, min(numVars*mult, 5000)).
 	// - numClauses/3: MiniSat-style base, keeps database proportional to instance.
-	// - min(numVars*10, 5000): Floor for small instances (need room to learn),
+	// - min(numVars*mult, 5000): Floor for small instances (need room to learn),
 	//   capped at 5000 to prevent excessive database size on large instances
 	//   (e.g. 7807v → 5000 instead of 78070, which caused 100K+ clause databases
 	//   and 6x slower propagation).
+	if maxLearnedMult <= 0 {
+		maxLearnedMult = 10.0
+	}
 	baseLimit := numClauses / 3
 
-	varFloor := int(numVars) * 10
+	varFloor := int(float64(numVars) * maxLearnedMult)
 	if varFloor > 5000 {
 		varFloor = 5000
 	}
@@ -134,6 +139,13 @@ type CDCLSolver struct {
 	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
 	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
 	learnedCapacity      int                   // Total capacity including tombstones
+	// Clause-activity deletion (VSIDS-style decayed activity for within-tier
+	// deletion ordering). When claActivityEnabled=false, all Activity fields
+	// stay 0 and the sort's index tiebreak reduces to pure FIFO (no behavior
+	// change vs pre-activity code).
+	claInc               float64 // Activity increment (grows via O(1) decay), starts 1.0
+	claDecayFactor       float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
+	claActivityEnabled   bool    // false = pure FIFO within LBD tiers
 	verbose              bool
 	statsInterval        int // Print stats every N conflicts (0=disabled, bypasses verbose gate)
 	solveStartNs         int64 // Wall-clock start (UnixNano) of the public Solve entry; for elapsed in stats
@@ -336,7 +348,7 @@ func precomputeOriginalUnitClauses(formula *cnf.CNF) []int {
 }
 
 func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
-	maxLearned := calculateMaxLearned(formula.NumVars, formula.NumClauses)
+	maxLearned := calculateMaxLearned(formula.NumVars, formula.NumClauses, 0)
 	restartBase := DefaultRestartBase
 
 	// Ensure literal pool is built for efficient propagation
@@ -378,6 +390,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		lubyThresholdCap:     0, // Disabled by default; enabled for structured instances in classifyInstance
 		lbdSum:               0,
 		lbdCount:             0,
+		// Clause-activity deletion: VSIDS-style decayed activity for within-tier
+		// deletion ordering. Defaults enable activity (can be disabled via CLI).
+		claInc:               1.0,
+		claDecayFactor:       0.99,
+		claActivityEnabled:   true,
 		randomSeed:           0,
 		// P1: Pre-allocate reusable buffers with generous capacity to avoid reallocation
 		tmpLiteralInClause:   make([]bool, formula.NumVars),
@@ -596,6 +613,21 @@ func (s *CDCLSolver) SetLevelRestartGap(n int) {
 	s.levelRestartGap = n
 }
 
+// SetClaDecay sets the clause-activity decay factor (0 < d < 1). Lower = faster
+// decay (shorter memory). Only meaningful when claActivityEnabled=true.
+func (s *CDCLSolver) SetClaDecay(d float64) {
+	if d > 0 && d < 1.0 {
+		s.claDecayFactor = d
+	}
+}
+
+// SetClaActivityEnabled toggles activity-based clause deletion. When false, all
+// Activity fields stay 0 and the within-tier sort's index tiebreak reduces to
+// pure FIFO (identical to pre-activity behavior).
+func (s *CDCLSolver) SetClaActivityEnabled(enabled bool) {
+	s.claActivityEnabled = enabled
+}
+
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
 // minimization (safety/cost cap). The natural DAG bound of the implication
 // graph already terminates recursion; this is a defensive limit.
@@ -694,9 +726,9 @@ func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemo
 	activeClauses = s.learnedActiveCount
 	poolLiterals = len(s.learnedLiterals)
 	// Approximate memory: literals (4 bytes each) + per-clause metadata arrays
-	// (learnedLoc 8B + learnedMetadata 64B + learnedWatchIdx0/1 8B each = 88B) × capacity
+	// (learnedLoc 8B + learnedMetadata 16B + learnedWatchIdx0/1 8B each = 48B) × capacity
 	cap := cap(s.learnedLoc)
-	poolMemoryKB = (len(s.learnedLiterals)*4 + cap*88) / 1024
+	poolMemoryKB = (len(s.learnedLiterals)*4 + cap*48) / 1024
 	return activeClauses, poolLiterals, poolMemoryKB
 }
 
@@ -1111,6 +1143,22 @@ func (s *CDCLSolver) classifyInstance() {
 	// subsumption 0.4s, search 0.01s. The threshold of 60 is above the
 	// highest-density suite instance (32baec6a, density 49).
 	s.skipSubsumption = structure.Density > 60.0
+
+	// Activity-based clause deletion gate. Activity-based deletion (VSIDS-style
+	// decayed activity for within-LBD-tier deletion ordering) helps structured
+	// instances with enough clause diversity but hurts instances whose search
+	// trajectories were carefully tuned by other optimizations (D2 pure k-SAT
+	// split, B11 adaptive phase flip, etc.). The gate disables activity for:
+	//   - Random-like/Pure k-SAT instances (StructuredScore < 0.7): phase-transition
+	//     ternary (30eb4ef4) and random 3-SAT (566f366c) timeout with activity.
+	//   - Low-density binary-heavy instances (binaryRatio > 0.5 AND density < 4.0):
+	//     bb34f22f (binary 67%, density 3.12) regresses from 18s to 31s with activity.
+	// The 44092fcc help (binary 97.6%, density 4.61, -12.36s) is preserved because
+	// density 4.61 > 4.0.
+	if structure.StructuredScore < 0.7 ||
+		(structure.BinaryRatio > 0.5 && structure.Density < 4.0) {
+		s.claActivityEnabled = false
+	}
 
 	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
 		structure.Density,
@@ -3661,6 +3709,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Decay VSIDS activity every conflict (standard)
 	s.vsids.decay(s.assignments)
 	s.vsids.decayLBD()
+	// Clause activity decay (O(1), mirrors VSIDS varInc trick). Only consults
+	// Activity at deletion time, so no heap to invalidate. No-op when disabled.
+	s.claDecay()
 }
 
 // learnClause performs 1-UIP conflict analysis to learn a new clause
@@ -3798,6 +3849,16 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 
 		reasonClauseIdx := s.implication[varIdx]
+		// Clause-activity bump: each learned reason clause traversed during
+		// 1-UIP resolution gets claInc added to its Activity (MiniSat
+		// claBumpEvent equivalent). Only learned clauses (impIdx <= -5) are
+		// bumped; original clauses and preprocessing sentinels (-2..-4) are
+		// skipped. Reason clauses are protected from deletion while in use,
+		// so the bump only matters once the clause becomes a candidate. When
+		// claActivityEnabled=false this is a no-op (Activity stays 0).
+		if s.claActivityEnabled && reasonClauseIdx <= -5 {
+			s.learnedMetadata[-reasonClauseIdx-5].Activity += s.claInc
+		}
 		if reasonClauseIdx == -1 {
 			continue
 		}
@@ -4245,6 +4306,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		})
 		s.learnedAlive = append(s.learnedAlive, 1)
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
+		// Fresh clauses start at Activity=0 (MiniSat convention). They only
+		// gain activity when used as reasons during 1-UIP resolution. With
+		// Activity=0, the sort's index tiebreak handles fresh-clause
+		// protection (they have high indices, deleted last within Activity=0
+		// tier = FIFO protection). When claActivityEnabled=false, Activity
+		// stays 0 (pure FIFO fallback).
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
 			LBD: int32(lbd),
 		})
@@ -4563,12 +4630,15 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	
 	deletedCount := 0
 
-	// Two-pass LBD-tiered deletion. Within each tier, candidates are in
-	// ascending clause-index order (oldest learned first), so deletion is
-	// FIFO within a tier. Glue clauses (LBD ≤ 2) are never deleted.
+	// Two-pass LBD-tiered deletion. Within each tier, candidates are sorted by
+	// Activity ascending (lowest = delete first) with FIFO index tiebreak, so
+	// the lowest-activity clauses are deleted first. Glue clauses (LBD ≤ 2)
+	// are never deleted. When claActivityEnabled=false all Activity fields
+	// are 0 and the index tieback reduces the sort to pure ascending index
+	// order = FIFO (identical to pre-activity behavior).
 	candidates := s.tmpDeletionCandidates[:0]
 
-	// Pass 1: collect LBD > 5 candidates (lowest quality), delete oldest first
+	// Pass 1: collect LBD > 5 candidates (lowest quality), delete lowest-activity first
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size == 0 || protected[i] {
 			continue
@@ -4576,6 +4646,17 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		if s.learnedMetadata[i].LBD > 5 {
 			candidates = append(candidates, i)
 		}
+	}
+	if len(candidates) > 1 {
+		sort.Slice(candidates, func(i, j int) bool {
+			ai, aj := candidates[i], candidates[j]
+			aiAct := s.learnedMetadata[ai].Activity
+			ajAct := s.learnedMetadata[aj].Activity
+			if aiAct != ajAct {
+				return aiAct < ajAct
+			}
+			return ai < aj // FIFO tiebreak: oldest (lowest index) first
+		})
 	}
 	for _, idx := range candidates {
 		if deletedCount >= toDelete {
@@ -4595,6 +4676,17 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			if s.learnedMetadata[i].LBD > 2 {
 				candidates = append(candidates, i)
 			}
+		}
+		if len(candidates) > 1 {
+			sort.Slice(candidates, func(i, j int) bool {
+				ai, aj := candidates[i], candidates[j]
+				aiAct := s.learnedMetadata[ai].Activity
+				ajAct := s.learnedMetadata[aj].Activity
+				if aiAct != ajAct {
+					return aiAct < ajAct
+				}
+				return ai < aj
+			})
 		}
 		for _, idx := range candidates {
 			if deletedCount >= toDelete {

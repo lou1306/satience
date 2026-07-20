@@ -51,6 +51,8 @@ func run() int {
 	statsInterval := flag.Int("stats", 0, "Print stats every N conflicts (0=disabled, bypasses verbose gate)")
 	restartLevelCap := flag.Int("restart-level-cap", 40, "Force restart when conflict level exceeds this on long-clause instances (0=disabled)")
 	levelRestartGap := flag.Int("restart-level-gap", 100, "Min conflicts between level-capped restarts")
+	claDecay := flag.Float64("cla-decay", 0.99, "Clause activity decay factor for deletion ordering (default=0.99, slower than MiniSat 0.95)")
+	noClaActivity := flag.Bool("no-cla-activity", false, "Disable activity-based clause deletion (use FIFO within LBD tiers)")
 	flag.Parse()
 
 	// -verify implies -model
@@ -132,6 +134,10 @@ func run() int {
 	s.SetStatsInterval(*statsInterval)
 	s.SetRestartLevelCap(*restartLevelCap)
 	s.SetLevelRestartGap(*levelRestartGap)
+	s.SetClaDecay(*claDecay)
+	if *noClaActivity {
+		s.SetClaActivityEnabled(false)
+	}
 
 	start := time.Now()
 	var result solver.SolveResult

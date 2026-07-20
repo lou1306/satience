@@ -1,6 +1,6 @@
 #!/bin/bash
 
-BINARY="../satience_bench"
+BINARY="${BINARY:-../satience_bench}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 TIMEOUT_SEC=30
 MAX_PARALLEL=4
