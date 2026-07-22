@@ -118,116 +118,76 @@ func calculateMaxLearned(numVars uint32, numClauses int, maxLearnedMult float64)
 // Fields are mostly private; use provided methods for interaction.
 
 type CDCLSolver struct {
-	cnf             *cnf.CNF
-	assignments     []Assignment
-	trail           []uint32
+	// ===== HOT FIELDS (touched every propagation/decision) =====
+	// First ~4 cache lines. Adding fields below this block does NOT shift these
+	// cache lines. This prevents struct-layout sensitivity where adding a cold
+	// field (e.g., vivify counters) shifts the cache lines of the hottest fields,
+	// perturbing borderline instances (30eb4ef4 SAT ~12s ↔ TIMEOUT 30s — see
+	// V1/V5 in AGENTS.md). Keep this block contiguous at the top of the struct.
+	cnf                *cnf.CNF
+	assignments        []Assignment
+	trail              []uint32
+	trailHead          []int
+	level              int
+	vsids              *VSIDS
+	implication        []int32 // Reason clause: >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal preprocess; -4 reserved
+	savedPhase         []bool
+	numUnassigned      int // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
+	watchLists         [][]cnf.Watch // watchLists[lit] = clauses watching lit
+	originalSearchHint []int32 // Per-original-clause search hint for replacement scan (0=no hint)
+	qhead              int // Watched literals: next trail index to process
+	litTrue            []bool // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
+
+	// ===== WARM FIELDS (per-conflict / per-restart) =====
 	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
-	trailHead       []int
-	level        int
-	vsids        *VSIDS
-	conflicts    int
-	implication  []int32 // Reason clause: >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal preprocess; -4 reserved
-	iterations   int
-	propagations int // Total propagations (assignments by unit propagation)
-	maxIter      int
-	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
-	learnedLiterals      []cnf.Literal         // All learned clause literals in one contiguous slice
-	learnedLoc           []LearnedClauseLoc    // Packed (Offset, Size) per learned clause; Size=0 means tombstone
-	learnedAlive         []byte                 // 1 = clause alive, 0 = tombstone (cache-friendly bitmap for tombstone check)
-	learnedMetadata      []cnf.ClauseMetadata  // Per-clause metadata (LBD, SearchHint)
-	learnedWatchIdx0     []int                 // First watched literal index (for fast watch removal)
-	learnedWatchIdx1     []int                 // Second watched literal index (for fast watch removal)
-	learnedActiveCount   int                   // Number of active clauses (excludes tombstones)
-	learnedCapacity      int                   // Total capacity including tombstones
-	// Clause-activity deletion (VSIDS-style decayed activity for within-tier
-	// deletion ordering). When claActivityEnabled=false, all Activity fields
-	// stay 0 and the sort's index tiebreak reduces to pure FIFO (no behavior
-	// change vs pre-activity code).
-	claInc               float64 // Activity increment (grows via O(1) decay), starts 1.0
-	claDecayFactor       float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
-	claActivityEnabled   bool    // false = pure FIFO within LBD tiers
-	verbose              bool
-	statsInterval        int // Print stats every N conflicts (0=disabled, bypasses verbose gate)
-	solveStartNs         int64 // Wall-clock start (UnixNano) of the public Solve entry; for elapsed in stats
-	decisions            int
-	backjumpLevel        int
-	maxLearned           int
-	savedPhase           []bool
-	restartBase          int
-	restartCount         int
-	lubyIndex            int
-	lubyThresholdCap     int // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
-	lbdSum               int
-	lbdCount             int
-	emaLBD               float64 // Exponential moving average of LBD (smooth restart signal)
+	conflicts       int
+	iterations      int
+	propagations    int // Total propagations (assignments by unit propagation)
+	maxIter         int
+	decisions       int
+	backjumpLevel   int
+	maxLearned      int
+	restartCount    int
+	lubyIndex       int
+	lbdSum          int
+	lbdCount        int
+	emaLBD          float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
-	totalLbdSum          uint64
-	totalLbdCount        uint64
-	maxLearnedShrunk     bool // True if maxLearned has been shrunk (one-way, no grow-back)
-	restartPropsDecLimit  int     // Props/dec threshold for restart (0=disabled, default 100)
-	adaptivePhaseFlipRate float64 // Phase flip rate when props/dec is high (0=disabled, default 0.1)
-	propsDecRestartGap    int     // Min conflicts between props/dec-bounded restarts (default 100)
+	totalLbdSum   uint64
+	totalLbdCount uint64
 	// B1: Level-capped restart for long-clause instances. Long-clause instances
 	// produce high-LBD clauses consistently, so the Glucose EMA criterion never
 	// fires (EMA ≈ avg). Deep search produces high-LBD clauses with no propagation
 	// guidance, creating a deep-search → high-LBD → no-guidance → deep-search cycle.
 	// This breaks the cycle by restarting when conflict level exceeds the cap.
 	// Gated on LongClauseRatio > 0.8 (binary-heavy instances have the props/dec restart).
-	lastConflictLevel    int     // Level at which the last conflict occurred (captured in handleConflict)
-	longClauseRatio      float64 // Cached LongClauseRatio from classifier (for B1 gate)
-	restartLevelCap      int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
-	levelRestartGap      int     // Min conflicts between level-capped restarts (anti-thrashing)
-	randomSeed           uint64          // Seed for deterministic random selection
-	rndInitNoise         float64 // Magnitude of random noise added to initial VSIDS activity (0=disabled)
-	unitLearnedList      []int           // List of learned clause indices that are unit clauses (for O(1) propagation)
-	unitsDirty           bool            // True when unit scan needs to run (new unit learned or backtrack occurred)
-	numUnassigned            int      // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	minimizeMaxDepth   int      // Max recursion depth for recursive clause minimization (default 0=unlimited)
-	unitPropBudget     int      // Max literal visits for unit propagation preprocess (0=unlimited)
-	veBudget           int      // Max resolvents for variable elimination (0=unlimited)
-	eliminatedVars     []eliminatedVar // Variables eliminated by BVE (for model reconstruction)
-	vivifyPeriod       int      // Run vivification every Nth restart (0=disabled, default 50)
-	vivifyMinConflictGap int    // Min conflicts between vivify rounds (default 5000)
-	conflictsAtLastVivify int   // conflict count at last vivify round (for gap gate)
+	lastConflictLevel int // Level at which the last conflict occurred (captured in handleConflict)
+	longClauseRatio   float64 // Cached LongClauseRatio from classifier (for B1 gate)
+	randomSeed        uint64 // Seed for deterministic random selection
+	rndInitNoise      float64 // Magnitude of random noise added to initial VSIDS activity (0=disabled)
+	unitLearnedList   []int // List of learned clause indices that are unit clauses (for O(1) propagation)
+	unitsDirty        bool // True when unit scan needs to run (new unit learned or backtrack occurred)
 	randomPhaseRate       float64 // Probability of flipping the saved phase per decision (0=disabled)
 	restartPhaseFlipRate  float64 // Probability of flipping each saved phase on restart (0=disabled)
 	lbdScaleOverride      bool    // True if user explicitly set LBD scale via CLI (skip adaptive)
-	vivifyEnabled      bool     // Whether vivification is enabled (adaptive: structured instances only)
-	inVivification     bool     // True during vivification trial propagation (suppresses false UNSAT from unit scan)
-	// Equivalence detection (SCC-based): stores mapping for model reconstruction.
-	equivRep           []uint32 // Representative variable for each variable (identity if not merged)
-	equivNeg           []bool   // Whether variable is equivalent to negation of its representative
-	hasEquivalences    bool     // True if detectEquivalences found and merged any equivalences
-	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
-	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
-	// occurrence-based phase is trajectory-sensitive and helps some instances
-	// while hurting others with near-identical structure, so the classifier
-	// score alone cannot predict benefit. The PolarityImbalance metric (mean
-	// per-variable |pos-neg|/(pos+neg)) is stored as a secondary signal.
-	structureScore      float64 // Cached StructuredScore from analyzeInstanceStructure
-	polarityImbalance   float64 // Mean per-variable polarity imbalance (0=balanced, 1=pure)
-	// skipPolarityPhase is set by the classifier for dense binary instances
-	// (binaryRatio > 0.9 AND density > 35) where the default phase propagates
-	// to a solution quickly via the highly-connected BIG, and the occurrence-
-	// based override fights the implication structure.
-	skipPolarityPhase   bool
-	// skipBVE is set by the classifier for dense binary instances
-	// (binaryRatio > 0.95 AND density > 10) where BVE hits the resolvent budget
-	// eliminating only 7-14% of variables while spending 4-15s on resolvent
-	// generation + post-BVE rebuild. These instances' highly-connected BIGs are
-	// navigated in <2s by watch-based propagation alone, so VE is pure overhead.
-	skipBVE             bool
-	// skipSubsumption is set by the classifier for very dense instances
-	// (density > 60) where the O(clauses × occurrences × clause-length) subsumption
-	// pass is pure overhead. On ramlb_6_6 (density 149, 44856 clauses) subsumption
-	// strengthens 47636 clauses in ~5s while the instance solves in 0.03s without
-	// it. On ramlb_5_5 (density 74, 11180 clauses) it strengthens 11244 clauses in
-	// ~0.4s while the instance solves in 0.01s without it. The threshold of 60 is
-	// above the highest-density MiniSat Fast Suite instance (32baec6a, density 49)
-	// but catches the divergent cnfgen instances (ramlb density 74-279,
-	// kcliquebin density 298).
-	skipSubsumption     bool
+	inVivification        bool    // True during vivification trial propagation (suppresses false UNSAT from unit scan)
+	emptyClauseFound      bool    // Set when empty learned clause derived (UNSAT)
+	compactPending        bool    // Set when learned-clause tombstone ratio is high; compaction runs at the next restart (level 0)
+	lastLearnedClauseIdx  int // Index of most recently learned clause (-1 = none); for asserting literal propagation
+	watchInitialized      bool    // True if watches have been initialized
+	originalUnitClauses   []int // Precomputed indices of original unit clauses (for restart re-propagation)
+
+	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
+	learnedLiterals    []cnf.Literal        // All learned clause literals in one contiguous slice
+	learnedLoc         []LearnedClauseLoc   // Packed (Offset, Size) per learned clause; Size=0 means tombstone
+	learnedAlive       []byte               // 1 = clause alive, 0 = tombstone (cache-friendly bitmap for tombstone check)
+	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, SearchHint)
+	learnedWatchIdx0   []int                // First watched literal index (for fast watch removal)
+	learnedWatchIdx1   []int                // Second watched literal index (for fast watch removal)
+	learnedActiveCount int                  // Number of active clauses (excludes tombstones)
+	learnedCapacity    int                  // Total capacity including tombstones
+
 	// Binary implication graph (BIG): bigAdj[litIdx] lists forward successors m
 	// such that binary clause (¬litIdx ∨ m) exists (i.e., litIdx → m in the
 	// implication graph). Built once from original binary clauses in buildBIG.
@@ -239,6 +199,87 @@ type CDCLSolver struct {
 	bigBfsVisited []uint32
 	bigBfsEpoch   uint32
 	bigBfsQueue   []int
+
+	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
+	tmpLiteralInClause []bool
+	tmpSeenVar          []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
+	tmpLiteralIsNegated []bool
+	tmpLevelCount       []int
+	tmpLevelCountUsed   []bool // Track which levels have non-zero tmpLevelCount
+	tmpCandidates       []resolveCandidate
+	tmpLevelSet         []int  // For LBD calculation (replaces map)
+	tmpLevelSetUsed     []bool // Track which levels are in tmpLevelSet
+	tmpResolved         []bool // Track resolved variables in 1-UIP to prevent re-resolution cycles
+	tmpResolvedVars     []uint32 // Track which variables were resolved (for fast reset)
+	tmpTouchedVars      []uint32 // Track which variables were modified (for fast reset)
+	tmpLearnedLits      []cnf.Literal // Reusable buffer for learned clause literals
+	tmpMinSeenVars      []uint32 // Vars marked in tmpSeenVar during minimization (for fast cleanup)
+	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
+	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
+
+	// Reusable buffer for vivification results (avoid per-round allocation)
+	tmpVivifyResults []vivifyResult
+
+	// Reusable buffers for clause deletion (avoid per-deletion allocation)
+	tmpDeleted            []bool // Bitmap for deleted clauses
+	tmpClauseUsedAsReason []bool // Track clauses used as implications
+	tmpClauseIndexMap     []int  // Pre-allocated buffer for old->new clause index mapping
+	tmpDeletionCandidates []int  // Pre-allocated buffer for deletion candidate sorting
+
+	// Equivalence detection (SCC-based): stores mapping for model reconstruction.
+	equivRep []uint32 // Representative variable for each variable (identity if not merged)
+	equivNeg []bool   // Whether variable is equivalent to negation of its representative
+	hasEquivalences bool // True if detectEquivalences found and merged any equivalences
+	eliminatedVars []eliminatedVar // Variables eliminated by BVE (for model reconstruction)
+
+	// ===== COLD CONFIG (set once at startup, rarely touched in hot path) =====
+	// Clause-activity deletion (VSIDS-style decayed activity for within-tier
+	// deletion ordering). When claActivityEnabled=false, all Activity fields
+	// stay 0 and the sort's index tiebreak reduces to pure FIFO (no behavior
+	// change vs pre-activity code).
+	claInc               float64 // Activity increment (grows via O(1) decay), starts 1.0
+	claDecayFactor       float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
+	claActivityEnabled   bool    // false = pure FIFO within LBD tiers
+	maxLearnedShrunk     bool    // True if maxLearned has been shrunk (one-way, no grow-back)
+	restartBase           int // Luby restart base (default 200; classifier may override)
+	lubyThresholdCap      int // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
+	restartPropsDecLimit  int     // Props/dec threshold for restart (0=disabled, default 100)
+	adaptivePhaseFlipRate float64 // Phase flip rate when props/dec is high (0=disabled, default 0.1)
+	propsDecRestartGap    int     // Min conflicts between props/dec-bounded restarts (default 100)
+	restartLevelCap      int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
+	levelRestartGap      int     // Min conflicts between level-capped restarts (anti-thrashing)
+	minimizeMaxDepth     int      // Max recursion depth for recursive clause minimization (default 0=unlimited)
+	unitPropBudget       int      // Max literal visits for unit propagation preprocess (0=unlimited)
+	veBudget             int      // Max resolvents for variable elimination (0=unlimited)
+	vivifyPeriod         int      // Run vivification every Nth restart (0=disabled, default 50)
+	vivifyMinConflictGap int      // Min conflicts between vivify rounds (default 5000)
+	conflictsAtLastVivify int     // conflict count at last vivify round (for gap gate)
+	vivifyEnabled        bool     // Whether vivification is enabled (adaptive: structured instances only)
+	subsumptionPeriod         int    // Run subsumption every Nth restart (0=disabled, default 50)
+	subsumptionMinConflictGap int    // Min conflicts between subsumption rounds (0=restart-based only)
+	conflictsAtLastSubsumption int   // conflict count at last subsumption round (for gap gate)
+	skipSubsumption      bool
+	skipBVE              bool
+	skipPolarityPhase    bool
+	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
+	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
+	// occurrence-based phase is trajectory-sensitive and helps some instances
+	// while hurting others with near-identical structure, so the classifier
+	// score alone cannot predict benefit. The PolarityImbalance metric (mean
+	// per-variable |pos-neg|/(pos+neg)) is stored as a secondary signal.
+	structureScore      float64 // Cached StructuredScore from analyzeInstanceStructure
+	polarityImbalance   float64 // Mean per-variable polarity imbalance (0=balanced, 1=pure)
+	maxLearnedClauseSize int
+	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
+	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
+	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
+	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
+	glucoseGap                 int     // Min conflicts between Glucose restarts (anti-thrashing, default 100)
+
+	// ===== DEBUG/STATS (only touched in verbose or -stats paths) =====
+	verbose              bool
+	statsInterval        int   // Print stats every N conflicts (0=disabled, bypasses verbose gate)
+	solveStartNs         int64 // Wall-clock start (UnixNano) of the public Solve entry; for elapsed in stats
 	// Diagnostic counters for learned-clause minimization (always-on; reported in
 	// printStats and a periodic solve-loop log). Pure instrumentation — no behavior.
 	minimizeCalls       uint64 // recursive self-subsumption invocations (clauses >2 lits)
@@ -250,77 +291,13 @@ type CDCLSolver struct {
 	vivifyClausesChecked uint64 // clauses passed to vivifyClause
 	vivifyClausesModified uint64 // clauses shortened by vivify
 	vivifyLiteralsRemoved  uint64 // literals removed by vivify
-	// Learned-clause subsumption (forward subsumption + self-subsumption
-	// strengthening). Runs at level-0 restart boundaries like vivification,
-	// using binary learned clauses as the subsumers. Self-gating: the occ
-	// build early-returns when no binary learned clauses exist (random
-	// instances produce none), so it is effectively free there.
-	subsumptionPeriod         int    // Run subsumption every Nth restart (0=disabled, default 50)
-	subsumptionMinConflictGap int    // Min conflicts between subsumption rounds (0=restart-based only)
-	conflictsAtLastSubsumption int   // conflict count at last subsumption round (for gap gate)
 	subsumptionRoundsRun       uint64 // subsumption rounds actually executed
 	subsumptionClausesChecked uint64 // non-binary learned clauses scanned
 	subsumptionClausesSubsumed  uint64 // clauses deleted by forward subsumption
 	subsumptionClausesStrengthened uint64 // literals removed by self-subsumption
 	// Histogram of final learned-clause sizes (post-minimization, at learn time).
 	// Buckets: [<=2, 3-5, 6-10, 11-20, 21-50, >50].
-	learnedLenHist     [6]uint64
-	maxLearnedClauseSize int
-	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
-	tmpLiteralInClause   []bool
-	tmpSeenVar           []bool // Pre-allocated bitset for duplicate/tautology checks (replaces per-conflict maps)
-	tmpLiteralIsNegated  []bool
-	tmpLevelCount        []int
-	tmpLevelCountUsed    []bool // Track which levels have non-zero tmpLevelCount
-	tmpCandidates        []resolveCandidate
-	tmpLevelSet          []int         // For LBD calculation (replaces map)
-	tmpLevelSetUsed      []bool        // Track which levels are in tmpLevelSet
-	tmpResolved          []bool        // Track resolved variables in 1-UIP to prevent re-resolution cycles
-	tmpResolvedVars      []uint32      // Track which variables were resolved (for fast reset)
-	tmpTouchedVars       []uint32      // Track which variables were modified (for fast reset)
-	tmpLearnedLits       []cnf.Literal // Reusable buffer for learned clause literals
-	tmpMinSeenVars       []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
-	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
-	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
-
-	// Reusable buffer for vivification results (avoid per-round allocation)
-	tmpVivifyResults []vivifyResult
-
-	// Reusable buffers for clause deletion (avoid per-deletion allocation)
-	tmpDeleted            []bool               // Bitmap for deleted clauses
-	tmpClauseUsedAsReason []bool               // Track clauses used as implications
-	tmpClauseIndexMap     []int                // Pre-allocated buffer for old->new clause index mapping
-	tmpDeletionCandidates []int                 // Pre-allocated buffer for deletion candidate sorting
-
-	// Watched literals infrastructure
-	watchLists          [][]cnf.Watch // watchLists[lit] = clauses watching lit
-	watchInitialized    bool          // True if watches have been initialized
-	originalUnitClauses []int         // Precomputed indices of original unit clauses (for restart re-propagation)
-	originalSearchHint  []int32        // Per-original-clause search hint for replacement scan (0=no hint)
-
-	// LBD-based learned clause ordering for propagation prioritization
-
-	// Watched literals infrastructure
-	emptyClauseFound    bool                     // Set when empty learned clause derived (UNSAT)
-	compactPending      bool                     // Set when learned-clause tombstone ratio is high; compaction runs at the next restart (level 0)
-
-	qhead                int // Watched literals: next trail index to process
-	lastLearnedClauseIdx int // Index of most recently learned clause (-1 = none); for asserting literal propagation
-
-	// Configurable parameters (exposed for tuning)
-	preprocessingMaxVars     int     // Skip preprocessing if > N vars (default 50000)
-	preprocessingMaxClauses  int     // Skip preprocessing if > N clauses (default 500000)
-	// Restart policy parameters
-	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
-	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
-	glucoseGap                 int     // Min conflicts between Glucose restarts (anti-thrashing, default 100)
-
-	// litTrue caches whether each literal is assigned-and-true, indexed by
-	// LitToIndex(lit) = varIdx*2 + negated. Updated on assign/unassign. The blit
-	// fast path reads this instead of decoding the literal + loading assignments[],
-	// eliminating 5 ops per watch. On unassign, both polarities are set to false
-	// (unassigned ≠ false-assigned). Trajectory-neutral: same truth values, just cached.
-	litTrue []bool
+	learnedLenHist [6]uint64
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
