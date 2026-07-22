@@ -1744,7 +1744,7 @@ func TestCancelUntil(t *testing.T) {
 // consistent (strengthened ≤ checked, subsumed ≤ checked) and that the result
 // is correct (UNSAT).
 func TestLearnedSubsumptionFires(t *testing.T) {
-	c := buildPigeonhole(6, 5)
+	c := buildPigeonhole(7, 6)
 	s := NewCDCLSolver(&c)
 	// Force subsumption to fire at every restart.
 	s.SetSubsumptionPeriod(1)

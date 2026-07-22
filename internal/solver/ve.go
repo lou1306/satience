@@ -425,6 +425,11 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 		}
 		clauseLits := clause.Literals
 
+		// Skip empty clauses (can appear after tautology/duplicate removal)
+		if len(clauseLits) == 0 {
+			continue
+		}
+
 		// Mark C's literals for subsumption checking
 		for _, lit := range clauseLits {
 			idx := cnf.LitToIndex(lit)

@@ -298,6 +298,11 @@ type CDCLSolver struct {
 	// Histogram of final learned-clause sizes (post-minimization, at learn time).
 	// Buckets: [<=2, 3-5, 6-10, 11-20, 21-50, >50].
 	learnedLenHist [6]uint64
+
+	// Cached classifier output (set once in classifyInstance, read occasionally).
+	// Placed at struct end to avoid shifting hot/warm cache lines (op_15 regression).
+	binaryRatio    float64 // Cached BinaryRatio from classifier
+	useBumpAnalyze bool    // True: bump all touched vars (minisat analyze_toclear); false: bump conflict clause only
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -1094,6 +1099,7 @@ func (s *CDCLSolver) classifyInstance() {
 	s.structureScore = structure.StructuredScore
 	s.polarityImbalance = structure.PolarityImbalance
 	s.longClauseRatio = structure.LongClauseRatio
+	s.binaryRatio = structure.BinaryRatio
 
 	// Dense binary instances: the BIG is highly connected, so the default phase
 	// propagates to a solution quickly (0 conflicts observed on 32baec6a, a
@@ -1170,6 +1176,7 @@ func (s *CDCLSolver) classifyInstance() {
 			s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=5\n",
 				structure.StructuredScore, structure.Density)
 			s.restartBase = 5
+			s.useBumpAnalyze = true
 			// Glucose restart policy stays at CLI defaults (ratio=10.0, min=10):
 			// active as a safety net. decay stays at 0.95 (default).
 			return
@@ -1183,6 +1190,17 @@ func (s *CDCLSolver) classifyInstance() {
 	}
 
 	s.Log("c [classification] Structured instance (score=%.2f)\n", structure.StructuredScore)
+
+	// Enable bumpAnalyze for structured non-binary instances (default decay).
+	// Binary-heavy instances (binaryRatio > 0.5) are excluded to protect
+	// bb34f22f's phase-flip escape dynamics.
+	// High-density + low-PolImb instances are excluded: 274099073 (density=15.6,
+	// PolImb=0.015, 99.4% long) regresses -8.8s — balanced polarities mean VSIDS
+	// is the sole guidance signal; diluting it across all touched vars hurts.
+	// 69d72f81 (density=11.6, PolImb=0.839) is kept — high PolImb means phase
+	// saving provides strong guidance, so broader VSIDS exploration helps.
+	s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
+		(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
 
 	// Cap Luby threshold growth to prevent Luby exhaustion on very long-clause
 	// instances. The Luby sequence grows unboundedly; without a cap, the
@@ -1215,7 +1233,7 @@ func (s *CDCLSolver) classifyInstance() {
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
-	if s.structureScore < 0.7 {
+	if s.structureScore < 0.7 && s.binaryRatio <= 0.5 {
 		s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", s.structureScore)
 		return PreprocessingConfig{
 			EnableUnitProp: false,
@@ -1473,6 +1491,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 				s.Log("c [preprocessing] Subsumption pass %d: %d clauses subsumed, %d strengthened\n", pass+1, subSubsumed, subStrengthened)
 				passChanged = true
 			}
+			// Self-subsumption can strengthen a clause to empty (removing all
+			// literals one by one). An empty clause means UNSAT.
+			if s.hasEmptyClause() {
+				s.Log("c [preprocessing] Empty clause after subsumption — UNSAT\n")
+				s.printStats()
+				return UNSAT
+			}
 		}
 
 		// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
@@ -1571,6 +1596,9 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 	// Propagate original unit clauses (not watched by watched literals)
 	for _, clauseIdx := range s.originalUnitClauses {
 		clause := &s.cnf.Clauses[clauseIdx]
+		if len(clause.Literals) == 0 {
+			continue
+		}
 		lit := clause.Literals[0]
 		varIdx := lit.Var()
 		if s.assignments[varIdx].Level >= 0 {
@@ -2509,6 +2537,12 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 		clauseCount := len(s.cnf.Clauses)
 		for clauseIdx := 0; clauseIdx < clauseCount; clauseIdx++ {
 			clause := s.cnf.Clauses[clauseIdx]
+
+			// Empty clause = UNSAT (can appear from subsumption strengthening)
+			if len(clause.Literals) == 0 {
+				s.Log("c [verbose] Preprocessing: empty clause detected during unit propagation\n")
+				return UNSAT
+			}
 
 			satisfied := false
 			falseCount := 0
@@ -3652,8 +3686,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Get the conflicting clause literals directly
 	conflictLits := conflictClause.Literals
 
-	s.vsids.bumpClause(conflictLits)
-
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
@@ -4008,6 +4040,19 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			}
 			currentCount = 1
 		}
+	}
+
+	// Bump variables touched during 1-UIP analysis. bumpAnalyze (minisat
+	// analyze_toclear) bumps ALL touched variables including intermediate
+	// resolved vars; bumpClause bumps only the conflict clause vars. bumpAnalyze
+	// is gated to default-decay instances — under aggressive decay (0.30→0.60)
+	// the fast varInc growth flattens the VSIDS signal when distributed across
+	// many touched vars (30eb4ef4 regression). Must run before the currentCount==0
+	// early return so degenerate conflicts still bump involved variables.
+	if s.useBumpAnalyze {
+		s.vsids.bumpAnalyze(s.tmpTouchedVars)
+	} else {
+		s.vsids.bumpClause(conflictLits)
 	}
 
 	// NOTE: currentCount == 0 means resolution canceled all literals at the
@@ -4429,7 +4474,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		// the derivation uses only the binary clauses, which are in the formula.
 		// Intermediate tautologies in the resolvent are harmless — only the
 		// final clause (C\{lit}) matters, and it is non-tautological.
-		if s.bigAdj != nil {
+		if s.bigAdj != nil && !(s.structureScore < 0.7 && s.binaryRatio > 0.4) { // GATE: disable BIG for mixed-binary sub-0.7
 			s.bigMinimizeCalls++
 			if s.bigReachableInClause(lit) {
 				s.bigMinimizeHits++

@@ -8,12 +8,15 @@ Sound and complete CDCL SAT solver in Go with DIMACS CNF support.
 
 ## Status
 Sound and complete. 44/44 unit tests, 110/110 CNFgen soundness (6 families: PHP, Tseitin, ordering, counting, parity, pebbling), 72/72 minisat cross-check (0 mismatches).
-MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 2.11s (July 2026, best-of-3).
+MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 1.99s (July 2026, best-of-3).
 
 ### Potential Next Steps (July 2026)
 - **C2. Propagation `unsafe` bounds-check elimination**: First `unsafe` usage. Expected ~1-3% PAR-2 (not 10-15% — `litValue[watch.Blit]` saves ~1 cycle/watch). Higher maintainability cost than gain warrants; defer.
+- **D4. Smooth classifier threshold interpolation**: Replace hard 0.7 StructuredScore threshold with smooth [0.65, 0.75] transition band. `SetDecayParams` infrastructure in vsids.go. Not yet implemented in classifyInstance.
 
 ### Completed (July 2026)
+
+- **B12. bumpAnalyze: VSIDS conflict analysis bumping** (-10.0% PAR-2): New `bumpAnalyze` in vsids.go bumps ALL variables touched during 1-UIP analysis (minisat's `analyze_toclear`) instead of only conflict-clause vars (`bumpClause`). Total activity per conflict is the same (varInc), distributed across touched vars. `useBumpAnalyze` flag on CDCLSolver; `tmpTouchedVars` already populated by 1-UIP scan. Moved bump from `handleConflict` to `learnClause` (before currentCount==0 early return). **Gate**: `binaryRatio <= 0.5 AND (density < 10.0 OR polarityImbalance > 0.4)`. Binary-heavy (>0.5) excluded (protects bb34f22f phase-flip dynamics). High-density + low-PolImb excluded: 274099073 (density=15.6, PolImb=0.015, 99.4% long) regresses -8.8s — balanced polarities mean VSIDS is sole guidance; diluting across touched vars hurts. 69d72f81 (density=11.6, PolImb=0.839) kept — high PolImb means phase saving guides, broader VSIDS exploration helps. Clean A/B: b8143c9d 8.5s→4.6s (+3.9s), 822378be 4.9s→3.2s (+1.7s), 69d72f81 20s→16.9s (+3.1s). Also enabled for pure k-SAT instances. PAR-2 2.21s→1.99s (best-of-3).
 
 - **L1. Struct field reorganization (hot/warm/cold blocks)** (PAR-2 neutral, layout stability): Reordered `CDCLSolver` struct fields into three blocks — HOT (12 fields touched every propagation/decision, ~3.5 cache lines) at the top, WARM (per-conflict/per-restart) in the middle, COLD CONFIG + DEBUG/STATS at the bottom. Adding cold fields (vivify counters, debug stats) no longer shifts the cache lines of hot fields, preventing struct-layout sensitivity that caused V1/V5 regressions (30eb4ef4 SAT ~12s ↔ TIMEOUT 30s). Unblocks future cold-field experiments. PAR-2 neutral (2.11s best-of-3, within noise of 2.11s baseline).
 
