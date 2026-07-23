@@ -164,7 +164,7 @@ satience/
 - **Literal**: `uint32` (bit 31 = sign, bits 0–30 = variable index). Variables 0-based internally, 1-based in DIMACS.
 - **Watch**: 8 bytes — `ClauseIdx int32` (bit 31 = learned, bit 30 = watch position, bits 0–29 = clause id) + `Blit uint32` (cached `litTrue` index for fast-path skip).
 - **Implication encoding**: `≥0` original clause; `≤-5` learned (`-learnedIdx-5`); `-1` decision; `-2` unit-prop preprocess; `-3` pure-literal; `-4` reserved. The 4-slot offset separates learned-clause decode from preprocessing sentinels.
-- **Learned clauses**: Contiguous literal pool with packed `LearnedClauseLoc` (`Offset int32` + `Size int32`). Deletion uses tombstones (`Size=0`); a `learnedAlive []byte` bitmap provides a 1-byte hot-path tombstone check.
+- **Learned clauses**: Contiguous literal pool with packed `LearnedClauseLoc` (`Offset int32` + `Size int32`). Deletion uses tombstones (`Size=0`); the hot path checks `learnedLoc[i].Size == 0` for tombstone detection.
 
 ### Key Algorithms
 1. **Conflict Analysis**: 1-UIP with recursive + BIG-based clause minimization.

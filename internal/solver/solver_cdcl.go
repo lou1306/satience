@@ -185,7 +185,6 @@ type CDCLSolver struct {
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals    []cnf.Literal        // All learned clause literals in one contiguous slice
 	learnedLoc         []LearnedClauseLoc   // Packed (Offset, Size) per learned clause; Size=0 means tombstone
-	learnedAlive       []byte               // 1 = alive, 0 = tombstone (maintained for deletion/compaction; propagateWatched uses learnedLoc.Size==0)
 	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, SearchHint)
 	learnedWatchIdx0   []int                // First watched literal index (for fast watch removal)
 	learnedWatchIdx1   []int                // Second watched literal index (for fast watch removal)
@@ -361,7 +360,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedMetadata:    make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedWatchIdx0:   make([]int, 0, maxLearned),                // Watched literal indices
 		learnedWatchIdx1:   make([]int, 0, maxLearned),
-		learnedAlive:       make([]byte, 0, maxLearned),
 		learnedActiveCount: 0,
 		learnedCapacity:    0,
 		unitLearnedList:    make([]int, 0, 64), // Pre-allocate for unit clause tracking
@@ -4342,7 +4340,6 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 			Offset: int32(offset),
 			Size:   int32(len(s.tmpLearnedLits)),
 		})
-		s.learnedAlive = append(s.learnedAlive, 1)
 		s.recordLearnedClauseSize(len(s.tmpLearnedLits))
 		// Fresh clauses start at Activity=0 (MiniSat convention). They only
 		// gain activity when used as reasons during 1-UIP resolution. With
@@ -4749,7 +4746,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			s.removeLearnedClauseWatches(i)
 			// Mark as tombstone
 			s.learnedLoc[i].Size = 0
-			s.learnedAlive[i] = 0
 			s.learnedWatchIdx0[i] = -1
 			s.learnedWatchIdx1[i] = -1
 			tombstoneCount++
@@ -4823,7 +4819,6 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		newStart := nextOffset
 
 		s.learnedLoc[writeIdx] = LearnedClauseLoc{Offset: int32(newStart), Size: int32(oldSize)}
-		s.learnedAlive[writeIdx] = 1
 		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
 		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
 		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
@@ -4918,7 +4913,6 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	// Truncate arrays to new capacity
 	s.learnedLiterals = s.learnedLiterals[:nextOffset]
 	s.learnedLoc = s.learnedLoc[:writeIdx]
-	s.learnedAlive = s.learnedAlive[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
 	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
 	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]

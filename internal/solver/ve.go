@@ -798,7 +798,6 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 			// Forward subsumed -- delete
 			s.removeLearnedClauseWatches(r.idx)
 			s.learnedLoc[r.idx].Size = 0
-			s.learnedAlive[r.idx] = 0
 			s.learnedWatchIdx0[r.idx] = -1
 			s.learnedWatchIdx1[r.idx] = -1
 			s.learnedActiveCount--
