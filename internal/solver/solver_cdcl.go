@@ -181,7 +181,7 @@ type CDCLSolver struct {
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals    []cnf.Literal        // All learned clause literals in one contiguous slice
 	learnedLoc         []LearnedClauseLoc   // Packed (Offset, Size) per learned clause; Size=0 means tombstone
-	learnedAlive       []byte               // 1 = clause alive, 0 = tombstone (cache-friendly bitmap for tombstone check)
+	learnedAlive       []byte               // 1 = alive, 0 = tombstone (maintained for deletion/compaction; propagateWatched uses learnedLoc.Size==0)
 	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, SearchHint)
 	learnedWatchIdx0   []int                // First watched literal index (for fast watch removal)
 	learnedWatchIdx1   []int                // Second watched literal index (for fast watch removal)
@@ -3262,7 +3262,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// s → s.learnedLiterals pointer chases.
 	learnedLoc := s.learnedLoc
 	learnedLiterals := s.learnedLiterals
-	learnedAlive := s.learnedAlive
 	learnedMetadata := s.learnedMetadata
 
 	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
@@ -3311,15 +3310,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					continue
 				}
 				clauseLits = originalClauses[clauseID].Literals
-			} else {
-				if clauseID >= len(learnedAlive) || learnedAlive[clauseID] == 0 {
-					continue
-				}
-				loc := learnedLoc[clauseID]
-				offset := int(loc.Offset)
-				size := int(loc.Size)
-				clauseLits = learnedLiterals[offset : offset+size]
+		} else {
+			loc := learnedLoc[clauseID]
+			if int(loc.Size) == 0 {
+				continue
 			}
+			clauseLits = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
+		}
 
 			// Re-read the actual blocking literal from clause data (Blit may be stale).
 			// The fast-path Blit check already filtered out the true case; here we
