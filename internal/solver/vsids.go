@@ -588,13 +588,13 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 // and the phase to assign (true=positive, false=negative) based on saved phase
 // Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity) with heap
 // Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
-func (v *VSIDS) selectVariableWithPhase(assignments []Assignment, savedPhase []bool) (uint32, bool) {
+func (v *VSIDS) selectVariableWithPhase(assignments []Assignment) (uint32, bool) {
 	bestVar := v.selectVariableWithHeap(assignments)
 
-	// Use saved phase if available, otherwise default to true (positive literal)
+	// Use saved phase from the Assignment struct if available
 	phase := true
-	if savedPhase != nil && int(bestVar) < len(savedPhase) {
-		phase = savedPhase[bestVar]
+	if int(bestVar) < len(assignments) {
+		phase = assignments[bestVar].SavedPhase
 	}
 
 	return bestVar, phase

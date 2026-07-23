@@ -1448,28 +1448,28 @@ func TestMinimizeGetReasonLitsForVar(t *testing.T) {
 		},
 	}
 	s := NewCDCLSolver(&c)
-	// Before solving, implication is -1 (unassigned) for all vars → nil
+	// Before solving, Reason is -1 (unassigned) for all vars → nil
 	if lits := s.getReasonLitsForVar(0); lits != nil {
 		t.Errorf("Expected nil for unassigned var, got %v", lits)
 	}
 	// Decision sentinel
-	s.implication[0] = -1
+	s.assignments[0].Reason = -1
 	if lits := s.getReasonLitsForVar(0); lits != nil {
 		t.Errorf("Expected nil for decision, got %v", lits)
 	}
 	// Original clause index
-	s.implication[0] = 0
+	s.assignments[0].Reason = 0
 	lits := s.getReasonLitsForVar(0)
 	if lits == nil || len(lits) != 2 {
 		t.Errorf("Expected 2 lits from original clause 0, got %v", lits)
 	}
 	// Out-of-bounds original clause index
-	s.implication[0] = 100
+	s.assignments[0].Reason = 100
 	if lits := s.getReasonLitsForVar(0); lits != nil {
 		t.Errorf("Expected nil for out-of-bounds clause, got %v", lits)
 	}
 	// Preprocessing sentinel
-	s.implication[0] = -2
+	s.assignments[0].Reason = -2
 	if lits := s.getReasonLitsForVar(0); lits != nil {
 		t.Errorf("Expected nil for preprocessing sentinel, got %v", lits)
 	}

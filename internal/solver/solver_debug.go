@@ -11,8 +11,9 @@ import "fmt"
 func verifyClauseIndices(s *CDCLSolver) bool {
 	errors := 0
 
-	// Check 1: All implications point to valid, non-deleted clauses
-	for varIdx, impIdx := range s.implication {
+	// Check 1: All reasons point to valid, non-deleted clauses
+	for varIdx, asg := range s.assignments {
+		impIdx := asg.Reason
 		if impIdx <= -5 {
 			learnedIdx := -impIdx - 5
 			if int(learnedIdx) >= s.learnedCapacity {

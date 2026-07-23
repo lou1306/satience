@@ -134,8 +134,6 @@ type CDCLSolver struct {
 	trailHead          []int
 	level              int
 	vsids              *VSIDS
-	implication        []int32 // Reason clause: >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal preprocess; -4 reserved
-	savedPhase         []bool
 	numUnassigned      int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	watchLists         [][]cnf.Watch // watchLists[lit] = clauses watching lit
 	originalSearchHint []int32       // Per-original-clause search hint for replacement scan (0=no hint)
@@ -350,7 +348,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		level:                0,
 		vsids:                NewVSIDS(formula.NumVars),
 		conflicts:            0,
-		implication:          make([]int32, formula.NumVars), // -1 = decision (no clause)
 		iterations:           0,
 		maxIter:              0,
 		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
@@ -367,7 +364,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decisions:          0,
 		backjumpLevel:      0,
 		maxLearned:         maxLearned,
-		savedPhase:         make([]bool, formula.NumVars),
 		restartBase:        restartBase,
 		restartCount:       0,
 		lubyIndex:          0,
@@ -445,17 +441,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		litTrue:                    make([]bool, int(formula.NumVars)*2),
 	}
 
-	// FIX: Initialize all assignments as unassigned (Level=-1)
-	// Also initialize implication to -1 (no reason) — make([]int, N) zero-fills to 0,
-	// which looks like "original clause 0" and causes assignLiteralByClause to skip assignment.
+	// Initialize all assignments as unassigned (Level=-1, Reason=-1) with default
+	// positive phase (SavedPhase=true). make zero-fills to 0, which would look like
+	// "original clause 0" for Reason — explicitly set to -1 (decision/no reason).
 	for i := range solver.assignments {
-		solver.assignments[i] = Assignment{Level: -1}
-		solver.implication[i] = -1
-	}
-
-	// Initialize savedPhase to true (default positive phase)
-	for i := range solver.savedPhase {
-		solver.savedPhase[i] = true
+		solver.assignments[i] = Assignment{Level: -1, Reason: -1, SavedPhase: true}
 	}
 
 	// Enable LBD-based VSIDS for better variable selection
@@ -718,7 +708,7 @@ func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
 //	-1   → decision (no reason)
 //	-2/-3/-4 → preprocessing sentinels (no resolvable reason clause)
 func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
-	reasonClauseIdx := s.implication[v]
+	reasonClauseIdx := s.assignments[v].Reason
 	if reasonClauseIdx >= 0 {
 		clauses := s.cnf.Clauses
 		if int(reasonClauseIdx) < len(clauses) {
@@ -1395,9 +1385,10 @@ func (s *CDCLSolver) pureLiteralElimination() int {
 		}
 
 		if isPure[v] {
-			s.assignments[v] = Assignment{Value: pureValue[v], Level: 0}
+			s.assignments[v].Level = 0
+			s.assignments[v].Value = pureValue[v]
+			s.assignments[v].Reason = -3 // pure literal preprocessing
 			s.preprocessTrail = append(s.preprocessTrail, uint32(v))
-			s.implication[v] = -3 // pure literal preprocessing
 			assignedCount++
 		}
 	}
@@ -1557,13 +1548,12 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	s.trailHead = []int{0}
 	s.level = 0
 	s.qhead = 0
-	// FIX: Only clear implication for unassigned variables
-	// Preprocessing assignments (Level >= 0) must keep their implication to prevent re-propagation
-	for i := range s.implication {
+	// Only clear Reason for unassigned variables. Preprocessing assignments
+	// (Level >= 0) must keep their Reason to prevent re-propagation.
+	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
-			s.implication[i] = -1
+			s.assignments[i].Reason = -1
 		}
-		// For assigned variables, implication stays as-is (set by unit propagation or pure literal elimination)
 	}
 
 	if s.verbose && preprocAssignments > 0 {
@@ -1620,9 +1610,10 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 			continue
 		}
 		value := !lit.IsNegated()
-		s.assignments[varIdx] = Assignment{Value: value, Level: 0}
+		s.assignments[varIdx].Level = 0
+		s.assignments[varIdx].Value = value
+		s.assignments[varIdx].Reason = -2
 		s.preprocessTrail = append(s.preprocessTrail, varIdx)
-		s.implication[varIdx] = -2
 	}
 
 	// Activate watches for preprocessing variables.
@@ -2075,10 +2066,11 @@ func (s *CDCLSolver) runVivification() bool {
 	s.inVivification = false
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
-			s.assignments[i] = Assignment{Level: -1}
+			s.assignments[i].Level = -1
+			s.assignments[i].Value = false
+			s.assignments[i].Reason = -1
 			s.litTrue[i*2] = false
 			s.litTrue[i*2+1] = false
-			s.implication[i] = -1
 			s.numUnassigned++
 		}
 	}
@@ -2299,10 +2291,11 @@ func (s *CDCLSolver) shouldRestart() bool {
 // derived state (litTrue, implication, numUnassigned). Used by cancelUntil,
 // backtrack, and restart to unassign variables from the trail.
 func (s *CDCLSolver) unassignVar(varIdx uint32) {
-	s.assignments[varIdx] = Assignment{Level: -1}
+	s.assignments[varIdx].Level = -1
+	s.assignments[varIdx].Value = false
+	s.assignments[varIdx].Reason = -1
 	s.litTrue[int(varIdx)*2] = false
 	s.litTrue[int(varIdx)*2+1] = false
-	s.implication[varIdx] = -1
 	s.numUnassigned++
 }
 
@@ -2409,12 +2402,12 @@ func (s *CDCLSolver) restart() bool {
 	// same polarity cascade repeats). Default 0 = disabled (standard
 	// phase saving).
 	if s.restartPhaseFlipRate > 0 {
-		for i := range s.savedPhase {
+		for i := range s.assignments {
 			s.randomSeed ^= s.randomSeed << 13
 			s.randomSeed ^= s.randomSeed >> 7
 			s.randomSeed ^= s.randomSeed << 17
 			if float64(s.randomSeed&0xFFFFFFFF)/float64(0xFFFFFFFF) < s.restartPhaseFlipRate {
-				s.savedPhase[i] = !s.savedPhase[i]
+				s.assignments[i].SavedPhase = !s.assignments[i].SavedPhase
 			}
 		}
 	}
@@ -2585,16 +2578,14 @@ func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 				}
 				value := !unassignedLit.IsNegated()
 				s.assignments[varIdx] = Assignment{
-					Value: value,
-					Level: 0, // Unit propagations at level 0
+					Value:  value,
+					Level:  0,  // Unit propagations at level 0
+					Reason: -2, // Assigned by preprocessing unit propagation
 				}
 				s.trail = append(s.trail, varIdx)
-				// FIX: Set implication to prevent re-propagation during search
-				// Use -2 to indicate "assigned by preprocessing unit propagation"
-				s.implication[varIdx] = -2
 				changed = true
 				if s.verbose && len(clause.Literals) == 1 {
-					s.Log("c [unit prop] Propagated unit clause: var %d = %v, implication=%d\n", varIdx, value, s.implication[varIdx])
+					s.Log("c [unit prop] Propagated unit clause: var %d = %v, Reason=%d\n", varIdx, value, s.assignments[varIdx].Reason)
 				}
 				// Don't modify clauses - just track assignments in trail
 			}
@@ -2694,9 +2685,9 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 			// orthogonal to the clause structure).
 			if !s.skipPolarityPhase {
 				if negCount[i] > posCount[i] {
-					s.savedPhase[i] = true
+					s.assignments[i].SavedPhase = true
 				} else if posCount[i] > negCount[i] {
-					s.savedPhase[i] = false
+					s.assignments[i].SavedPhase = false
 				}
 			}
 		}
@@ -3076,7 +3067,7 @@ func (s *CDCLSolver) verifyModel() bool {
 				s.Log("(assignments: ")
 				for _, lit := range clause.Literals {
 					v := lit.Var()
-					s.Log("var%d={V=%v,L=%d,I=%d} ", v+1, s.assignments[v].Value, s.assignments[v].Level, s.implication[v])
+					s.Log("var%d={V=%v,L=%d,I=%d} ", v+1, s.assignments[v].Value, s.assignments[v].Level, s.assignments[v].Reason)
 				}
 				s.Log(")\n")
 			}
@@ -3134,19 +3125,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if s.verbose {
 					s.Log("c [UNIT PROP] var=%d, value=%v, level=%d (s.level=%d)\n", varIdx+1, litValue, propLevel, s.level)
 				}
-				s.assignments[varIdx] = Assignment{Value: litValue, Level: int32(propLevel)}
+				s.assignments[varIdx] = Assignment{Value: litValue, Level: int32(propLevel), Reason: int32(-learnedIdx - 5)}
 				s.litTrue[int(varIdx)*2] = litValue
 				s.litTrue[int(varIdx)*2+1] = !litValue
 				s.trail = append(s.trail, varIdx)
 				s.numUnassigned--
-				// Store learned clause index as negative: -learnedIdx-5
-				// Offset by 4 so clause 0 maps to -5, freeing -1/-2/-3/-4 as sentinels
-				// (-1 decision, -2 unit-prop preprocess, -3 pure-literal preprocess, -4 reserved)
-				s.implication[varIdx] = int32(-learnedIdx - 5)
 				s.propagations++
 			} else if s.assignments[varIdx].Value != litValue {
 				// Conflict: unit learned clause conflicts with existing assignment
-				existingIdx := s.implication[varIdx]
+				existingIdx := s.assignments[varIdx].Reason
 				existingLevel := s.assignments[varIdx].Level
 				existingValue := s.assignments[varIdx].Value
 				if s.verbose {
@@ -3216,11 +3203,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// (370ms) in the hot loop.
 	watchLists := s.watchLists
 
-	// Cache implication and savedPhase arrays (allocated once, never reallocated)
-	// to eliminate s → s.implication and s → s.savedPhase pointer chases in the
-	// inlined propagation path.
-	implication := s.implication
-	savedPhase := s.savedPhase
 	// litTrue cache: backing array never reallocated, writes through local visible
 	// to s.litTrue automatically. Eliminates per-trail-entry s → s.litTrue chase.
 	litValue := s.litTrue
@@ -3429,7 +3411,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if blitAsg.Level < 0 {
 				// Unassigned blit - propagate it (inlined assignLiteralByClause)
-				if implication[blitVarIdx] == -1 {
+				if blitAsg.Reason == -1 {
 					propLevel := s.level
 					if propLevel == 0 {
 						propLevel = 1
@@ -3439,13 +3421,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						reasonIdx = -clauseID - 5
 					}
 					blitValue := !blitNegated
-					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel)}
+					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel), Reason: int32(reasonIdx), SavedPhase: blitNegated}
 					litValue[blitVarIdx*2] = blitValue
 					litValue[blitVarIdx*2+1] = !blitValue
 					s.trail = append(s.trail, uint32(blitVarIdx))
 					numUnassigned--
-					implication[blitVarIdx] = int32(reasonIdx)
-					savedPhase[blitVarIdx] = blitNegated
 				}
 				propagations++
 				continue
@@ -3499,7 +3479,7 @@ func (s *CDCLSolver) decide() bool {
 	// Standard CDCL: no random decisions, no diversification overrides.
 	var varIdx uint32
 	var phase bool
-	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments, s.savedPhase)
+	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments)
 
 	// SAFETY CHECK: Ensure variable is unassigned before deciding.
 	// A stale heap entry can slip through; fall back to linear scan.
@@ -3508,8 +3488,8 @@ func (s *CDCLSolver) decide() bool {
 		for i := uint32(0); i < s.cnf.NumVars; i++ {
 			if s.assignments[i].Level < 0 {
 				varIdx = i
-				if int(varIdx) < len(s.savedPhase) {
-					phase = s.savedPhase[varIdx]
+				if int(varIdx) < len(s.assignments) {
+					phase = s.assignments[varIdx].SavedPhase
 				} else {
 					phase = false
 				}
@@ -3562,14 +3542,14 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 
 	value := !lit.IsNegated()
 	s.assignments[varIdx] = Assignment{
-		Value: value,
-		Level: int32(level),
+		Value:      value,
+		Level:      int32(level),
+		Reason:     int32(clauseIdx),
+		SavedPhase: lit.IsNegated(),
 	}
 	s.litTrue[int(varIdx)*2] = value
 	s.litTrue[int(varIdx)*2+1] = !value
 	s.trail = append(s.trail, varIdx)
-	s.implication[varIdx] = int32(clauseIdx)
-	s.savedPhase[varIdx] = lit.IsNegated()
 	s.numUnassigned--
 
 	if s.verbose && level > 0 {
@@ -3594,26 +3574,24 @@ func (s *CDCLSolver) assignLiteral(lit cnf.Literal, level int, clauseIdx int) {
 func (s *CDCLSolver) assignLiteralByClause(lit cnf.Literal, level int, clauseIdx int) {
 	varIdx := lit.Var()
 
-	// CRITICAL FIX: Check implication instead of Level != 0
+	// CRITICAL FIX: Check Reason instead of Level != 0
 	// Level 0 can mean both "unassigned" AND "assigned at level 0" after backtracking
-	// implication[varIdx] != -1 properly indicates the variable is already assigned
-	if s.implication[varIdx] != -1 {
+	// Reason != -1 properly indicates the variable is already assigned
+	if s.assignments[varIdx].Reason != -1 {
 		return
 	}
 
 	value := !lit.IsNegated()
 	s.assignments[varIdx] = Assignment{
-		Value: value,
-		Level: int32(level),
+		Value:      value,
+		Level:      int32(level),
+		Reason:     int32(clauseIdx),
+		SavedPhase: lit.IsNegated(),
 	}
 	s.litTrue[int(varIdx)*2] = value
 	s.litTrue[int(varIdx)*2+1] = !value
 	s.trail = append(s.trail, varIdx)
 	s.numUnassigned--
-
-	// Store clause index
-	s.implication[varIdx] = int32(clauseIdx)
-	s.savedPhase[varIdx] = lit.IsNegated()
 }
 func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	s.conflicts++
@@ -3634,7 +3612,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 			if s.assignments[varIdx].Value != litValue {
 				// Variable assigned with opposite value
 				// Check if existing assignment was from a unit propagation (not a decision)
-				impIdx := s.implication[varIdx]
+				impIdx := s.assignments[varIdx].Reason
 				if impIdx != -1 {
 					// Has an implication clause
 					isUnit := false
@@ -3830,7 +3808,7 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 			continue
 		}
 
-		reasonClauseIdx := s.implication[varIdx]
+		reasonClauseIdx := s.assignments[varIdx].Reason
 		// Clause-activity bump: each learned reason clause traversed during
 		// 1-UIP resolution gets claInc added to its Activity (MiniSat
 		// claBumpEvent equivalent). Only learned clauses (impIdx <= -5) are
@@ -3953,7 +3931,7 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 	propagationsAtCurrentLevel := 0
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
-			if s.implication[varIdx] == -1 {
+			if s.assignments[varIdx].Reason == -1 {
 				decisionsAtCurrentLevel++
 			} else {
 				propagationsAtCurrentLevel++
@@ -4461,7 +4439,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			continue
 		}
 		// Skip decisions (no reason clause to resolve against).
-		if s.implication[v] == -1 {
+		if s.assignments[v].Reason == -1 {
 			continue
 		}
 		// BIG fast-path: check if lit is removable via a chain of binary
@@ -4591,7 +4569,7 @@ func (s *CDCLSolver) exploreRemovable(v uint32, depth int) bool {
 		if s.assignments[rv].Level == 0 {
 			continue
 		}
-		if s.implication[rv] == -1 {
+		if s.assignments[rv].Reason == -1 {
 			return false
 		}
 		s.tmpSeenVar[rv] = true
@@ -4615,7 +4593,8 @@ func (s *CDCLSolver) markProtectedClauses() []bool {
 	for i := range protected {
 		protected[i] = false
 	}
-	for _, impIdx := range s.implication {
+	for _, asg := range s.assignments {
+		impIdx := asg.Reason
 		if impIdx <= -5 {
 			learnedIdx := -impIdx - 5
 			if int(learnedIdx) < s.learnedCapacity {
@@ -4830,15 +4809,15 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		nextOffset += oldSize
 	}
 
-	// Update implication array using the mapping
-	for varIdx := range s.implication {
-		if s.implication[varIdx] <= -5 {
-			learnedIdx := -s.implication[varIdx] - 5
+	// Update Reason fields using the mapping
+	for varIdx := range s.assignments {
+		if s.assignments[varIdx].Reason <= -5 {
+			learnedIdx := -s.assignments[varIdx].Reason - 5
 			if int(learnedIdx) < len(clauseIndexMap) && clauseIndexMap[learnedIdx] >= 0 {
-				s.implication[varIdx] = int32(-clauseIndexMap[learnedIdx] - 5)
+				s.assignments[varIdx].Reason = int32(-clauseIndexMap[learnedIdx] - 5)
 			} else if int(learnedIdx) < len(clauseIndexMap) {
 				// Clause was deleted - reset to decision
-				s.implication[varIdx] = -1
+				s.assignments[varIdx].Reason = -1
 			}
 		}
 	}

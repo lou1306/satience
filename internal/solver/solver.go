@@ -1,13 +1,16 @@
 package solver
 
-// Assignment tracks variable assignments.
-// Packed to 8 bytes (Level int32 + Value bool) so a single cache-line load
-// fetches both fields. This replaces the former separate varLevel []int cache
-// (which caused a second cache miss on every variable lookup in the
-// propagation hot path) and halves the per-variable memory footprint.
+// Assignment tracks variable assignments, reason clause, and saved phase.
+// Packed to 12 bytes (Level int32 + Reason int32 + Value bool + SavedPhase bool)
+// so a single cache-line load fetches Level and Reason together. This replaces
+// the former separate implication []int32 and savedPhase []bool arrays, which
+// each caused additional cache-line writes on every assign/unassign and an
+// extra cache-line read on the propagation hot path (reason check).
 type Assignment struct {
-	Level int32
-	Value bool // true = positive, false = negative
+	Level      int32
+	Reason     int32 // >=0 original; <=-5 learned (-learnedIdx-5); -1 decision; -2 unit-prop preprocess; -3 pure-literal; -4 reserved
+	Value      bool  // true = positive, false = negative
+	SavedPhase bool  // phase saving for next decision
 }
 
 // LearnedClauseLoc packs a learned clause's offset and size into 8 bytes so a
