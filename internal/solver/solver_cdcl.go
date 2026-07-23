@@ -3186,13 +3186,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// constructor), so the cached header stays valid for the whole call.
 	assignments := s.assignments
 
-	// Cache original-clause slice header + length. Original clauses are never
-	// deleted (only learned clauses are tombstoned), so the bounds check at the
-	// slow-path entry never fires — but the compiler reloads s.cnf.Clauses (a
-	// pointer chase through s → s.cnf → .Clauses) on every watch. Caching the
-	// header eliminates that per-watch pointer chase.
-	originalClauses := s.cnf.Clauses
-	numOriginalClauses := len(originalClauses)
+	// Cache original-clause SoA arrays. Original clauses are never deleted (only
+	// learned clauses are tombstoned), so the bounds check at the slow-path entry
+	// never fires. The packed ClauseLoc (8B) replaces the 32-byte Clause struct
+	// load, and the literalPool provides the literal data directly — eliminating
+	// the s → s.cnf → .Clauses pointer chase and reducing metadata cache footprint
+	// by 4x (8B per clause vs 32B Clause struct).
+	originalClauseLocs := s.cnf.GetOriginalClauseLocs()
+	originalLiteralPool := s.cnf.GetLiteralPool()
+	numOriginalClauses := len(originalClauseLocs)
 	originalSearchHint := s.originalSearchHint
 
 	// Cache watchLists outer slice header. The outer slice is allocated once in
@@ -3262,7 +3264,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if clauseID >= numOriginalClauses {
 					continue
 				}
-				clauseLits = originalClauses[clauseID].Literals
+				loc := originalClauseLocs[clauseID]
+				clauseLits = originalLiteralPool[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
 			} else {
 				loc := learnedLoc[clauseID]
 				if int(loc.Size) == 0 {

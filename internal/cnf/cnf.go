@@ -58,6 +58,14 @@ type Clause struct {
 	Learned  bool
 }
 
+// ClauseLoc packs a clause's offset and size into the literal pool as two int32s
+// (8 bytes), so a single load fetches both fields. Used for original-clause SoA
+// access in the propagation hot path, replacing the 32-byte Clause struct load.
+type ClauseLoc struct {
+	Offset int32
+	Size   int32
+}
+
 // ClauseMetadata packs learned clause metadata into a single struct for cache efficiency.
 // LBD is int32 (values are small: LBD ≤ clause size).
 // SearchHint caches the last-known replacement position for the watched-literal
@@ -78,9 +86,10 @@ type CNF struct {
 
 	// Contiguous literal storage for original clauses (optimization)
 	// All original clause literals stored in one array for better cache locality
-	originalClauseOffsets []int     // Start offset of each clause
-	originalClauseSizes   []int     // Number of literals in each clause
-	literalPool           []Literal // Contiguous storage for all original clause literals
+	originalClauseOffsets []int       // Start offset of each clause
+	originalClauseSizes   []int       // Number of literals in each clause
+	originalClauseLocs    []ClauseLoc // Packed (Offset, Size) per clause — 8B vs 32B Clause struct
+	literalPool           []Literal   // Contiguous storage for all original clause literals
 }
 
 // NewCNF creates a new CNF formula
@@ -156,17 +165,28 @@ func (c *CNF) GetLiteralPool() []Literal {
 	return c.literalPool
 }
 
+// GetOriginalClauseLocs returns the packed (Offset, Size) array for original clauses
+func (c *CNF) GetOriginalClauseLocs() []ClauseLoc {
+	return c.originalClauseLocs
+}
+
 // RebuildLiteralPool rebuilds the literal pool from Clauses slice
 // Call this after preprocessing modifies Clauses directly
 func (c *CNF) RebuildLiteralPool() {
 	c.literalPool = make([]Literal, 0, c.NumClauses*4)
 	c.originalClauseOffsets = make([]int, 0, c.NumClauses)
 	c.originalClauseSizes = make([]int, 0, c.NumClauses)
+	c.originalClauseLocs = make([]ClauseLoc, 0, c.NumClauses)
 
 	for _, clause := range c.Clauses {
 		offset := len(c.literalPool)
+		size := len(clause.Literals)
 		c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
-		c.originalClauseSizes = append(c.originalClauseSizes, len(clause.Literals))
+		c.originalClauseSizes = append(c.originalClauseSizes, size)
+		c.originalClauseLocs = append(c.originalClauseLocs, ClauseLoc{
+			Offset: int32(offset),
+			Size:   int32(size),
+		})
 
 		c.literalPool = append(c.literalPool, clause.Literals...)
 	}
