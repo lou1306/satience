@@ -2297,6 +2297,17 @@ func (s *CDCLSolver) shouldRestart() bool {
 // above it. Used by vivification to roll back trial assignments. Unlike
 // backtrack(), this does not flip decisions or perform conflict analysis — it
 // is a pure state rollback.
+// unassignVar clears the assignment for a single variable and updates all
+// derived state (litTrue, implication, numUnassigned). Used by cancelUntil,
+// backtrack, and restart to unassign variables from the trail.
+func (s *CDCLSolver) unassignVar(varIdx uint32) {
+	s.assignments[varIdx] = Assignment{Level: -1}
+	s.litTrue[int(varIdx)*2] = false
+	s.litTrue[int(varIdx)*2+1] = false
+	s.implication[varIdx] = -1
+	s.numUnassigned++
+}
+
 func (s *CDCLSolver) cancelUntil(level int) {
 	if level >= s.level {
 		return
@@ -2308,12 +2319,7 @@ func (s *CDCLSolver) cancelUntil(level int) {
 		decisionPoint = len(s.trail)
 	}
 	for i := decisionPoint; i < len(s.trail); i++ {
-		varIdx := s.trail[i]
-		s.assignments[varIdx] = Assignment{Level: -1}
-		s.litTrue[int(varIdx)*2] = false
-		s.litTrue[int(varIdx)*2+1] = false
-		s.implication[varIdx] = -1
-		s.numUnassigned++
+		s.unassignVar(s.trail[i])
 	}
 	s.trail = s.trail[:decisionPoint]
 	s.trailHead = s.trailHead[:level+1]
@@ -2357,11 +2363,7 @@ func (s *CDCLSolver) restart() bool {
 	s.level = 0
 	for i := range s.assignments {
 		if s.assignments[i].Level > 0 {
-			s.assignments[i] = Assignment{Level: -1}
-			s.litTrue[i*2] = false
-			s.litTrue[i*2+1] = false
-			s.implication[i] = -1
-			s.numUnassigned++
+			s.unassignVar(uint32(i))
 		}
 	}
 	// Restart clears all search assignments. Sunk heap entries (at -Inf) are
@@ -3762,31 +3764,13 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 // LBD = number of distinct decision levels in the learned clause.
 // Lower LBD = better clause (involves fewer decision levels).
 // Clauses with LBD=2 are "glue clauses" - most valuable, never delete.
-func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
-	s.lastLearnedClauseIdx = -1
-	if s.verbose && s.conflicts <= DebugConflictLimit {
-		s.Log("c [conflict] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
-			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
-	}
-
-	// Fast cleanup from previous conflict
-	for _, varIdx := range s.tmpTouchedVars {
-		s.tmpLiteralInClause[varIdx] = false
-		s.tmpLiteralIsNegated[varIdx] = false
-	}
-	for _, varIdx := range s.tmpResolvedVars {
-		s.tmpResolved[varIdx] = false
-	}
-	s.tmpResolvedVars = s.tmpResolvedVars[:0]
-	for _, lvl := range s.tmpLevelSet {
-		s.tmpLevelCount[lvl] = 0
-		s.tmpLevelSetUsed[lvl] = false
-		s.tmpLevelCountUsed[lvl] = false
-	}
-	s.tmpTouchedVars = s.tmpTouchedVars[:0]
-	s.tmpCandidates = s.tmpCandidates[:0]
-	s.tmpLevelSet = s.tmpLevelSet[:0]
-
+// runOneUIPResolution performs 1-UIP conflict analysis: it marks the conflict
+// clause literals, then resolves on candidates from the current decision level
+// until exactly one literal (the UIP) remains. If resolution does not converge
+// (inconsistent reason clauses), a fallback forces the most recent literal as
+// the UIP. Returns currentCount (number of literals at the current level after
+// resolution; 0 = non-asserting, 1 = asserting).
+func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCount int) {
 	// Add conflict clause literals
 	if s.verbose {
 		s.Log("c [1-UIP] ===== Conflict %d: %d literals at level %d =====\n", s.conflicts, len(conflictLits), s.level)
@@ -3812,7 +3796,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	}
 
 	// 1-UIP: Resolve until exactly 1 literal at current level
-	currentCount := s.tmpLevelCount[s.level]
+	currentCount = s.tmpLevelCount[s.level]
 
 	// Build candidate list from trail (most recent first). Only the current
 	// decision level's trail slice can contain level==s.level literals (the
@@ -4032,6 +4016,35 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 			currentCount = 1
 		}
 	}
+	return currentCount
+}
+
+func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
+	s.lastLearnedClauseIdx = -1
+	if s.verbose && s.conflicts <= DebugConflictLimit {
+		s.Log("c [conflict] Conflict %d, iter %d, level %d, learned %d, trail %d\n",
+			s.conflicts, s.iterations, s.level, s.learnedActiveCount, len(s.trail))
+	}
+
+	// Fast cleanup from previous conflict
+	for _, varIdx := range s.tmpTouchedVars {
+		s.tmpLiteralInClause[varIdx] = false
+		s.tmpLiteralIsNegated[varIdx] = false
+	}
+	for _, varIdx := range s.tmpResolvedVars {
+		s.tmpResolved[varIdx] = false
+	}
+	s.tmpResolvedVars = s.tmpResolvedVars[:0]
+	for _, lvl := range s.tmpLevelSet {
+		s.tmpLevelCount[lvl] = 0
+		s.tmpLevelSetUsed[lvl] = false
+		s.tmpLevelCountUsed[lvl] = false
+	}
+	s.tmpTouchedVars = s.tmpTouchedVars[:0]
+	s.tmpCandidates = s.tmpCandidates[:0]
+	s.tmpLevelSet = s.tmpLevelSet[:0]
+
+	currentCount := s.runOneUIPResolution(conflictLits)
 
 	// Bump variables touched during 1-UIP analysis. bumpAnalyze (minisat
 	// analyze_toclear) bumps ALL touched variables including intermediate
@@ -4273,6 +4286,18 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
+	if !s.storeLearnedClause(lbd) {
+		return 0
+	}
+
+	return backjumpLevel
+}
+
+// storeLearnedClause stores the learned clause in the database, sets up watches,
+// and bumps VSIDS. Returns false if a duplicate-literal soundness bug was
+// detected (caller returns backjump level 0). Returns true on success or
+// when there is nothing to store (empty tmpLearnedLits).
+func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 	// Store learned clause in database.
 	// MiniSat stores ALL learned clauses and uses LBD for deletion priority,
 	// not for initial storage. Filtering by LBD at learning time creates a
@@ -4303,7 +4328,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 				}
 			}
 			// Skip storing this buggy clause
-			return 0
+			return false
 		}
 
 		// Store literals in contiguous pool
@@ -4380,8 +4405,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		// VSIDS bump
 		s.vsids.bumpLBD(s.tmpLearnedLits, lbd)
 	}
-
-	return backjumpLevel
+	return true
 }
 
 // minimizeLearnedClause reduces the size of a learned clause via recursive
@@ -5033,12 +5057,8 @@ func (s *CDCLSolver) backtrack() bool {
 	// No preprocessing check needed — preprocessing vars are on preprocessTrail (not s.trail).
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := s.trail[i]
-		s.assignments[varIdx] = Assignment{Level: -1}
-		s.litTrue[int(varIdx)*2] = false
-		s.litTrue[int(varIdx)*2+1] = false
-		s.implication[varIdx] = -1
+		s.unassignVar(varIdx)
 		s.vsids.onUnassign(varIdx)
-		s.numUnassigned++
 	}
 	s.trail = s.trail[:decisionPoint]
 	s.qhead = decisionPoint
