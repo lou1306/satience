@@ -8,13 +8,14 @@ Sound and complete CDCL SAT solver in Go with DIMACS CNF support.
 
 ## Status
 Sound and complete. 44/44 unit tests, 110/110 CNFgen soundness (6 families: PHP, Tseitin, ordering, counting, parity, pebbling), 72/72 minisat cross-check (0 mismatches).
-MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 1.99s (July 2026, best-of-3).
+MiniSat Fast Suite (30s timeout): **72/72 solved (100%)**, PAR-2 1.87s (July 2026, best-of-3).
 
 ### Potential Next Steps (July 2026)
 - **C2. Propagation `unsafe` bounds-check elimination**: First `unsafe` usage. Expected ~1-3% PAR-2 (not 10-15% — `litValue[watch.Blit]` saves ~1 cycle/watch). Higher maintainability cost than gain warrants; defer.
-- **D4. Smooth classifier threshold interpolation**: Replace hard 0.7 StructuredScore threshold with smooth [0.65, 0.75] transition band. `SetDecayParams` infrastructure in vsids.go. Not yet implemented in classifyInstance.
 
 ### Completed (July 2026)
+
+- **D4. Smooth classifier threshold interpolation + mixedSizeScore fix** (-6% PAR-2, -36% on rphp_12_10_10): Two changes. (1) **mixedSizeScore fix**: binary+long (no ternary) now scores 0.7 (was 0.3) — rphp family (binary+4-clauses) was misclassified as "not mixed." rphp_10_8_8 score 0.63→0.71 (structured), rphp_12_10_10 0.634→0.714 (structured). (2) **D4 smooth interpolation**: Replaced hard `SetAggressiveDecay()` call for sub-0.7 mixed instances with `SetDecayParams(initialDecay, maxDecay, 5000)` where `t = (score-0.60)/0.10` clamped [0,1], `initialDecay = 0.30 + t*0.65`, `maxDecay = 0.60 + t*0.35`. **Gate**: `binaryRatio > 0.4` — 30eb4ef4 (0% binary, score 0.62) needs fully aggressive decay (D1: SAT→TIMEOUT without it); rphp (62% binary) has binary implication structure that benefits from longer memory. D1 mixed cluster (23-34% binary) stays fully aggressive (t=0). PAR-2 1.99s→1.87s (best-of-3), 72/72 solved. Divergence: rphp_12_10_10 74.2s→47.6s (now beats minisat which times out at 60s), rphp_10_8_8 6.2s→4.6s. `SetAggressiveDecay` kept (unused, D1 ban documents it).
 
 - **B12. bumpAnalyze: VSIDS conflict analysis bumping** (-10.0% PAR-2): New `bumpAnalyze` in vsids.go bumps ALL variables touched during 1-UIP analysis (minisat's `analyze_toclear`) instead of only conflict-clause vars (`bumpClause`). Total activity per conflict is the same (varInc), distributed across touched vars. `useBumpAnalyze` flag on CDCLSolver; `tmpTouchedVars` already populated by 1-UIP scan. Moved bump from `handleConflict` to `learnClause` (before currentCount==0 early return). **Gate**: `binaryRatio <= 0.5 AND (density < 10.0 OR polarityImbalance > 0.4)`. Binary-heavy (>0.5) excluded (protects bb34f22f phase-flip dynamics). High-density + low-PolImb excluded: 274099073 (density=15.6, PolImb=0.015, 99.4% long) regresses -8.8s — balanced polarities mean VSIDS is sole guidance; diluting across touched vars hurts. 69d72f81 (density=11.6, PolImb=0.839) kept — high PolImb means phase saving guides, broader VSIDS exploration helps. Clean A/B: b8143c9d 8.5s→4.6s (+3.9s), 822378be 4.9s→3.2s (+1.7s), 69d72f81 20s→16.9s (+3.1s). Also enabled for pure k-SAT instances. PAR-2 2.21s→1.99s (best-of-3).
 

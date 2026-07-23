@@ -1067,6 +1067,9 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	if structure.BinaryRatio > 0 && structure.TernaryRatio > 0 {
 		// Has both binary and ternary - good mix
 		mixedSizeScore = 1.0
+	} else if structure.BinaryRatio > 0 && structure.LongClauseRatio > 0 {
+		// Binary + long (no ternary) - also structured (e.g., rphp family)
+		mixedSizeScore = 0.7
 	} else if structure.BinaryRatio > 0 || structure.TernaryRatio > 0 {
 		// Has some small clauses but not mixed
 		mixedSizeScore = 0.3
@@ -1165,10 +1168,11 @@ func (s *CDCLSolver) classifyInstance() {
 	//     phase-transition random 3-SAT. The density > 4.5 gate excludes
 	//     30eb4ef4 (density 4.20, phase-transition pure ternary) which regresses
 	//     to TIMEOUT under default decay (see D1).
-	//   - Mixed (binaryRatio > 0): aggressive decay (0.30->0.60) + restartBase=5
-	//     + Glucose disabled. The aggressive decay was tuned for this cluster
-	//     (score<0.7 with 23-34% binary); removing it regressed 15+ instances
-	//     (+30% PAR-2, see D1).
+	//   - Mixed (binaryRatio > 0): D4 smooth threshold interpolation. Instead of
+	//     a hard 0.7 cliff, decay interpolates in [0.60, 0.70] from aggressive
+	//     (0.30->0.60) to near-default (0.95). Below 0.60: fully aggressive (D1:
+	//     needed by 15+ mixed instances). Above 0.70: structured path.
+	//     rphp_7_6_6 (0.64, t=0.41): decay 0.57->0.74 vs 0.30->0.60 aggressive.
 	// Unit propagation on random/mixed instances causes 76x more conflicts, so
 	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
@@ -1181,11 +1185,30 @@ func (s *CDCLSolver) classifyInstance() {
 			// active as a safety net. decay stays at 0.95 (default).
 			return
 		}
-		s.Log("c [classification] Random-like mixed instance (score=%.2f) - aggressive decay, restartBase=5\n", structure.StructuredScore)
-		s.vsids.SetAggressiveDecay()
+		// D4: Smooth threshold interpolation in [0.60, 0.70].
+		// t=0 (score ≤ 0.60): fully aggressive (0.30→0.60) — D1's 15+ instances.
+		// t=1 (score ≥ 0.70): near-default (0.95) — but falls through to structured.
+		// In between: smooth interpolation. restartBase=5, Glucose disabled
+		// throughout (decay is the main lever; D1 showed decay dominates).
+		// Gate: binaryRatio > 0.4. 30eb4ef4 (0% binary, score 0.62) needs fully
+		// aggressive decay (D1: SAT→TIMEOUT without it). rphp (62% binary) has
+		// strong binary implication structure that benefits from longer conflict
+		// memory. D1 mixed cluster (23-34% binary) stays fully aggressive.
+		t := 0.0
+		if structure.BinaryRatio > 0.4 && structure.StructuredScore > 0.60 {
+			t = (structure.StructuredScore - 0.60) / 0.10
+			if t > 1.0 {
+				t = 1.0
+			}
+		}
+		initialDecay := 0.30 + t*0.65
+		maxDecay := 0.60 + t*0.35
+		s.vsids.SetDecayParams(initialDecay, maxDecay, 5000)
 		s.restartBase = 5
 		s.restartGlucoseRatio = 100.0
 		s.restartGlucoseMinConflicts = 1000000
+		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=5\n",
+			structure.StructuredScore, t, initialDecay, maxDecay)
 		return
 	}
 
