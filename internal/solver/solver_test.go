@@ -31,7 +31,7 @@ func TestCDCLSolveUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	if s.Solve() {
 		t.Error("Expected UNSAT")
 	}
@@ -48,7 +48,7 @@ func TestCDCLSolveSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	if !s.Solve() {
 		t.Error("Expected SAT")
 	}
@@ -67,7 +67,7 @@ func TestCDCLSolve3SAT(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	if !s.Solve() {
 		t.Error("Expected SAT")
 	}
@@ -90,7 +90,7 @@ func TestCDCLSolveUnsat3SAT(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT && result != UNKNOWN {
@@ -181,7 +181,7 @@ func TestCDCLTseitin4x4Unsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT {
@@ -203,7 +203,7 @@ func TestCDCLAlgebra20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (simple 20 unit clauses)")
@@ -234,7 +234,7 @@ func TestCDCLPhp3p4hSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (pigeonhole 3 pigeons 4 holes)")
@@ -281,7 +281,7 @@ func TestCDCLPhp4p3hUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if result {
 		t.Error("Expected UNSAT (pigeonhole 4 pigeons 3 holes)")
@@ -304,7 +304,7 @@ func TestCDCLSimple50vSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (simple 50v)")
@@ -326,7 +326,7 @@ func TestCDCLArgChain20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (argumentation chain 20)")
@@ -351,7 +351,7 @@ func TestCDCLAlgebraXor20Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (algebra XOR 20)")
@@ -441,7 +441,7 @@ func TestCDCLTseitin5x5Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (tseitin grid 5x5)")
@@ -533,7 +533,7 @@ func TestCDCLTseitin5x5Unsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (tseitin grid 5x5), got %v", result)
@@ -555,7 +555,7 @@ func TestCDCLArgChain50Sat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.Solve()
 	if !result {
 		t.Error("Expected SAT (argumentation chain 50)")
@@ -577,7 +577,7 @@ func TestCDCLEquivalenceRich50vUnsat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	if result != UNSAT {
 		t.Errorf("Expected UNSAT (equivalence-rich 50v), got %v", result)
@@ -624,7 +624,7 @@ func TestCDCLPhp6p5hUnsat(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
-	
+
 	s.SetMaxIter(1000000)
 	result := s.SolveWithResult()
 	if result != UNSAT {
@@ -657,7 +657,7 @@ func TestCDCLRandomK3Sat(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	// Don't check SAT/UNSAT - just ensure it terminates quickly
 	if result == UNKNOWN {
@@ -752,7 +752,7 @@ func TestCDCLSudoku2x2(t *testing.T) {
 	c.NumClauses = len(c.Clauses)
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	if result != SAT {
 		t.Errorf("Expected SAT (2x2 Sudoku), got %v", result)
@@ -835,7 +835,7 @@ func TestCDCLPhp5p6hSat(t *testing.T) {
 	}
 
 	s := NewCDCLSolver(&c)
-	
+
 	result := s.SolveWithResult()
 	if result != SAT {
 		t.Errorf("Expected SAT (pigeonhole 5 pigeons 6 holes), got %v", result)
@@ -992,7 +992,7 @@ func TestPureLiteralElimination(t *testing.T) {
 	c := cnf.CNF{
 		NumVars: 3,
 		Clauses: []cnf.Clause{
-			newClause(1, 2),  // var 2 is pure positive
+			newClause(1, 2),   // var 2 is pure positive
 			newClause(-1, -3), // var 3 is pure negative
 		},
 		NumClauses: 2,
@@ -1163,10 +1163,10 @@ func TestModelVerification(t *testing.T) {
 						break
 					}
 				}
-			if !satisfied {
-				t.Errorf("Clause %d not satisfied by model", i)
+				if !satisfied {
+					t.Errorf("Clause %d not satisfied by model", i)
+				}
 			}
-		}
 		})
 	}
 }
@@ -1224,11 +1224,11 @@ func TestRecursiveMinimizationSoundness(t *testing.T) {
 			cnf: cnf.CNF{
 				NumVars: 3, NumClauses: 5,
 				Clauses: []cnf.Clause{
-					newClause(-1, 2),  // x1 → x2
-					newClause(-2, 1),  // x2 → x1
-					newClause(2),      // x2 must be true
-					newClause(-1),     // x1 must be false
-					newClause(3),      // x3 must be true (independent)
+					newClause(-1, 2), // x1 → x2
+					newClause(-2, 1), // x2 → x1
+					newClause(2),     // x2 must be true
+					newClause(-1),    // x1 must be false
+					newClause(3),     // x3 must be true (independent)
 				},
 			},
 			expected: UNSAT,
@@ -1314,8 +1314,8 @@ func TestMinimizeDepthDefault(t *testing.T) {
 	// up to 10 deep, exercising recursive minimization.
 	numVars := 10
 	clauses := []cnf.Clause{
-		newClause(1),       // x1 = true
-		newClause(-10),     // x10 = false
+		newClause(1),   // x1 = true
+		newClause(-10), // x10 = false
 	}
 	for i := 1; i < numVars; i++ {
 		clauses = append(clauses, newClause(-int32(i), int32(i+1)))
@@ -1514,8 +1514,8 @@ func TestVivificationSoundness(t *testing.T) {
 			expected: SAT,
 		},
 		{
-			name: "pigeonhole_unsat",
-			cnf:   buildPigeonhole(3, 2),
+			name:     "pigeonhole_unsat",
+			cnf:      buildPigeonhole(3, 2),
 			expected: UNSAT,
 		},
 		{
@@ -1622,8 +1622,8 @@ func TestVivifyDisabled(t *testing.T) {
 func TestMinimizationDiagnostics(t *testing.T) {
 	c := buildPigeonhole(4, 3)
 	s := NewCDCLSolver(&c)
-	s.SetVivifyPeriod(1)             // Run vivification at every restart
-	s.SetVivifyMinConflictGap(0)     // Disable conflict gap gate (test wants restart-based triggering)
+	s.SetVivifyPeriod(1)              // Run vivification at every restart
+	s.SetVivifyMinConflictGap(0)      // Disable conflict gap gate (test wants restart-based triggering)
 	s.SetRestartParameters(1, 1.5, 1) // Aggressive restarts (base=1) to ensure vivify fires
 	s.SetMaxIter(200000)
 	result := s.SolveWithResult()

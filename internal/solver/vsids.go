@@ -144,21 +144,21 @@ func (h *vsidsHeap) init(heapPos []int) {
 // - Increases toward 0.999 over 10k conflicts (slower decay to focus on important vars)
 // - This allows rapid initial exploration followed by focused search on critical variables
 type VSIDS struct {
-	activity              []float64 // Activity score for each variable
-	varInc                float64   // O(1) decay: bump counter (grows as varInc /= decayFactor)
-	decayFactor           float64   // Current decay factor (initialDecay -> maxDecayFactor)
-	conflictCount         int       // Total conflicts for decay timing
-	useLBD                bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
-	lbdBonus              []float64 // Bonus score from appearing in low-LBD clauses
-	lbdInc                float64   // O(1) decay: LBD bump counter (grows as lbdInc /= lbdBonusDecay)
-	maxDecayFactor        float64   // Maximum decay factor
-	decayIncrement        float64   // Increment per decay fire
-	heap                  vsidsHeap // Activity heap for O(log n) selection
-	heapPos               []int     // Position of each variable in heap (-1 = not in heap)
-	heapValid             bool      // True if heap is up-to-date
-	refreshInterval       int       // Conflicts between heap rebuilds (fixes deeply stale entries)
-	decayInterval         int       // Number of conflicts between activity decays
-	randomSeed            uint64    // Seed for deterministic random noise (default 0)
+	activity        []float64 // Activity score for each variable
+	varInc          float64   // O(1) decay: bump counter (grows as varInc /= decayFactor)
+	decayFactor     float64   // Current decay factor (initialDecay -> maxDecayFactor)
+	conflictCount   int       // Total conflicts for decay timing
+	useLBD          bool      // Use LBD-based activity (variables in low-LBD clauses prioritized)
+	lbdBonus        []float64 // Bonus score from appearing in low-LBD clauses
+	lbdInc          float64   // O(1) decay: LBD bump counter (grows as lbdInc /= lbdBonusDecay)
+	maxDecayFactor  float64   // Maximum decay factor
+	decayIncrement  float64   // Increment per decay fire
+	heap            vsidsHeap // Activity heap for O(log n) selection
+	heapPos         []int     // Position of each variable in heap (-1 = not in heap)
+	heapValid       bool      // True if heap is up-to-date
+	refreshInterval int       // Conflicts between heap rebuilds (fixes deeply stale entries)
+	decayInterval   int       // Number of conflicts between activity decays
+	randomSeed      uint64    // Seed for deterministic random noise (default 0)
 	// Configurable parameters (exposed for tuning)
 	initialDecayFactor   float64 // Initial decay factor (default 0.979)
 	decayRampUpConflicts int     // Conflicts to reach max decay (default 25000)
@@ -184,21 +184,21 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	initialDecay := 0.95
 	maxDecay := 0.95
 	v := &VSIDS{
-		activity:              make([]float64, numVars),
-		varInc:                25.0, // Initial bump amount (matches baseBumpAmount)
-		decayFactor:           initialDecay,
-		conflictCount:         0,
-		useLBD:                true,
-		lbdBonus:              make([]float64, numVars),
-		lbdInc:                1.0,
-		maxDecayFactor:        maxDecay,
-		decayIncrement:        0.0, // Fixed decay — no ramp
-		heap:                  vsidsHeap{scores: make([]float64, 0, numVars), varIdxs: make([]uint32, 0, numVars)},
-		heapPos:               make([]int, numVars),
-		heapValid:             false,
-		refreshInterval:       2000,
-		decayInterval:         1, // O(1) decay — fire every conflict
-		randomSeed:            0,
+		activity:        make([]float64, numVars),
+		varInc:          25.0, // Initial bump amount (matches baseBumpAmount)
+		decayFactor:     initialDecay,
+		conflictCount:   0,
+		useLBD:          true,
+		lbdBonus:        make([]float64, numVars),
+		lbdInc:          1.0,
+		maxDecayFactor:  maxDecay,
+		decayIncrement:  0.0, // Fixed decay — no ramp
+		heap:            vsidsHeap{scores: make([]float64, 0, numVars), varIdxs: make([]uint32, 0, numVars)},
+		heapPos:         make([]int, numVars),
+		heapValid:       false,
+		refreshInterval: 2000,
+		decayInterval:   1, // O(1) decay — fire every conflict
+		randomSeed:      0,
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
 		decayRampUpConflicts: 100, // Minimal — no ramp (initial == max)
@@ -320,6 +320,7 @@ func (v *VSIDS) SetLBDBonusScale(scale float64) {
 	}
 	v.lbdBonusScale = scale
 }
+
 // SetBaseBumpAmount sets the base bump amount for clauses (default 50.0)
 // Higher values = more aggressive activity increase for conflict variables
 func (v *VSIDS) SetBaseBumpAmount(amount float64) {
@@ -329,6 +330,7 @@ func (v *VSIDS) SetBaseBumpAmount(amount float64) {
 	v.baseBumpAmount = amount
 	v.varInc = amount // varInc starts at baseBumpAmount, grows via O(1) decay
 }
+
 // SetDecayParams sets VSIDS decay parameters (initial, max, ramp-up conflicts).
 // Generalized form of SetAggressiveDecay for smooth threshold interpolation.
 func (v *VSIDS) SetDecayParams(initial, max float64, rampUpConflicts int) {
@@ -345,6 +347,7 @@ func (v *VSIDS) SetDecayParams(initial, max float64, rampUpConflicts int) {
 func (v *VSIDS) SetAggressiveDecay() {
 	v.SetDecayParams(0.30, 0.60, 5000)
 }
+
 // SetClauseInitWeights sets the initialization weights for clauses
 // baseWeight: base weight for all clauses (default 10.0)
 // binaryWeight: weight multiplier for binary clauses (default 100.0)
@@ -507,14 +510,14 @@ func (v *VSIDS) decay(assignments []Assignment) {
 
 // selectVariableWithHeap returns the unassigned variable with highest activity.
 // Lazy heap with sink approach:
-// - Peek at the root. If assigned, sink it to -Inf (it stays in the heap but
-//   drops to the bottom). If unassigned but stale (activity was bumped since
-//   last heap update), fix the score in-place. If unassigned and current,
-//   return it (without removeMax — decide() will assign it, and the next
-//   select will sink it).
-// - The heap never empties (entries are sunk, not removed), eliminating
-//   frequent O(n) buildHeap calls.
-// - onUnassign restores sunk entries' real scores and sifts them up.
+//   - Peek at the root. If assigned, sink it to -Inf (it stays in the heap but
+//     drops to the bottom). If unassigned but stale (activity was bumped since
+//     last heap update), fix the score in-place. If unassigned and current,
+//     return it (without removeMax — decide() will assign it, and the next
+//     select will sink it).
+//   - The heap never empties (entries are sunk, not removed), eliminating
+//     frequent O(n) buildHeap calls.
+//   - onUnassign restores sunk entries' real scores and sifts them up.
 func (v *VSIDS) selectVariableWithHeap(assignments []Assignment) uint32 {
 	if !v.heapValid || len(v.heap.scores) == 0 {
 		v.buildHeap(assignments)

@@ -99,7 +99,6 @@ func run() int {
 	}
 
 	s := solver.NewCDCLSolver(cnfFormula)
-	solver.InitLogger(*verbose)
 	s.SetVerbose(*verbose)
 	if *maxIter > 0 {
 		s.SetMaxIter(*maxIter)

@@ -23,9 +23,6 @@ func BenchmarkRealInstanceLogAlloc(b *testing.B) {
 		b.Fatalf("parse: %v", err)
 	}
 
-	// Ensure logging is OFF (production default)
-	InitLogger(false)
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

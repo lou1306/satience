@@ -645,26 +645,11 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 	// Mark protected clauses (used as reasons). At level 0 after restart, no
 	// learned clause is in use as a reason, so this is all false. Built for
 	// safety in case the function is ever called at a non-level-0 state.
-	if cap(s.tmpClauseUsedAsReason) < s.learnedCapacity {
-		s.tmpClauseUsedAsReason = make([]bool, s.learnedCapacity)
-	}
-	protected := s.tmpClauseUsedAsReason[:s.learnedCapacity]
-	for i := range protected {
-		protected[i] = false
-	}
-	for _, impIdx := range s.implication {
-		if impIdx <= -5 {
-			learnedIdx := -impIdx - 5
-			if int(learnedIdx) < s.learnedCapacity {
-				protected[learnedIdx] = true
-			}
-		}
-	}
+	protected := s.markProtectedClauses()
 
 	seenLit := make([]bool, numLits)
 	var touched []int
 
-	const maxCheckPerRound = 2000
 	checkedCount := 0
 	var results []subsumptionResult
 

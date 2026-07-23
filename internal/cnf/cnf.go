@@ -78,8 +78,8 @@ type CNF struct {
 
 	// Contiguous literal storage for original clauses (optimization)
 	// All original clause literals stored in one array for better cache locality
-	originalClauseOffsets []int    // Start offset of each clause
-	originalClauseSizes   []int    // Number of literals in each clause
+	originalClauseOffsets []int     // Start offset of each clause
+	originalClauseSizes   []int     // Number of literals in each clause
 	literalPool           []Literal // Contiguous storage for all original clause literals
 }
 

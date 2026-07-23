@@ -32,7 +32,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 		for i, watch := range s.watchLists[litIdx] {
 			if watch.ClauseIdx < 0 {
 				learnedIdx := -watch.ClauseIdx - 1
-			if int(learnedIdx) >= s.learnedCapacity {
+				if int(learnedIdx) >= s.learnedCapacity {
 					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
 						litIdx, i, learnedIdx, s.learnedCapacity)
 					errors++
@@ -45,7 +45,7 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 		}
 	}
 
-// Check 3 (removed): Binary watch lists reference existing clauses
+	// Check 3 (removed): Binary watch lists reference existing clauses
 	// The CDCLSolver has no watchListsBinary field; this check referenced a
 	// nonexistent struct member and prevented `make debug` from compiling.
 
