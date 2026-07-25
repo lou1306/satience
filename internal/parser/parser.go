@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 
 	"satience/internal/cnf"
@@ -115,7 +116,7 @@ func processLine(line string, numVars *uint32, numClauses *int, headerFound *boo
 
 	// Clause line: parse integers directly
 	if !*headerFound {
-		return nil // skip lines before header
+		return fmt.Errorf("clause data before problem line")
 	}
 
 	// Parse integers from the line
@@ -203,9 +204,16 @@ func parseIntFrom(s string, i int) (int, int, error) {
 		return 0, i, fmt.Errorf("expected digit")
 	}
 
+	// DIMACS literals fit in int32. Rejecting values beyond MaxInt32 prevents
+	// uint32 truncation in the caller (e.g. 4294967297 aliasing to variable 1).
+	const maxVal = math.MaxInt32
 	val := 0
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		val = val*10 + int(s[i]-'0')
+		d := int(s[i] - '0')
+		if val > (maxVal-d)/10 {
+			return 0, i, fmt.Errorf("literal out of range")
+		}
+		val = val*10 + d
 		i++
 	}
 

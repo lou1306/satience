@@ -105,3 +105,48 @@ func TestParseEmptyClause(t *testing.T) {
 		t.Errorf("Expected 1 clause, got %d", cnf.NumClauses)
 	}
 }
+
+func TestParseOverflowLiteral(t *testing.T) {
+	// Literals exceeding int32 must be rejected to prevent uint32 truncation
+	// aliasing (e.g. 4294967297 would truncate to variable 1).
+	cases := []string{
+		"p cnf 5 1\n4294967297 0\n",  // 2^32 + 1
+		"p cnf 5 1\n-4294967297 0\n", // -(2^32 + 1)
+		"p cnf 5 1\n9999999999 0\n",  // > int32 max
+		"p cnf 5 1\n2147483648 0\n",  // int32 max + 1
+	}
+	for _, input := range cases {
+		_, err := Parse(strings.NewReader(input))
+		if err == nil {
+			t.Errorf("Expected error for overflow literal in:\n%s", input)
+		}
+	}
+}
+
+func TestParseClauseBeforeHeader(t *testing.T) {
+	// Clause data appearing before the problem line is malformed DIMACS.
+	// Previously silently dropped; now rejected.
+	input := `1 2 0
+p cnf 3 2
+1 2 0
+-1 3 0`
+
+	_, err := Parse(strings.NewReader(input))
+	if err == nil {
+		t.Error("Expected error for clause data before problem line")
+	}
+}
+
+func TestParseMaxInt32Literal(t *testing.T) {
+	// int32 max is the largest accepted literal (2147483647).
+	// With numVars large enough, this should parse cleanly.
+	input := "p cnf 2147483647 1\n2147483647 0\n"
+
+	cnf, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if cnf.NumClauses != 1 {
+		t.Errorf("Expected 1 clause, got %d", cnf.NumClauses)
+	}
+}

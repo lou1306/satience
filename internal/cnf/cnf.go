@@ -94,9 +94,15 @@ type CNF struct {
 
 // NewCNF creates a new CNF formula
 func NewCNF(numVars uint32, numClauses int) *CNF {
+	// Cap pre-allocation to avoid OOM on malformed headers declaring billions
+	// of clauses. The slice grows dynamically as clauses are added.
+	preCap := numClauses
+	if preCap > 1<<20 {
+		preCap = 1 << 20
+	}
 	return &CNF{
 		NumVars:    numVars,
-		Clauses:    make([]Clause, 0, numClauses),
+		Clauses:    make([]Clause, 0, preCap),
 		NumClauses: 0,
 	}
 }

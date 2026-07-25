@@ -15,7 +15,7 @@ satience_v3
 satience_opt
 satience_preproc
 satience_prephase*
-fuzz
+/fuzz
 solver.test
 *.exe
 *.exe~
