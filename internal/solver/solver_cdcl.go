@@ -712,9 +712,13 @@ func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
 func (s *CDCLSolver) getReasonLitsForVar(v uint32) []cnf.Literal {
 	reasonClauseIdx := s.assignments[v].Reason
 	if reasonClauseIdx >= 0 {
-		clauses := s.cnf.Clauses
-		if int(reasonClauseIdx) < len(clauses) {
-			return clauses[reasonClauseIdx].Literals
+		clauseLocs := s.cnf.GetOriginalClauseLocs()
+		if int(reasonClauseIdx) < len(clauseLocs) {
+			loc := clauseLocs[reasonClauseIdx]
+			if loc.Size > 0 {
+				pool := s.cnf.GetLiteralPool()
+				return pool[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
+			}
 		}
 		return nil
 	}
@@ -2533,15 +2537,14 @@ func (s *CDCLSolver) restart() bool {
 	// Clear search trail and assignments.
 	// Preprocessing vars live on preprocessTrail (separate, permanent) — no preservation check needed.
 	// Search assignments are always at Level >= 1 (propLevel hack ensures root-level props get Level 1).
+	// Iterate the trail (only assigned vars) instead of scanning the full assignment array.
+	for i := 0; i < len(s.trail); i++ {
+		s.unassignVar(s.trail[i])
+	}
 	s.trail = s.trail[:0]
 	s.trailHead = append(s.trailHead[:0], 0)
 	s.qhead = 0
 	s.level = 0
-	for i := range s.assignments {
-		if s.assignments[i].Level > 0 {
-			s.unassignVar(uint32(i))
-		}
-	}
 	// Restart clears all search assignments. Sunk heap entries (at -Inf) are
 	// NOT restored by onUnassign (restart doesn't call it). Force a rebuild
 	// to fix all entries with current scores.
