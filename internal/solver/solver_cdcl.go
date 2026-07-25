@@ -142,6 +142,7 @@ type CDCLSolver struct {
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
 	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	probeTrail      []int    // Reusable trail for FLP non-watch BCP (literal indices)
 	conflicts       int
 	iterations      int
 	propagations    int // Total propagations (assignments by unit propagation)
@@ -1644,6 +1645,180 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 	return false
 }
 
+// failedLiteralProbing performs failed-literal probing (FLP) as a preprocessing
+// step. For each unassigned variable v, tries v=true and v=false; if either
+// assignment causes a conflict, v is a failed literal and its negation is
+// forced (added as a level-0 assignment).
+//
+// Uses probePropagate (non-watch BCP via occurrence lists) so NO solver state
+// (trail, assignments, watches) is modified during probing — only temporary
+// tmpValue/tmpAssigned arrays are touched and restored after each probe.
+//
+// Gate: only runs on random-like instances (structureScore < 0.7 and
+// binaryRatio <= 0.5). On structured instances, aggressive preprocessing
+// (subsumption, BVE, equivalence) already simplifies the formula, and FLP's
+// trajectory change from the relatively few failed literals it finds can hurt.
+func (s *CDCLSolver) failedLiteralProbing() SolveResult {
+	if int(s.cnf.NumVars) > s.preprocessingMaxVars {
+		return UNKNOWN
+	}
+
+	if s.structureScore >= 0.7 || s.binaryRatio > 0.5 {
+		return UNKNOWN
+	}
+
+	numVars := int(s.cnf.NumVars)
+	if numVars == 0 || s.cnf.NumClauses == 0 {
+		return UNKNOWN
+	}
+	numLits := numVars * 2
+
+	occ := make([][]int, numLits)
+	for i := range s.cnf.Clauses {
+		lits := s.cnf.Clauses[i].Literals
+		if len(lits) == 0 {
+			continue
+		}
+		for _, lit := range lits {
+			occ[cnf.LitToIndex(lit)] = append(occ[cnf.LitToIndex(lit)], i)
+		}
+	}
+
+	tmpValue := make([]bool, numVars)
+	tmpAssigned := make([]bool, numVars)
+	for v := 0; v < numVars; v++ {
+		if s.assignments[v].Level >= 0 {
+			tmpAssigned[v] = true
+			tmpValue[v] = s.assignments[v].Value
+		}
+	}
+
+	budget := 2000
+	probed := 0
+	var failedLits []cnf.Literal
+
+	s.probeTrail = s.probeTrail[:0]
+
+	for v := uint32(0); v < s.cnf.NumVars && probed < budget; v++ {
+		if tmpAssigned[v] {
+			continue
+		}
+		probed++
+
+		trailLen := len(s.probeTrail)
+		tmpAssigned[v] = true
+		tmpValue[v] = true
+		s.probeTrail = append(s.probeTrail, int(v)*2)
+		conflict := s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
+		for i := trailLen; i < len(s.probeTrail); i++ {
+			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
+		}
+		s.probeTrail = s.probeTrail[:trailLen]
+		tmpAssigned[v] = false
+
+		if conflict {
+			failedLits = append(failedLits, cnf.NewLiteral(v, true))
+			continue
+		}
+
+		trailLen = len(s.probeTrail)
+		tmpAssigned[v] = true
+		tmpValue[v] = false
+		s.probeTrail = append(s.probeTrail, int(v)*2+1)
+		conflict = s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
+		for i := trailLen; i < len(s.probeTrail); i++ {
+			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
+		}
+		s.probeTrail = s.probeTrail[:trailLen]
+		tmpAssigned[v] = false
+
+		if conflict {
+			failedLits = append(failedLits, cnf.NewLiteral(v, false))
+		}
+	}
+
+	s.Log("c [preprocessing] Failed literal probing: %d probes, %d failed literals\n", probed, len(failedLits))
+
+	if len(failedLits) == 0 {
+		return UNKNOWN
+	}
+
+	s.numUnassigned = 0
+	for v := uint32(0); v < s.cnf.NumVars; v++ {
+		if s.assignments[v].Level < 0 {
+			s.numUnassigned++
+		}
+	}
+
+	for _, lit := range failedLits {
+		v := lit.Var()
+		if s.assignments[v].Level >= 0 {
+			if s.assignments[v].Value != !lit.IsNegated() {
+				return UNSAT
+			}
+			continue
+		}
+		value := !lit.IsNegated()
+		s.assignments[v] = Assignment{Value: value, Level: 0, Reason: -2}
+		s.litTrue[int(v)*2] = value
+		s.litTrue[int(v)*2+1] = !value
+		s.preprocessTrail = append(s.preprocessTrail, v)
+		s.numUnassigned--
+	}
+
+	if s.propagateOriginalUnitsAndActivateWatches() {
+		return UNSAT
+	}
+
+	return UNKNOWN
+}
+
+// probePropagate performs Boolean constraint propagation without watch lists.
+// Scans occurrence lists read-only, appending newly derived literals to
+// s.probeTrail. Returns true if a conflict is detected.
+// tmpValue/tmpAssigned are modified in-place; the caller restores them after.
+func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []bool, trailStart int) bool {
+	clauses := s.cnf.Clauses
+	head := trailStart
+	for head < len(s.probeTrail) {
+		litIdx := s.probeTrail[head]
+		head++
+
+		negIdx := litIdx ^ 1
+		for _, ci := range occ[negIdx] {
+			clauseLits := clauses[ci].Literals
+			unassignedCount := 0
+			unassignedLitIdx := 0
+			satisfied := false
+			for _, lit := range clauseLits {
+				v := lit.Var()
+				if tmpAssigned[v] {
+					if tmpValue[v] != lit.IsNegated() {
+						satisfied = true
+						break
+					}
+					continue
+				}
+				unassignedCount++
+				unassignedLitIdx = cnf.LitToIndex(lit)
+			}
+			if satisfied {
+				continue
+			}
+			if unassignedCount == 0 {
+				return true
+			}
+			if unassignedCount == 1 {
+				v := uint32(unassignedLitIdx >> 1)
+				tmpAssigned[v] = true
+				tmpValue[v] = !(unassignedLitIdx&1 == 1)
+				s.probeTrail = append(s.probeTrail, unassignedLitIdx)
+			}
+		}
+	}
+	return false
+}
+
 // initWatches initializes watched literals for all clauses
 // Called after preprocessing completes (preprocessing modifies clauses)
 func (s *CDCLSolver) initWatches() {
@@ -2963,6 +3138,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 			s.litTrue[i*2] = v
 			s.litTrue[i*2+1] = !v
 		}
+	}
+
+	if flpResult := s.failedLiteralProbing(); flpResult != UNKNOWN {
+		s.printStats()
+		return flpResult
 	}
 
 	result := s.cdclLoop()
