@@ -199,8 +199,8 @@ type CDCLSolver struct {
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
 	// increments). The queue is reused across calls (sliced to [:0]).
-	bigBfsVisited []uint32
-	bigBfsEpoch   uint32
+	bigBfsVisited []uint16
+	bigBfsEpoch   uint16
 	bigBfsQueue   []int
 
 	// Reusable buffers for conflict analysis (avoid per-conflict allocation)
@@ -382,7 +382,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLiteralInClause:  make([]bool, formula.NumVars),
 		tmpSeenVar:          make([]bool, formula.NumVars),
 		tmpLiteralIsNegated: make([]bool, formula.NumVars),
-		bigBfsVisited:       make([]uint32, int(formula.NumVars)*2),
+		bigBfsVisited:       make([]uint16, int(formula.NumVars)*2),
 		bigBfsQueue:         make([]int, 0, 256),
 		tmpLevelCount:       make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
@@ -1632,6 +1632,17 @@ func (s *CDCLSolver) propagateOriginalUnitsAndActivateWatches() bool {
 	s.level = 0
 	s.trailHead = s.trailHead[:1]
 	s.trailHead[0] = 0
+	// Sync litTrue with preprocessing assignments. Preprocessing (unit prop,
+	// BVE, pure-literal) sets assignments without updating litTrue — litTrue is
+	// only initialized later in SolveWithResult (line ~3148). The binary fast
+	// path in propagateWatched trusts litValue[watch.Blit] to skip satisfied
+	// clauses; if litTrue is stale (false for an actually-true literal), it
+	// falls through to the conflict path and reports a false UNSAT.
+	for _, v := range s.trail {
+		val := s.assignments[v].Value
+		s.litTrue[int(v)*2] = val
+		s.litTrue[int(v)*2+1] = !val
+	}
 	conflict, _ := s.propagateWatched()
 	if conflict {
 		return true
@@ -2954,11 +2965,17 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 		return false
 	}
 	s.bigBfsEpoch++
+	if s.bigBfsEpoch == 0 {
+		// Wrap: clear all stamps so stale values can't masquerade as "visited".
+		clear(s.bigBfsVisited)
+		s.bigBfsEpoch = 1
+	}
 	ep := s.bigBfsEpoch
 	litVar := lit.Var()
 	visited := s.bigBfsVisited
 	tmpInClause := s.tmpLiteralInClause
 	tmpIsNeg := s.tmpLiteralIsNegated
+	bigAdj := s.bigAdj
 
 	visited[litIdx] = ep
 	q := s.bigBfsQueue[:0]
@@ -2970,8 +2987,8 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	for head < len(q) && !found {
 		cur := q[head]
 		head++
-		for _, m := range s.bigAdj[cur] {
-			if m >= len(visited) || visited[m] == ep {
+		for _, m := range bigAdj[cur] {
+			if visited[m] == ep {
 				continue
 			}
 			visited[m] = ep
@@ -3198,6 +3215,10 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
 		if s.assignments[i].Level < 0 {
 			s.numUnassigned++
+		} else {
+			v := s.assignments[i].Value
+			s.litTrue[i*2] = v
+			s.litTrue[i*2+1] = !v
 		}
 	}
 	return s.cdclLoop()
