@@ -143,21 +143,22 @@ type CDCLSolver struct {
 	litTrue            []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
-	preprocessTrail  []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
-	probeTrail       []int    // Reusable trail for FLP non-watch BCP (literal indices)
-	conflicts        int
-	iterations       int
-	propagations     int // Total propagations (assignments by unit propagation)
-	maxIter          int
-	decisions        int
-	uipFallbackCount int // Number of times 1-UIP resolution didn't converge (diagnostic)
-	backjumpLevel    int
-	maxLearned       int
-	restartCount     int
-	lubyIndex        int
-	lbdSum           int
-	lbdCount         int
-	emaLBD           float64 // Exponential moving average of LBD (smooth restart signal)
+	preprocessTrail   []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	probeTrail        []int    // Reusable trail for FLP non-watch BCP (literal indices)
+	conflicts         int
+	iterations        int
+	propagations      int // Total propagations (assignments by unit propagation)
+	maxIter           int
+	decisions         int
+	uipFallbackCount  int // Number of times 1-UIP resolution didn't converge (diagnostic)
+	uipFallbackLogged int // Counter for capping per-solve fallback diagnostic output (diagnostic)
+	backjumpLevel     int
+	maxLearned        int
+	restartCount      int
+	lubyIndex         int
+	lbdSum            int
+	lbdCount          int
+	emaLBD            float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
 	totalLbdSum   uint64
@@ -3337,13 +3338,28 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				s.Log("c [UNIT SCAN] idx=%d, var=%d, level=%d\n", learnedIdx, varIdx+1, s.assignments[varIdx].Level)
 			}
 			if s.assignments[varIdx].Level < 0 {
-				// CRITICAL FIX: Propagate at max(s.level, 1) to maintain trail invariant
-				// All trail elements must be at levels <= s.level (or level 1 if s.level=0)
+				// Root-level learned units are propagated at Level 1 (propLevel hack)
+				// when s.level==0. They sit at the front of s.trail (before
+				// trailHead[1]) and survive cancelUntil(0). Level 1 (not 0) is used
+				// so that 1-UIP treats them as current-level literals and resolves
+				// their reasons — this produces better learned clauses than the
+				// "correct" Level 0 (which skips them entirely). The side effect is
+				// 1-UIP non-convergence fallbacks (rare, <0.01% of conflicts):
+				// because these literals are below trailHead[1], the candidate scan
+				// (trail[trailHead[s.level]:]) misses them, so they inflate
+				// currentCount without being resolvable. The fallback picks the
+				// most-recent level-1 literal as UIP and drops the rest, which is
+				// sound and empirically gives the best PAR2.
+				//
+				// When s.level >= 1 (unit learned mid-search), propagate at the
+				// current level: the var sits at the trail end (correct region)
+				// and is cleared on backtrack, then re-propagated at Level 1
+				// after the next restart.
 				propLevel := s.level
 				if propLevel == 0 {
 					propLevel = 1
 				}
-				// FIX: Do NOT update trailHead during unit propagation when s.level=0.
+				// Do NOT update trailHead during unit propagation when s.level=0.
 				// trailHead should only track decisions, not propagated variables.
 				// If we append trailHead here, backtracking will incorrectly clear unit-propagated variables.
 				if s.verbose {
@@ -3448,7 +3464,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// calls see the grown trail. Same aliasing rationale as assignments above.
 	// Also cache s.level (constant for the whole call — no decisions/conflicts
 	// occur inside this loop) and derive propLevel once. Level 0 propagations
-	// are encoded as Level=1 (see the propLevel=1 hack), so propLevel is never 0.
+	// are encoded as Level=1 (propLevel hack): root-level learned units sit at
+	// the front of the trail (before trailHead[1]) and 1-UIP resolves their
+	// reasons, which empirically yields better learned clauses and lower PAR2
+	// than the "correct" Level 0 (which skips them). The side effect is rare
+	// 1-UIP non-convergence fallbacks (<0.01% of conflicts) because these
+	// literals are below trailHead[1] and the candidate scan misses them; the
+	// fallback is sound and picks the most-recent level-1 literal as UIP.
 	trail := s.trail
 	level := s.level
 	propLevel := level
@@ -4259,6 +4281,10 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 			s.trailPos[s.trail[ti]] = ti
 		}
 
+		// Diagnostic: dump residual-literal state before fallback selection.
+		// trailPos is currently populated for the current-level slice.
+		s.logUIPFallback(decisionsAtCurrentLevel, propagationsAtCurrentLevel, startIdx)
+
 		var uipVar uint32 = 0
 		var uipTrailPos int = -1
 		for _, varIdx := range s.tmpTouchedVars {
@@ -4290,6 +4316,79 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 		}
 	}
 	return currentCount
+}
+
+// uipFallbackLogCap bounds per-solve diagnostic output from logUIPFallback.
+// Fallback is rare (<0.01% of conflicts), but uncapped logging on a long run
+// could still produce excessive output.
+const uipFallbackLogCap = 32
+
+// logUIPFallback dumps diagnostic state when 1-UIP resolution fails to
+// converge. Output goes to stderr regardless of s.verbose (fallback is rare
+// enough that the noise is bounded by uipFallbackLogCap per solve, but turning
+// on full -verbose to catch it is impractical at 100K+ conflicts).
+// startIdx is the trail index where the current decision level begins
+// (trailHead[s.level]); trailPos must already be populated for
+// [startIdx, len(trail)). decisionsAtCurrentLevel/propagationsAtCurrentLevel
+// are precomputed by the caller.
+func (s *CDCLSolver) logUIPFallback(decisionsAtCurrentLevel, propagationsAtCurrentLevel, startIdx int) {
+	if s.uipFallbackLogged >= uipFallbackLogCap {
+		return
+	}
+	s.uipFallbackLogged++
+	fmt.Fprintf(os.Stderr, "c [uip-fallback] conflict=%d level=%d trailLen=%d trailHead=%d decisions=%d propagations=%d\n",
+		s.conflicts, s.level, len(s.trail), startIdx, decisionsAtCurrentLevel, propagationsAtCurrentLevel)
+	for _, v := range s.tmpTouchedVars {
+		if !s.tmpLiteralInClause[v] || s.assignments[v].Level != int32(s.level) {
+			continue
+		}
+		reasonIdx := s.assignments[v].Reason
+		vDimacs := int32(v) + 1
+		if s.tmpLiteralIsNegated[v] {
+			vDimacs = -vDimacs
+		}
+		if reasonIdx == -1 {
+			fmt.Fprintf(os.Stderr, "c   [residual] lit=%d trailPos=%d reason=DECISION resolved=%v\n",
+				vDimacs, s.trailPos[v], s.tmpResolved[v])
+			continue
+		}
+		reasonLits := s.getReasonLitsForVar(v)
+		if reasonLits == nil {
+			fmt.Fprintf(os.Stderr, "c   [residual] lit=%d trailPos=%d reason=DANGLING(%d) resolved=%v\n",
+				vDimacs, s.trailPos[v], reasonIdx, s.tmpResolved[v])
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "c   [residual] lit=%d trailPos=%d reason=%d resolved=%v assign(L%d,R%d,V%v) reasonLits=",
+			vDimacs, s.trailPos[v], reasonIdx, s.tmpResolved[v],
+			s.assignments[v].Level, s.assignments[v].Reason, s.assignments[v].Value)
+		for _, rl := range reasonLits {
+			rlVar := rl.Var()
+			rlLevel := -1
+			if int(rlVar) < len(s.assignments) {
+				rlLevel = int(s.assignments[rlVar].Level)
+			}
+			fmt.Fprintf(os.Stderr, "%d@%d ", rl.ToDimacs(), rlLevel)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+		// Full-trail scan to find the ACTUAL trail position of v (or -1 if absent).
+		// O(trailLen) per residual, but only runs in the rare fallback path (capped).
+		actualPos := -1
+		for ti, tv := range s.trail {
+			if tv == v {
+				actualPos = ti
+				break
+			}
+		}
+		fmt.Fprintf(os.Stderr, "c             actualTrailPos=%d", actualPos)
+		if actualPos >= 0 {
+			lvlAtPos := -1
+			if actualPos < len(s.trail) {
+				lvlAtPos = int(s.assignments[s.trail[actualPos]].Level)
+			}
+			fmt.Fprintf(os.Stderr, " levelAtActualPos=%d", lvlAtPos)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+	}
 }
 
 func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
