@@ -53,7 +53,19 @@ func run() int {
 	levelRestartGap := flag.Int("restart-level-gap", 100, "Min conflicts between level-capped restarts")
 	claDecay := flag.Float64("cla-decay", 0.99, "Clause activity decay factor for deletion ordering (default=0.99, slower than MiniSat 0.95)")
 	noClaActivity := flag.Bool("no-cla-activity", false, "Disable activity-based clause deletion (use FIFO within LBD tiers)")
+	noClassify := flag.Bool("no-classify", false, "Skip instance classification (keep CLI defaults for all search parameters)")
+	decayFloor := flag.Float64("decay-floor", 0.50, "Random-like mixed t=0 initial decay floor (default 0.50)")
+	decayCeil := flag.Float64("decay-ceil", 0.80, "Random-like mixed t=0 max decay ceiling (default 0.80)")
 	flag.Parse()
+
+	// Collect explicitly-set flags so classifyInstance knows which CLI values
+	// to respect instead of clobbering with per-category overrides. flag.Visit
+	// only yields flags that were actually passed on the command line, not
+	// flags at their default values.
+	explicitFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
 
 	// -verify implies -model
 	if *verify {
@@ -137,6 +149,11 @@ func run() int {
 	if *noClaActivity {
 		s.SetClaActivityEnabled(false)
 	}
+	if *noClassify {
+		s.SetSkipClassify(true)
+	}
+	s.SetExplicitFlags(explicitFlags)
+	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
 
 	start := time.Now()
 	var result solver.SolveResult

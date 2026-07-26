@@ -253,6 +253,10 @@ type CDCLSolver struct {
 	claDecayFactor             float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
 	claActivityEnabled         bool    // false = pure FIFO within LBD tiers
 	maxLearnedShrunk           bool    // True if maxLearned has been shrunk (one-way, no grow-back)
+	skipClassify               bool    // Skip classifyInstance (keep CLI defaults for tuning)
+	explicitFlags              map[string]bool
+	decayFloor                 float64 // Random-like mixed t=0 initial decay (default 0.50)
+	decayCeil                  float64 // Random-like mixed t=0 max decay (default 0.80)
 	restartBase                int     // Luby restart base (default 200; classifier may override)
 	lubyThresholdCap           int     // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	restartPropsDecLimit       int     // Props/dec threshold for restart (0=disabled, default 100)
@@ -451,6 +455,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartLevelCap:            40,  // Force restart when conflict level > 40 on long-clause instances
 		levelRestartGap:            100, // Min 100 conflicts between level-capped restarts
 		litTrue:                    make([]bool, int(formula.NumVars)*2),
+		decayFloor:                 0.50,
+		decayCeil:                  0.80,
 	}
 
 	// Initialize all assignments as unassigned (Level=-1, Reason=-1) with default
@@ -610,6 +616,39 @@ func (s *CDCLSolver) SetClaDecay(d float64) {
 // pure FIFO (identical to pre-activity behavior).
 func (s *CDCLSolver) SetClaActivityEnabled(enabled bool) {
 	s.claActivityEnabled = enabled
+}
+
+// SetSkipClassify disables instance classification, keeping CLI defaults for
+// all search parameters. Used for tuning: tests whether the classifier's
+// parameter overrides (tuned for the previous propLevel=1 behavior) are
+// harmful under the corrected Level-0 root propagation.
+func (s *CDCLSolver) SetSkipClassify(skip bool) {
+	s.skipClassify = skip
+}
+
+// SetExplicitFlags records which CLI flags were explicitly set by the user.
+// classifyInstance respects user-set flags: it skips clobbering any parameter
+// whose flag appears in this set. Without this, the classifier's per-category
+// overrides would unconditionally overwrite CLI values, making most search
+// flags no-ops for the categories where tuning matters most (Cat B decay and
+// Glucose, Cat A/B/C-binary-heavy restartBase). The map keys are the CLI flag
+// names (e.g. "restart-base", "initial-decay").
+func (s *CDCLSolver) SetExplicitFlags(flags map[string]bool) {
+	s.explicitFlags = flags
+}
+
+// flagSet reports whether the user explicitly passed the named CLI flag.
+// Returns false if SetExplicitFlags was never called (no flags recorded).
+func (s *CDCLSolver) flagSet(name string) bool {
+	return s.explicitFlags != nil && s.explicitFlags[name]
+}
+
+// SetDecayFloorCeil sets the random-like mixed decay floor and ceiling. At
+// t=0 (pure aggressive), initialDecay=floor, maxDecay=ceil. At t=1
+// (near-default), both interpolate to 0.95. Defaults: floor=0.50, ceil=0.80.
+func (s *CDCLSolver) SetDecayFloorCeil(floor, ceil float64) {
+	s.decayFloor = floor
+	s.decayCeil = ceil
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -1159,23 +1198,29 @@ func (s *CDCLSolver) classifyInstance() {
 	//   - Pure k-SAT (binaryRatio == 0, density > 4.5): default decay 0.95,
 	//     restartBase=5, Glucose active. Matches the minisat config that solves
 	//     566f366c (300v random 3-SAT) in ~0.04s; the aggressive-decay branch
-	//     took ~12s (346x). Aggressive decay (0.30->0.60) gives only ~3-5
+	//     took ~12s (346x). Aggressive decay gives only ~3-5
 	//     conflict memory vs minisat's ~50-100, causing 118x more conflicts on
 	//     phase-transition random 3-SAT. The density > 4.5 gate excludes
 	//     30eb4ef4 (density 4.20, phase-transition pure ternary) which regresses
 	//     to TIMEOUT under default decay (see D1).
 	//   - Mixed (binaryRatio > 0): D4 smooth threshold interpolation. Instead of
-	//     a hard 0.7 cliff, decay interpolates in [0.60, 0.70] from aggressive
-	//     (0.30->0.60) to near-default (0.95). Below 0.60: fully aggressive (D1:
-	//     needed by 15+ mixed instances). Above 0.70: structured path.
-	//     rphp_7_6_6 (0.64, t=0.41): decay 0.57->0.74 vs 0.30->0.60 aggressive.
+	//     a hard 0.7 cliff, decay interpolates from aggressive (0.50→0.80) to
+	//     near-default (0.95). Below 0.60: fully aggressive (D1: needed by 15+
+	//     mixed instances). Above 0.70: structured path.
+	//     The floor/ceiling were re-tuned after the level-0 literal filter fix:
+	//     shorter clauses (no level-0 literals) give a cleaner VSIDS signal, so
+	//     less aggressive decay (longer memory) works better. 0.30→0.60 was the
+	//     optimum with level-0 literals in clauses; 0.50→0.80 is the optimum
+	//     without them. 30eb4ef4: 11s→6.5s, daf59d67: 7s→4.3s.
 	// Unit propagation on random/mixed instances causes 76x more conflicts, so
 	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
 		if structure.BinaryRatio == 0 && structure.Density > 4.5 {
 			s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=5\n",
 				structure.StructuredScore, structure.Density)
-			s.restartBase = 5
+			if !s.flagSet("restart-base") {
+				s.restartBase = 5
+			}
 			s.useBumpAnalyze = true
 			// Glucose restart policy stays at CLI defaults (ratio=10.0, min=10):
 			// active as a safety net. decay stays at 0.95 (default).
@@ -1197,12 +1242,23 @@ func (s *CDCLSolver) classifyInstance() {
 				t = 1.0
 			}
 		}
-		initialDecay := 0.30 + t*0.65
-		maxDecay := 0.60 + t*0.35
-		s.vsids.SetDecayParams(initialDecay, maxDecay, 5000)
-		s.restartBase = 5
-		s.restartGlucoseRatio = 100.0
-		s.restartGlucoseMinConflicts = 1000000
+		initialDecay := s.decayFloor + t*(0.95-s.decayFloor)
+		maxDecay := s.decayCeil + t*(0.95-s.decayCeil)
+		// The decay interpolation is a unit: if the user set any of the decay
+		// flags, skip the whole SetDecayParams call and keep CLI values for all
+		// three. Partial override produces a nonsensical mix.
+		if !s.flagSet("initial-decay") && !s.flagSet("max-decay") && !s.flagSet("decay-rampup") {
+			s.vsids.SetDecayParams(initialDecay, maxDecay, 5000)
+		}
+		if !s.flagSet("restart-base") {
+			s.restartBase = 5
+		}
+		if !s.flagSet("restart-glucose-ratio") {
+			s.restartGlucoseRatio = 100.0
+		}
+		if !s.flagSet("restart-glucose-min") {
+			s.restartGlucoseMinConflicts = 1000000
+		}
 		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=5\n",
 			structure.StructuredScore, t, initialDecay, maxDecay)
 		return
@@ -1244,7 +1300,9 @@ func (s *CDCLSolver) classifyInstance() {
 	// times out). The default 200 matches the -no-preprocess behavior that
 	// solves these instances in <2s.
 	if structure.BinaryRatio > 0.5 && !s.skipBVE {
-		s.restartBase = 20
+		if !s.flagSet("restart-base") {
+			s.restartBase = 20
+		}
 		s.Log("c [classification] Binary-heavy (%.0f%%) - restartBase=20\n", structure.BinaryRatio*100)
 	}
 }
@@ -2558,7 +2616,6 @@ func (s *CDCLSolver) restart() bool {
 
 	// Clear search trail and assignments.
 	// Preprocessing vars live on preprocessTrail (separate, permanent) — no preservation check needed.
-	// Search assignments are always at Level >= 1 (propLevel hack ensures root-level props get Level 1).
 	// Iterate the trail (only assigned vars) instead of scanning the full assignment array.
 	for i := 0; i < len(s.trail); i++ {
 		s.unassignVar(s.trail[i])
@@ -3127,7 +3184,9 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// search-parameter tuning is available even when preprocessing is skipped
 	// (SolveWithoutPreprocessing), so -no-preprocess is a clean search-quality
 	// diagnostic axis rather than also disabling adaptive tuning.
-	s.classifyInstance()
+	if !s.skipClassify {
+		s.classifyInstance()
+	}
 	// Adaptive preprocessing: structure analysis selects techniques and
 	// tunes VSIDS/restart parameters. See preprocessAggressive.
 	preprocResult := s.preprocessAggressive()
@@ -3207,7 +3266,9 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	// -no-preprocess a polluted diagnostic that conflated "no preprocessing" with
 	// "no adaptive tuning". classifyInstance is read-only on s.cnf, so it cannot
 	// change the search trajectory the way forced unit propagation does.
-	s.classifyInstance()
+	if !s.skipClassify {
+		s.classifyInstance()
+	}
 	if s.hasEmptyClause() {
 		s.printStats()
 		return UNSAT
@@ -3338,30 +3399,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				s.Log("c [UNIT SCAN] idx=%d, var=%d, level=%d\n", learnedIdx, varIdx+1, s.assignments[varIdx].Level)
 			}
 			if s.assignments[varIdx].Level < 0 {
-				// Root-level learned units are propagated at Level 1 (propLevel hack)
-				// when s.level==0. They sit at the front of s.trail (before
-				// trailHead[1]) and survive cancelUntil(0). Level 1 (not 0) is used
-				// so that 1-UIP treats them as current-level literals and resolves
-				// their reasons — this produces better learned clauses than the
-				// "correct" Level 0 (which skips them entirely). The side effect is
-				// 1-UIP non-convergence fallbacks (rare, <0.01% of conflicts):
-				// because these literals are below trailHead[1], the candidate scan
-				// (trail[trailHead[s.level]:]) misses them, so they inflate
-				// currentCount without being resolvable. The fallback picks the
-				// most-recent level-1 literal as UIP and drops the rest, which is
-				// sound and empirically gives the best PAR2.
-				//
-				// When s.level >= 1 (unit learned mid-search), propagate at the
-				// current level: the var sits at the trail end (correct region)
-				// and is cleared on backtrack, then re-propagated at Level 1
-				// after the next restart.
+				// Root-level learned units propagate at s.level (0 after restart).
+				// Level 0 is correct: 1-UIP skips level-0 literals (always-true),
+				// so they neither pollute the working clause nor appear as
+				// candidates. They sit at the front of s.trail (before trailHead[1])
+				// and survive cancelUntil(0).
+				// Do NOT update trailHead — it tracks decisions only.
 				propLevel := s.level
-				if propLevel == 0 {
-					propLevel = 1
-				}
-				// Do NOT update trailHead during unit propagation when s.level=0.
-				// trailHead should only track decisions, not propagated variables.
-				// If we append trailHead here, backtracking will incorrectly clear unit-propagated variables.
 				if s.verbose {
 					s.Log("c [UNIT PROP] var=%d, value=%v, level=%d (s.level=%d)\n", varIdx+1, litValue, propLevel, s.level)
 				}
@@ -3463,20 +3507,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// header must be written back to s.trail at every return so subsequent
 	// calls see the grown trail. Same aliasing rationale as assignments above.
 	// Also cache s.level (constant for the whole call — no decisions/conflicts
-	// occur inside this loop) and derive propLevel once. Level 0 propagations
-	// are encoded as Level=1 (propLevel hack): root-level learned units sit at
-	// the front of the trail (before trailHead[1]) and 1-UIP resolves their
-	// reasons, which empirically yields better learned clauses and lower PAR2
-	// than the "correct" Level 0 (which skips them). The side effect is rare
-	// 1-UIP non-convergence fallbacks (<0.01% of conflicts) because these
-	// literals are below trailHead[1] and the candidate scan misses them; the
-	// fallback is sound and picks the most-recent level-1 literal as UIP.
+	// occur inside this loop) and derive propLevel once. Root-level propagations
+	// (s.level==0) get Level 0: 1-UIP correctly skips them as always-true.
 	trail := s.trail
 	level := s.level
 	propLevel := level
-	if propLevel == 0 {
-		propLevel = 1
-	}
 
 	for trailIndex := s.qhead; trailIndex < len(trail); trailIndex++ {
 		lit := trail[trailIndex]
@@ -4475,12 +4510,21 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	}
 
-	// Build learned clause
+	// Build learned clause — exclude level-0 literals (always-true root facts).
+	// Level-0 literals are preprocessing assignments and root-level learned units.
+	// They are always true during search, so including them in learned clauses
+	// wastes storage and watch slots without adding constraint value. The old
+	// propLevel=1 hack resolved root-level propagated units away via 1-UIP
+	// (their reason was a unit clause, so resolution removed them and added
+	// nothing); Level 0 skips them, so we filter here to produce equally short
+	// clauses.
 	s.tmpLearnedLits = s.tmpLearnedLits[:0]
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			s.tmpLiteralInClause[varIdx] = false
-			s.tmpLearnedLits = append(s.tmpLearnedLits, cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx]))
+			if s.assignments[varIdx].Level > 0 {
+				s.tmpLearnedLits = append(s.tmpLearnedLits, cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx]))
+			}
 		}
 	}
 
@@ -5346,9 +5390,6 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 	verifyAssertingInvariant(s, learnedIdx, literals)
 
 	propLevel := s.level
-	if propLevel == 0 {
-		propLevel = 1
-	}
 	s.assignLiteralByClause(literals[0], propLevel, -learnedIdx-5)
 }
 
