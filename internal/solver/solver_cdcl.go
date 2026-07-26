@@ -133,6 +133,7 @@ type CDCLSolver struct {
 	assignments        []Assignment
 	trail              []uint32
 	trailHead          []int
+	trailPos           []int // trailPos[varIdx] = position in trail (-1 if not on trail); O(1) lookup for 1-UIP fallback
 	level              int
 	vsids              *VSIDS
 	numUnassigned      int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
@@ -142,20 +143,21 @@ type CDCLSolver struct {
 	litTrue            []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
-	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
-	probeTrail      []int    // Reusable trail for FLP non-watch BCP (literal indices)
-	conflicts       int
-	iterations      int
-	propagations    int // Total propagations (assignments by unit propagation)
-	maxIter         int
-	decisions       int
-	backjumpLevel   int
-	maxLearned      int
-	restartCount    int
-	lubyIndex       int
-	lbdSum          int
-	lbdCount        int
-	emaLBD          float64 // Exponential moving average of LBD (smooth restart signal)
+	preprocessTrail  []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	probeTrail       []int    // Reusable trail for FLP non-watch BCP (literal indices)
+	conflicts        int
+	iterations       int
+	propagations     int // Total propagations (assignments by unit propagation)
+	maxIter          int
+	decisions        int
+	uipFallbackCount int // Number of times 1-UIP resolution didn't converge (diagnostic)
+	backjumpLevel    int
+	maxLearned       int
+	restartCount     int
+	lubyIndex        int
+	lbdSum           int
+	lbdCount         int
+	emaLBD           float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
 	totalLbdSum   uint64
@@ -224,9 +226,9 @@ type CDCLSolver struct {
 	tmpVivifyResults []vivifyResult
 
 	// Reusable buffers for learned-clause subsumption (avoid per-round allocation)
-	tmpLearnedSubOcc     [][]int              // occurrence lists: occ[litIdx] = learned clause indices
-	tmpLearnedSubSeen    []bool               // literal mark for subsumption checking
-	tmpLearnedSubTouched []int                // marked literals (for fast clear of tmpLearnedSubSeen)
+	tmpLearnedSubOcc     [][]int             // occurrence lists: occ[litIdx] = learned clause indices
+	tmpLearnedSubSeen    []bool              // literal mark for subsumption checking
+	tmpLearnedSubTouched []int               // marked literals (for fast clear of tmpLearnedSubSeen)
 	tmpLearnedSubResults []subsumptionResult // subsumption/strengthening results
 
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
@@ -351,6 +353,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		trail:                make([]uint32, 0, formula.NumVars),
 		preprocessTrail:      make([]uint32, 0, formula.NumVars),
 		trailHead:            make([]int, 1),
+		trailPos:             make([]int, formula.NumVars),
 		qhead:                0,
 		lastLearnedClauseIdx: -1,
 		level:                0,
@@ -859,12 +862,13 @@ func (s *CDCLSolver) printFinalStats() {
 	if s.maxLearnedShrunk {
 		shrunk = " [DB shrunk]"
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | hist=[%d %d %d %d %d %d]\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d]\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		minRate,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
+		s.uipFallbackCount,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5])
 }
@@ -4224,6 +4228,7 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 	}
 
 	if currentCount > 1 {
+		s.uipFallbackCount++
 		// 1-UIP did not converge: there is more than one literal at the current
 		// decision level remaining after resolution. In a correct CDCL this never
 		// happens (each level has exactly one decision, so resolving non-decision
@@ -4246,21 +4251,29 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 				decisionsAtCurrentLevel, propagationsAtCurrentLevel, s.level)
 		}
 
-		// Find the most recent literal at current level (this will be the UIP)
+		// Find the most recent literal at current level (this will be the UIP).
+		// Build trailPos for the current-level trail slice (O(current-level trail))
+		// for O(1) position lookup, avoiding O(touched × total trail) scanning.
+		startIdx := s.trailHead[s.level]
+		for ti := startIdx; ti < len(s.trail); ti++ {
+			s.trailPos[s.trail[ti]] = ti
+		}
+
 		var uipVar uint32 = 0
 		var uipTrailPos int = -1
 		for _, varIdx := range s.tmpTouchedVars {
 			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
-				for ti := len(s.trail) - 1; ti >= 0; ti-- {
-					if s.trail[ti] == varIdx {
-						if uipTrailPos < 0 || ti > uipTrailPos {
-							uipTrailPos = ti
-							uipVar = varIdx
-						}
-						break
-					}
+				ti := s.trailPos[varIdx]
+				if ti >= startIdx && (uipTrailPos < 0 || ti > uipTrailPos) {
+					uipTrailPos = ti
+					uipVar = varIdx
 				}
 			}
+		}
+
+		// Clear trailPos for the current-level trail slice
+		for ti := startIdx; ti < len(s.trail); ti++ {
+			s.trailPos[s.trail[ti]] = 0
 		}
 
 		// Remove all other literals at current level (keep only the UIP)
