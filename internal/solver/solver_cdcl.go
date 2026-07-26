@@ -223,6 +223,12 @@ type CDCLSolver struct {
 	// Reusable buffer for vivification results (avoid per-round allocation)
 	tmpVivifyResults []vivifyResult
 
+	// Reusable buffers for learned-clause subsumption (avoid per-round allocation)
+	tmpLearnedSubOcc     [][]int              // occurrence lists: occ[litIdx] = learned clause indices
+	tmpLearnedSubSeen    []bool               // literal mark for subsumption checking
+	tmpLearnedSubTouched []int                // marked literals (for fast clear of tmpLearnedSubSeen)
+	tmpLearnedSubResults []subsumptionResult // subsumption/strengthening results
+
 	// Reusable buffers for clause deletion (avoid per-deletion allocation)
 	tmpDeleted            []bool // Bitmap for deleted clauses
 	tmpClauseUsedAsReason []bool // Track clauses used as implications
@@ -3433,8 +3439,21 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	learnedLiterals := s.learnedLiterals
 	learnedMetadata := s.learnedMetadata
 
-	for trailIndex := s.qhead; trailIndex < len(s.trail); trailIndex++ {
-		lit := s.trail[trailIndex]
+	// Cache the trail slice header. trail grows via append below; the cached
+	// header must be written back to s.trail at every return so subsequent
+	// calls see the grown trail. Same aliasing rationale as assignments above.
+	// Also cache s.level (constant for the whole call — no decisions/conflicts
+	// occur inside this loop) and derive propLevel once. Level 0 propagations
+	// are encoded as Level=1 (see the propLevel=1 hack), so propLevel is never 0.
+	trail := s.trail
+	level := s.level
+	propLevel := level
+	if propLevel == 0 {
+		propLevel = 1
+	}
+
+	for trailIndex := s.qhead; trailIndex < len(trail); trailIndex++ {
+		lit := trail[trailIndex]
 
 		// CRITICAL FIX: Skip unassigned variables (level < 0)
 		// Unassigned variables have Value=false by default, which incorrectly triggers watches
@@ -3487,10 +3506,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 				if blitAsg.Level < 0 {
 					// Unassigned — propagate the blocking literal
-					propLevel := s.level
-					if propLevel == 0 {
-						propLevel = 1
-					}
 					reasonIdx := clauseID
 					if isLearned {
 						reasonIdx = -clauseID - 5
@@ -3499,7 +3514,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel), Reason: int32(reasonIdx), SavedPhase: blitNegated}
 					litValue[blitVarIdx*2] = blitValue
 					litValue[blitVarIdx*2+1] = !blitValue
-					s.trail = append(s.trail, uint32(blitVarIdx))
+					trail = append(trail, uint32(blitVarIdx))
 					numUnassigned--
 					propagations++
 					continue
@@ -3507,7 +3522,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 				// Assigned — check for conflict (blit is false since fast path
 				// already filtered out the true case)
-				if s.level == 0 {
+				if level == 0 {
 					s.emptyClauseFound = true
 				}
 				// Build conflict clause (rare path — clause data load OK here)
@@ -3523,6 +3538,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				}
 				s.propagations = propagations
 				s.numUnassigned = numUnassigned
+				s.trail = trail
 				return true, &s.conflictClauseBuf
 			}
 
@@ -3682,10 +3698,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			if blitAsg.Level < 0 {
 				// Unassigned blit - propagate it (inlined assignLiteralByClause)
 				if blitAsg.Reason == -1 {
-					propLevel := s.level
-					if propLevel == 0 {
-						propLevel = 1
-					}
 					reasonIdx := clauseID
 					if isLearned {
 						reasonIdx = -clauseID - 5
@@ -3694,7 +3706,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel), Reason: int32(reasonIdx), SavedPhase: blitNegated}
 					litValue[blitVarIdx*2] = blitValue
 					litValue[blitVarIdx*2+1] = !blitValue
-					s.trail = append(s.trail, uint32(blitVarIdx))
+					trail = append(trail, uint32(blitVarIdx))
 					numUnassigned--
 				}
 				propagations++
@@ -3718,22 +3730,24 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					conflictClause = &s.conflictClauseBuf
 				}
 
-				if s.level == 0 {
+				if level == 0 {
 					s.emptyClauseFound = true
 				}
 				if s.verbose {
 					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
-						watchIdx, clauseID, s.level)
+						watchIdx, clauseID, level)
 				}
 				s.propagations = propagations
 				s.numUnassigned = numUnassigned
+				s.trail = trail
 				return true, conflictClause
 			}
 		}
 	}
 
 	// Update qhead to end of trail
-	s.qhead = len(s.trail)
+	s.qhead = len(trail)
+	s.trail = trail
 	s.propagations = propagations
 	s.numUnassigned = numUnassigned
 
@@ -4482,12 +4496,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		if s.verbose {
 			s.Log("c [learnClause] Learning unit: var=%d, value=%v\n", varIdx+1, litValue)
 		}
-		// Check if opposite unit already exists
-		for i := 0; i < s.learnedCapacity; i++ {
-			if s.learnedLoc[i].Size != 1 {
-				continue
-			}
-			existingLits := s.getLearnedClauseLiterals(i)
+		// Check if an opposite unit already exists among learned units.
+		// unitLearnedList is maintained at store/delete/compact/vivify/restart,
+		// so it's current here. This replaces the prior O(learnedCapacity)
+		// scan over all learned clauses.
+		for _, existingIdx := range s.unitLearnedList {
+			existingLits := s.getLearnedClauseLiterals(existingIdx)
 			if len(existingLits) != 1 {
 				continue
 			}

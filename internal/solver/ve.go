@@ -620,9 +620,19 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 	}
 	numLits := numVars * 2
 
-	// Build occurrence lists from binary learned clauses only.
-	// occ[litIdx] = list of learned clause indices of binary clauses containing litIdx.
-	occ := make([][]int, numLits)
+	// Reusable occurrence lists: grow the outer slice if needed, clear inner
+	// slices to [:0] (preserves backing arrays) so they can be re-appended
+	// without re-allocation.
+	if cap(s.tmpLearnedSubOcc) < numLits {
+		s.tmpLearnedSubOcc = make([][]int, numLits)
+	} else {
+		s.tmpLearnedSubOcc = s.tmpLearnedSubOcc[:numLits]
+		for i := range s.tmpLearnedSubOcc {
+			s.tmpLearnedSubOcc[i] = s.tmpLearnedSubOcc[i][:0]
+		}
+	}
+	occ := s.tmpLearnedSubOcc
+
 	binaryCount := 0
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size != 2 {
@@ -647,11 +657,14 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 	// safety in case the function is ever called at a non-level-0 state.
 	protected := s.markProtectedClauses()
 
-	seenLit := make([]bool, numLits)
-	var touched []int
+	if cap(s.tmpLearnedSubSeen) < numLits {
+		s.tmpLearnedSubSeen = make([]bool, numLits)
+	}
+	seenLit := s.tmpLearnedSubSeen[:numLits]
+	touched := s.tmpLearnedSubTouched[:0]
 
 	checkedCount := 0
-	var results []subsumptionResult
+	results := s.tmpLearnedSubResults[:0]
 
 	for i := 0; i < s.learnedCapacity; i++ {
 		size := int(s.learnedLoc[i].Size)
@@ -787,6 +800,8 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 	}
 
 	if len(results) == 0 {
+		s.tmpLearnedSubTouched = touched
+		s.tmpLearnedSubResults = results
 		return false
 	}
 
@@ -826,6 +841,9 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 	}
 
 	s.compactPending = true
+
+	s.tmpLearnedSubTouched = touched
+	s.tmpLearnedSubResults = results
 
 	s.Log("c [subsumption] Subsumed %d, strengthened %d/%d clauses\n",
 		s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened, checkedCount)
