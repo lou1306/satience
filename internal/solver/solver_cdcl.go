@@ -344,16 +344,6 @@ type CDCLSolver struct {
 	glueAtLastAdapt   uint64
 	lbdSumAtLastAdapt uint64
 	countAtLastAdapt  uint64
-
-	// "Commit harder" toggle for very structured instances (score >= 0.90).
-	// Every commitHarderPeriod restarts, switches decay to 0.97 for one
-	// restart cycle, then unconditionally reverts to 0.95 at the next
-	// restart. Periodic exposure to 0.97 (longer VSIDS memory) lets
-	// converging instances (8d58ca18, 822378be) exploit tight implication
-	// chains, while the automatic revert limits damage on instances where
-	// 0.97 hurts (de2b584e, 8202af80). See maybeCommitHarder.
-	commitHarderActive        bool // true: decay=0.97 this restart cycle
-	restartsSinceCommitHarder int  // restarts since last 0.97 window
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -1551,51 +1541,6 @@ func (s *CDCLSolver) maybeAdaptDecay() {
 			s.conflicts, glueRatio, avgLBD)
 	}
 }
-
-// maybeCommitHarder toggles decay to 0.97 (longer VSIDS memory) for one
-// restart cycle every commitHarderPeriod restarts, then unconditionally
-// reverts to 0.95 at the next restart boundary.
-//
-// Motivation: decay=0.97 helps some very structured instances (8d58ca18:
-// 8.5s→1.5s, 822378be: 2.7s→1.1s) by letting VSIDS retain activity longer,
-// exploiting tight implication chains. But the same decay catastrophically
-// hurts others (de2b584e: 2.2s→5.3s, 8202af80: 2.3s→9.6s). The static
-// classifier cannot distinguish them (both score=1.00, 99.8% binary).
-//
-// Instead of a one-shot probe with a measurement window (which failed:
-// avgLBD was identical at both decay levels on de2b584e, so the probe
-// kept 0.97 and regressed), this approach periodically exposes the search
-// to 0.97 for a single restart cycle. Instances that benefit from 0.97
-// make progress during those windows; instances that are hurt by it only
-// suffer for one restart cycle before automatic reversion.
-//
-// Safety:
-//   - Respect explicit CLI decay flags (skip entirely)
-//   - Skip if maybeAdaptDecay already overrode decay (decayAdapted)
-//   - Inline gate (score >= 0.90) ensures no function call for
-//     non-structured instances (69d72f81 at score=0.74)
-func (s *CDCLSolver) maybeCommitHarder() {
-	if s.flagSet("initial-decay") || s.flagSet("max-decay") || s.flagSet("decay-rampup") {
-		return
-	}
-	if s.commitHarderActive {
-		s.vsids.SetDecayParams(0.95, 0.95, 1)
-		s.commitHarderActive = false
-		s.restartsSinceCommitHarder = 0
-		s.Log("c [commit-harder] off at restart %d (conflict %d) → decay→0.95\n",
-			s.lubyIndex, s.conflicts)
-	} else {
-		s.restartsSinceCommitHarder++
-		if s.restartsSinceCommitHarder >= commitHarderPeriod {
-			s.vsids.SetDecayParams(0.97, 0.97, 1)
-			s.commitHarderActive = true
-			s.Log("c [commit-harder] on at restart %d (conflict %d) → decay→0.97\n",
-				s.lubyIndex, s.conflicts)
-		}
-	}
-}
-
-const commitHarderPeriod = 30 // restarts between 0.97 windows (1/30 ≈ 3% duty cycle)
 
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
@@ -3046,14 +2991,6 @@ func (s *CDCLSolver) restart() bool {
 	const adaptRestartPeriod = 10
 	if !s.decayAdapted && s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
 		s.maybeAdaptDecay()
-	}
-
-	// "Commit harder" toggle for very structured instances. Inline gate
-	// (score >= 0.90) ensures no function call for non-structured instances
-	// (69d72f81 at score=0.74). Skips if decay was already adapted or if
-	// explicit CLI decay flags are set — checked inside the function.
-	if !s.decayAdapted && s.structureScore >= 0.90 {
-		s.maybeCommitHarder()
 	}
 
 	return false // No UNSAT detected
