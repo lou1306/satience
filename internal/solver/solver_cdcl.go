@@ -281,6 +281,7 @@ type CDCLSolver struct {
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
+	subsumptionPeriodSet        bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
 	skipSubsumption            bool
@@ -328,6 +329,31 @@ type CDCLSolver struct {
 	// Placed at struct end to avoid shifting hot/warm cache lines (op_15 regression).
 	binaryRatio    float64 // Cached BinaryRatio from classifier
 	useBumpAnalyze bool    // True: bump all touched vars (minisat analyze_toclear); false: bump conflict clause only
+
+	// Runtime decay adaptation (periodic re-check with rolling windows).
+	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
+	// search start; decayAdapted gates the one-way override (once fired, stays).
+	// adaptNextConflict is the next conflict count at which to re-evaluate.
+	// *AtLastAdapt snapshots cumulative counters at the previous check for
+	// rolling-window delta computation. See maybeAdaptDecay for the rationale.
+	// Placed at struct end with other cold fields to avoid shifting hot/warm
+	// cache lines (69d72f81 regressed from 9s to TMO when these were mid-struct).
+	glueLearned       uint64
+	decayAdapted      bool
+	adaptNextConflict int
+	glueAtLastAdapt   uint64
+	lbdSumAtLastAdapt uint64
+	countAtLastAdapt  uint64
+
+	// "Commit harder" toggle for very structured instances (score >= 0.90).
+	// Every commitHarderPeriod restarts, switches decay to 0.97 for one
+	// restart cycle, then unconditionally reverts to 0.95 at the next
+	// restart. Periodic exposure to 0.97 (longer VSIDS memory) lets
+	// converging instances (8d58ca18, 822378be) exploit tight implication
+	// chains, while the automatic revert limits damage on instances where
+	// 0.97 hurts (de2b584e, 8202af80). See maybeCommitHarder.
+	commitHarderActive        bool // true: decay=0.97 this restart cycle
+	restartsSinceCommitHarder int  // restarts since last 0.97 window
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -449,6 +475,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// is effectively free on random instances, so it is always enabled.
 		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
+		// Runtime decay adaptation: first check after 500-conflict warmup.
+		adaptNextConflict: 500,
 		randomPhaseRate:           0,
 		restartPhaseFlipRate:      0,
 		// Configurable parameters with defaults
@@ -703,6 +731,7 @@ func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
 // Nth restart). 0 disables subsumption entirely.
 func (s *CDCLSolver) SetSubsumptionPeriod(p int) {
 	s.subsumptionPeriod = p
+	s.subsumptionPeriodSet = true
 }
 
 // SetSubsumptionMinConflictGap sets the minimum number of conflicts that must
@@ -984,9 +1013,13 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.maxLearnedShrunk {
 		shrunk = " [DB shrunk]"
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
+	glueRatio := 0.0
+	if s.totalLbdCount > 0 {
+		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
+	}
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
 		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
-		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
+		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, glueRatio, shrunk,
 		minRate,
 		s.bigMinimizeHits, s.bigMinimizeCalls)
 }
@@ -1036,6 +1069,12 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	posCount := make([]int, s.cnf.NumVars)
 	negCount := make([]int, s.cnf.NumVars)
 
+	// Track whether long clauses have varied sizes. Random k-SAT (k≥4) has
+	// all long clauses the same size; structured instances have varied sizes.
+	// Used to penalize longScore for random k-SAT misclassified as structured.
+	firstLongSize := 0
+	longSizeVaried := false
+
 	for i := 0; i < s.cnf.NumClauses; i++ {
 		offset, size := s.cnf.GetOriginalClauseInfo(i)
 		if size == 2 {
@@ -1046,6 +1085,11 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 			smallCount++
 		} else if size > 3 {
 			longCount++
+			if firstLongSize == 0 {
+				firstLongSize = size
+			} else if size != firstLongSize {
+				longSizeVaried = true
+			}
 		}
 		lits := s.cnf.GetLiteralPool()[offset : offset+size]
 		for _, lit := range lits {
@@ -1097,6 +1141,16 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 
 	binaryScore := structure.BinaryRatio
 	longScore := structure.LongClauseRatio
+	// Penalize uniform-size long clauses: random k-SAT (k≥4) has all long
+	// clauses the same size, which is not "structured". Without this, rand4sat
+	// (density 9.8, 100% long, all size 4) scores 0.80 and gets the structured
+	// path (restartBase=200, no aggressive decay) — but it needs the random
+	// path. Penalizing to 0.3 drops the score to ~0.38, below the 0.70
+	// threshold. Structured instances (e.g. 274099073, density 15.6, 99.4%
+	// long with VARIED sizes) keep full longScore.
+	if longCount > 0 && !longSizeVaried {
+		longScore *= 0.3
+	}
 	// Ternary-heavy structured instances (e.g., graph coloring) score low on
 	// binary/long signals but are still structured — they need unit propagation
 	// and Glucose restarts, not the aggressive random-config decay/restart.
@@ -1191,6 +1245,16 @@ func (s *CDCLSolver) classifyInstance() {
 	// highest-density suite instance (32baec6a, density 49).
 	s.skipSubsumption = structure.Density > 60.0
 
+	// Fix 1: Size-adaptive subsumption period. Small instances (numVars < 500)
+	// benefit from period=50 (subsumption fires at restart 50 vs 100); op_18
+	// regresses +1.6s and rand3sat_200 +1.4s with period=100. Large instances
+	// keep period=100 to avoid subsumption overhead on instances that don't
+	// reach 50 restarts before solving. Skipped if the caller explicitly set
+	// the period via SetSubsumptionPeriod (CLI or tests).
+	if !s.subsumptionPeriodSet && s.cnf.NumVars < 500 {
+		s.subsumptionPeriod = 50
+	}
+
 	// Activity-based clause deletion gate. Activity-based deletion (VSIDS-style
 	// decayed activity for within-LBD-tier deletion ordering) helps structured
 	// instances with enough clause diversity but hurts instances whose search
@@ -1241,7 +1305,20 @@ func (s *CDCLSolver) classifyInstance() {
 	// Unit propagation on random/mixed instances causes 76x more conflicts, so
 	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
-		if structure.BinaryRatio == 0 && structure.Density > 4.5 {
+		// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.5).
+		// Uses default decay 0.95, restartBase=5, Glucose active. Matches the
+		// minisat config that solves 566f366c (300v random 3-SAT) in ~0.04s;
+		// the aggressive-decay branch took ~12s (346x). Aggressive decay gives
+		// only ~3-5 conflict memory vs minisat's ~50-100, causing 118x more
+		// conflicts on phase-transition random 3-SAT. The density > 4.5 gate
+		// excludes 30eb4ef4 (density 4.20, phase-transition pure ternary) which
+		// regresses to TIMEOUT under default decay (see D1).
+		//
+		// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
+		// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
+		// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
+		// These fall through to the D4 interpolation with t=0 (fully aggressive).
+		if structure.BinaryRatio == 0 && structure.TernaryRatio > 0 && structure.Density > 4.5 {
 			s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=5\n",
 				structure.StructuredScore, structure.Density)
 			if !s.flagSet("restart-base") {
@@ -1250,6 +1327,30 @@ func (s *CDCLSolver) classifyInstance() {
 			s.useBumpAnalyze = true
 			// Glucose restart policy stays at CLI defaults (ratio=10.0, min=10):
 			// active as a safety net. decay stays at 0.95 (default).
+			return
+		}
+		// Random k-SAT k≥4 (binaryRatio==0, ternaryRatio==0, all long clauses
+		// with uniform size). Fix 3 penalizes these to score < 0.7. Needs
+		// aggressive initial decay (0.50) for quick exploration but high max
+		// decay (0.999) so activities persist — long clauses mean more
+		// variables per conflict, and forgetting important ones hurts. The D4
+		// path's max 0.80 is too aggressive: rand4sat_75 0.5s with 0.999 vs
+		// 6.8s with 0.80.
+		if structure.BinaryRatio == 0 && structure.TernaryRatio == 0 {
+			if !s.flagSet("initial-decay") && !s.flagSet("max-decay") && !s.flagSet("decay-rampup") {
+				s.vsids.SetDecayParams(0.50, 0.999, 5000)
+			}
+			if !s.flagSet("restart-base") {
+				s.restartBase = 5
+			}
+			if !s.flagSet("restart-glucose-ratio") {
+				s.restartGlucoseRatio = 100.0
+			}
+			if !s.flagSet("restart-glucose-min") {
+				s.restartGlucoseMinConflicts = 1000000
+			}
+			s.Log("c [classification] Random k-SAT k≥4 (score=%.2f, density=%.2f) - decay 0.50→0.999, restartBase=5\n",
+				structure.StructuredScore, structure.Density)
 			return
 		}
 		// D4: Smooth threshold interpolation in [0.60, 0.70].
@@ -1332,6 +1433,169 @@ func (s *CDCLSolver) classifyInstance() {
 		s.Log("c [classification] Binary-heavy (%.0f%%) - restartBase=20\n", structure.BinaryRatio*100)
 	}
 }
+
+// maybeAdaptDecay is the runtime correction layer for the static classifier.
+//
+// Motivation: classifyInstance predicts search behavior from SYNTACTIC features
+// (clause-size histogram, density). The prediction is fragile — a single
+// off-size clause among 1000 uniform-k clauses flips longSizeVaried=true and
+// misclassifies random k-SAT as structured (wrong decay, restartBase=200,
+// Glucose active → slow or TMO). Random 4-SAT needed Fix 3; random 5-SAT and
+// noisier variants are one accident away from the same failure.
+//
+// This layer measures BEHAVIORAL structure (glue ratio = fraction of learned
+// clauses with LBD ≤ 2) over rolling windows and corrects the decay schedule
+// when behavior disagrees with the syntactic prediction. Glue ratio is the
+// canonical structured-vs-random discriminator: structured instances (Tseitin,
+// hardware, combinatorial) produce many glues via tight implication chains;
+// random k-SAT produces almost none.
+//
+// Periodic re-check with rolling windows: instead of a single one-shot at
+// conflict 500, we re-evaluate every adaptWindowSize conflicts. Each window
+// sees only RECENT behavior (delta of cumulative counters), not diluted
+// cumulative stats. This catches instances whose behavior shifts mid-search
+// (starts structured, becomes random) and instances where the first window
+// was borderline. The one-shot version could miss both.
+//
+// Safety scoping (one-way forward guard):
+//   - Exempt when structureScore < 0.7: random branches (pure 3-SAT, random
+//     k≥4, D4-mixed) already have appropriate aggressive decay set by the
+//     classifier. Pure 3-SAT (566f366c) correctly uses default 0.95 and has a
+//     low glue ratio — overriding it to aggressive decay would regress 118×
+//     (per existing tuning notes). The score < 0.7 gate exempts it.
+//   - Exempt when the user set any decay flag: respect explicit CLI.
+//   - One-way: once decayAdapted is set, the override is permanent. Reverting
+//     aggressive→default would distort VSIDS — under aggressive decay, varInc
+//     grows huge (÷0.5 each conflict); switching back to 0.95 would leave a
+//     massive varInc that freezes scores until rescaling. The aggressive
+//     ramp's max (0.999) self-heals for the reverse case.
+func (s *CDCLSolver) maybeAdaptDecay() {
+	if s.decayAdapted {
+		return
+	}
+
+	// Respect explicit CLI decay flags (initial-decay, max-decay, decay-rampup).
+	if s.flagSet("initial-decay") || s.flagSet("max-decay") || s.flagSet("decay-rampup") {
+		return
+	}
+
+	// Only correct the STRUCTURED branch. Random branches (score < 0.7) were
+	// tuned with aggressive decay that low glue ratio would (wrongly) confirm.
+	if s.structureScore < 0.7 {
+		return
+	}
+
+	// Exempt binary-heavy instances. Binary cascades produce high-LBD learned
+	// clauses (spanning many decision levels), so few are glue (LBD≤2) — the
+	// low glue ratio means "binary cascade," not "random." bb34f22f (67% binary,
+	// glue ratio 0.04) and de2b584e (99.8% binary, glue ratio 0.00) are genuine
+	// structured instances that need default decay. The target (noisy random
+	// k-SAT) always has binaryRatio ≈ 0 (pure k-SAT has no binary clauses), so
+	// exempting binaryRatio > 0.5 doesn't weaken the guard's coverage.
+	if s.binaryRatio > 0.5 {
+		return
+	}
+
+	// Not time to re-check yet. adaptNextConflict starts at the warmup (500)
+	// and advances by adaptWindowSize after each evaluation.
+	if s.conflicts < s.adaptNextConflict {
+		return
+	}
+
+	// Rolling window: compute stats from the delta of cumulative counters since
+	// the last check. This isolates recent behavior rather than diluting it
+	// with cumulative stats from earlier (possibly different) search phases.
+	const adaptWindowSize = 500
+	winCount := s.totalLbdCount - s.countAtLastAdapt
+	if winCount == 0 {
+		s.adaptNextConflict += adaptWindowSize
+		return
+	}
+	winGlue := s.glueLearned - s.glueAtLastAdapt
+	winLbdSum := s.totalLbdSum - s.lbdSumAtLastAdapt
+	glueRatio := float64(winGlue) / float64(winCount)
+	avgLBD := float64(winLbdSum) / float64(winCount)
+
+	// Snapshot cumulative counters for the next window's delta computation.
+	s.glueAtLastAdapt = s.glueLearned
+	s.lbdSumAtLastAdapt = s.totalLbdSum
+	s.countAtLastAdapt = s.totalLbdCount
+	s.adaptNextConflict = s.conflicts + adaptWindowSize
+
+	// Two-signal test: BOTH must indicate random behavior.
+	//   - glueRatio < 0.10: few glue clauses (LBD ≤ 2). Necessary but not
+	//     sufficient — long-clause structured instances also have low glue
+	//     ratios because long clauses naturally produce high-LBD learned clauses.
+	//   - avgLBD > 25: conflicts span ~25+ decision levels with no tight
+	//     implication chains. This separates random k-SAT (avgLBD 30-40, no
+	//     structure) from long-clause structured instances (avgLBD ~15, structure
+	//     exists but is obscured by clause length). Measured: noisy random 5-SAT
+	//     avgLBD=34.4 → fires; 274099073 avgLBD=15.9 → correctly exempt.
+	//
+	// The conjunction prevents false positives on structured instances that
+	// happen to have low glue ratios (binary cascades, long clauses) while
+	// still catching genuinely random search behavior.
+	const glueRatioThreshold = 0.10
+	const avgLBDThreshold = 25.0
+	if glueRatio < glueRatioThreshold && avgLBD > avgLBDThreshold {
+		s.vsids.SetDecayParams(0.50, 0.999, 5000)
+		s.decayAdapted = true
+		s.Log("c [adapt] decay override at conflict %d: window glueRatio=%.3f avgLBD=%.1f → decay 0.50→0.999\n",
+			s.conflicts, glueRatio, avgLBD)
+		return
+	}
+	// Verbose-only: confirm each window so structured instances don't spam the
+	// log. The override log above always fires (it's rare and actionable).
+	if s.verbose {
+		s.Log("c [adapt] window at conflict %d: glueRatio=%.3f avgLBD=%.1f — keeping default decay\n",
+			s.conflicts, glueRatio, avgLBD)
+	}
+}
+
+// maybeCommitHarder toggles decay to 0.97 (longer VSIDS memory) for one
+// restart cycle every commitHarderPeriod restarts, then unconditionally
+// reverts to 0.95 at the next restart boundary.
+//
+// Motivation: decay=0.97 helps some very structured instances (8d58ca18:
+// 8.5s→1.5s, 822378be: 2.7s→1.1s) by letting VSIDS retain activity longer,
+// exploiting tight implication chains. But the same decay catastrophically
+// hurts others (de2b584e: 2.2s→5.3s, 8202af80: 2.3s→9.6s). The static
+// classifier cannot distinguish them (both score=1.00, 99.8% binary).
+//
+// Instead of a one-shot probe with a measurement window (which failed:
+// avgLBD was identical at both decay levels on de2b584e, so the probe
+// kept 0.97 and regressed), this approach periodically exposes the search
+// to 0.97 for a single restart cycle. Instances that benefit from 0.97
+// make progress during those windows; instances that are hurt by it only
+// suffer for one restart cycle before automatic reversion.
+//
+// Safety:
+//   - Respect explicit CLI decay flags (skip entirely)
+//   - Skip if maybeAdaptDecay already overrode decay (decayAdapted)
+//   - Inline gate (score >= 0.90) ensures no function call for
+//     non-structured instances (69d72f81 at score=0.74)
+func (s *CDCLSolver) maybeCommitHarder() {
+	if s.flagSet("initial-decay") || s.flagSet("max-decay") || s.flagSet("decay-rampup") {
+		return
+	}
+	if s.commitHarderActive {
+		s.vsids.SetDecayParams(0.95, 0.95, 1)
+		s.commitHarderActive = false
+		s.restartsSinceCommitHarder = 0
+		s.Log("c [commit-harder] off at restart %d (conflict %d) → decay→0.95\n",
+			s.lubyIndex, s.conflicts)
+	} else {
+		s.restartsSinceCommitHarder++
+		if s.restartsSinceCommitHarder >= commitHarderPeriod {
+			s.vsids.SetDecayParams(0.97, 0.97, 1)
+			s.commitHarderActive = true
+			s.Log("c [commit-harder] on at restart %d (conflict %d) → decay→0.97\n",
+				s.lubyIndex, s.conflicts)
+		}
+	}
+}
+
+const commitHarderPeriod = 30 // restarts between 0.97 windows (1/30 ≈ 3% duty cycle)
 
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
@@ -2764,6 +3028,32 @@ func (s *CDCLSolver) restart() bool {
 			return true // UNSAT detected
 		}
 		s.conflictsAtLastSubsumption = s.conflicts
+	}
+
+	// Runtime decay adaptation: periodic re-check with rolling windows.
+	// Called at restart boundaries (cold path) — calling from the hot CDCL loop
+	// caused 69d72f81 to regress 9s→TMO due to compiler generating worse loop
+	// code around the non-inlinable call target, even when gated to 1/500
+	// conflicts. Restart boundaries are already cold (vivify/subsumption run
+	// here), so the call is free.
+	//
+	// Gate on lubyIndex%adaptPeriod == 0 (like vivify/subsumption) to avoid
+	// calling the function at every restart — even the call overhead at every
+	// restart caused 1.7s regression on 69d72f81 (8.8s→10.5s). adaptPeriod=10
+	// means the function is called every 10th restart; internally it early-
+	// returns if s.conflicts < s.adaptNextConflict, so most calls are a single
+	// comparison + return.
+	const adaptRestartPeriod = 10
+	if !s.decayAdapted && s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
+		s.maybeAdaptDecay()
+	}
+
+	// "Commit harder" toggle for very structured instances. Inline gate
+	// (score >= 0.90) ensures no function call for non-structured instances
+	// (69d72f81 at score=0.74). Skips if decay was already adapted or if
+	// explicit CLI decay flags are set — checked inside the function.
+	if !s.decayAdapted && s.structureScore >= 0.90 {
+		s.maybeCommitHarder()
 	}
 
 	return false // No UNSAT detected
@@ -4618,6 +4908,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.emaLBD = 0.9*s.emaLBD + 0.1*float64(lbd)
 	s.totalLbdSum += uint64(lbd)
 	s.totalLbdCount++
+	// Glue clause (LBD ≤ 2) counter for runtime decay adaptation. See
+	// maybeAdaptDecay: structured instances produce many glues (tight
+	// implication chains → low LBD); random instances produce almost none.
+	// The ratio is the canonical structured-vs-random behavioral signal.
+	if lbd <= 2 {
+		s.glueLearned++
+	}
 
 	// Backjump level = second-highest in learned clause (= maxLevel)
 	// SPECIAL CASE: If learned clause is unit (1 literal) at current level, backjump to level 0
