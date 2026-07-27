@@ -249,14 +249,23 @@ type CDCLSolver struct {
 	// deletion ordering). When claActivityEnabled=false, all Activity fields
 	// stay 0 and the sort's index tiebreak reduces to pure FIFO (no behavior
 	// change vs pre-activity code).
-	claInc                     float64 // Activity increment (grows via O(1) decay), starts 1.0
-	claDecayFactor             float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
-	claActivityEnabled         bool    // false = pure FIFO within LBD tiers
-	maxLearnedShrunk           bool    // True if maxLearned has been shrunk (one-way, no grow-back)
-	skipClassify               bool    // Skip classifyInstance (keep CLI defaults for tuning)
-	explicitFlags              map[string]bool
-	decayFloor                 float64 // Random-like mixed t=0 initial decay (default 0.50)
-	decayCeil                  float64 // Random-like mixed t=0 max decay (default 0.80)
+	claInc             float64 // Activity increment (grows via O(1) decay), starts 1.0
+	claDecayFactor     float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
+	claActivityEnabled bool    // false = pure FIFO within LBD tiers
+	maxLearnedShrunk   bool    // True if maxLearned has been shrunk (one-way, no grow-back)
+	skipClassify       bool    // Skip classifyInstance (keep CLI defaults for tuning)
+	explicitFlags      map[string]bool
+	decayFloor         float64 // Random-like mixed t=0 initial decay (default 0.50)
+	decayCeil          float64 // Random-like mixed t=0 max decay (default 0.80)
+	// Clause DB deletion thresholds (Tier 1 tunables). These control which
+	// learned clauses are deleted and when. Sweeping them matters because the
+	// level-0 literal filter changed clause DB composition.
+	lbdTier1Threshold          int     // Pass 1 deletion: delete LBD > threshold (default 5)
+	lbdTier2Threshold          int     // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
+	dbGrowthDivisor            int     // dynamicLimit = maxLearned + conflicts/divisor (default 50)
+	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
+	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
+	dbShrinkFloorMultiplier    int     // Shrink floor = numVars × multiplier (default 3)
 	restartBase                int     // Luby restart base (default 200; classifier may override)
 	lubyThresholdCap           int     // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	restartPropsDecLimit       int     // Props/dec threshold for restart (0=disabled, default 100)
@@ -271,7 +280,7 @@ type CDCLSolver struct {
 	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
-	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 50)
+	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
 	skipSubsumption            bool
@@ -438,7 +447,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Learned-clause subsumption: same gating cadence as vivification.
 		// Self-gating via early-return on no binary learned clauses means it
 		// is effectively free on random instances, so it is always enabled.
-		subsumptionPeriod:         50,
+		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
 		randomPhaseRate:           0,
 		restartPhaseFlipRate:      0,
@@ -457,6 +466,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		litTrue:                    make([]bool, int(formula.NumVars)*2),
 		decayFloor:                 0.50,
 		decayCeil:                  0.80,
+		lbdTier1Threshold:          5,
+		lbdTier2Threshold:          2,
+		dbGrowthDivisor:            50,
+		deletionTriggerRatio:       1.5,
+		dbShrinkThreshold:          10,
+		dbShrinkFloorMultiplier:    3,
 	}
 
 	// Initialize all assignments as unassigned (Level=-1, Reason=-1) with default
@@ -649,6 +664,17 @@ func (s *CDCLSolver) flagSet(name string) bool {
 func (s *CDCLSolver) SetDecayFloorCeil(floor, ceil float64) {
 	s.decayFloor = floor
 	s.decayCeil = ceil
+}
+
+// SetClauseDBParams sets the clause DB deletion thresholds. All default to
+// the pre-tuning hardcoded values.
+func (s *CDCLSolver) SetClauseDBParams(lbdTier1, lbdTier2, dbGrowthDiv int, delTriggerRatio float64, dbShrinkThresh, dbShrinkFloorMult int) {
+	s.lbdTier1Threshold = lbdTier1
+	s.lbdTier2Threshold = lbdTier2
+	s.dbGrowthDivisor = dbGrowthDiv
+	s.deletionTriggerRatio = delTriggerRatio
+	s.dbShrinkThreshold = dbShrinkThresh
+	s.dbShrinkFloorMultiplier = dbShrinkFloorMult
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -4009,23 +4035,23 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// clauses. One-way shrink (don't grow back) to avoid oscillation.
 	if !s.maxLearnedShrunk && s.totalLbdCount > 1000 {
 		avgLbd := s.totalLbdSum / s.totalLbdCount
-		if avgLbd > 10 {
-			newFloor := int(s.cnf.NumVars) * 3
+		if int(avgLbd) > s.dbShrinkThreshold {
+			newFloor := int(s.cnf.NumVars) * s.dbShrinkFloorMultiplier
 			if newFloor < 300 {
 				newFloor = 300
 			}
 			if s.maxLearned > newFloor {
 				s.maxLearned = newFloor
-				s.Log("c [clause-db] Shrunk maxLearned to %d (avg LBD=%d > 10)\n", s.maxLearned, avgLbd)
+				s.Log("c [clause-db] Shrunk maxLearned to %d (avg LBD=%d > %d)\n", s.maxLearned, avgLbd, s.dbShrinkThreshold)
 			}
 			s.maxLearnedShrunk = true
 		}
 	}
 
 	// Delete learned clauses when database exceeds dynamic limit
-	// Formula: base + conflicts/50, trigger at 150% of limit
-	dynamicLimit := s.maxLearned + s.conflicts/50
-	if s.learnedActiveCount > dynamicLimit+dynamicLimit/2 {
+	// Formula: base + conflicts/growthDivisor, trigger at deletionTriggerRatio × limit
+	dynamicLimit := s.maxLearned + s.conflicts/s.dbGrowthDivisor
+	if float64(s.learnedActiveCount) > float64(dynamicLimit)*s.deletionTriggerRatio {
 		s.deleteLearnedClauses()
 	}
 
@@ -5075,15 +5101,15 @@ func (s *CDCLSolver) sortDeletionCandidates(candidates []int) {
 //     is FIFO (oldest learned first). This is deterministic and simple; a
 //     decayed-activity sort was tested (B9) and regressed +33% PAR-2.
 //
-// Deletion trigger: when learnedActiveCount > 150% of dynamicLimit
-// (dynamicLimit = maxLearned + conflicts/50). Target after deletion: dynamicLimit.
+// Deletion trigger: when learnedActiveCount > deletionTriggerRatio × dynamicLimit
+// (dynamicLimit = maxLearned + conflicts/dbGrowthDivisor). Target after deletion: dynamicLimit.
 func (s *CDCLSolver) deleteLearnedClauses() {
 	// LAZY LBD-BASED DELETION (Glucose-style)
 	// Key insight: LBD is the best predictor of clause usefulness
 	// - Keep all "glue" clauses (LBD ≤ 2) permanently
 	// - Delete clauses with high LBD when database grows too large
 
-	dynamicLimit := s.maxLearned + s.conflicts/50
+	dynamicLimit := s.maxLearned + s.conflicts/s.dbGrowthDivisor
 	targetCount := dynamicLimit
 
 	currentActive := s.learnedActiveCount
@@ -5116,12 +5142,12 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// order = FIFO (identical to pre-activity behavior).
 	candidates := s.tmpDeletionCandidates[:0]
 
-	// Pass 1: collect LBD > 5 candidates (lowest quality), delete lowest-activity first
+	// Pass 1: collect LBD > tier1Threshold candidates (lowest quality), delete lowest-activity first
 	for i := 0; i < s.learnedCapacity; i++ {
 		if s.learnedLoc[i].Size == 0 || protected[i] {
 			continue
 		}
-		if s.learnedMetadata[i].LBD > 5 {
+		if int(s.learnedMetadata[i].LBD) > s.lbdTier1Threshold {
 			candidates = append(candidates, i)
 		}
 	}
@@ -5136,14 +5162,14 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 		deletedCount++
 	}
 
-	// Pass 2: lower threshold to LBD > 2 (glue clauses are LBD ≤ 2, never deleted)
+	// Pass 2: lower threshold to LBD > tier2Threshold (glue clauses are LBD ≤ tier2Threshold, never deleted)
 	if deletedCount < toDelete {
 		candidates = candidates[:0]
 		for i := 0; i < s.learnedCapacity; i++ {
 			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
 				continue
 			}
-			if s.learnedMetadata[i].LBD > 2 {
+			if int(s.learnedMetadata[i].LBD) > s.lbdTier2Threshold {
 				candidates = append(candidates, i)
 			}
 		}

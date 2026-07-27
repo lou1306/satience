@@ -31,6 +31,7 @@ func run() int {
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
+	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	// Restart policy parameters
@@ -56,6 +57,12 @@ func run() int {
 	noClassify := flag.Bool("no-classify", false, "Skip instance classification (keep CLI defaults for all search parameters)")
 	decayFloor := flag.Float64("decay-floor", 0.50, "Random-like mixed t=0 initial decay floor (default 0.50)")
 	decayCeil := flag.Float64("decay-ceil", 0.80, "Random-like mixed t=0 max decay ceiling (default 0.80)")
+	lbdTier1 := flag.Int("lbd-tier1", 5, "Pass 1 deletion: delete LBD > threshold (default 5)")
+	lbdTier2 := flag.Int("lbd-tier2", 2, "Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)")
+	dbGrowthDiv := flag.Int("db-growth-div", 50, "dynamicLimit = maxLearned + conflicts/div (default 50)")
+	delTriggerRatio := flag.Float64("del-trigger-ratio", 1.5, "Trigger deletion when active > ratio × dynamicLimit (default 1.5)")
+	dbShrinkThresh := flag.Int("db-shrink-thresh", 10, "Shrink maxLearned when avgLBD > threshold (default 10)")
+	dbShrinkFloorMult := flag.Int("db-shrink-mult", 3, "Shrink floor = numVars × multiplier (default 3)")
 	flag.Parse()
 
 	// Collect explicitly-set flags so classifyInstance knows which CLI values
@@ -140,6 +147,7 @@ func run() int {
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
+	s.SetSubsumptionPeriod(*subsumptionPeriod)
 	s.SetRandomPhaseRate(*randomPhaseRate)
 	s.SetRestartPhaseFlipRate(*restartPhaseFlip)
 	s.SetStatsInterval(*statsInterval)
@@ -154,6 +162,7 @@ func run() int {
 	}
 	s.SetExplicitFlags(explicitFlags)
 	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
+	s.SetClauseDBParams(*lbdTier1, *lbdTier2, *dbGrowthDiv, *delTriggerRatio, *dbShrinkThresh, *dbShrinkFloorMult)
 
 	start := time.Now()
 	var result solver.SolveResult
