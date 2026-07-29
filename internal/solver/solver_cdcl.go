@@ -4272,7 +4272,9 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// B2: Adaptively shrink clause DB when average LBD is consistently high.
 	// High-LBD clauses rarely propagate; a smaller DB keeps only the lowest-LBD
 	// clauses. One-way shrink (don't grow back) to avoid oscillation.
-	if !s.maxLearnedShrunk && s.totalLbdCount > 1000 {
+	// Gated on structured instances only: random k-SAT naturally has high LBD
+	// (unstructured conflicts), so shrinking there cripples the DB.
+	if !s.maxLearnedShrunk && s.structureScore >= 0.7 && s.totalLbdCount > 1000 {
 		avgLbd := s.totalLbdSum / s.totalLbdCount
 		if int(avgLbd) > s.dbShrinkThreshold {
 			newFloor := int(s.cnf.NumVars) * s.dbShrinkFloorMultiplier
