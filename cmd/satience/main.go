@@ -63,6 +63,7 @@ func run() int {
 	delTriggerRatio := flag.Float64("del-trigger-ratio", 1.5, "Trigger deletion when active > ratio × dynamicLimit (default 1.5)")
 	dbShrinkThresh := flag.Int("db-shrink-thresh", 10, "Shrink maxLearned when avgLBD > threshold (default 10)")
 	dbShrinkFloorMult := flag.Int("db-shrink-mult", 3, "Shrink floor = numVars × multiplier (default 3)")
+	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
 	flag.Parse()
 
 	// Collect explicitly-set flags so classifyInstance knows which CLI values
@@ -163,6 +164,7 @@ func run() int {
 	s.SetExplicitFlags(explicitFlags)
 	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
 	s.SetClauseDBParams(*lbdTier1, *lbdTier2, *dbGrowthDiv, *delTriggerRatio, *dbShrinkThresh, *dbShrinkFloorMult)
+	s.SetOccurrenceWeight(*occurrenceWeight)
 
 	start := time.Now()
 	var result solver.SolveResult

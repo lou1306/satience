@@ -287,6 +287,7 @@ type CDCLSolver struct {
 	skipSubsumption            bool
 	skipBVE                    bool
 	skipPolarityPhase          bool
+	occurrenceWeight           float64
 	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
 	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
 	// occurrence-based phase is trajectory-sensitive and helps some instances
@@ -490,6 +491,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		deletionTriggerRatio:       1.5,
 		dbShrinkThreshold:          10,
 		dbShrinkFloorMultiplier:    3,
+		occurrenceWeight:           0.5,
 	}
 
 	// Initialize all assignments as unassigned (Level=-1, Reason=-1) with default
@@ -693,6 +695,10 @@ func (s *CDCLSolver) SetClauseDBParams(lbdTier1, lbdTier2, dbGrowthDiv int, delT
 	s.deletionTriggerRatio = delTriggerRatio
 	s.dbShrinkThreshold = dbShrinkThresh
 	s.dbShrinkFloorMultiplier = dbShrinkFloorMult
+}
+
+func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
+	s.occurrenceWeight = w
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -3198,7 +3204,7 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 	}
 	for i := range s.assignments {
 		if s.assignments[i].Level < 0 {
-			s.vsids.activity[i] += 1.0 + float64(occurrences[i])*0.5
+			s.vsids.activity[i] += float64(occurrences[i]) * s.occurrenceWeight
 			// Polarity-based initial phase: set savedPhase to the more frequent
 			// polarity (satisfy more clauses with the first assignment).
 			//
