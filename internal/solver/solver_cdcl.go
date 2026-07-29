@@ -1275,14 +1275,10 @@ func (s *CDCLSolver) classifyInstance() {
 
 	// Random-like instances (StructuredScore < 0.7). Split into two sub-branches
 	// by binaryRatio because they need opposite decay schedules:
-	//   - Pure k-SAT (binaryRatio == 0, density > 4.5): default decay 0.95,
-	//     restartBase=5, Glucose active. Matches the minisat config that solves
-	//     566f366c (300v random 3-SAT) in ~0.04s; the aggressive-decay branch
-	//     took ~12s (346x). Aggressive decay gives only ~3-5
-	//     conflict memory vs minisat's ~50-100, causing 118x more conflicts on
-	//     phase-transition random 3-SAT. The density > 4.5 gate excludes
-	//     30eb4ef4 (density 4.20, phase-transition pure ternary) which regresses
-	//     to TIMEOUT under default decay (see D1).
+	//   - Pure k-SAT (binaryRatio == 0, density > 4.0): default decay 0.95.
+	//     density > 4.5: restartBase=20 (swept: 6x faster than 5 on 566f366c).
+	//     density 4.0-4.5: restartBase=100, Glucose=1.5 (phase transition needs
+	//     deep search; base≤50 times out on 30eb4ef4).
 	//   - Mixed (binaryRatio > 0): D4 smooth threshold interpolation. Instead of
 	//     a hard 0.7 cliff, decay interpolates from aggressive (0.50→0.80) to
 	//     near-default (0.95). Below 0.60: fully aggressive (D1: needed by 15+
@@ -1295,28 +1291,40 @@ func (s *CDCLSolver) classifyInstance() {
 	// Unit propagation on random/mixed instances causes 76x more conflicts, so
 	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
-		// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.5).
-		// Uses default decay 0.95, restartBase=5, Glucose active. Matches the
-		// minisat config that solves 566f366c (300v random 3-SAT) in ~0.04s;
-		// the aggressive-decay branch took ~12s (346x). Aggressive decay gives
-		// only ~3-5 conflict memory vs minisat's ~50-100, causing 118x more
-		// conflicts on phase-transition random 3-SAT. The density > 4.5 gate
-		// excludes 30eb4ef4 (density 4.20, phase-transition pure ternary) which
-		// regresses to TIMEOUT under default decay (see D1).
-		//
-		// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
-		// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
-		// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
-		// These fall through to the D4 interpolation with t=0 (fully aggressive).
-		if structure.BinaryRatio == 0 && structure.TernaryRatio > 0 && structure.Density > 4.5 {
-			s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=5\n",
-				structure.StructuredScore, structure.Density)
-			if !s.flagSet("restart-base") {
-				s.restartBase = 5
+	// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.0).
+	// Uses default decay 0.95. Restart params depend on density:
+	//   - density > 4.5 (easy, above phase transition): restartBase=20. Swept
+	//     {5,20,50,100} on 566f366c: 5=0.12s, 20=0.02s, 50=0.31s, 100=5.9s.
+	//     20 is 6x faster than 5 — the old value was never optimal.
+	//   - density 4.0-4.5 (hard, at phase transition): restartBase=100,
+	//     Glucose=1.5. restartBase≤50 times out (30eb4ef4: base=20 → 87s,
+	//     base=50 → TMO). Only base=100 builds enough search depth.
+	//
+	// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
+	// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
+	// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
+	// These fall through to the D4 interpolation with t=0 (fully aggressive).
+		if structure.BinaryRatio == 0 && structure.TernaryRatio > 0 && structure.Density > 4.0 {
+			if structure.Density > 4.5 {
+				s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=20\n",
+					structure.StructuredScore, structure.Density)
+				if !s.flagSet("restart-base") {
+					s.restartBase = 20
+				}
+				s.useBumpAnalyze = true
+			} else {
+				s.Log("c [classification] Pure k-SAT phase-transition (score=%.2f, density=%.2f) - default decay, restartBase=100, Glucose=1.5\n",
+					structure.StructuredScore, structure.Density)
+				if !s.flagSet("restart-base") {
+					s.restartBase = 100
+				}
+				if !s.flagSet("restart-glucose-ratio") {
+					s.restartGlucoseRatio = 1.5
+				}
+				if !s.flagSet("restart-glucose-min") {
+					s.restartGlucoseMinConflicts = 100
+				}
 			}
-			s.useBumpAnalyze = true
-			// Glucose restart policy stays at CLI defaults (ratio=10.0, min=10):
-			// active as a safety net. decay stays at 0.95 (default).
 			return
 		}
 		// Random k-SAT k≥4 (binaryRatio==0, ternaryRatio==0, all long clauses
@@ -1331,7 +1339,7 @@ func (s *CDCLSolver) classifyInstance() {
 				s.vsids.SetDecayParams(0.50, 0.999, 5000)
 			}
 			if !s.flagSet("restart-base") {
-				s.restartBase = 5
+				s.restartBase = 20
 			}
 			if !s.flagSet("restart-glucose-ratio") {
 				s.restartGlucoseRatio = 100.0
@@ -1339,19 +1347,23 @@ func (s *CDCLSolver) classifyInstance() {
 			if !s.flagSet("restart-glucose-min") {
 				s.restartGlucoseMinConflicts = 1000000
 			}
-			s.Log("c [classification] Random k-SAT k≥4 (score=%.2f, density=%.2f) - decay 0.50→0.999, restartBase=5\n",
+			s.Log("c [classification] Random k-SAT k≥4 (score=%.2f, density=%.2f) - decay 0.50→0.999, restartBase=20\n",
 				structure.StructuredScore, structure.Density)
 			return
 		}
 		// D4: Smooth threshold interpolation in [0.60, 0.70].
 		// t=0 (score ≤ 0.60): fully aggressive (0.30→0.60) — D1's 15+ instances.
 		// t=1 (score ≥ 0.70): near-default (0.95) — but falls through to structured.
-		// In between: smooth interpolation. restartBase=5, Glucose disabled
+		// In between: smooth interpolation. restartBase=50, Glucose disabled
 		// throughout (decay is the main lever; D1 showed decay dominates).
-		// Gate: binaryRatio > 0.4. 30eb4ef4 (0% binary, score 0.62) needs fully
-		// aggressive decay (D1: SAT→TIMEOUT without it). rphp (62% binary) has
+		// Swept {5,20,50,100} on 8 hard mixed instances (1-5s each): total
+		// 5=26.5s, 20=24.3s, 50=22.9s, 100=25.5s. 50 is best overall; 5 was
+		// never optimal for any instance.
+		// Pure ternary instances (binaryRatio=0, density>4.0) are handled by
+		// the pure k-SAT path above. This path handles mixed instances only.
+		// Gate: binaryRatio > 0.4 for t>0 interpolation. rphp (62% binary) has
 		// strong binary implication structure that benefits from longer conflict
-		// memory. D1 mixed cluster (23-34% binary) stays fully aggressive.
+		// memory. D1 mixed cluster (23-34% binary) stays fully aggressive (t=0).
 		t := 0.0
 		if structure.BinaryRatio > 0.4 && structure.StructuredScore > 0.60 {
 			t = (structure.StructuredScore - 0.60) / 0.10
@@ -1368,7 +1380,7 @@ func (s *CDCLSolver) classifyInstance() {
 			s.vsids.SetDecayParams(initialDecay, maxDecay, 5000)
 		}
 		if !s.flagSet("restart-base") {
-			s.restartBase = 5
+			s.restartBase = 50
 		}
 		if !s.flagSet("restart-glucose-ratio") {
 			s.restartGlucoseRatio = 100.0
@@ -1376,7 +1388,7 @@ func (s *CDCLSolver) classifyInstance() {
 		if !s.flagSet("restart-glucose-min") {
 			s.restartGlucoseMinConflicts = 1000000
 		}
-		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=5\n",
+		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=50\n",
 			structure.StructuredScore, t, initialDecay, maxDecay)
 		return
 	}
@@ -3515,7 +3527,7 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	// Classify structure and set search parameters even when preprocessing is
 	// skipped. Previously -no-preprocess skipped adaptive tuning entirely,
 	// running random 3-SAT with decay 0.95 + restartBase=200 instead of the
-	// aggressive decay 0.30 + restartBase=5 the classifier prescribes. This made
+	// aggressive decay 0.30 + restartBase=20 the classifier prescribes. This made
 	// -no-preprocess a polluted diagnostic that conflated "no preprocessing" with
 	// "no adaptive tuning". classifyInstance is read-only on s.cnf, so it cannot
 	// change the search trajectory the way forced unit propagation does.
