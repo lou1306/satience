@@ -4274,7 +4274,7 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// clauses. One-way shrink (don't grow back) to avoid oscillation.
 	// Gated on structured instances only: random k-SAT naturally has high LBD
 	// (unstructured conflicts), so shrinking there cripples the DB.
-	if !s.maxLearnedShrunk && s.structureScore >= 0.7 && s.totalLbdCount > 1000 {
+	if !s.maxLearnedShrunk && s.structureScore >= 0.75 && s.totalLbdCount > 1000 {
 		avgLbd := s.totalLbdSum / s.totalLbdCount
 		if int(avgLbd) > s.dbShrinkThreshold {
 			newFloor := int(s.cnf.NumVars) * s.dbShrinkFloorMultiplier
