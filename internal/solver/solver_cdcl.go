@@ -196,11 +196,14 @@ type CDCLSolver struct {
 	learnedActiveCount int                  // Number of active clauses (excludes tombstones)
 	learnedCapacity    int                  // Total capacity including tombstones
 
-	// Binary implication graph (BIG): bigAdj[litIdx] lists forward successors m
-	// such that binary clause (¬litIdx ∨ m) exists (i.e., litIdx → m in the
+	// Binary implication graph (BIG), CSR layout: bigAdjData holds the flat
+	// successor lists and bigAdjOff[litIdx..litIdx+1] delimits litIdx's slice
+	// (bigAdjOff has len numLits+1). bigAdjOff==nil signals "not built".
+	// Successors m satisfy binary clause (¬litIdx ∨ m) (i.e., litIdx → m in the
 	// implication graph). Built once from original binary clauses in buildBIG.
 	// Used for transitive BIG-based clause minimization (see bigReachableInClause).
-	bigAdj [][]int
+	bigAdjData []int32
+	bigAdjOff  []int32
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
 	// increments). The queue is reused across calls (sliced to [:0]).
@@ -3257,11 +3260,12 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 
 // buildBIG builds the binary implication graph from original binary clauses.
 // For each binary clause (a ∨ b), edges ¬a→b and ¬b→a are added.
-// bigAdj[litIdx] lists literals m such that binary clause (¬lit ∨ m) exists.
-// Used for BIG-based clause minimization (Kissat-style).
+// bigAdjOff[litIdx]..bigAdjOff[litIdx+1] delimits successors m such that
+// binary clause (¬lit ∨ m) exists. Used for BIG-based clause minimization
+// (Kissat-style).
 func (s *CDCLSolver) buildBIG() {
 	numLits := int(s.cnf.NumVars) * 2
-	s.bigAdj = make([][]int, numLits)
+	off := make([]int32, numLits+1)
 	for i := range s.cnf.Clauses {
 		lits := s.cnf.Clauses[i].Literals
 		if len(lits) != 2 {
@@ -3272,9 +3276,32 @@ func (s *CDCLSolver) buildBIG() {
 		if a == b || a == b^1 {
 			continue
 		}
-		s.bigAdj[a^1] = append(s.bigAdj[a^1], b)
-		s.bigAdj[b^1] = append(s.bigAdj[b^1], a)
+		off[a^1+1]++
+		off[b^1+1]++
 	}
+	for i := 1; i <= numLits; i++ {
+		off[i] += off[i-1]
+	}
+	data := make([]int32, off[numLits])
+	cur := make([]int32, numLits)
+	copy(cur, off[:numLits])
+	for i := range s.cnf.Clauses {
+		lits := s.cnf.Clauses[i].Literals
+		if len(lits) != 2 {
+			continue
+		}
+		a := cnf.LitToIndex(lits[0])
+		b := cnf.LitToIndex(lits[1])
+		if a == b || a == b^1 {
+			continue
+		}
+		data[cur[a^1]] = int32(b)
+		cur[a^1]++
+		data[cur[b^1]] = int32(a)
+		cur[b^1]++
+	}
+	s.bigAdjData = data
+	s.bigAdjOff = off
 }
 
 // bigReachableInClause returns true if lit can reach, via forward BIG edges
@@ -3303,7 +3330,7 @@ func (s *CDCLSolver) buildBIG() {
 // (fewer removals found), never soundness.
 func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	litIdx := cnf.LitToIndex(lit)
-	if litIdx >= len(s.bigAdj) {
+	if litIdx >= len(s.bigAdjOff)-1 {
 		return false
 	}
 	s.bigBfsEpoch++
@@ -3317,7 +3344,8 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	visited := s.bigBfsVisited
 	tmpInClause := s.tmpLiteralInClause
 	tmpIsNeg := s.tmpLiteralIsNegated
-	bigAdj := s.bigAdj
+	bigAdjData := s.bigAdjData
+	bigAdjOff := s.bigAdjOff
 
 	visited[litIdx] = ep
 	q := s.bigBfsQueue[:0]
@@ -3329,7 +3357,10 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	for head < len(q) && !found {
 		cur := q[head]
 		head++
-		for _, m := range bigAdj[cur] {
+		start := int(bigAdjOff[cur])
+		end := int(bigAdjOff[cur+1])
+		for i := start; i < end; i++ {
+			m := int(bigAdjData[i])
 			if visited[m] == ep {
 				continue
 			}
@@ -5201,7 +5232,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		// the derivation uses only the binary clauses, which are in the formula.
 		// Intermediate tautologies in the resolvent are harmless — only the
 		// final clause (C\{lit}) matters, and it is non-tautological.
-		if s.bigAdj != nil && !(s.structureScore < 0.7 && s.binaryRatio > 0.4) { // GATE: disable BIG for mixed-binary sub-0.7
+		if s.bigAdjOff != nil && !(s.structureScore < 0.7 && s.binaryRatio > 0.4) { // GATE: disable BIG for mixed-binary sub-0.7
 			s.bigMinimizeCalls++
 			if s.bigReachableInClause(lit) {
 				s.bigMinimizeHits++
