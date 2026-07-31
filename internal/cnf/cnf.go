@@ -84,12 +84,12 @@ type CNF struct {
 	Clauses    []Clause
 	NumClauses int
 
-	// Contiguous literal storage for original clauses (optimization)
-	// All original clause literals stored in one array for better cache locality
-	originalClauseOffsets []int       // Start offset of each clause
-	originalClauseSizes   []int       // Number of literals in each clause
-	originalClauseLocs    []ClauseLoc // Packed (Offset, Size) per clause — 8B vs 32B Clause struct
-	literalPool           []Literal   // Contiguous storage for all original clause literals
+	// Contiguous literal storage for original clauses (optimization).
+	// originalClauseLocs packs (Offset, Size) per clause into 8 bytes — the only
+	// metadata the propagation hot path reads. The legacy parallel []int arrays
+	// (offsets/sizes) were removed since the packed array subsumes them.
+	originalClauseLocs []ClauseLoc // Packed (Offset, Size) per original clause — 8B vs 32B Clause struct load
+	literalPool       []Literal   // Contiguous storage for all original clause literals
 }
 
 // NewCNF creates a new CNF formula
@@ -117,8 +117,10 @@ func (c *CNF) AddClause(literals []Literal, learned bool) {
 
 	// Also store in contiguous literal pool for cache efficiency
 	offset := len(c.literalPool)
-	c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
-	c.originalClauseSizes = append(c.originalClauseSizes, len(literals))
+	c.originalClauseLocs = append(c.originalClauseLocs, ClauseLoc{
+		Offset: int32(offset),
+		Size:   int32(len(literals)),
+	})
 
 	for _, lit := range literals {
 		c.literalPool = append(c.literalPool, lit)
@@ -144,26 +146,20 @@ func IndexToLit(idx int) Literal {
 	return NewLiteral(varIdx, isNegated)
 }
 
-// GetOriginalClauseLiterals returns literals for an original clause (zero-allocation view)
-// Returns offset and size into the literal pool
-func (c *CNF) GetOriginalClauseLiterals(clauseIdx int) (offset int, size int, pool []Literal) {
-	if clauseIdx < 0 || clauseIdx >= len(c.originalClauseOffsets) {
-		return 0, 0, nil
-	}
-	return c.originalClauseOffsets[clauseIdx], c.originalClauseSizes[clauseIdx], c.literalPool
-}
-
 // NumOriginalClauses returns the number of original clauses
 func (c *CNF) NumOriginalClauses() int {
-	return len(c.originalClauseOffsets)
+	return len(c.originalClauseLocs)
 }
 
-// GetOriginalClauseInfo returns the offset and size for an original clause
+// GetOriginalClauseInfo returns the offset and size for an original clause,
+// derived from the packed originalClauseLocs array (the single source of truth
+// for original-clause metadata on both hot and cold paths).
 func (c *CNF) GetOriginalClauseInfo(clauseIdx int) (offset int, size int) {
-	if clauseIdx < 0 || clauseIdx >= len(c.originalClauseOffsets) {
+	if clauseIdx < 0 || clauseIdx >= len(c.originalClauseLocs) {
 		return 0, 0
 	}
-	return c.originalClauseOffsets[clauseIdx], c.originalClauseSizes[clauseIdx]
+	loc := c.originalClauseLocs[clauseIdx]
+	return int(loc.Offset), int(loc.Size)
 }
 
 // GetLiteralPool returns the contiguous literal storage
@@ -180,15 +176,11 @@ func (c *CNF) GetOriginalClauseLocs() []ClauseLoc {
 // Call this after preprocessing modifies Clauses directly
 func (c *CNF) RebuildLiteralPool() {
 	c.literalPool = make([]Literal, 0, c.NumClauses*4)
-	c.originalClauseOffsets = make([]int, 0, c.NumClauses)
-	c.originalClauseSizes = make([]int, 0, c.NumClauses)
 	c.originalClauseLocs = make([]ClauseLoc, 0, c.NumClauses)
 
 	for _, clause := range c.Clauses {
 		offset := len(c.literalPool)
 		size := len(clause.Literals)
-		c.originalClauseOffsets = append(c.originalClauseOffsets, offset)
-		c.originalClauseSizes = append(c.originalClauseSizes, size)
 		c.originalClauseLocs = append(c.originalClauseLocs, ClauseLoc{
 			Offset: int32(offset),
 			Size:   int32(size),
@@ -198,8 +190,9 @@ func (c *CNF) RebuildLiteralPool() {
 	}
 
 	for i := range c.Clauses {
-		off := c.originalClauseOffsets[i]
-		sz := c.originalClauseSizes[i]
+		loc := c.originalClauseLocs[i]
+		off := int(loc.Offset)
+		sz := int(loc.Size)
 		c.Clauses[i].Literals = c.literalPool[off : off+sz]
 	}
 }
