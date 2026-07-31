@@ -28,6 +28,7 @@ import (
 	"satience/internal/cnf"
 	"sort"
 	"time"
+	"unsafe"
 )
 
 // SolveResult represents the result of SAT solving.
@@ -188,7 +189,8 @@ type CDCLSolver struct {
 	// Memory pool for learned clauses - contiguous literal storage to eliminate per-clause allocations
 	learnedLiterals    []cnf.Literal        // All learned clause literals in one contiguous slice
 	learnedLoc         []LearnedClauseLoc   // Packed (Offset, Size) per learned clause; Size=0 means tombstone
-	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, SearchHint)
+	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, Activity) — cold path only (deletion/rescale)
+	learnedSearchHint  []int32              // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
 	learnedWatchIdx0   []int                // First watched literal index (for fast watch removal)
 	learnedWatchIdx1   []int                // Second watched literal index (for fast watch removal)
 	learnedActiveCount int                  // Number of active clauses (excludes tombstones)
@@ -281,7 +283,7 @@ type CDCLSolver struct {
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
-	subsumptionPeriodSet        bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
+	subsumptionPeriodSet       bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
 	skipSubsumption            bool
@@ -397,6 +399,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedLiterals:    make([]cnf.Literal, 0, maxLearned*8),
 		learnedLoc:         make([]LearnedClauseLoc, 0, maxLearned),
 		learnedMetadata:    make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
+		learnedSearchHint:  make([]int32, 0, maxLearned),              // Hot-path search hints
 		learnedWatchIdx0:   make([]int, 0, maxLearned),                // Watched literal indices
 		learnedWatchIdx1:   make([]int, 0, maxLearned),
 		learnedActiveCount: 0,
@@ -467,9 +470,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
-		adaptNextConflict: 500,
-		randomPhaseRate:           0,
-		restartPhaseFlipRate:      0,
+		adaptNextConflict:    500,
+		randomPhaseRate:      0,
+		restartPhaseFlipRate: 0,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -1297,19 +1300,19 @@ func (s *CDCLSolver) classifyInstance() {
 	// Unit propagation on random/mixed instances causes 76x more conflicts, so
 	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
 	if structure.StructuredScore < 0.7 {
-	// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.0).
-	// Uses default decay 0.95. Restart params depend on density:
-	//   - density > 4.5 (easy, above phase transition): restartBase=20. Swept
-	//     {5,20,50,100} on 566f366c: 5=0.12s, 20=0.02s, 50=0.31s, 100=5.9s.
-	//     20 is 6x faster than 5 — the old value was never optimal.
-	//   - density 4.0-4.5 (hard, at phase transition): restartBase=100,
-	//     Glucose=1.5. restartBase≤50 times out (30eb4ef4: base=20 → 87s,
-	//     base=50 → TMO). Only base=100 builds enough search depth.
-	//
-	// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
-	// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
-	// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
-	// These fall through to the D4 interpolation with t=0 (fully aggressive).
+		// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.0).
+		// Uses default decay 0.95. Restart params depend on density:
+		//   - density > 4.5 (easy, above phase transition): restartBase=20. Swept
+		//     {5,20,50,100} on 566f366c: 5=0.12s, 20=0.02s, 50=0.31s, 100=5.9s.
+		//     20 is 6x faster than 5 — the old value was never optimal.
+		//   - density 4.0-4.5 (hard, at phase transition): restartBase=100,
+		//     Glucose=1.5. restartBase≤50 times out (30eb4ef4: base=20 → 87s,
+		//     base=50 → TMO). Only base=100 builds enough search depth.
+		//
+		// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
+		// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
+		// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
+		// These fall through to the D4 interpolation with t=0 (fully aggressive).
 		if structure.BinaryRatio == 0 && structure.TernaryRatio > 0 && structure.Density > 4.0 {
 			if structure.Density > 4.5 {
 				s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=20\n",
@@ -2552,7 +2555,7 @@ func (s *CDCLSolver) runVivification() bool {
 		}
 		// Reset search hint — vivification rewrites clause literals and
 		// rebuilds watches, invalidating any position-based hint.
-		s.learnedMetadata[r.idx].SearchHint = 0
+		s.learnedSearchHint[r.idx] = 0
 		// Rebuild watches
 		if len(r.newLits) >= 2 {
 			lits := s.learnedLiterals[offset : offset+len(r.newLits)]
@@ -3516,6 +3519,12 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		return flpResult
 	}
 
+	// Release the Clauses slice (32B/clause) — all solving-path access now
+	// goes through originalClauseLocs + literalPool. Preprocessing modified
+	// Clauses directly; the final RebuildLiteralPool (inside preprocessAggressive
+	// or SolveWithoutPreprocessing) captured everything into the pool.
+	s.cnf.Clauses = nil
+
 	result := s.cdclLoop()
 	if result == SAT {
 		s.extendModel()
@@ -3564,6 +3573,8 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 			s.litTrue[i*2+1] = !v
 		}
 	}
+	// Release the Clauses slice (32B/clause) — solving uses the pool.
+	s.cnf.Clauses = nil
 	return s.cdclLoop()
 }
 
@@ -3741,17 +3752,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// constructor), so the cached header stays valid for the whole call.
 	assignments := s.assignments
 
-	// Cache original-clause SoA arrays. Original clauses are never deleted (only
-	// learned clauses are tombstoned), so the bounds check at the slow-path entry
-	// never fires. The packed ClauseLoc (8B) replaces the 32-byte Clause struct
-	// load, and the literalPool provides the literal data directly — eliminating
-	// the s → s.cnf → .Clauses pointer chase and reducing metadata cache footprint
-	// by 4x (8B per clause vs 32B Clause struct).
-	originalClauseLocs := s.cnf.GetOriginalClauseLocs()
-	originalLiteralPool := s.cnf.GetLiteralPool()
-	numOriginalClauses := len(originalClauseLocs)
-	originalSearchHint := s.originalSearchHint
-
 	// Cache watchLists outer slice header. The outer slice is allocated once in
 	// initWatches and never grows (length is always 2*numVars). Only inner slices
 	// grow via append, and the cached header shares the backing array, so inner-
@@ -3761,18 +3761,19 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	watchLists := s.watchLists
 
 	// litTrue cache: backing array never reallocated, writes through local visible
-	// to s.litTrue automatically. Eliminates per-trail-entry s → s.litTrue chase.
+	// to s.litTrue automatically. litValueBase provides bounds-check-free access
+	// via unsafe.Add — the invariant watch.Blit < len(litValue) always holds
+	// (Blit = varIdx*2+negated, varIdx < NumVars, litValue has 2*NumVars entries),
+	// so the CMPQ+JLS the compiler emits for litValue[watch.Blit] is pure overhead.
 	litValue := s.litTrue
+	var litValueBase unsafe.Pointer
+	if len(litValue) > 0 {
+		litValueBase = unsafe.Pointer(&litValue[0])
+	}
 	// Cache scalar counters as locals — incremented/decremented on every propagation,
 	// writing through s pointer each time. Write back at returns.
 	propagations := s.propagations
 	numUnassigned := s.numUnassigned
-	// Cache learned clause arrays — accessed on every slow-path watch check
-	// (tombstone check + literal load). Eliminates s → s.learnedLoc and
-	// s → s.learnedLiterals pointer chases.
-	learnedLoc := s.learnedLoc
-	learnedLiterals := s.learnedLiterals
-	learnedMetadata := s.learnedMetadata
 
 	// Cache the trail slice header. trail grows via append below; the cached
 	// header must be written back to s.trail at every return so subsequent
@@ -3783,6 +3784,14 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	trail := s.trail
 	level := s.level
 	propLevel := level
+
+	// A1: Slow-path-only slice headers (originalClauseLocs, originalLiteralPool,
+	// originalSearchHint, learnedLoc, learnedLiterals, learnedSearchHint) are
+	// NOT cached here. They are loaded on demand inside the slow path (after the
+	// blit check fails). This prevents the compiler from carrying 6 slice headers
+	// (18 words) across the fast-path inner loop, which was forcing the
+	// fast-path-critical values (litValueBase, watchList, readIdx) to spill to
+	// the stack on every iteration.
 
 	for trailIndex := s.qhead; trailIndex < len(trail); trailIndex++ {
 		lit := trail[trailIndex]
@@ -3809,12 +3818,26 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			watch := watchList[readIdx]
 
 			// FAST PATH: Blit stores the litTrue index directly (varIdx*2 + negated).
-			if litValue[watch.Blit] {
+			// unsafe.Add skips the bounds check — the invariant Blit < len(litValue)
+			// always holds (Blit = varIdx*2+negated, varIdx < NumVars).
+			if *(*bool)(unsafe.Add(litValueBase, watch.Blit)) {
 				continue
 			}
 
 			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
+			//
+			// A1: Slow-path-only slice headers are loaded here (after the blit
+			// check fails), not at function entry. This keeps the fast-path inner
+			// loop free of 6 extra slice headers (18 words) that would otherwise
+			// force litValueBase/watchList/readIdx to spill to the stack.
+			originalClauseLocs := s.cnf.GetOriginalClauseLocs()
+			originalLiteralPool := s.cnf.GetLiteralPool()
+			numOriginalClauses := len(originalClauseLocs)
+			originalSearchHint := s.originalSearchHint
+			learnedLoc := s.learnedLoc
+			learnedLiterals := s.learnedLiterals
+			learnedSearchHint := s.learnedSearchHint
 
 			// Decode ClauseIdx once (was decoded 5+ times per watch iteration).
 			// Bit 31: learned flag, bit 30: myPos, bit 29: binary, bits 0-28: clause index.
@@ -3827,10 +3850,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// BINARY FAST PATH: For size-2 clauses, the Blit field already has
 			// the blocking literal. No replacement search is possible (only 2
 			// literals), so we skip the clause data load entirely and go straight
-			// to propagate/conflict. This eliminates 2 cache misses (clause loc +
-			// clause literals) and an empty replacement scan on every binary-clause
-			// watch hit. On binary-heavy instances (67%+), this cuts propagation
-			// time significantly.
+			// to propagate/conflict.
 			if clauseIdxRaw&watchBinaryBit != 0 {
 				blitVarIdx := int(watch.Blit >> 1)
 				blitNegated := watch.Blit&1 == 1
@@ -3915,8 +3935,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					hint = originalSearchHint[clauseID]
 				}
 			} else {
-				if clauseID < len(learnedMetadata) {
-					hint = learnedMetadata[clauseID].SearchHint
+				if clauseID < len(learnedSearchHint) {
+					hint = learnedSearchHint[clauseID]
 				}
 			}
 			if hint >= 2 && int(hint) < len(clauseLits) {
@@ -4004,8 +4024,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						originalSearchHint[clauseID] = int32(foundJ)
 					}
 				} else {
-					if clauseID < len(learnedMetadata) {
-						learnedMetadata[clauseID].SearchHint = int32(foundJ)
+					if clauseID < len(learnedSearchHint) {
+						learnedSearchHint[clauseID] = int32(foundJ)
 					}
 				}
 
@@ -4052,7 +4072,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				// Build conflict clause
 				var conflictClause *cnf.Clause
 				if !isLearned {
-					conflictClause = &s.cnf.Clauses[clauseID]
+					loc := originalClauseLocs[clauseID]
+					s.conflictClauseBuf.Literals = originalLiteralPool[loc.Offset : loc.Offset+loc.Size]
+					s.conflictClauseBuf.Learned = false
+					conflictClause = &s.conflictClauseBuf
 				} else {
 					literals := s.getLearnedClauseLiterals(clauseID)
 					s.conflictLitsBuf = s.conflictLitsBuf[:0]
@@ -4240,8 +4263,11 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 						}
 					} else {
 						// Original clause (guard against preprocessing sentinels -2/-3/-4)
-						if impIdx >= 0 && int(impIdx) < len(s.cnf.Clauses) && len(s.cnf.Clauses[impIdx].Literals) == 1 {
-							isUnit = true
+						if impIdx >= 0 {
+							locs := s.cnf.GetOriginalClauseLocs()
+							if int(impIdx) < len(locs) && locs[impIdx].Size == 1 {
+								isUnit = true
+							}
 						}
 					}
 					if isUnit {
@@ -5048,6 +5074,7 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 		s.learnedMetadata = append(s.learnedMetadata, cnf.ClauseMetadata{
 			LBD: int32(lbd),
 		})
+		s.learnedSearchHint = append(s.learnedSearchHint, 0) // Fresh clause: no hint yet
 		s.learnedActiveCount++
 		s.learnedCapacity++
 
@@ -5523,6 +5550,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 
 		s.learnedLoc[writeIdx] = LearnedClauseLoc{Offset: int32(newStart), Size: int32(oldSize)}
 		s.learnedMetadata[writeIdx] = s.learnedMetadata[readIdx]
+		s.learnedSearchHint[writeIdx] = s.learnedSearchHint[readIdx]
 		s.learnedWatchIdx0[writeIdx] = s.learnedWatchIdx0[readIdx]
 		s.learnedWatchIdx1[writeIdx] = s.learnedWatchIdx1[readIdx]
 
@@ -5611,7 +5639,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		s.learnedWatchIdx1[i] = idx1
 		// Reset search hint — compaction re-ran chooseWatchPositions which
 		// reordered literals, invalidating any position-based hint.
-		s.learnedMetadata[i].SearchHint = 0
+		s.learnedSearchHint[i] = 0
 	}
 
 	// Mark watches as initialized
@@ -5621,6 +5649,7 @@ func (s *CDCLSolver) compactLearnedClauses() {
 	s.learnedLiterals = s.learnedLiterals[:nextOffset]
 	s.learnedLoc = s.learnedLoc[:writeIdx]
 	s.learnedMetadata = s.learnedMetadata[:writeIdx]
+	s.learnedSearchHint = s.learnedSearchHint[:writeIdx]
 	s.learnedWatchIdx0 = s.learnedWatchIdx0[:writeIdx]
 	s.learnedWatchIdx1 = s.learnedWatchIdx1[:writeIdx]
 	s.learnedCapacity = writeIdx

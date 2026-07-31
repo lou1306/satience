@@ -827,7 +827,7 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 			if newSize < int(s.learnedMetadata[r.idx].LBD) {
 				s.learnedMetadata[r.idx].LBD = int32(newSize)
 			}
-			s.learnedMetadata[r.idx].SearchHint = 0
+			s.learnedSearchHint[r.idx] = 0
 			if newSize >= 2 {
 				lits := s.learnedLiterals[offset : offset+newSize]
 				tmpClause := &cnf.Clause{Literals: lits, Learned: true}

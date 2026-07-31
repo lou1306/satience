@@ -13,9 +13,12 @@ func VerifySolution(cnfFormula *cnf.CNF, assignments []Assignment, verbose bool)
 		}
 	}
 
-	for clauseID, clause := range cnfFormula.Clauses {
+	// Use the SoA literal pool (Clauses may be nil'd after preprocessing).
+	locs := cnfFormula.GetOriginalClauseLocs()
+	pool := cnfFormula.GetLiteralPool()
+	for clauseID, loc := range locs {
 		satisfied := false
-		for _, lit := range clause.Literals {
+		for _, lit := range pool[loc.Offset : loc.Offset+loc.Size] {
 			varIdx := lit.Var()
 			litIsTrue := (assignments[varIdx].Value != lit.IsNegated())
 			if litIsTrue {

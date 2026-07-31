@@ -66,16 +66,14 @@ type ClauseLoc struct {
 	Size   int32
 }
 
-// ClauseMetadata packs learned clause metadata into a single struct for cache efficiency.
-// LBD is int32 (values are small: LBD ≤ clause size).
-// SearchHint caches the last-known replacement position for the watched-literal
-// replacement scan (probe-then-scan optimization). 0 = no hint (scan from pos 2).
-// Activity is VSIDS-style decayed clause activity used to order deletion
-// candidates within LBD tiers (0 = pure FIFO when claActivityEnabled=false).
+// ClauseMetadata holds learned-clause metadata accessed only on cold paths
+// (clause deletion, activity rescale, vivification LBD update). The hot-path
+// SearchHint was extracted into a dedicated []int32 (learnedSearchHint) so the
+// propagation slow path reads 4 bytes/clause instead of dragging the 16-byte
+// struct — with padding this struct is 16 bytes, but it is never touched per-watch.
 type ClauseMetadata struct {
-	LBD        int32   // LBD at time of learning
-	SearchHint int32   // Last-known replacement position in clause (0 = no hint)
-	Activity   float64 // VSIDS-style decayed activity for deletion ordering
+	LBD      int32   // LBD at time of learning
+	Activity float64 // VSIDS-style decayed activity for deletion ordering
 }
 
 // CNF represents a CNF formula
@@ -89,7 +87,7 @@ type CNF struct {
 	// metadata the propagation hot path reads. The legacy parallel []int arrays
 	// (offsets/sizes) were removed since the packed array subsumes them.
 	originalClauseLocs []ClauseLoc // Packed (Offset, Size) per original clause — 8B vs 32B Clause struct load
-	literalPool       []Literal   // Contiguous storage for all original clause literals
+	literalPool        []Literal   // Contiguous storage for all original clause literals
 }
 
 // NewCNF creates a new CNF formula
