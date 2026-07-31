@@ -1,6 +1,9 @@
 # Editor configs
 opencode.json
 
+# Opencode local config
+.opencode/
+
 # Binaries
 satience
 satience_debug
@@ -15,6 +18,19 @@ satience_v3
 satience_opt
 satience_preproc
 satience_prephase*
+satience_b[0-9]*
+satience_bench_*
+satience_base
+satience_csr
+satience_clean
+satience_head
+satience_probe
+satience_test
+satience_zero
+satience_big64
+satience_flp
+satience_stamp_big
+satience_t1
 /fuzz
 solver.test
 *.exe
