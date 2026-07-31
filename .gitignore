@@ -5,7 +5,7 @@ opencode.json
 .opencode/
 
 # Binaries
-satience
+/satience
 satience_debug
 satience_bench
 satience_bench_*
