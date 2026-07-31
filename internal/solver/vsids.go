@@ -167,6 +167,7 @@ type VSIDS struct {
 	baseBumpAmount       float64 // Base bump amount for clauses (default 25.0)
 	clauseInitBaseWeight float64 // Base weight for clause initialization (default 10.0)
 	binaryClauseWeight   float64 // Weight for binary clauses (default 100.0)
+	minisatBumps         bool    // MiniSat-style: equal bump per var (no /N, no minBump floor)
 }
 
 // NewVSIDS creates a new VSIDS heuristic with clause-length weighted initialization
@@ -261,9 +262,26 @@ func (v *VSIDS) buildHeap(assignments []Assignment) {
 	v.heapValid = true
 }
 
-// EnableLBD enables LBD-based activity (variables in low-LBD clauses prioritized)
-func (v *VSIDS) EnableLBD() {
-	v.useLBD = true
+// SetUseLBD enables or disables LBD-based activity bonus
+func (v *VSIDS) SetUseLBD(enabled bool) {
+	v.useLBD = enabled
+}
+
+// ResetActivity zeroes all variable activity and LBD bonus, resets varInc
+// to baseBumpAmount, and invalidates the heap. Used by lazy init to clear
+// bad trajectory accumulation before injecting a fresh occurrence prior.
+func (v *VSIDS) ResetActivity() {
+	for i := range v.activity {
+		v.activity[i] = 0
+	}
+	if v.lbdBonus != nil {
+		for i := range v.lbdBonus {
+			v.lbdBonus[i] = 0
+		}
+	}
+	v.varInc = v.baseBumpAmount
+	v.lbdInc = 1.0
+	v.heapValid = false
 }
 
 // SetRandomSeed sets the seed for deterministic random noise in tie-breaking
@@ -329,6 +347,14 @@ func (v *VSIDS) SetBaseBumpAmount(amount float64) {
 	}
 	v.baseBumpAmount = amount
 	v.varInc = amount // varInc starts at baseBumpAmount, grows via O(1) decay
+}
+
+// SetMinisatBumps enables MiniSat-style equal bumps: every variable in the
+// conflict analysis gets varInc (absolute), not varInc/N. No minBump floor.
+// This makes VSIDS a pure frequency signal (like MiniSat) rather than
+// clause-length-weighted.
+func (v *VSIDS) SetMinisatBumps(enabled bool) {
+	v.minisatBumps = enabled
 }
 
 // SetDecayParams sets VSIDS decay parameters (initial, max, ramp-up conflicts).
@@ -430,14 +456,19 @@ func (v *VSIDS) bumpLarge(varIdx uint32, amount float64) {
 // Bump amount is inversely proportional to clause size - smaller clauses = larger bump
 // Uses varInc (grows over time via O(1) decay) instead of fixed baseBumpAmount
 func (v *VSIDS) bumpClause(literals []cnf.Literal) {
-	bumpAmount := v.varInc / float64(len(literals))
-	minBump := v.varInc * 0.04
-	if bumpAmount < minBump {
-		bumpAmount = minBump
-	}
-
-	for _, lit := range literals {
-		v.bumpLarge(lit.Var(), bumpAmount)
+	if v.minisatBumps {
+		for _, lit := range literals {
+			v.bumpLarge(lit.Var(), v.varInc)
+		}
+	} else {
+		bumpAmount := v.varInc / float64(len(literals))
+		minBump := v.varInc * 0.04
+		if bumpAmount < minBump {
+			bumpAmount = minBump
+		}
+		for _, lit := range literals {
+			v.bumpLarge(lit.Var(), bumpAmount)
+		}
 	}
 	v.conflictCount++
 
@@ -459,13 +490,19 @@ func (v *VSIDS) bumpAnalyze(vars []uint32) {
 	if len(vars) == 0 {
 		return
 	}
-	bumpAmount := v.varInc / float64(len(vars))
-	minBump := v.varInc * 0.04
-	if bumpAmount < minBump {
-		bumpAmount = minBump
-	}
-	for _, varIdx := range vars {
-		v.bumpLarge(varIdx, bumpAmount)
+	if v.minisatBumps {
+		for _, varIdx := range vars {
+			v.bumpLarge(varIdx, v.varInc)
+		}
+	} else {
+		bumpAmount := v.varInc / float64(len(vars))
+		minBump := v.varInc * 0.04
+		if bumpAmount < minBump {
+			bumpAmount = minBump
+		}
+		for _, varIdx := range vars {
+			v.bumpLarge(varIdx, bumpAmount)
+		}
 	}
 	v.conflictCount++
 

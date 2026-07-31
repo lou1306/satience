@@ -293,6 +293,10 @@ type CDCLSolver struct {
 	skipBVE                    bool
 	skipPolarityPhase          bool
 	occurrenceWeight           float64
+	skipVSIDSInit              bool
+	minisatRestart             bool
+	geometricRestartThreshold  float64 // Cached threshold for minisatRestart (= restartBase × 1.5^lubyIndex)
+	lazyInit                   *lazyInitState
 	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
 	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
 	// occurrence-based phase is trajectory-sensitive and helps some instances
@@ -350,6 +354,17 @@ type CDCLSolver struct {
 	glueAtLastAdapt   uint64
 	lbdSumAtLastAdapt uint64
 	countAtLastAdapt  uint64
+}
+
+// lazyInitState holds lazy init detection state. Heap-allocated only when
+// -lazy-init is enabled, keeping CDCLSolver's hot cache lines unchanged.
+type lazyInitState struct {
+	done            bool
+	emaLBDSnapshots []float64
+	avgLBDThreshold float64
+	glueRateLimit   float64
+	minConflicts    int
+	trendWindow     int
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -509,7 +524,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 
 	// Enable LBD-based VSIDS for better variable selection
 	// Variables in low-LBD clauses get higher priority
-	solver.vsids.EnableLBD()
+	solver.vsids.SetUseLBD(true)
 
 	return solver
 }
@@ -705,6 +720,33 @@ func (s *CDCLSolver) SetClauseDBParams(lbdTier1, lbdTier2, dbGrowthDiv int, delT
 
 func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
 	s.occurrenceWeight = w
+}
+
+func (s *CDCLSolver) SetSkipVSIDSInit(skip bool) {
+	s.skipVSIDSInit = skip
+}
+
+func (s *CDCLSolver) SetMinisatRestart(enabled bool) {
+	s.minisatRestart = enabled
+}
+
+func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
+	s.vsids.SetMinisatBumps(enabled)
+}
+
+func (s *CDCLSolver) SetNoLBDBonus(enabled bool) {
+	s.vsids.SetUseLBD(!enabled)
+}
+
+func (s *CDCLSolver) SetLazyInit(enabled bool) {
+	if enabled {
+		s.lazyInit = &lazyInitState{
+			avgLBDThreshold: 12.0,
+			glueRateLimit:   0.05,
+			minConflicts:    50,
+			trendWindow:     3,
+		}
+	}
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -1212,6 +1254,17 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 // runs the CDCL loop (SolveWithResult, SolveWithoutPreprocessing).
 func (s *CDCLSolver) classifyInstance() {
 	structure := s.analyzeInstanceStructure()
+
+	// When minisatRestart is enabled, skip all classifier restart tuning —
+	// use MiniSat's fixed geometric base=100 for all instances.
+	if s.minisatRestart {
+		s.structureScore = structure.StructuredScore
+		s.polarityImbalance = structure.PolarityImbalance
+		s.longClauseRatio = structure.LongClauseRatio
+		s.binaryRatio = structure.BinaryRatio
+		s.restartBase = 100
+		return
+	}
 
 	// Cache classifier output for downstream consumers (initVSIDSOccurrenceBonus
 	// gates the polarity-based initial phase on these metrics; the level-capped
@@ -2728,48 +2781,62 @@ func luby(i int) int {
 // - They propagate often and prune large parts of search space
 // - Deleting them would cause the solver to re-explore the same conflicts
 func (s *CDCLSolver) shouldRestart() bool {
-	// Check Glucose-style adaptive restart first (if past min conflicts).
-	// The gap gate (conflicts - restartCount >= glucoseGap) prevents double-
-	// restarts: with a persistent EMA (B5 fix), the EMA carries high pre-
-	// restart LBD values while avgLBD is low right after a restart (fresh
-	// good clauses), so the criterion could fire immediately. The gap lets
-	// avgLBD stabilize first.
-	if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 &&
-		s.conflicts-s.restartCount >= s.glucoseGap {
-		avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
-
-		// Glucose criterion: restart when the EMA of recent LBDs exceeds
-		// ratio × overall average. Using EMA (α=0.1, half-life ~7 conflicts)
-		// instead of single lastConflictLBD avoids noise from individual
-		// LBD spikes triggering spurious restarts.
-		if s.emaLBD > avgLBD*s.restartGlucoseRatio {
-			s.Log("c [restart] Glucose: EMA LBD %.1f > avg %.1f × %.2f\n",
-				s.emaLBD, avgLBD, s.restartGlucoseRatio)
+	// MiniSat-style mode: pure geometric restart, no Glucose LBD criterion.
+	// threshold = restartBase * 1.5^lubyIndex. Cached incrementally in
+	// geometricRestartThreshold (updated in restart() alongside lubyIndex) to
+	// avoid math.Pow on every conflict. With base=100: 100, 150, 225, 337, ...
+	if s.minisatRestart {
+		if s.geometricRestartThreshold == 0 {
+			s.geometricRestartThreshold = float64(s.restartBase)
+		}
+		if float64(s.conflicts-s.restartCount) >= s.geometricRestartThreshold {
 			return true
 		}
-	}
+		// Still allow props/dec and level-capped early escape (below).
+	} else {
+		// Check Glucose-style adaptive restart first (if past min conflicts).
+		// The gap gate (conflicts - restartCount >= glucoseGap) prevents double-
+		// restarts: with a persistent EMA (B5 fix), the EMA carries high pre-
+		// restart LBD values while avgLBD is low right after a restart (fresh
+		// good clauses), so the criterion could fire immediately. The gap lets
+		// avgLBD stabilize first.
+		if s.conflicts >= s.restartGlucoseMinConflicts && s.lbdCount > 0 &&
+			s.conflicts-s.restartCount >= s.glucoseGap {
+			avgLBD := float64(s.lbdSum) / float64(s.lbdCount)
 
-	// Fall back to Luby sequence (configurable base).
-	// The Luby sequence grows unboundedly (1, 1, 2, 1, 1, 2, 4, ..., 2^k, ...).
-	// Without a cap, the threshold (lubyValue × restartBase) eventually exceeds
-	// the conflict budget, and Luby restarts effectively stop — leaving the
-	// solver without periodic diversification for the rest of the solve.
-	// Fix: when the threshold exceeds lubyThresholdCap, reset lubyIndex to 0 —
-	// re-running the Luby sequence from the start. This keeps the restart
-	// cadence in the productive range indefinitely. CaDiCaL and Kissat use
-	// similar bounded restart sequences. Disabled for random instances
-	// (lubyThresholdCap=0) where Luby growth aids convergence.
-	lubyValue := luby(s.lubyIndex + 1)
-	threshold := lubyValue * s.restartBase
+			// Glucose criterion: restart when the EMA of recent LBDs exceeds
+			// ratio × overall average. Using EMA (α=0.1, half-life ~7 conflicts)
+			// instead of single lastConflictLBD avoids noise from individual
+			// LBD spikes triggering spurious restarts.
+			if s.emaLBD > avgLBD*s.restartGlucoseRatio {
+				s.Log("c [restart] Glucose: EMA LBD %.1f > avg %.1f × %.2f\n",
+					s.emaLBD, avgLBD, s.restartGlucoseRatio)
+				return true
+			}
+		}
 
-	if s.conflicts-s.restartCount >= threshold {
-		return true
-	}
+		// Fall back to Luby sequence (configurable base).
+		// The Luby sequence grows unboundedly (1, 1, 2, 1, 1, 2, 4, ..., 2^k, ...).
+		// Without a cap, the threshold (lubyValue × restartBase) eventually exceeds
+		// the conflict budget, and Luby restarts effectively stop — leaving the
+		// solver without periodic diversification for the rest of the solve.
+		// Fix: when the threshold exceeds lubyThresholdCap, reset lubyIndex to 0 —
+		// re-running the Luby sequence from the start. This keeps the restart
+		// cadence in the productive range indefinitely. CaDiCaL and Kissat use
+		// similar bounded restart sequences. Disabled for random instances
+		// (lubyThresholdCap=0) where Luby growth aids convergence.
+		lubyValue := luby(s.lubyIndex + 1)
+		threshold := lubyValue * s.restartBase
 
-	// If the threshold exceeds the cap, reset the index so the sequence
-	// restarts from the beginning on the next restart.
-	if s.lubyThresholdCap > 0 && threshold > s.lubyThresholdCap {
-		s.lubyIndex = 0
+		if s.conflicts-s.restartCount >= threshold {
+			return true
+		}
+
+		// If the threshold exceeds the cap, reset the index so the sequence
+		// restarts from the beginning on the next restart.
+		if s.lubyThresholdCap > 0 && threshold > s.lubyThresholdCap {
+			s.lubyIndex = 0
+		}
 	}
 
 	// Props/dec-bounded restart: if the solver is going too deep per decision
@@ -2779,10 +2846,13 @@ func (s *CDCLSolver) shouldRestart() bool {
 	// binary clauses for a single conflict). The Glucose EMA criterion doesn't
 	// fire here because binary cascades produce low-LBD glue clauses, making
 	// the search look productive by LBD metrics when it's actually going nowhere.
-	// Only fires after the first few restarts (lubyIndex >= 3) and requires a
-	// minimum conflict gap to prevent thrashing (the solver needs time to
-	// explore between restarts, and the phase flip needs time to take effect).
-	if s.restartPropsDecLimit > 0 && s.lubyIndex >= 3 && s.decisions > 10 &&
+	// Requires a minimum conflict gap to prevent thrashing (the solver needs
+	// time to explore between restarts, and the phase flip needs time to take
+	// effect). In no-init mode, fires from conflict 0 (early escape needed to
+	// compensate for missing VSIDS init). In default init-on mode, gated on
+	// lubyIndex >= 3 (matches B3 baseline behavior).
+	if s.restartPropsDecLimit > 0 && s.decisions > 10 &&
+		(s.skipVSIDSInit || s.lubyIndex >= 3) &&
 		s.conflicts-s.restartCount >= s.propsDecRestartGap {
 		propsPerDec := float64(s.propagations) / float64(s.decisions)
 		if propsPerDec > float64(s.restartPropsDecLimit) {
@@ -2798,9 +2868,12 @@ func (s *CDCLSolver) shouldRestart() bool {
 	// propagation guidance, creating a deep-search → high-LBD → no-guidance →
 	// deep-search cycle. This breaks the cycle by restarting when level > cap.
 	// Gated on LongClauseRatio > 0.8 (binary-heavy instances have the props/dec
-	// restart instead). Anti-thrashing: lubyIndex >= 3, decisions > 10, min-conflict gap.
+	// restart instead). Anti-thrashing: decisions > 10, min-conflict gap.
+	// In no-init mode, fires from conflict 0. In default init-on mode, gated
+	// on lubyIndex >= 3 (matches B3 baseline behavior).
 	if s.restartLevelCap > 0 && s.longClauseRatio > 0.8 &&
-		s.lubyIndex >= 3 && s.decisions > 10 &&
+		(s.skipVSIDSInit || s.lubyIndex >= 3) &&
+		s.decisions > 10 &&
 		s.conflicts-s.restartCount >= s.levelRestartGap &&
 		s.lastConflictLevel > s.restartLevelCap {
 		s.Log("c [restart] Level-capped: conflict level %d > %d (long-clause instance)\n",
@@ -2890,6 +2963,12 @@ func (s *CDCLSolver) restart() bool {
 
 	// Reset restart counters
 	s.lubyIndex++
+	if s.minisatRestart {
+		if s.geometricRestartThreshold == 0 {
+			s.geometricRestartThreshold = float64(s.restartBase)
+		}
+		s.geometricRestartThreshold *= 1.5
+	}
 	s.restartCount = s.conflicts
 	s.lbdSum = 0
 	s.lbdCount = 0
@@ -3017,7 +3096,121 @@ func (s *CDCLSolver) restart() bool {
 		s.maybeAdaptDecay()
 	}
 
+	// Lazy init: detect bad trajectory and inject occurrence-based VSIDS bump.
+	// Only fires when skipVSIDSInit is true — checked here to avoid the
+	// function call overhead when lazy init is enabled but skipVSIDSInit is not.
+	if s.lazyInit != nil && !s.lazyInit.done && s.skipVSIDSInit {
+		s.maybeLazyInit()
+	}
+
 	return false // No UNSAT detected
+}
+
+// maybeLazyInit detects when the search has locked onto a bad trajectory and
+// injects an occurrence-based VSIDS bump to escape it. This is the reactive
+// counterpart to initVSIDSOccurrenceBonus: instead of always injecting an init
+// prior (which creates trajectory sensitivity), it injects only when the search
+// is demonstrably stuck. One-shot (li.done).
+//
+// Only active when skipVSIDSInit is true — when static init is already applied,
+// the occurrence signal is already in VSIDS activity, and injecting more just
+// amplifies the prior harmfully. Lazy init is a REPLACEMENT for static init,
+// not a supplement.
+//
+// Detection requires ALL of:
+//   - Enough data: totalLbdCount > li.minConflicts
+//   - High avg LBD: totalAvgLBD > li.avgLBDThreshold (consistently bad learned clauses)
+//   - Low glue rate: glueLearned/totalLbdCount < li.glueRateLimit (no tight implication chains)
+//   - Flat/increasing LBD trend: emaLBD hasn't improved across the last li.trendWindow restarts
+//
+// The trend check distinguishes "bad trajectory" (stuck, not improving) from
+// "legitimately hard instance" (slow but improving — LBD trend is downward).
+func (s *CDCLSolver) maybeLazyInit() {
+	li := s.lazyInit
+
+	// Snapshot emaLBD at each restart for trend analysis.
+	li.emaLBDSnapshots = append(li.emaLBDSnapshots, s.emaLBD)
+
+	// Size guard: occurrence-based priors are most informative for small
+	// instances where the search space is compact. For large instances,
+	// the occurrence distribution adds noise — skip injection.
+	if s.cnf.NumVars > 2000 {
+		li.done = true
+		return
+	}
+
+	// Need enough data for stable metrics.
+	if s.totalLbdCount < uint64(li.minConflicts) {
+		return
+	}
+
+	// Condition 1: high average LBD (consistently bad learned clauses).
+	totalAvgLBD := float64(s.totalLbdSum) / float64(s.totalLbdCount)
+	if totalAvgLBD <= li.avgLBDThreshold {
+		return
+	}
+
+	// Condition 2: low glue rate (no tight implication chains found).
+	glueRate := float64(s.glueLearned) / float64(s.totalLbdCount)
+	if glueRate >= li.glueRateLimit {
+		return
+	}
+
+	// Condition 3: flat or increasing LBD trend across recent restarts.
+	// The search isn't learning — emaLBD is not going down.
+	n := len(li.emaLBDSnapshots)
+	if n < li.trendWindow+1 {
+		return // not enough snapshots yet
+	}
+	oldest := li.emaLBDSnapshots[n-li.trendWindow-1]
+	newest := li.emaLBDSnapshots[n-1]
+	// Trend must be flat or increasing (not improving by more than 5%).
+	if newest < oldest*0.95 {
+		return // improving — don't interfere
+	}
+
+	// Bad trajectory detected. Inject occurrence-based VSIDS bump.
+	s.Log("c [lazy-init] Bad trajectory detected: avgLBD=%.1f, glueRate=%.3f, emaLBD %.1f→%.1f (flat/increasing)\n",
+		totalAvgLBD, glueRate, oldest, newest)
+	s.injectOccurrenceBonus()
+	li.done = true
+}
+
+// injectOccurrenceBonus resets VSIDS activity to zero, then injects an
+// occurrence-based prior: variables appearing in more original clauses get
+// higher activity. The bump is scaled relative to current varInc so it's
+// competitive with future conflict bumps. Used by lazy init to recreate
+// the init-on state mid-search after a bad trajectory is detected.
+func (s *CDCLSolver) injectOccurrenceBonus() {
+	// Reset VSIDS activity to clear bad trajectory accumulation, then inject
+	// occurrence-based prior.
+	s.vsids.ResetActivity()
+
+	occurrences := make([]int, s.cnf.NumVars)
+	maxOcc := 0
+	for _, clause := range s.cnf.Clauses {
+		for _, lit := range clause.Literals {
+			occurrences[lit.Var()]++
+		}
+	}
+	for _, occ := range occurrences {
+		if occ > maxOcc {
+			maxOcc = occ
+		}
+	}
+	if maxOcc == 0 {
+		return
+	}
+
+	// Scale: bump = occurrenceWeight × varInc × (occ/maxOcc).
+	// The most-occurring var gets occurrenceWeight × varInc (comparable to
+	// one conflict bump). Less-occurring vars get proportionally less.
+	scale := s.occurrenceWeight * s.vsids.varInc / float64(maxOcc)
+	for i := range s.assignments {
+		if s.assignments[i].Level < 0 {
+			s.vsids.activity[i] += float64(occurrences[i]) * scale
+		}
+	}
 }
 
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
@@ -3185,6 +3378,9 @@ func (s *CDCLSolver) Solve() bool {
 // Variables appearing in more clauses get higher activity since they are more
 // constrained. Built in O(clauses x literals) rather than O(vars x clauses).
 func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
+	if s.skipVSIDSInit {
+		return
+	}
 	// Initialize VSIDS with clause-length weighted activity BEFORE search.
 	// Variables in shorter clauses get higher activity (more constrained).
 	// Binary clauses get 100x base weight to bias initial variable selection.

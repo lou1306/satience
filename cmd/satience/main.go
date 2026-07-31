@@ -64,6 +64,11 @@ func run() int {
 	dbShrinkThresh := flag.Int("db-shrink-thresh", 10, "Shrink maxLearned when avgLBD > threshold (default 10)")
 	dbShrinkFloorMult := flag.Int("db-shrink-mult", 3, "Shrink floor = numVars × multiplier (default 3)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
+	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
+	minisatRestart := flag.Bool("minisat-restart", false, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD)")
+	minisatBumps := flag.Bool("minisat-bumps", false, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor)")
+	noLBDBonus := flag.Bool("no-lbd-bonus", false, "Disable LBD-based VSIDS activity bonus (pure conflict-frequency activity, like MiniSat)")
+	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
 	flag.Parse()
 
 	// Collect explicitly-set flags so classifyInstance knows which CLI values
@@ -165,6 +170,21 @@ func run() int {
 	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
 	s.SetClauseDBParams(*lbdTier1, *lbdTier2, *dbGrowthDiv, *delTriggerRatio, *dbShrinkThresh, *dbShrinkFloorMult)
 	s.SetOccurrenceWeight(*occurrenceWeight)
+	if *skipVSIDSInit {
+		s.SetSkipVSIDSInit(true)
+	}
+	if *minisatRestart {
+		s.SetMinisatRestart(true)
+	}
+	if *minisatBumps {
+		s.SetMinisatBumps(true)
+	}
+	if *noLBDBonus {
+		s.SetNoLBDBonus(true)
+	}
+	if *lazyInit {
+		s.SetLazyInit(true)
+	}
 
 	start := time.Now()
 	var result solver.SolveResult
