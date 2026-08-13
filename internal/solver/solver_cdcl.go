@@ -281,6 +281,7 @@ type CDCLSolver struct {
 	minimizeMaxDepth           int     // Max recursion depth for recursive clause minimization (default 0=unlimited)
 	unitPropBudget             int     // Max literal visits for unit propagation preprocess (0=unlimited)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
+	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
 	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 50)
 	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
@@ -473,6 +474,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Variable elimination budget: 0 = unlimited (small instances).
 		// Large instances set this to bound resolvent generation.
 		veBudget: 5000000, // 5M resolvents default; large instances override to 2M
+		// Subsumption budget: 0 = unlimited. Sized adaptively before preprocessing
+		// (in preprocessAggressive) to bound the O(n²)-ish clause-pair scans.
+		subsumptionBudget: 0,
 		// Vivification: run every 50 restarts (configurable via CLI)
 		vivifyPeriod:  50,
 		vivifyEnabled: true,
@@ -1861,6 +1865,20 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
 	}
 
+	// Bound subsumption's O(n²)-ish clause-pair scans adaptively. Subsumption
+	// only runs on structured instances (config.EnableUnitProp). Small instances
+	// keep unlimited behavior (proven tuning); larger ones get a budget scaled
+	// to the original literal count so heavy long-clause processing stays
+	// bounded instead of dominating the whole run (e.g. stone_3_tree12 was ~69%
+	// of wall time in subsumptionPass). 0 = unlimited.
+	if s.subsumptionBudget == 0 && int(s.cnf.NumVars) >= 8000 {
+		if totalLits := len(s.cnf.GetLiteralPool()); totalLits > 0 {
+			s.subsumptionBudget = 25 * totalLits
+			s.Log("c [verbose] subsumption budget=%d (%d vars, %d lits)\n",
+				s.subsumptionBudget, s.cnf.NumVars, totalLits)
+		}
+	}
+
 	// Iterative simplification loop: subsumption → BVE → unit propagation.
 	// Each pass creates new opportunities for the others (e.g., subsumption
 	// shrinks clauses → BVE eliminates variables → new subsumptions appear).
@@ -1903,6 +1921,11 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 			if veResult > 0 {
 				passChanged = true
+			}
+			// VE expands the clause DB; tighten the next subsumption scan so later
+			// passes don't burn the full budget re-scanning the bloated DB.
+			if s.subsumptionBudget > 0 && veResult > 0 {
+				s.subsumptionBudget /= 2
 			}
 		}
 

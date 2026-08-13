@@ -419,7 +419,26 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 	seenLit := make([]bool, numLits)
 	var touched []int
 
+	// Work budget: count clause-pair comparisons (the dominant O(n²)-ish cost).
+	// Once exhausted, stop simplifying — subsumption is purely an optimization,
+	// so stopping early is sound (it just does less). Budget 0 = unlimited.
+	budget := s.subsumptionBudget
+	comparisons := 0
+
+	// cleanupAndExit clears the current clause's seenLit marks before bailing on
+	// a budget exhaustion mid-clause, then aborts the whole pass.
+	cleanupAndExit := func() {
+		for _, idx := range touched {
+			seenLit[idx] = false
+		}
+		touched = touched[:0]
+	}
+
+clauseLoop:
 	for ci, clause := range s.cnf.Clauses {
+		if budget > 0 && comparisons >= budget {
+			break clauseLoop
+		}
 		if removed[ci] {
 			continue
 		}
@@ -454,6 +473,11 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 		// Forward subsumption: check if C is subsumed by any D (|D| <= |C|, D ⊆ C)
 		isSubsumed := false
 		for _, di := range occ[bestIdx] {
+			comparisons++
+			if budget > 0 && comparisons >= budget {
+				cleanupAndExit()
+				break clauseLoop
+			}
 			if di == ci || removed[di] {
 				continue
 			}
@@ -510,6 +534,11 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 
 			strengthenedHere := false
 			for _, di := range occ[negIdx] {
+				comparisons++
+				if budget > 0 && comparisons >= budget {
+					cleanupAndExit()
+					break clauseLoop
+				}
 				if di == ci || removed[di] {
 					continue
 				}
@@ -539,8 +568,10 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 					}
 				}
 				if allIn {
-					// Remove l from C (strengthen C)
-					clauseLits = removeLiteral(clauseLits, lit)
+					// Remove l from C (strengthen C). In-place shift avoids an
+					// allocation+copy per strengthening (thousands per pass).
+					// Clause literal order is irrelevant for subsumption.
+					clauseLits = removeLiteralAt(clauseLits, i)
 					s.cnf.Clauses[ci].Literals = clauseLits
 					seenLit[lIdx] = false
 					strengthened++
@@ -571,14 +602,12 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 	return subsumed, strengthened
 }
 
-// removeLiteral returns a new slice with the first occurrence of lit removed.
-func removeLiteral(lits []cnf.Literal, lit cnf.Literal) []cnf.Literal {
-	for i, l := range lits {
-		if l == lit {
-			return append(lits[:i], lits[i+1:]...)
-		}
-	}
-	return lits
+// removeLiteralAt removes the literal at position i in-place by shifting the
+// tail left, avoiding an allocation/copy per removal. Returns the shortened
+// slice. Clause literal order is irrelevant for subsumption correctness.
+func removeLiteralAt(lits []cnf.Literal, i int) []cnf.Literal {
+	copy(lits[i:], lits[i+1:])
+	return lits[:len(lits)-1]
 }
 
 // subsumptionResult records a single clause modification from
