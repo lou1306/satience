@@ -1481,6 +1481,14 @@ func (s *CDCLSolver) classifyInstance() {
 				if !s.flagSet("restart-glucose-min") {
 					s.restartGlucoseMinConflicts = 100
 				}
+				// Analyze_toclear (bump all touched vars, like MiniSat) is the
+				// dominant branching-quality lever for random 3-SAT at phase
+				// transition: rand3sat_200 drops 99K->21K conflicts (matches
+				// minisat 22K). Enabled here for the phase-transition branch,
+				// mirroring the density>4.5 pure-k-SAT branch above.
+				if !s.useBumpAnalyzeOverride {
+					s.useBumpAnalyze = true
+				}
 			}
 			return
 		}
