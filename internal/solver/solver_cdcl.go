@@ -188,6 +188,11 @@ type CDCLSolver struct {
 	restartSegProdRatio   float64 // conflicts per 1000 decisions over the last segment (negative=unset)
 	restartSegGlueCount   int    // glue clauses learned in the current segment
 	restartSegStartGlue   int    // glueLearned at the start of the current segment
+	// Branch-quality telemetry (instrumentation): which VSIDS bump scheme and
+	// init mode were actually in effect. 1=analyze_toclear (bump all touched),
+	// 0=bumpClause only; initMode 1=clause/occurrence-weighted, 0=zero-init.
+	branchBumpScheme int
+	branchInitMode   int
 	// Adaptive restart gear: multiplier on the Luby fallback base. Starts at
 	// 1.0 (exact baseline). Raised to maxAdaptiveRestartGear by restart() when
 	// the search has ground past restartPatienceConflicts conflicts with no
@@ -1060,9 +1065,10 @@ func (s *CDCLSolver) printFinalStats() {
 	if s.maxLearnedShrunk {
 		shrunk = " [DB shrunk]"
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d]\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d]\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
+		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
@@ -1143,9 +1149,10 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.totalLbdCount > 0 {
 		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg=%.0f/1kdec glue=%d\n",
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg=%.0f/1kdec glue=%d\n",
 		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, glueRatio, shrunk,
+		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeHits, s.bigMinimizeCalls,
 		s.restartReasonSummary(), s.restartSegProdRatio, s.restartSegGlueCount)
@@ -3895,6 +3902,15 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
 	// Also initialize litTrue cache from preprocessing assignments.
 	s.numUnassigned = 0
+	// Branch-quality telemetry: record the effective bump scheme and init mode.
+	if s.useBumpAnalyze {
+		s.branchBumpScheme = 1
+	}
+	if s.skipVSIDSInit {
+		s.branchInitMode = 0
+	} else {
+		s.branchInitMode = 1
+	}
 	for i := uint32(0); i < s.cnf.NumVars; i++ {
 		if s.assignments[i].Level < 0 {
 			s.numUnassigned++
