@@ -27,6 +27,8 @@ import (
 	"runtime"
 	"satience/internal/cnf"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -157,6 +159,18 @@ type CDCLSolver struct {
 	maxLearned        int
 	restartCount      int
 	lubyIndex         int
+	// Restart-reason attribution counters (instrumentation). Which mechanism
+	// triggered each restart: Luby fallback, Glucose LBD restarts, props/dec
+	// bounded, level-capped, or MiniSat geometric. Used to diagnose where
+	// search time goes (flat-high-LBD instances never fire Glucose, so the
+	// Luby fallback dominates).
+	restartReasons        [5]int // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
+	restartSegStartConf   int    // conflicts at the start of the current restart segment
+	restartSegStartDec    int    // decisions at the start of the current restart segment
+	restartSegStartProps  int    // propagations at the start of the current restart segment
+	restartSegProdRatio   float64 // conflicts per 1000 decisions over the last segment (negative=unset)
+	restartSegGlueCount   int    // glue clauses learned in the current segment
+	restartSegStartGlue   int    // glueLearned at the start of the current segment
 	lbdSum            int
 	lbdCount          int
 	emaLBD            float64 // Exponential moving average of LBD (smooth restart signal)
@@ -968,6 +982,8 @@ func (s *CDCLSolver) printStats() {
 		s.Log("c Avg LBD:       %d\n", stats.AvgLBD)
 	}
 	s.logDiagnostics()
+	s.Log("c Restarts:      %s (last segment %d conf/1kdec, %d glue)\n",
+		s.restartReasonSummary(), int(s.restartSegProdRatio), s.restartSegGlueCount)
 	s.Log("c \n")
 
 	// When -stats is enabled without -verbose, emit a compact final summary to
@@ -1014,6 +1030,29 @@ func (s *CDCLSolver) printFinalStats() {
 		s.uipFallbackCount,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5])
+}
+
+// restartReasonSummary returns a descriptive string of restart attribution.
+// Instrumentation only — no effect on search behavior.
+func (s *CDCLSolver) restartReasonSummary() string {
+	total := s.restartReasons[0] + s.restartReasons[1] + s.restartReasons[2] +
+		s.restartReasons[3] + s.restartReasons[4]
+	if total == 0 {
+		return "no restarts"
+	}
+	names := []string{"glucose", "luby", "propsdec", "levelcap", "geometric"}
+	var sb strings.Builder
+	for i, n := range s.restartReasons {
+		if n > 0 {
+			if sb.Len() > 0 {
+				sb.WriteString(" ")
+			}
+			sb.WriteString(names[i])
+			sb.WriteString("=")
+			sb.WriteString(strconv.Itoa(n))
+		}
+	}
+	return sb.String()
 }
 
 // logDiagnostics prints a compact one-line summary of learned-clause
@@ -1065,11 +1104,12 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.totalLbdCount > 0 {
 		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | min: rate=%.1f%% | BIG: hits=%d/%d\n",
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg=%.0f/1kdec glue=%d\n",
 		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, glueRatio, shrunk,
 		minRate,
-		s.bigMinimizeHits, s.bigMinimizeCalls)
+		s.bigMinimizeHits, s.bigMinimizeCalls,
+		s.restartReasonSummary(), s.restartSegProdRatio, s.restartSegGlueCount)
 }
 
 // elapsedSec returns seconds since the public Solve entry set solveStartNs.
@@ -2813,6 +2853,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 			s.geometricRestartThreshold = float64(s.restartBase)
 		}
 		if float64(s.conflicts-s.restartCount) >= s.geometricRestartThreshold {
+			s.restartReasons[4]++ // geometric
 			return true
 		}
 		// Still allow props/dec and level-capped early escape (below).
@@ -2832,6 +2873,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 			// instead of single lastConflictLBD avoids noise from individual
 			// LBD spikes triggering spurious restarts.
 			if s.emaLBD > avgLBD*s.restartGlucoseRatio {
+				s.restartReasons[0]++ // glucose
 				s.Log("c [restart] Glucose: EMA LBD %.1f > avg %.1f × %.2f\n",
 					s.emaLBD, avgLBD, s.restartGlucoseRatio)
 				return true
@@ -2852,6 +2894,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 		threshold := lubyValue * s.restartBase
 
 		if s.conflicts-s.restartCount >= threshold {
+			s.restartReasons[1]++ // luby
 			return true
 		}
 
@@ -2879,6 +2922,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 		s.conflicts-s.restartCount >= s.propsDecRestartGap {
 		propsPerDec := float64(s.propagations) / float64(s.decisions)
 		if propsPerDec > float64(s.restartPropsDecLimit) {
+			s.restartReasons[2]++ // propsdec
 			s.Log("c [restart] Props/dec %.1f > %d\n", propsPerDec, s.restartPropsDecLimit)
 			return true
 		}
@@ -2899,6 +2943,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 		s.decisions > 10 &&
 		s.conflicts-s.restartCount >= s.levelRestartGap &&
 		s.lastConflictLevel > s.restartLevelCap {
+		s.restartReasons[3]++ // levelcap
 		s.Log("c [restart] Level-capped: conflict level %d > %d (long-clause instance)\n",
 			s.lastConflictLevel, s.restartLevelCap)
 		return true
@@ -2945,6 +2990,28 @@ func (s *CDCLSolver) cancelUntil(level int) {
 func (s *CDCLSolver) restart() bool {
 	s.unitsDirty = true // Restart clears all assignments; units need re-propagation
 	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
+
+	// Record the just-ended segment's productivity (instrumentation): conflicts
+	// per 1000 decisions. A low value means the search made little progress per
+	// decision (unproductive deep/branching search); high means many conflicts
+	// per decision (dense cascades). Both extremes are signals the governor can
+	// use. Segments with no decisions (preprocessing) yield a neutral 0.
+	segDec := s.decisions - s.restartSegStartDec
+	if segDec > 0 {
+		segConf := s.conflicts - s.restartSegStartConf
+		s.restartSegProdRatio = float64(segConf) * 1000.0 / float64(segDec)
+	} else {
+		s.restartSegProdRatio = 0.0
+	}
+	s.restartSegGlueCount = int(s.glueLearned) - s.restartSegStartGlue
+	if s.verbose {
+		s.Log("c [verbose] segment: %d conflicts / %d decisions = %.1f conflicts/1kdec, %d glue learned\n",
+			s.conflicts-s.restartSegStartConf, segDec, s.restartSegProdRatio, s.restartSegGlueCount)
+	}
+	s.restartSegStartConf = s.conflicts
+	s.restartSegStartDec = s.decisions
+	s.restartSegStartProps = s.propagations
+	s.restartSegStartGlue = int(s.glueLearned)
 
 	// VSIDS activity is NOT reset on restart. Standard CDCL solvers (MiniSat,
 	// Glucose) preserve activity across restarts — it is the solver's memory of
