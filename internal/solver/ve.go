@@ -207,6 +207,18 @@ func (s *CDCLSolver) boundedVarElimination() int {
 			}
 		}
 
+		// SOUNDNESS: if the resolvent budget was exhausted while generating
+		// resolvents for this variable, the resolvent set above is INCOMPLETE
+		// (the break at the budget check truncated it mid-variable). Eliminating
+		// now would mark this variable's clauses removed while adding only a
+		// partial resolvent set, silently dropping the unsolved implications and
+		// weakening the formula (an UNSAT instance can become satisfiable).
+		// Budget is exhausted, so abort elimination entirely rather than produce
+		// an unsound result.
+		if s.veBudget > 0 && totalResolvents >= s.veBudget {
+			break
+		}
+
 		// Clause-count gate: only eliminate if resolvents <= old clauses.
 		// Allow equality (minisat does): eliminating a variable that keeps
 		// the clause count the same still reduces the variable count.

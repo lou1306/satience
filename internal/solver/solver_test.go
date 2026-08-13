@@ -1786,3 +1786,27 @@ func TestLearnedSubsumptionFires(t *testing.T) {
 		s.subsumptionRoundsRun, s.subsumptionClausesChecked,
 		s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened, s.conflicts)
 }
+
+// TestVEBudgetNeverCorruptsUnsat guards against a VE soundness bug where the
+// resolvent budget, exhausted mid-variable, truncated the resolvent set but the
+// variable was still eliminated with the incomplete set — weakening the formula
+// and turning an UNSAT instance satisfiable. Sweeping many small VE budgets
+// exercises the truncation boundary at many points: an elimination performed
+// with a partial resolvent set on an UNSAT input must never yield SAT.
+func TestVEBudgetNeverCorruptsUnsat(t *testing.T) {
+	// UNSAT pigeonhole instances (more pigeons than holes). Sweep a range of
+	// small VE budgets so the resolvent budget is hit at many different points
+	// during elimination.
+	for _, pq := range [][2]int{{6, 5}, {7, 6}, {8, 7}} {
+		for budget := int64(1); budget <= 64; budget++ {
+			c := buildPigeonhole(pq[0], pq[1])
+			s := NewCDCLSolver(&c)
+			s.veBudget = int(budget)
+			result := s.SolveWithResult()
+			if result != UNSAT {
+				t.Fatalf("PHP(%d,%d) veBudget=%d: should be UNSAT but got %v (VE corrupted formula)",
+					pq[0], pq[1], budget, result)
+			}
+		}
+	}
+}
