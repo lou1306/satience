@@ -53,6 +53,23 @@ const (
 	DefaultRestartBase      = 200   // Base for Luby restart sequence (MiniSat-style)
 	IterationReportInterval = 10000 // Report progress every N iterations
 
+	// maxAdaptiveRestartGear caps the multiplicative gear on the Luby fallback
+	// base (see adaptiveRestartGear). Bounding ensures the fallback can never
+	// grow so rare that the solver loses all periodic diversification — the
+	// cap is a safety bound on the adaptive multiplier, not a per-instance
+	// threshold.
+	maxAdaptiveRestartGear = 16.0
+
+	// restartPatienceConflicts is the uniform accumulated-conflict horizon that
+	// must elapse before the adaptive gear may start deepening the Luby
+	// fallback. Instances that solve within an ordinary conflict budget (all
+	// suite instances solve below ~85K) never reach it and keep their tuned
+	// frequent-restart schedule untouched; only long grinders, whose default
+	// schedule has demonstrably failed to converge, are deepened. This is a
+	// single uniform horizon — a "give the default schedule a fair chance"
+	// rule — not a per-family or per-instance threshold.
+	restartPatienceConflicts = 120000
+
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
 
@@ -171,6 +188,15 @@ type CDCLSolver struct {
 	restartSegProdRatio   float64 // conflicts per 1000 decisions over the last segment (negative=unset)
 	restartSegGlueCount   int    // glue clauses learned in the current segment
 	restartSegStartGlue   int    // glueLearned at the start of the current segment
+	// Adaptive restart gear: multiplier on the Luby fallback base. Starts at
+	// 1.0 (exact baseline). Raised to maxAdaptiveRestartGear by restart() when
+	// the search has ground past restartPatienceConflicts conflicts with no
+	// Glucose ever firing and no glue learned — the flat-LBD grinder signature
+	// (rphp). Decayed back to 1.0 whenever Glucose/glue activity appears, since
+	// healthy instances need their frequent diversification preserved.
+	adaptiveRestartGear      float64
+	restartSegTotalConflicts uint64 // accumulated conflicts across segments
+	restartSegSteps          int    // number of restart segments observed
 	lbdSum            int
 	lbdCount          int
 	emaLBD            float64 // Exponential moving average of LBD (smooth restart signal)
@@ -444,6 +470,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		maxLearned:         maxLearned,
 		restartBase:        restartBase,
 		restartCount:       0,
+		adaptiveRestartGear: 1.0,
 		lubyIndex:          0,
 		lubyThresholdCap:   0, // Disabled by default; enabled for structured instances in classifyInstance
 		lbdSum:             0,
@@ -2880,27 +2907,26 @@ func (s *CDCLSolver) shouldRestart() bool {
 			}
 		}
 
-		// Fall back to Luby sequence (configurable base).
-		// The Luby sequence grows unboundedly (1, 1, 2, 1, 1, 2, 4, ..., 2^k, ...).
-		// Without a cap, the threshold (lubyValue × restartBase) eventually exceeds
-		// the conflict budget, and Luby restarts effectively stop — leaving the
-		// solver without periodic diversification for the rest of the solve.
-		// Fix: when the threshold exceeds lubyThresholdCap, reset lubyIndex to 0 —
-		// re-running the Luby sequence from the start. This keeps the restart
-		// cadence in the productive range indefinitely. CaDiCaL and Kissat use
-		// similar bounded restart sequences. Disabled for random instances
-		// (lubyThresholdCap=0) where Luby growth aids convergence.
+		// Fall back to Luby sequence (configurable base), scaled by an adaptive
+		// gear. The raw Luby sequence alone oscillates back to short segments
+		// (1,1,2,1,1,2,4,...) forever, so on flat-high-LBD instances where
+		// Glucose can never fire (EMA ≈ avg), the fallback throttles search into
+		// a permanent cycle of frequent shallow restarts, never letting it go
+		// deep. Raising the gear (rarer restarts) on such grinders lets deep
+		// search develop. Gear = 1.0 reproduces baseline exactly; it is moved
+		// only by the behavioral governor in restart(). Bounded via
+		// maxAdaptiveRestartGear so it can never starve diversification.
 		lubyValue := luby(s.lubyIndex + 1)
-		threshold := lubyValue * s.restartBase
+		threshold := float64(lubyValue*s.restartBase) * s.adaptiveRestartGear
 
-		if s.conflicts-s.restartCount >= threshold {
+		if float64(s.conflicts-s.restartCount) >= threshold {
 			s.restartReasons[1]++ // luby
 			return true
 		}
 
 		// If the threshold exceeds the cap, reset the index so the sequence
 		// restarts from the beginning on the next restart.
-		if s.lubyThresholdCap > 0 && threshold > s.lubyThresholdCap {
+		if s.lubyThresholdCap > 0 && threshold > float64(s.lubyThresholdCap) {
 			s.lubyIndex = 0
 		}
 	}
@@ -2997,8 +3023,8 @@ func (s *CDCLSolver) restart() bool {
 	// per decision (dense cascades). Both extremes are signals the governor can
 	// use. Segments with no decisions (preprocessing) yield a neutral 0.
 	segDec := s.decisions - s.restartSegStartDec
+	segConf := s.conflicts - s.restartSegStartConf
 	if segDec > 0 {
-		segConf := s.conflicts - s.restartSegStartConf
 		s.restartSegProdRatio = float64(segConf) * 1000.0 / float64(segDec)
 	} else {
 		s.restartSegProdRatio = 0.0
@@ -3012,6 +3038,38 @@ func (s *CDCLSolver) restart() bool {
 	s.restartSegStartDec = s.decisions
 	s.restartSegStartProps = s.propagations
 	s.restartSegStartGlue = int(s.glueLearned)
+
+	// Adaptive restart gear governor. Advance only when BOTH hold:
+	//   1. The search has passed the uniform conflict horizon
+	//      (restartPatienceConflicts) without a result — the default schedule
+	//      has demonstrably failed to converge, so deepening is justified.
+	//      Instances that solve within an ordinary budget never reach this.
+	//   2. There has been NO Glucose ever and no glue learned in this segment —
+	//      the flat-LBD grinder signature where the LBD-Glucose restart is
+	//      dead (rphp: zero glue, zero Glucose, grinds past 300K conflicts).
+	// Decay back to 1.0 whenever Glucose or glue activity appears, since those
+	// instances need their frequent diversification preserved.
+	s.restartSegTotalConflicts += uint64(segConf)
+	s.restartSegSteps++
+	if s.adaptiveRestartGear < maxAdaptiveRestartGear {
+		if s.restartSegTotalConflicts > restartPatienceConflicts &&
+			s.restartReasons[0] == 0 && s.restartSegGlueCount == 0 {
+			s.adaptiveRestartGear += 0.5
+			if s.adaptiveRestartGear > maxAdaptiveRestartGear {
+				s.adaptiveRestartGear = maxAdaptiveRestartGear
+			}
+			if s.verbose {
+				s.Log("c [governor] flat-LBD grind: advancing gear -> %.1f\n", s.adaptiveRestartGear)
+			}
+		} else if s.restartReasons[0] > 0 || s.restartSegSteps > 8 {
+			// Any Glucose activity, or a well-settled instance without sign of
+			// grind, pulls the gear back toward baseline diversification.
+			s.adaptiveRestartGear -= 0.5
+			if s.adaptiveRestartGear < 1.0 {
+				s.adaptiveRestartGear = 1.0
+			}
+		}
+	}
 
 	// VSIDS activity is NOT reset on restart. Standard CDCL solvers (MiniSat,
 	// Glucose) preserve activity across restarts — it is the solver's memory of
