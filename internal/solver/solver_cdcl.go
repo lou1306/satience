@@ -380,6 +380,9 @@ type CDCLSolver struct {
 	// Placed at struct end to avoid shifting hot/warm cache lines (op_15 regression).
 	binaryRatio    float64 // Cached BinaryRatio from classifier
 	useBumpAnalyze bool    // True: bump all touched vars (minisat analyze_toclear); false: bump conflict clause only
+	// True when the user explicitly set useBumpAnalyze via CLI (-ms-analyze),
+	// so classifyInstance should not overwrite it.
+	useBumpAnalyzeOverride bool
 
 	// Runtime decay adaptation (periodic re-check with rolling windows).
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
@@ -777,6 +780,15 @@ func (s *CDCLSolver) SetMinisatRestart(enabled bool) {
 
 func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
 	s.vsids.SetMinisatBumps(enabled)
+}
+
+// SetUseBumpAnalyze forces updateScores-style analyze_toclear behavior:
+// bump all variables touched during 1-UIP analysis (matching MiniSat) instead
+// of bumping only the conflict clause's variables. Pure diagnostic toggle; when
+// true it overrides the classifier's useBumpAnalyze decision for A/B testing.
+func (s *CDCLSolver) SetUseBumpAnalyze(enabled bool) {
+	s.useBumpAnalyzeOverride = true
+	s.useBumpAnalyze = enabled
 }
 
 func (s *CDCLSolver) SetNoLBDBonus(enabled bool) {
@@ -1447,7 +1459,9 @@ func (s *CDCLSolver) classifyInstance() {
 				if !s.flagSet("restart-base") {
 					s.restartBase = 20
 				}
-				s.useBumpAnalyze = true
+				if !s.useBumpAnalyzeOverride {
+					s.useBumpAnalyze = true
+				}
 			} else {
 				s.Log("c [classification] Pure k-SAT phase-transition (score=%.2f, density=%.2f) - default decay, restartBase=100, Glucose=1.5\n",
 					structure.StructuredScore, structure.Density)
@@ -1539,8 +1553,10 @@ func (s *CDCLSolver) classifyInstance() {
 	// is the sole guidance signal; diluting it across all touched vars hurts.
 	// 69d72f81 (density=11.6, PolImb=0.839) is kept — high PolImb means phase
 	// saving provides strong guidance, so broader VSIDS exploration helps.
-	s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
-		(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
+	if !s.useBumpAnalyzeOverride {
+		s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
+			(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
+	}
 
 	// Cap Luby threshold growth to prevent Luby exhaustion on very long-clause
 	// instances. The Luby sequence grows unboundedly; without a cap, the
