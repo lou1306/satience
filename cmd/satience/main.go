@@ -36,16 +36,15 @@ func run() int {
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 200, "Luby restart sequence base multiplier (default=200)")
-	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (default=1.5 for PHP)")
-	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10 for PHP)")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (default=10.0; classifier overrides per-instance)")
+	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10.0; classifier overrides per-instance)")
 	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Restart when props/dec exceeds this (deep search escape, 0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.5, "Phase flip rate when props/dec is high (0=disabled)")
 	// VSIDS parameters
-	decayInterval := flag.Int("decay-interval", 1, "VSIDS decay interval - conflicts between activity decays (default=1, O(1) decay)")
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
 	decayRampup := flag.Int("decay-rampup", 100, "Conflicts to reach max decay (default=100, minimal since initial==max)")
-	lbdScale := flag.Float64("lbd-scale", 0.0, "LBD bonus scale for VSIDS (default=0=adaptive: max(10, 200000/numVars))")
+	lbdScale := flag.Float64("lbd-scale", 0.0, "LBD bonus scale for VSIDS (>0=explicit, 0=adaptive: max(10, 200000/numVars), <0=disable)")
 	bumpAmount := flag.Float64("bump-amount", 25.0, "Base bump amount for conflicts (default=25.0)")
 	clauseInitBase := flag.Float64("clause-init-base", 10.0, "Base clause initialization weight (default=10.0)")
 	clauseInitBinary := flag.Float64("clause-init-binary", 100.0, "Binary clause initialization weight (default=100.0)")
@@ -68,7 +67,6 @@ func run() int {
 	minisatRestart := flag.Bool("minisat-restart", false, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD)")
 	minisatBumps := flag.Bool("minisat-bumps", false, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor)")
 	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
-	noLBDBonus := flag.Bool("no-lbd-bonus", false, "Disable LBD-based VSIDS activity bonus (pure conflict-frequency activity, like MiniSat)")
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
 	flag.Parse()
 
@@ -138,12 +136,13 @@ func run() int {
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters
-	s.SetDecayInterval(*decayInterval)
 	s.SetInitialDecay(*initialDecay)
 	s.SetMaxDecay(*maxDecay)
 	s.SetDecayRampup(*decayRampup)
 	if *lbdScale > 0 {
 		s.SetLBDBonusScale(*lbdScale)
+	} else if *lbdScale < 0 {
+		s.SetNoLBDBonus(true)
 	}
 	s.SetBumpAmount(*bumpAmount)
 	s.SetClauseInitWeights(*clauseInitBase, *clauseInitBinary)
@@ -182,9 +181,6 @@ func run() int {
 	}
 	if *msAnalyze {
 		s.SetUseBumpAnalyze(true)
-	}
-	if *noLBDBonus {
-		s.SetNoLBDBonus(true)
 	}
 	if *lazyInit {
 		s.SetLazyInit(true)

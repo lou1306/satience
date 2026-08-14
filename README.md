@@ -98,7 +98,7 @@ v 1 -2 3 -4 5 0
 | `-restart-base N` | 200 | Luby restart sequence base multiplier |
 | `-restart-glucose-ratio R` | 10.0 | Glucose restart when LBD > ratio × avg |
 | `-vivify-period N` | 50 | Run vivification every Nth restart (0 = disabled) |
-| `-lbd-scale R` | 0 | LBD bonus scale (0 = adaptive) |
+| `-lbd-scale R` | 0 | LBD bonus scale (>0 = explicit, 0 = adaptive, <0 = disable) |
 | `-cpuprofile file` | — | Write CPU profile to file |
 
 ### Examples

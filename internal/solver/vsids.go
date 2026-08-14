@@ -157,7 +157,6 @@ type VSIDS struct {
 	heapPos         []int     // Position of each variable in heap (-1 = not in heap)
 	heapValid       bool      // True if heap is up-to-date
 	refreshInterval int       // Conflicts between heap rebuilds (fixes deeply stale entries)
-	decayInterval   int       // Number of conflicts between activity decays
 	randomSeed      uint64    // Seed for deterministic random noise (default 0)
 	// Configurable parameters (exposed for tuning)
 	initialDecayFactor   float64 // Initial decay factor (default 0.979)
@@ -175,7 +174,7 @@ func NewVSIDS(numVars uint32) *VSIDS {
 	// O(1) decay: varInc grows as varInc /= decayFactor each conflict.
 	// Activities are bumped by varInc (not baseBumpAmount), so recent bumps
 	// are naturally larger than old ones — no O(n) scan needed.
-	// decayInterval=1 (decay every conflict) is free since decay is O(1).
+	// Decay fires every conflict since it is O(1).
 	// Fixed decay at 0.95 (MiniSat-equivalent). The old ramp from 0.9792 to
 	// 0.9998 over 25K conflicts caused the solver to retain 98% of activity
 	// over 100 conflicts at steady state, keeping VSIDS locked on the same
@@ -198,7 +197,6 @@ func NewVSIDS(numVars uint32) *VSIDS {
 		heapPos:         make([]int, numVars),
 		heapValid:       false,
 		refreshInterval: 2000,
-		decayInterval:   1, // O(1) decay — fire every conflict
 		randomSeed:      0,
 		// Default parameter values
 		initialDecayFactor:   initialDecay,
@@ -289,17 +287,6 @@ func (v *VSIDS) SetRandomSeed(seed uint64) {
 	v.randomSeed = seed
 }
 
-// SetDecayInterval sets the number of conflicts between activity decays
-// Higher values = fewer heap rebuilds but slower activity differentiation
-// Lower values = more frequent decay but more heap rebuilds
-// Default is 10, which provides good balance for most instances
-func (v *VSIDS) SetDecayInterval(interval int) {
-	if interval < 1 {
-		interval = 1
-	}
-	v.decayInterval = interval
-}
-
 // SetInitialDecayFactor sets the initial decay factor (default 0.95)
 // Lower values = more aggressive decay = more exploration
 func (v *VSIDS) SetInitialDecayFactor(factor float64) {
@@ -365,11 +352,9 @@ func (v *VSIDS) SetDecayParams(initial, max float64, rampUpConflicts int) {
 	v.decayFactor = initial
 	v.decayRampUpConflicts = rampUpConflicts
 	v.decayIncrement = (max - initial) / float64(rampUpConflicts)
-	v.decayInterval = 1
 }
 
 // Much more aggressive decay to prevent any single variable from dominating
-// With O(1) decay, decayInterval=1 is already the default.
 func (v *VSIDS) SetAggressiveDecay() {
 	v.SetDecayParams(0.30, 0.60, 5000)
 }

@@ -614,14 +614,6 @@ func (s *CDCLSolver) SetRndInitNoise(noise float64) {
 	s.rndInitNoise = noise
 }
 
-// SetDecayInterval sets the VSIDS decay interval (conflicts between activity decays)
-// Higher values = fewer heap rebuilds but slower activity differentiation
-// Lower values = more frequent decay but more heap rebuilds
-// Default is 10, which provides good balance for most instances
-func (s *CDCLSolver) SetDecayInterval(interval int) {
-	s.vsids.SetDecayInterval(interval)
-}
-
 // SetInitialDecay sets the VSIDS initial decay factor (default 0.95)
 // Lower values = more aggressive decay = more exploration
 func (s *CDCLSolver) SetInitialDecay(factor float64) {
