@@ -4012,13 +4012,22 @@ func (s *CDCLSolver) allAssigned() bool {
 	return s.numUnassigned == 0
 }
 
-// verifyModel checks if the current assignment satisfies all clauses
-// Returns true if model is valid, false otherwise
+// verifyModel checks if the current assignment satisfies all clauses.
+// Runs on the SAT path inside cdclLoop, AFTER s.cnf.Clauses has been released
+// (set to nil), so it validates against the surviving SoA representation
+// (originalClauseLocs + literalPool) rather than the (now-nil) Clauses slice —
+// otherwise the check would iterate zero clauses and vacuously pass.
+// Returns true if model is valid, false otherwise.
 func (s *CDCLSolver) verifyModel() bool {
-	s.Log("c [VERIFY] Checking %d clauses...\n", len(s.cnf.Clauses))
-	for ci, clause := range s.cnf.Clauses {
+	numOrig := s.cnf.NumOriginalClauses()
+	locs := s.cnf.GetOriginalClauseLocs()
+	pool := s.cnf.GetLiteralPool()
+	s.Log("c [VERIFY] Checking %d clauses...\n", numOrig)
+	for ci := 0; ci < numOrig; ci++ {
+		loc := locs[ci]
+		clause := pool[loc.Offset : loc.Offset+loc.Size]
 		clauseSat := false
-		for _, lit := range clause.Literals {
+		for _, lit := range clause {
 			assign := s.assignments[lit.Var()]
 			// FIX: Check if variable is actually assigned (level >= 0)
 			// Unassigned variables (level < 0) cannot satisfy clauses
@@ -4033,14 +4042,14 @@ func (s *CDCLSolver) verifyModel() bool {
 		}
 		if !clauseSat {
 			s.Log("c [VERIFY] Clause %d NOT satisfied: ", ci)
-			for _, lit := range clause.Literals {
+			for _, lit := range clause {
 				if lit.IsNegated() {
 					s.Log("-%d ", lit.Var()+1)
 				} else {
 					s.Log("%d ", lit.Var()+1)
 				}
 				s.Log("(assignments: ")
-				for _, lit := range clause.Literals {
+				for _, lit := range clause {
 					v := lit.Var()
 					s.Log("var%d={V=%v,L=%d,I=%d} ", v+1, s.assignments[v].Value, s.assignments[v].Level, s.assignments[v].Reason)
 				}
