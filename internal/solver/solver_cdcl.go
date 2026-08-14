@@ -1907,6 +1907,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		return UNSAT
 	}
 
+	ppStart := time.Now()
+	ppMark := func(step string) {
+		if s.verbose {
+			s.Log("c [preproc-time] %-28s %8.1fms\n", step, float64(time.Since(ppStart).Microseconds())/1000.0)
+		}
+	}
+
 	s.Log("c [verbose] Aggressive preprocessing: %d variables, %d clauses\n", s.cnf.NumVars, s.cnf.NumClauses)
 
 	// Tautology and duplicate-literal removal (all instances, trivially sound).
@@ -1917,12 +1924,14 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		s.Log("c [preprocessing] Removed %d tautological clauses\n", tautRemoved)
 		s.cnf.RebuildLiteralPool()
 	}
+	ppMark("tautology/duplicate removal")
 
 	// Pure literal elimination (all instances, trivially sound).
 	if pleAssigned := s.pureLiteralElimination(); pleAssigned > 0 {
 		s.Log("c [preprocessing] Pure literal elimination: assigned %d variables\n", pleAssigned)
 		s.cnf.RebuildLiteralPool()
 	}
+	ppMark("pure-literal elimination")
 
 	// Empty clause may have appeared from dedup (e.g. a clause of all-identical
 	// literals becomes a unit, not empty — but check defensively).
@@ -1937,6 +1946,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// This ensures structured instances like bb34f22f (score 0.73 pre-equiv) get
 	// the structured config instead of being misclassified after equiv changes ratios.
 	config := s.getAdaptivePreprocessingConfig()
+	ppMark("adaptive config")
 
 	// SCC-based equivalence detection (all instances, sound).
 	// Runs before the size gate: O(V+E) and can significantly reduce instance
@@ -1997,6 +2007,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 				return UNSAT
 			}
 		}
+		ppMark("subsumption pass")
 
 		// Bounded variable elimination (standard Davis-Putnam VE, NOT the banned
 		// pos=1 definitional variant). Eliminates variables by resolving all
@@ -2025,6 +2036,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 				return unitResult
 			}
 		}
+		ppMark("unit propagation")
 
 		if !passChanged {
 			break // Fixpoint reached
@@ -2075,16 +2087,19 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	// Rebuild literal pool after preprocessing (even if no clauses removed)
 	s.cnf.RebuildLiteralPool()
+	ppMark("rebuild pool")
 
 	// Initialize watches after unit propagation
 	// CRITICAL: Reset watchInitialized flag so watches are re-initialized
 	s.watchInitialized = false
 	s.initWatches()
+	ppMark("init watches")
 
 	// CRITICAL: Propagate original unit clauses + activate watches for preprocessing vars.
 	if unsat := s.propagateOriginalUnitsAndActivateWatches(); unsat {
 		return UNSAT
 	}
+	ppMark("propagate units")
 
 	return UNKNOWN
 }

@@ -437,6 +437,24 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 	budget := s.subsumptionBudget
 	comparisons := 0
 
+	// Diminishing-returns abort: track comparisons since the last yield
+	// (subsumed or strengthened). Subsumption finds most of its results in the
+	// early part of a scan; on large structured instances the tail is pure
+	// waste (e.g. 8202af80: 734K clauses burned 37M comparisons / ~690ms
+	// yielding sub=0 str=0). If a long no-yield stretch elapses we abort the
+	// pass entirely — subsumption is only an optimization, so doing less is
+	// sound. The window scales with instance size and yields frequently reset
+	// it, so instances that do benefit are unaffected.
+	comparisonsSinceHit := 0
+	noYieldWindow := len(s.cnf.Clauses)
+	if noYieldWindow < 400000 {
+		noYieldWindow = 400000
+	}
+	if s.subsumptionBudget > 0 && s.subsumptionBudget < noYieldWindow {
+		noYieldWindow = s.subsumptionBudget
+	}
+	aborted := false
+
 	// cleanupAndExit clears the current clause's seenLit marks before bailing on
 	// a budget exhaustion mid-clause, then aborts the whole pass.
 	cleanupAndExit := func() {
@@ -446,8 +464,27 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 		touched = touched[:0]
 	}
 
+	// checkAbort bails the pass when the total budget is exhausted or the
+	// diminishing-returns window (comparisons since the last yield) is exceeded.
+	checkAbort := func() bool {
+		if budget > 0 && comparisons >= budget {
+			cleanupAndExit()
+			aborted = true
+			return true
+		}
+		if comparisonsSinceHit >= noYieldWindow {
+			cleanupAndExit()
+			aborted = true
+			return true
+		}
+		return false
+	}
+
 clauseLoop:
 	for ci, clause := range s.cnf.Clauses {
+		if aborted {
+			break clauseLoop
+		}
 		if budget > 0 && comparisons >= budget {
 			break clauseLoop
 		}
@@ -486,8 +523,8 @@ clauseLoop:
 		isSubsumed := false
 		for _, di := range occ[bestIdx] {
 			comparisons++
-			if budget > 0 && comparisons >= budget {
-				cleanupAndExit()
+			comparisonsSinceHit++
+			if checkAbort() {
 				break clauseLoop
 			}
 			if di == ci || removed[di] {
@@ -514,6 +551,7 @@ clauseLoop:
 		if isSubsumed {
 			removed[ci] = true
 			subsumed++
+			comparisonsSinceHit = 0
 			// Cleanup and continue to next clause
 			for _, idx := range touched {
 				seenLit[idx] = false
@@ -547,8 +585,8 @@ clauseLoop:
 			strengthenedHere := false
 			for _, di := range occ[negIdx] {
 				comparisons++
-				if budget > 0 && comparisons >= budget {
-					cleanupAndExit()
+				comparisonsSinceHit++
+				if checkAbort() {
 					break clauseLoop
 				}
 				if di == ci || removed[di] {
@@ -587,6 +625,7 @@ clauseLoop:
 					s.cnf.Clauses[ci].Literals = clauseLits
 					seenLit[lIdx] = false
 					strengthened++
+					comparisonsSinceHit = 0
 					strengthenedHere = true
 					break
 				}
