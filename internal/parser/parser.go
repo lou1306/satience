@@ -137,11 +137,13 @@ func processLine(line string, numVars *uint32, numClauses *int, headerFound *boo
 		i = ni
 
 		if val == 0 {
-			// End of clause
-			lits := make([]cnf.Literal, len(*currentLits))
-			copy(lits, *currentLits)
-			(*cnfFormula).AddClause(lits, false)
-			*currentLits = (*currentLits)[:0]
+			// End of clause — transfer ownership of the currentLits slice to
+			// AddClause (which stores it in Clauses and copies into literalPool)
+			// instead of allocating a fresh copy per clause. Then drop the
+			// reference so the next clause appends into a fresh allocation
+			// rather than aliasing the stored clause's backing array.
+			(*cnfFormula).AddClause(*currentLits, false)
+			*currentLits = nil
 		} else {
 			var varIdx uint32
 			var negated bool
