@@ -428,6 +428,38 @@ func (s *CDCLSolver) subsumptionPass() (int, int) {
 	subsumed := 0
 	strengthened := 0
 
+	// Signature prefilter for subsumption (hash/cache-based). Each clause gets
+	// `sigWords` 64-bit membership masks: mask w has bit (hash(lit){w} % 64) set
+	// for every literal. A *necessary* condition for D ⊆ C is that every
+	// signature word of D is a bit-subset of the corresponding word of C
+	// (lit ─→ same literal always sets the same bit, so a bit set in D that is
+	// absent from C proves D ⊄ C). This lets us skip the expensive per-literal
+	// containment loop for the vast majority of candidate pairs, leaving only
+	// the full exact check for pairs that actually pass (collisions only loosen
+	// the filter, never make it accept a non-subset, so soundness is preserved).
+	// This is the classic multi-probe signature trick used in CaDiCaL/Kissat
+	// subsume. numSigWords=2 gives 128 bits; enough discrimination while staying
+	// cache-friendly to fetch per candidate.
+	const sigWords = 2
+	sig := make([][sigWords]uint64, len(s.cnf.Clauses))
+	{
+		numClauses := len(s.cnf.Clauses)
+		pool := s.cnf.GetLiteralPool()
+		locs := s.cnf.GetOriginalClauseLocs()
+		for ci := 0; ci < numClauses; ci++ {
+			off := int(locs[ci].Offset)
+			sz := int(locs[ci].Size)
+			var s [sigWords]uint64
+			for _, lit := range pool[off : off+sz] {
+				h := uint64(cnf.LitToIndex(lit)) * 0x9E3779B97F4A7C15
+				for w := 0; w < sigWords; w++ {
+					s[w] |= uint64(1) << ((h + uint64(w)*0x94D049BB133111EB) & 63)
+				}
+			}
+			sig[ci] = s
+		}
+	}
+
 	seenLit := make([]bool, numLits)
 	var touched []int
 
@@ -534,6 +566,14 @@ clauseLoop:
 			if len(dLits) > len(clauseLits) {
 				continue
 			}
+			// Signature prefilter: D ⊆ C requires D's signature to be a
+			// bit-subset of C's in every word. This skips the per-literal
+			// containment scan for most non-subsuming candidates.
+			sd := sig[di]
+			sc := sig[ci]
+			if sd[0]&^sc[0] != 0 || sd[1]&^sc[1] != 0 {
+				continue
+			}
 			allIn := true
 			for _, lit := range dLits {
 				idx := cnf.LitToIndex(lit)
@@ -604,6 +644,25 @@ clauseLoop:
 				}
 				if !containsNegL {
 					continue
+				}
+				// Signature prefilter for strengthening: D\{¬l} ⊆ C. Clear ¬l's
+				// bit from D's signature in each word, then require the result
+				// to be a bit-subset of C's signature (necessary condition;
+				// collisions only loosen, never wrongly accept).
+				{
+					sd := sig[di]
+					sc := sig[ci]
+					ok := true
+					for w := 0; w < sigWords; w++ {
+						bitNeg := uint64(1) << ((uint64(negIdx)*0x9E3779B97F4A7C15 + uint64(w)*0x94D049BB133111EB) & 63)
+						if (sd[w]&^bitNeg)&^sc[w] != 0 {
+							ok = false
+							break
+						}
+					}
+					if !ok {
+						continue
+					}
 				}
 				// Check D\{¬l} ⊆ C: every literal in D except ¬l must be in C
 				allIn := true
