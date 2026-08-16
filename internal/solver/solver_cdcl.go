@@ -53,6 +53,13 @@ const (
 	DefaultRestartBase      = 200   // Base for Luby restart sequence (MiniSat-style)
 	IterationReportInterval = 10000 // Report progress every N iterations
 
+	// propsDecPhaseFlipBase is the nominal props/dec reference for the adaptive
+	// phase-flip hysteresis (enable at 120% of this, disable at 80%). Decoupled
+	// from the restart trigger's low limit so that only genuinely cascade-bound
+	// instances flip phases; lowering the restart limit must not toggle flip on
+	// for productive shallow instances.
+	propsDecPhaseFlipBase = 100
+
 	// maxAdaptiveRestartGear caps the multiplicative gear on the Luby fallback
 	// base (see adaptiveRestartGear). Bounding ensures the fallback can never
 	// grow so rare that the solver loses all periodic diversification — the
@@ -319,6 +326,8 @@ type CDCLSolver struct {
 	restartBase                int     // Luby restart base (default 200; classifier may override)
 	lubyThresholdCap           int     // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	restartPropsDecLimit       int     // Props/dec threshold for restart (0=disabled, default 100)
+	adaptPropDecLimit          int     // Tier-2 low props/dec threshold for deep-search escape restart
+	adaptPropDecDeepGate       int     // Tier-2 gate: deep-search escape fires when conflict level exceeds this (0=disabled)
 	adaptivePhaseFlipRate      float64 // Phase flip rate when props/dec is high (0=disabled, default 0.1)
 	propsDecRestartGap         int     // Min conflicts between props/dec-bounded restarts (default 100)
 	restartLevelCap            int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
@@ -551,7 +560,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
 		glucoseGap:                 100, // Min 100 conflicts between Glucose restarts
-		restartPropsDecLimit:       100, // Restart when props/dec > 100 (deep search pathology)
+		restartPropsDecLimit:       100, // Tier 1: restart when props/dec > 100 (cascade-bound)
+		adaptPropDecLimit:          20,  // Tier 2: low props/dec deep-search escape threshold
+		adaptPropDecDeepGate:       85,  // Tier 2: escape fires only above this conflict level
 		adaptivePhaseFlipRate:      0.1, // Flip 10% of phases when props/dec is high
 		propsDecRestartGap:         100, // Min 100 conflicts between props/dec restarts
 		restartLevelCap:            40,  // Force restart when conflict level > 40 on long-clause instances
@@ -682,6 +693,11 @@ func (s *CDCLSolver) SetRestartParameters(base int, glucoseRatio float64, minCon
 
 func (s *CDCLSolver) SetRestartPropsDecLimit(limit int) {
 	s.restartPropsDecLimit = limit
+}
+
+func (s *CDCLSolver) SetAdaptPropDecDeepGate(limit, gate int) {
+	s.adaptPropDecLimit = limit
+	s.adaptPropDecDeepGate = gate
 }
 
 func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
@@ -2992,6 +3008,24 @@ func (s *CDCLSolver) shouldRestart() bool {
 		}
 	}
 
+	// Tier 2: deep-search escape. A low props/dec threshold gated on unrewarded
+	// deep search (conflict level exceeding adaptPropDecDeepGate). This restarts
+	// instances stuck in a deep cascade (high conflict level) despite only modest
+	// average props/dec (e.g. 8d58ca: level up to 4400), while leaving shallow
+	// productive cascades (30eb4e2 level<=28) and high-props/dec cascade-bound
+	// instances (caught by Tier 1) untouched.
+	if s.adaptPropDecDeepGate > 0 &&
+		s.decisions > 10 && (s.skipVSIDSInit || s.lubyIndex >= 3) &&
+		s.conflicts-s.restartCount >= s.propsDecRestartGap {
+		propsPerDec := float64(s.propagations) / float64(s.decisions)
+		if propsPerDec > float64(s.adaptPropDecLimit) &&
+			s.lastConflictLevel > s.adaptPropDecDeepGate {
+			s.restartReasons[2]++ // propsdec
+			s.Log("c [restart] Props/dec %.1f > %d (deep-search, level %d > gate %d)\n", propsPerDec, s.adaptPropDecLimit, s.lastConflictLevel, s.adaptPropDecDeepGate)
+			return true
+		}
+	}
+
 	// Level-capped restart: on long-clause instances, force a restart when the
 	// conflict level is excessively deep. Long-clause instances produce high-LBD
 	// clauses consistently, so the Glucose EMA criterion (emaLBD > avg*ratio)
@@ -3177,8 +3211,13 @@ func (s *CDCLSolver) restart() bool {
 	// search trajectories.
 	if s.adaptivePhaseFlipRate > 0 && s.decisions > 10 {
 		propsPerDec := float64(s.propagations) / float64(s.decisions)
-		enableThreshold := float64(s.restartPropsDecLimit) * 12 / 10
-		disableThreshold := float64(s.restartPropsDecLimit) * 8 / 10
+		// Phase flip tracks the ABSOLUTE props/dec magnitude (deep binary
+		// cascades), independent of the restart trigger's low limit and its
+		// deep-search gate. Baseline thresholds (120% / 80% of 100) preserve
+		// pre-existing behavior: only genuinely cascade-bound instances (e.g.
+		// bb34f22f at props/dec ~175) enable flipping.
+		enableThreshold := float64(propsDecPhaseFlipBase) * 12 / 10
+		disableThreshold := float64(propsDecPhaseFlipBase) * 8 / 10
 		if propsPerDec > enableThreshold {
 			s.restartPhaseFlipRate = s.adaptivePhaseFlipRate
 		} else if propsPerDec < disableThreshold {

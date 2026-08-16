@@ -38,7 +38,9 @@ func run() int {
 	restartBase := flag.Int("restart-base", 200, "Luby restart sequence base multiplier (default=200)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (default=10.0; classifier overrides per-instance)")
 	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts (default=10.0; classifier overrides per-instance)")
-	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Restart when props/dec exceeds this (deep search escape, 0=disabled)")
+	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Tier-1 restart when props/dec exceeds this (cascade-bound, 0=disabled)")
+	adaptPropDecLimit := flag.Int("restart-props-deep-limit", 20, "Tier-2 low props/dec threshold for deep-search escape")
+	adaptPropDecDeepGate := flag.Int("restart-props-deep", 85, "Tier-2 deep-search escape fires when conflict level exceeds this (0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.5, "Phase flip rate when props/dec is high (0=disabled)")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
@@ -133,6 +135,7 @@ func run() int {
 	// Configure restart policy
 	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin)
 	s.SetRestartPropsDecLimit(*restartPropsDecLimit)
+	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters
