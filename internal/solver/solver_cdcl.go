@@ -1555,11 +1555,35 @@ func (s *CDCLSolver) classifyInstance() {
 		if !s.flagSet("restart-base") {
 			s.restartBase = 50
 		}
+		// High-density ternary-heavy mixed instances (e.g. course-timetabling:
+		// daf59d, 262ba88b) score 0.62-0.69, just under the structured threshold,
+		// but are genuinely structured: they wander in decision space (~200
+		// decisions/conflict during SAT model search) and benefit critically
+		// from Glucose restarts. The generic D4 path disables Glucose (ratio=100,
+		// min=1e6) because aggressive decay is the dominant lever for low-density
+		// mixed/random instances, but that leaves these wanderers unguided.
+		// Gate on Density>4.5 && TernaryRatio>0.7: captures all four 0.69
+		// wanderers, excludes lower-density mixed instances (66e6fea density
+		// 3.91, which regresses with Glucose: 4.41s->4.79s) and never touches
+		// pure-k-SAT/random (density<=4.5 or ternary<=0.7).
+		wanderer := structure.Density > 4.5 && structure.TernaryRatio > 0.7
 		if !s.flagSet("restart-glucose-ratio") {
-			s.restartGlucoseRatio = 100.0
+			if wanderer {
+				s.restartGlucoseRatio = 1.5
+			} else {
+				s.restartGlucoseRatio = 100.0
+			}
 		}
 		if !s.flagSet("restart-glucose-min") {
-			s.restartGlucoseMinConflicts = 1000000
+			if wanderer {
+				s.restartGlucoseMinConflicts = 100
+			} else {
+				s.restartGlucoseMinConflicts = 1000000
+			}
+		}
+		if wanderer {
+			s.Log("c [classification] Mixed wanderer (density=%.2f, ternary=%.1f%%) - Glucose restarts enabled (1.5/%d)\n",
+				structure.Density, structure.TernaryRatio*100, s.restartGlucoseMinConflicts)
 		}
 		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=50\n",
 			structure.StructuredScore, t, initialDecay, maxDecay)
