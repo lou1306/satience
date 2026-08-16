@@ -412,6 +412,29 @@ type CDCLSolver struct {
 	glueAtLastAdapt   uint64
 	lbdSumAtLastAdapt uint64
 	countAtLastAdapt  uint64
+
+	// Unified search governor: runtime self-correction compensating for
+	// classifier misclassification WITHOUT static per-instance gates. Evaluated
+	// at restart boundaries (cold path) using rolling-window deltas of live
+	// search signals. See governor.go / maybeAdaptSearch.
+	govWindows      int    // number of governor windows evaluated
+	govStartConf    uint64 // cumulative conflicts at last window snapshot
+	govStartDec     uint64 // cumulative decisions at last window snapshot
+	govStartProps   uint64 // cumulative propagations at last window snapshot
+	govStartGlue    uint64 // cumulative glue at last snapshot
+	govStartLbd     uint64 // cumulative LBD sum at last snapshot
+	govNextConflict int    // next conflict count at which to evaluate the governor
+	govGlucoseOn    bool   // Detector 3 fired: reactive Glucose enabled
+	govGearRaised   bool   // Detector 1 fired: restart base already lowered
+
+	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
+	// empirically-tuned governor). See governor.go.
+	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
+	govGrindPDec  float64 // Det1: props/dec threshold to qualify as cascade grind (default 120)
+	govGrindConf  int     // Det1: min conflicts before Det1 may fire (default 30000)
+	govWanderDecC float64 // Det3: min decisions/conflict to qualify as wander (default 40)
+	govWanderGlue float64 // Det3: max glue ratio to qualify as wander (default 0.10)
+	govWindow     int     // window scope in conflicts per governor eval (default 20000)
 }
 
 // lazyInitState holds lazy init detection state. Heap-allocated only when
@@ -551,11 +574,19 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		subsumptionMinConflictGap: 20000,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
 		adaptNextConflict:    500,
+		govNextConflict:      500,
 		randomPhaseRate:      0,
 		restartPhaseFlipRate: 0,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
+		// Governor tuning knobs (CLI-exposed).
+		govGrindBase:  5,
+		govGrindPDec:  120.0,
+		govGrindConf:  30000,
+		govWanderDecC: 40.0,
+		govWanderGlue: 0.10,
+		govWindow:     20000,
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
@@ -698,6 +729,29 @@ func (s *CDCLSolver) SetRestartPropsDecLimit(limit int) {
 func (s *CDCLSolver) SetAdaptPropDecDeepGate(limit, gate int) {
 	s.adaptPropDecLimit = limit
 	s.adaptPropDecDeepGate = gate
+}
+
+// SetGovernorParams overrides the runtime search-governor tuning knobs
+// (Detector 1 cascade-grind and Detector 3 wander). Used for parameter sweeps.
+func (s *CDCLSolver) SetGovernorParams(grindBase int, grindPDec float64, grindConf int, wanderDecC, wanderGlue float64, window int) {
+	if grindBase >= 1 {
+		s.govGrindBase = grindBase
+	}
+	if grindPDec > 0 {
+		s.govGrindPDec = grindPDec
+	}
+	if grindConf > 0 {
+		s.govGrindConf = grindConf
+	}
+	if wanderDecC > 0 {
+		s.govWanderDecC = wanderDecC
+	}
+	if wanderGlue >= 0 {
+		s.govWanderGlue = wanderGlue
+	}
+	if window > 0 {
+		s.govWindow = window
+	}
 }
 
 func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
@@ -3343,6 +3397,15 @@ func (s *CDCLSolver) restart() bool {
 	const adaptRestartPeriod = 10
 	if !s.decayAdapted && s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
 		s.maybeAdaptDecay()
+	}
+
+	// Unified search governor: runtime self-correction compensating for
+	// classifier misclassification. Same cadence as decay adaptation (every
+	// adaptRestartPeriod restarts, cold path); internally window-gated on
+	// govNextConflict (govWindowConfScope conflicts), so it is effectively a
+	// compare+return plus a cheap window eval every 20K conflicts.
+	if s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
+		s.maybeAdaptSearch()
 	}
 
 	// Lazy init: detect bad trajectory and inject occurrence-based VSIDS bump.

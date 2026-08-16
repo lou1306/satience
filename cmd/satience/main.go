@@ -42,6 +42,13 @@ func run() int {
 	adaptPropDecLimit := flag.Int("restart-props-deep-limit", 20, "Tier-2 low props/dec threshold for deep-search escape")
 	adaptPropDecDeepGate := flag.Int("restart-props-deep", 85, "Tier-2 deep-search escape fires when conflict level exceeds this (0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.5, "Phase flip rate when props/dec is high (0=disabled)")
+	// Search-governor tuning knobs (runtime self-correction parameter sweeps).
+	govGrindBase := flag.Int("gov-grind-base", 5, "Governor Det1: target restartBase when cascade grind fires")
+	govGrindPDec := flag.Float64("gov-grind-pdec", 120.0, "Governor Det1: props/dec threshold to qualify as cascade grind")
+	govGrindConf := flag.Int("gov-grind-conf", 30000, "Governor Det1: min conflicts before Det1 may fire")
+	govWanderDecC := flag.Float64("gov-wander-decconf", 40.0, "Governor Det3: min decisions/conflict to qualify as wander")
+	govWanderGlue := flag.Float64("gov-wander-glue", 0.10, "Governor Det3: max glue ratio to qualify as wander")
+	govWindow := flag.Int("gov-window", 20000, "Governor: window scope in conflicts per evaluation")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
@@ -136,6 +143,7 @@ func run() int {
 	s.SetRestartParameters(*restartBase, *restartGlucoseRatio, *restartGlucoseMin)
 	s.SetRestartPropsDecLimit(*restartPropsDecLimit)
 	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
+	s.SetGovernorParams(*govGrindBase, *govGrindPDec, *govGrindConf, *govWanderDecC, *govWanderGlue, *govWindow)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters
