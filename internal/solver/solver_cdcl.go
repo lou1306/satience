@@ -4407,19 +4407,15 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// SLOW PATH: Blocking literal is not true (or unassigned).
 			// Access clause data for replacement search / conflict detection.
 			//
-			// A1: Slow-path-only slice headers are loaded here (after the blit
-			// check fails), not at function entry. This keeps the fast-path inner
-			// loop free of 6 extra slice headers (18 words) that would otherwise
-			// force litValueBase/watchList/readIdx to spill to the stack.
-			originalClauseLocs := s.cnf.GetOriginalClauseLocs()
-			originalLiteralPool := s.cnf.GetLiteralPool()
-			numOriginalClauses := len(originalClauseLocs)
-			originalSearchHint := s.originalSearchHint
-			learnedLoc := s.learnedLoc
-			learnedLiterals := s.learnedLiterals
-			learnedSearchHint := s.learnedSearchHint
-
-			// Decode ClauseIdx once (was decoded 5+ times per watch iteration).
+			// A1: Slow-path-only slice headers are loaded lazily (see below), not
+			// at function entry. This keeps the fast-path inner loop free of the
+			// extra slice headers that would otherwise force litValueBase/watchList/
+			// readIdx to spill to the stack.
+			//
+			// First decode ClauseIdx (no header loads — pure bit ops), and handle
+			// the BINARY fast path immediately: binary clauses need NO clause-data
+			// headers except on the rare conflict branch, so loading them before the
+			// binary check was pure waste for the dominant binary propagation case.
 			// Bit 31: learned flag, bit 30: myPos, bit 29: binary, bits 0-28: clause index.
 			clauseIdxRaw := uint32(watch.ClauseIdx)
 			isLearned := clauseIdxRaw&watchLearnedBit != 0
@@ -4457,11 +4453,16 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if level == 0 {
 					s.emptyClauseFound = true
 				}
-				// Build conflict clause (rare path — clause data load OK here)
+				// Build conflict clause (rare path — clause data load OK here).
+				// Load only the pool this clause needs.
 				if !isLearned {
+					originalClauseLocs := s.cnf.GetOriginalClauseLocs()
+					originalLiteralPool := s.cnf.GetLiteralPool()
 					s.conflictClauseBuf.Literals = originalLiteralPool[int(originalClauseLocs[clauseID].Offset) : int(originalClauseLocs[clauseID].Offset)+int(originalClauseLocs[clauseID].Size)]
 					s.conflictClauseBuf.Learned = false
 				} else {
+					learnedLoc := s.learnedLoc
+					learnedLiterals := s.learnedLiterals
 					loc := learnedLoc[clauseID]
 					s.conflictLitsBuf = s.conflictLitsBuf[:0]
 					s.conflictLitsBuf = append(s.conflictLitsBuf, learnedLiterals[int(loc.Offset):int(loc.Offset)+int(loc.Size)]...)
@@ -4473,6 +4474,17 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				s.trail = trail
 				return true, &s.conflictClauseBuf
 			}
+
+			// NON-BINARY clause: load all six slow-path headers lazily here,
+			// after the binary check has been excluded. All are used by the
+			// replacement search (clause pools + search hints).
+			originalClauseLocs := s.cnf.GetOriginalClauseLocs()
+			originalLiteralPool := s.cnf.GetLiteralPool()
+			numOriginalClauses := len(originalClauseLocs)
+			originalSearchHint := s.originalSearchHint
+			learnedLoc := s.learnedLoc
+			learnedLiterals := s.learnedLiterals
+			learnedSearchHint := s.learnedSearchHint
 
 			var clauseLits []cnf.Literal
 			if !isLearned {
