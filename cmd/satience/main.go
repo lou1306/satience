@@ -49,6 +49,10 @@ func run() int {
 	govWanderDecC := flag.Float64("gov-wander-decconf", 40.0, "Governor Det3: min decisions/conflict to qualify as wander")
 	govWanderGlue := flag.Float64("gov-wander-glue", 0.10, "Governor Det3: max glue ratio to qualify as wander")
 	govWindow := flag.Int("gov-window", 20000, "Governor: window scope in conflicts per evaluation")
+	govStagLBD := flag.Float64("gov-stag-lbd", 12.0, "Governor Det4: window avgLBD threshold for LBD-stagnation")
+	govStagGlue := flag.Float64("gov-stag-glue", 0.05, "Governor Det4: max window glue ratio to qualify as unguided")
+	govStagWin := flag.Int("gov-stag-win", 3, "Governor Det4: consecutive windows with no LBD improvement to confirm")
+	govStagBase := flag.Int("gov-stag-base", 20, "Governor Det4: target restartBase when LBD-stagnation fires")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
@@ -144,6 +148,7 @@ func run() int {
 	s.SetRestartPropsDecLimit(*restartPropsDecLimit)
 	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
 	s.SetGovernorParams(*govGrindBase, *govGrindPDec, *govGrindConf, *govWanderDecC, *govWanderGlue, *govWindow)
+	s.SetGovernorDet4Params(*govStagLBD, *govStagGlue, *govStagWin, *govStagBase)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters

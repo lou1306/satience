@@ -36,11 +36,14 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	winConf := s.conflicts - int(s.govStartConf)
 	winDec := s.decisions - int(s.govStartDec)
 	winProps := s.propagations - int(s.govStartProps)
+	lbdDelta := s.totalLbdSum - s.govStartLbd
+	winLbdC := s.totalLbdCount - s.govStartLbdC
 	s.govStartConf = uint64(s.conflicts)
 	s.govStartDec = uint64(s.decisions)
 	s.govStartProps = uint64(s.propagations)
 	s.govStartGlue = s.glueLearned
 	s.govStartLbd = s.totalLbdSum
+	s.govStartLbdC = s.totalLbdCount
 	s.govWindows++
 	// Skip very short windows (search may be about to conclude anyway).
 	if winConf < 2000 {
@@ -62,6 +65,13 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
 
+	// Window-average LBD (delta over this window only) for stagnation tracking.
+	winLBD := 0.0
+	if winLbdC > 0 {
+		winLBD = float64(lbdDelta) / float64(winLbdC)
+	}
+
+	s.detector4LbdStagnation(winLBD, glueRatio)
 	s.detector1Grind(propsPerDec)
 	s.detector3Wander(decPerConf, glueRatio)
 }
@@ -137,4 +147,98 @@ func (s *CDCLSolver) detector3Wander(decPerConf, glueRatio float64) {
 	}
 	s.Log("c [governor] Det3 wander: %.0f decisions/conflict, glue=%.3f -> enable Glucose (1.5/100)\n",
 		decPerConf, glueRatio)
+}
+
+// detector4LbdStagnation targets the unguided deep-search spiral: sustained
+// HIGH and FLAT window-average LBD with essentially no glue. When learned
+// clauses keep coming out at high LBD (spanning many levels) the LBD/Glucose
+// restart is dead (EMA never exceeds avg), and the search grinds deeper and
+// deeper producing ever-more high-LBD clauses with no propagation guidance —
+// a deep-search → high-LBD → no-guidance cycle. Classic case: the ordering-
+// principle family (op_20 is TMO at restartBase=200, 0.4s at 20).
+//
+// Correction: lower restartBase so restarts come much more frequently, cutting
+// the deep spiral short and keeping learned clauses tight. One-way ratchet via
+// govStagFired.
+//
+// False-positive protection is critical (behavior alone can't separate these):
+//   - 274099073 (99.4% long clause, avgLBD ~16 flat, 0 glue) also looks stagnant
+//     but needs DEEP search with DEFAULT decay — its long-clause structure means
+//     the flat-LBD signature is genuine structure, not unguided wandering. The
+//     existing adaptiveRestartGear governor already RAISES the gear for exactly
+//     these. Guard: never fire when long clause dominated (longClauseRatio > 0.8).
+//   - 69d72f81 (88% ternary, but PolImb 0.84) looks stagnant yet needs deep
+//     search (base=200 beats base=20) because high polarity imbalance means
+//     phase saving provides strong guidance. Guard: require weak phase guidance
+//     (PolarityImbalance < 0.4).
+//   - Already-frequent-restart instances (binary-heavy: Det1 already ran, or
+//     govGearRaised) need no further lowering.
+func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
+	if s.govStagFired {
+		return
+	}
+	// Don't fight Det1 (grind) or the gear governor; both already lowered or
+	// manage deep-search cases differently.
+	if s.govGearRaised {
+		return
+	}
+	// Long-clause + high-PolImb structural guards (see comment above).
+	if s.longClauseRatio > 0.8 {
+		return
+	}
+	if s.polarityImbalance >= 0.4 {
+		return
+	}
+	// Structured-only guard. Random k-SAT / phase-transition instances
+	// (structureScore < 0.7) also show sustained high-LBD + no glue, but they are
+	// deliberately tuned for DEEP search (restartBase=100, Glucose) and lowering
+	// the base to 20 breaks them (30eb4ef4: TMO with Det4, instant without).
+	// Det4 targets the STRUCTURED unguided-spiral signature only.
+	if s.structureScore < 0.7 {
+		return
+	}
+	// Respect explicit CLI restart-base.
+	if s.flagSet("restart-base") {
+		return
+	}
+
+	// Record this window's avgLBD (ring buffer); compute stagnation over history.
+	s.govLbdHist[s.govLbdHistIdx] = winLBD
+	s.govLbdHistIdx = (s.govLbdHistIdx + 1) % len(s.govLbdHist)
+	if s.govLbdHistN < len(s.govLbdHist) {
+		s.govLbdHistN++
+	}
+	if s.govLbdHistN < s.govStagWin {
+		return // not enough windows yet
+	}
+
+	// Stagnation = every recent window avgLBD is HIGH and NONE shows meaningful
+	// improvement. Compute the min over the last govStagWin windows.
+	need := s.govStagWin
+	minLBD := 1e18
+	ll := s.govLbdHistN
+	if ll > len(s.govLbdHist) {
+		ll = len(s.govLbdHist)
+	}
+	highCount := 0
+	for i := 0; i < ll; i++ {
+		if s.govLbdHist[i] >= s.govStagLBD {
+			highCount++
+		}
+		if s.govLbdHist[i] < minLBD {
+			minLBD = s.govLbdHist[i]
+		}
+	}
+	if highCount < need {
+		return // not consistently high LBD
+	}
+	if glueRatio >= s.govStagGlue {
+		return // there IS glue guidance — not unguided
+	}
+
+	s.govStagFired = true
+	save := s.restartBase
+	s.restartBase = s.govStagBase
+	s.Log("c [governor] Det4 LBD-stagnation: win LBD=%.1f (min %.1f), glue=%.3f -> drop restartBase %d->%d\n",
+		winLBD, minLBD, glueRatio, save, s.govStagBase)
 }

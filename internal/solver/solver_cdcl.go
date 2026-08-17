@@ -423,9 +423,16 @@ type CDCLSolver struct {
 	govStartProps   uint64 // cumulative propagations at last window snapshot
 	govStartGlue    uint64 // cumulative glue at last snapshot
 	govStartLbd     uint64 // cumulative LBD sum at last snapshot
+	govStartLbdC    uint64 // cumulative LBD-clause count at last snapshot
 	govNextConflict int    // next conflict count at which to evaluate the governor
 	govGlucoseOn    bool   // Detector 3 fired: reactive Glucose enabled
 	govGearRaised   bool   // Detector 1 fired: restart base already lowered
+	govStagFired    bool   // Detector 4 fired: restart base already lowered on LBD stagnation
+
+	// Detector 4 LBD-stagnation history (last govStagWin window avgLBDs).
+	govLbdHist    [8]float64
+	govLbdHistN   int
+	govLbdHistIdx int
 
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
@@ -435,6 +442,10 @@ type CDCLSolver struct {
 	govWanderDecC float64 // Det3: min decisions/conflict to qualify as wander (default 40)
 	govWanderGlue float64 // Det3: max glue ratio to qualify as wander (default 0.10)
 	govWindow     int     // window scope in conflicts per governor eval (default 20000)
+	govStagLBD    float64 // Det4: window avgLBD threshold to qualify as high (default 12)
+	govStagGlue   float64 // Det4: max window glue ratio to qualify as stagnation (default 0.05)
+	govStagWin    int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
+	govStagBase   int     // Det4: target restartBase when stagnation fires (default 20)
 }
 
 // lazyInitState holds lazy init detection state. Heap-allocated only when
@@ -587,6 +598,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govWanderDecC: 40.0,
 		govWanderGlue: 0.10,
 		govWindow:     20000,
+		govStagLBD:    12.0,
+		govStagGlue:   0.05,
+		govStagWin:    3,
+		govStagBase:   20,
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
@@ -751,6 +766,22 @@ func (s *CDCLSolver) SetGovernorParams(grindBase int, grindPDec float64, grindCo
 	}
 	if window > 0 {
 		s.govWindow = window
+	}
+}
+
+// SetGovernorDet4Params overrides the Detector 4 (LBD-stagnation) tuning knobs.
+func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, stagBase int) {
+	if stagLBD > 0 {
+		s.govStagLBD = stagLBD
+	}
+	if stagGlue >= 0 {
+		s.govStagGlue = stagGlue
+	}
+	if stagWin >= 1 {
+		s.govStagWin = stagWin
+	}
+	if stagBase >= 1 {
+		s.govStagBase = stagBase
 	}
 }
 
@@ -1702,6 +1733,9 @@ func (s *CDCLSolver) classifyInstance() {
 	// Low PolImb (op, 0.32) means phase-saving guidance is weak, so frequent
 	// restarts are needed to escape the high-LBD spiral. Threshold 0.4 matches
 	// the existing bumpAnalyze PolImb boundary.
+	// This is a static gate (acts at t=0) because the behavioral governor
+	// detector cannot match its latency: Det4 observes behavior over ~20K-conflict
+	// windows, by which time op-family instances have largely solved at base=200.
 	if structure.TernaryRatio > 0.7 && structure.BinaryRatio <= 0.5 &&
 		structure.PolarityImbalance < 0.4 {
 		if !s.flagSet("restart-base") {
