@@ -104,8 +104,8 @@ func applyTransforms(c *cnf.CNF, seed int64) *cnf.CNF {
 
 // testFormulas provides known SAT/UNSAT formulas for transformation testing.
 var testFormulas = []struct {
-	name   string
-	sat    bool
+	name    string
+	sat     bool
 	formula cnf.CNF
 }{
 	{

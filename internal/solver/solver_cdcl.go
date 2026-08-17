@@ -188,13 +188,13 @@ type CDCLSolver struct {
 	// bounded, level-capped, or MiniSat geometric. Used to diagnose where
 	// search time goes (flat-high-LBD instances never fire Glucose, so the
 	// Luby fallback dominates).
-	restartReasons        [5]int // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
-	restartSegStartConf   int    // conflicts at the start of the current restart segment
-	restartSegStartDec    int    // decisions at the start of the current restart segment
-	restartSegStartProps  int    // propagations at the start of the current restart segment
-	restartSegProdRatio   float64 // conflicts per 1000 decisions over the last segment (negative=unset)
-	restartSegGlueCount   int    // glue clauses learned in the current segment
-	restartSegStartGlue   int    // glueLearned at the start of the current segment
+	restartReasons       [5]int  // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
+	restartSegStartConf  int     // conflicts at the start of the current restart segment
+	restartSegStartDec   int     // decisions at the start of the current restart segment
+	restartSegStartProps int     // propagations at the start of the current restart segment
+	restartSegProdRatio  float64 // conflicts per 1000 decisions over the last segment (negative=unset)
+	restartSegGlueCount  int     // glue clauses learned in the current segment
+	restartSegStartGlue  int     // glueLearned at the start of the current segment
 	// Branch-quality telemetry (instrumentation): which VSIDS bump scheme and
 	// init mode were actually in effect. 1=analyze_toclear (bump all touched),
 	// 0=bumpClause only; initMode 1=clause/occurrence-weighted, 0=zero-init.
@@ -209,9 +209,9 @@ type CDCLSolver struct {
 	adaptiveRestartGear      float64
 	restartSegTotalConflicts uint64 // accumulated conflicts across segments
 	restartSegSteps          int    // number of restart segments observed
-	lbdSum            int
-	lbdCount          int
-	emaLBD            float64 // Exponential moving average of LBD (smooth restart signal)
+	lbdSum                   int
+	lbdCount                 int
+	emaLBD                   float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
 	totalLbdSum   uint64
@@ -495,26 +495,26 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		maxIter:              0,
 		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
 		// learnedLiterals: 8 literals per clause average (covers most learned clauses)
-		learnedLiterals:    make([]cnf.Literal, 0, maxLearned*8),
-		learnedLoc:         make([]LearnedClauseLoc, 0, maxLearned),
-		learnedMetadata:    make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
-		learnedSearchHint:  make([]int32, 0, maxLearned),              // Hot-path search hints
-		learnedWatchIdx0:   make([]int, 0, maxLearned),                // Watched literal indices
-		learnedWatchIdx1:   make([]int, 0, maxLearned),
-		learnedActiveCount: 0,
-		learnedCapacity:    0,
-		unitLearnedList:    make([]int, 0, 64), // Pre-allocate for unit clause tracking
-		verbose:            false,
-		decisions:          0,
-		backjumpLevel:      0,
-		maxLearned:         maxLearned,
-		restartBase:        restartBase,
-		restartCount:       0,
+		learnedLiterals:     make([]cnf.Literal, 0, maxLearned*8),
+		learnedLoc:          make([]LearnedClauseLoc, 0, maxLearned),
+		learnedMetadata:     make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
+		learnedSearchHint:   make([]int32, 0, maxLearned),              // Hot-path search hints
+		learnedWatchIdx0:    make([]int, 0, maxLearned),                // Watched literal indices
+		learnedWatchIdx1:    make([]int, 0, maxLearned),
+		learnedActiveCount:  0,
+		learnedCapacity:     0,
+		unitLearnedList:     make([]int, 0, 64), // Pre-allocate for unit clause tracking
+		verbose:             false,
+		decisions:           0,
+		backjumpLevel:       0,
+		maxLearned:          maxLearned,
+		restartBase:         restartBase,
+		restartCount:        0,
 		adaptiveRestartGear: 1.0,
-		lubyIndex:          0,
-		lubyThresholdCap:   0, // Disabled by default; enabled for structured instances in classifyInstance
-		lbdSum:             0,
-		lbdCount:           0,
+		lubyIndex:           0,
+		lubyThresholdCap:    0, // Disabled by default; enabled for structured instances in classifyInstance
+		lbdSum:              0,
+		lbdCount:            0,
 		// Clause-activity deletion: VSIDS-style decayed activity for within-tier
 		// deletion ordering. Defaults enable activity (can be disabled via CLI).
 		claInc:             1.0,
