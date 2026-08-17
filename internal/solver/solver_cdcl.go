@@ -1687,6 +1687,29 @@ func (s *CDCLSolver) classifyInstance() {
 		}
 		s.Log("c [classification] Binary-heavy (%.0f%%) - restartBase=20\n", structure.BinaryRatio*100)
 	}
+
+	// Ternary-heavy structured instances: the default Luby restartBase=200 runs
+	// far too deeply, producing high-LBD non-glue learned clauses that give no
+	// propagation guidance — a deep-search → high-LBD → no-guidance cycle that
+	// spirals (ordering-principle family: op_20 is TMO at base=200, 0.4s at 20).
+	// Frequent restarts keep learned clauses tight (LBD≤2 glue), restoring
+	// convergence. Swept {10,20,30,50} on op_18/19/20: base=20 is the most
+	// consistent. Gate: structured & ternary-heavy (>70%) & not binary-heavy
+	// (binary-heavy already handled above) AND low polarity imbalance.
+	// PolImb is the key separator: high PolImb (69d72f81, 0.84) means phase
+	// saving provides strong decision guidance, so that instance needs DEEP
+	// search (base=200: 6.6s vs base=20: 8.6s) — frequent restarts disrupt it.
+	// Low PolImb (op, 0.32) means phase-saving guidance is weak, so frequent
+	// restarts are needed to escape the high-LBD spiral. Threshold 0.4 matches
+	// the existing bumpAnalyze PolImb boundary.
+	if structure.TernaryRatio > 0.7 && structure.BinaryRatio <= 0.5 &&
+		structure.PolarityImbalance < 0.4 {
+		if !s.flagSet("restart-base") {
+			s.restartBase = 20
+		}
+		s.Log("c [classification] Ternary-heavy low-PolImb structured (%.0f%% ternary, PolImb=%.2f) - restartBase=20\n",
+			structure.TernaryRatio*100, structure.PolarityImbalance)
+	}
 }
 
 // maybeAdaptDecay is the runtime correction layer for the static classifier.
