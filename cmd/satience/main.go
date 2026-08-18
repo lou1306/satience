@@ -75,6 +75,7 @@ func run() int {
 	delTriggerRatio := flag.Float64("del-trigger-ratio", 1.5, "Trigger deletion when active > ratio × dynamicLimit (default 1.5)")
 	dbShrinkThresh := flag.Int("db-shrink-thresh", 10, "Shrink maxLearned when avgLBD > threshold (default 10)")
 	dbShrinkFloorMult := flag.Int("db-shrink-mult", 3, "Shrink floor = numVars × multiplier (default 3)")
+	dbMaxLen := flag.Int("db-max-len", 25, "reduceDB length gate: evict clauses strictly longer than this first on binary-heavy formulas (0 = disabled)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	minisatRestart := flag.Bool("minisat-restart", false, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD)")
@@ -185,6 +186,7 @@ func run() int {
 	s.SetExplicitFlags(explicitFlags)
 	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
 	s.SetClauseDBParams(*lbdTier1, *lbdTier2, *dbGrowthDiv, *delTriggerRatio, *dbShrinkThresh, *dbShrinkFloorMult)
+	s.SetDBMaxLen(*dbMaxLen)
 	s.SetOccurrenceWeight(*occurrenceWeight)
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)

@@ -323,6 +323,7 @@ type CDCLSolver struct {
 	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
 	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
 	dbShrinkFloorMultiplier    int     // Shrink floor = numVars × multiplier (default 3)
+	dbMaxLen                   int     // reduceDB: clauses strictly longer than this get eviction priority (0 = disabled)
 	restartBase                int     // Luby restart base (default 200; classifier may override)
 	lubyThresholdCap           int     // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	restartPropsDecLimit       int     // Props/dec threshold for restart (0=disabled, default 100)
@@ -622,6 +623,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		deletionTriggerRatio:       1.5,
 		dbShrinkThreshold:          10,
 		dbShrinkFloorMultiplier:    3,
+		dbMaxLen:                   25, // reduceDB length gate: evict >25-lit clauses first on binary-heavy formulas
 		occurrenceWeight:           0.5,
 	}
 
@@ -862,6 +864,15 @@ func (s *CDCLSolver) SetClauseDBParams(lbdTier1, lbdTier2, dbGrowthDiv int, delT
 	s.deletionTriggerRatio = delTriggerRatio
 	s.dbShrinkThreshold = dbShrinkThresh
 	s.dbShrinkFloorMultiplier = dbShrinkFloorMult
+}
+
+// SetDBMaxLen sets the reduceDB length gate: learned clauses strictly longer
+// than dbMaxLen become top-priority eviction candidates. 0 (default) disables
+// the length gate entirely. The gate is applied ONLY at reduceDB time — the
+// asserting clause is always still learned after a conflict, so search always
+// progresses regardless of this setting.
+func (s *CDCLSolver) SetDBMaxLen(dbMaxLen int) {
+	s.dbMaxLen = dbMaxLen
 }
 
 func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
@@ -1158,16 +1169,42 @@ func (s *CDCLSolver) printFinalStats() {
 	if s.maxLearnedShrunk {
 		shrunk = " [DB shrunk]"
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d]\n",
+	liveHist := [6]int{}
+	liveLong := 0
+	for i := 0; i < s.learnedCapacity; i++ {
+		sz := int(s.learnedLoc[i].Size)
+		if sz > 0 {
+			switch {
+			case sz <= 2:
+				liveHist[0]++
+			case sz <= 5:
+				liveHist[1]++
+			case sz <= 10:
+				liveHist[2]++
+			case sz <= 20:
+				liveHist[3]++
+			case sz <= 50:
+				liveHist[4]++
+			default:
+				liveHist[5]++
+			}
+			if sz > 10 {
+				liveLong++
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
+		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
-		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5])
+		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5],
+		liveHist[0], liveHist[1], liveHist[2], liveHist[3], liveHist[4], liveHist[5], liveLong)
 }
 
 // restartReasonSummary returns a descriptive string of restart attribution.
@@ -6048,6 +6085,48 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// are 0 and the index tieback reduces the sort to pure ascending index
 	// order = FIFO (identical to pre-activity behavior).
 	candidates := s.tmpDeletionCandidates[:0]
+
+	// Pass 0 (length gate): if dbMaxLen>0, evict the longest clauses first.
+	// The LBD passes below can never remove long near-glue clauses (LBD ≤ tier2
+	// never deleted), so on long-clause instances the DB fills with them and
+	// propagation gets slow. This pass prioritizes evicting any clause longer
+	// than dbMaxLen. It is a deletion-time-only preference: the asserting learned
+	// clause is still always added after a conflict, so search always progresses.
+	//
+	// Gated on binary-heavy formulas (binaryRatio > 0.5): these are formulas
+	// (e.g., pigeonhole, parity) whose ORIGINAL clauses are small but whose
+	// LEARNED DB bloats with long redundant near-glue clauses — pruning them is
+	// pure win. Long-clause formulas (e.g. 274099073, ~99% long originals) need
+	// their long learned clauses to drive search, so the gate must not touch
+	// them. binaryRatio is cached by classifyInstance (runs before solving).
+	if s.dbMaxLen > 0 && s.binaryRatio > 0.5 {
+		for i := 0; i < s.learnedCapacity; i++ {
+			if s.learnedLoc[i].Size == 0 || protected[i] {
+				continue
+			}
+			if int(s.learnedLoc[i].Size) > s.dbMaxLen {
+				candidates = append(candidates, i)
+			}
+		}
+		if len(candidates) > 1 {
+			sort.Slice(candidates, func(a, b int) bool {
+				ia, ib := candidates[a], candidates[b]
+				sa, sb := int(s.learnedLoc[ia].Size), int(s.learnedLoc[ib].Size)
+				if sa != sb {
+					return sa > sb // longest first
+				}
+				return ia < ib
+			})
+		}
+		for _, idx := range candidates {
+			if deletedCount >= toDelete {
+				break
+			}
+			deleted[idx] = true
+			deletedCount++
+		}
+		candidates = candidates[:0]
+	}
 
 	// Pass 1: collect LBD > tier1Threshold candidates (lowest quality), delete lowest-activity first
 	for i := 0; i < s.learnedCapacity; i++ {
