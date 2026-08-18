@@ -174,7 +174,8 @@ type CDCLSolver struct {
 	probeTrail        []int    // Reusable trail for FLP non-watch BCP (literal indices)
 	conflicts         int
 	iterations        int
-	propagations      int // Total propagations (assignments by unit propagation)
+	propagations      int    // Total propagations (assignments by unit propagation)
+	numWatchMoves     uint64 // Instrumentation: count of watch replacement moves in propagateWatched (diagnostic/witness)
 	maxIter           int
 	decisions         int
 	uipFallbackCount  int // Number of times 1-UIP resolution didn't converge (diagnostic)
@@ -1193,8 +1194,8 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
-		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec,
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
@@ -2546,22 +2547,31 @@ func (s *CDCLSolver) initWatches() {
 	}
 	s.watchLists = make([][]cnf.Watch, numLits)
 
-	// Pre-allocate watch lists with estimated capacity to avoid reallocations
-	// Account for both original clauses AND expected learned clauses
-	// Each clause adds 2 watches (one per watched literal)
-	// Formula: (originalClauses + maxLearned) * 2 watches / num literals
-	// Minimum 32 to handle uneven distribution (some literals appear in many clauses)
-	totalClauses := s.cnf.NumClauses + s.maxLearned
-	avgWatchesPerLit := (totalClauses * 2) / numLits
-	if avgWatchesPerLit < 32 {
-		avgWatchesPerLit = 32
-	}
-	// Cap at 256 to avoid over-allocation on small instances
-	if avgWatchesPerLit > 256 {
-		avgWatchesPerLit = 256
+	// Pre-allocate each watch list to its actual original-clause load rather
+	// than a uniform estimate. At init (post-preprocessing) most literals are
+	// unassigned, so chooseWatchPositions picks each clause's first two literals
+	// (positions 0 and 1); count those per literal. Capacity is purely a memory/
+	// reallocation concern and never affects search order (append handles any
+	// under-count, e.g. clauses containing level-0-assigned literals whose watch
+	// position differs). Headroom covers learned-clause growth during the solve.
+	occ := make([]int, numLits)
+	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
+		lits := s.cnf.Clauses[clauseID].Literals
+		if len(lits) < 2 {
+			continue
+		}
+		occ[cnf.LitToIndex(lits[0])]++
+		occ[cnf.LitToIndex(lits[1])]++
 	}
 	for i := range s.watchLists {
-		s.watchLists[i] = make([]cnf.Watch, 0, avgWatchesPerLit)
+		capEst := occ[i]*2 + 16
+		if capEst < 8 {
+			capEst = 8
+		}
+		if capEst > 1024 {
+			capEst = 1024
+		}
+		s.watchLists[i] = make([]cnf.Watch, 0, capEst)
 	}
 
 	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
@@ -4696,6 +4706,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			if foundReplacement {
+				s.numWatchMoves++
 				// Watch moved - remove old watch using swap-with-last
 				lastIdx := len(watchList) - 1
 				if readIdx != lastIdx {
