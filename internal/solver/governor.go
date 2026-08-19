@@ -36,11 +36,13 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	winConf := s.conflicts - int(s.govStartConf)
 	winDec := s.decisions - int(s.govStartDec)
 	winProps := s.propagations - int(s.govStartProps)
+	winMoves := int(s.numWatchMoves - s.govStartMoves)
 	lbdDelta := s.totalLbdSum - s.govStartLbd
 	winLbdC := s.totalLbdCount - s.govStartLbdC
 	s.govStartConf = uint64(s.conflicts)
 	s.govStartDec = uint64(s.decisions)
 	s.govStartProps = uint64(s.propagations)
+	s.govStartMoves = s.numWatchMoves
 	s.govStartGlue = s.glueLearned
 	s.govStartLbd = s.totalLbdSum
 	s.govStartLbdC = s.totalLbdCount
@@ -74,6 +76,7 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	s.detector4LbdStagnation(winLBD, glueRatio)
 	s.detector1Grind(propsPerDec)
 	s.detector3Wander(decPerConf, glueRatio)
+	s.detector5DBCost(winMoves, winDec, propsPerDec)
 }
 
 // detector1Grind targets the deep-binary-cascade / timeout-cliff signature
@@ -241,4 +244,80 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 	s.restartBase = s.govStagBase
 	s.Log("c [governor] Det4 LBD-stagnation: win LBD=%.1f (min %.1f), glue=%.3f -> drop restartBase %d->%d\n",
 		winLBD, minLBD, glueRatio, save, s.govStagBase)
+}
+
+// detector5DBCost progressively reduces the learned-DB cap on binary-heavy
+// formulas whose per-propagation cost (watch-moves/decision) is elevated,
+// self-correcting per window: it steps dbCapFactor down while the next window's
+// moves/decision keeps improving, and reverts the last step (then stops)
+// whenever improvement stalls. The binaryRatio guard excludes deep-search
+// non-binary instances (e.g. 30eb4ef brat=0.00) that rely on a large learned DB.
+func (s *CDCLSolver) detector5DBCost(winMoves, winDec int, propsPerDec float64) {
+	if !s.govDbEnabled {
+		return
+	}
+	if s.binaryRatio <= s.govDbMinBinary {
+		return
+	}
+	if s.conflicts < s.govDbStartConf {
+		return
+	}
+	if winDec <= 0 {
+		return
+	}
+	curMovesPerDec := float64(winMoves) / float64(winDec)
+
+	if !s.govDbLaunched {
+		// Precondition: per-prop cost must be elevated before we shrink anything.
+		if propsPerDec < s.govDbStartPDec {
+			return
+		}
+		s.govDbLaunched = true
+		s.govDbPendingEval = true
+		s.govDbFactorBase = s.dbCapFactor
+		s.govDbRefMovesPerDec = curMovesPerDec
+		next := s.dbCapFactor * s.govDbStepFactor
+		if next < s.govDbFloor {
+			next = s.govDbFloor
+		}
+		if next < s.dbCapFactor {
+			s.dbCapFactor = next
+			s.govDbSteps++
+		}
+		s.govDbActive = s.dbCapFactor < 1.0
+		s.govDbFinalFactor = s.dbCapFactor
+		s.Log("c [governor] Det5 DB-cost: launch (props/dec=%.0f, binary=%.2f) cap %.2f->%.2f\n",
+			propsPerDec, s.binaryRatio, s.govDbFactorBase, s.dbCapFactor)
+		return
+	}
+
+	if !s.govDbPendingEval {
+		return
+	}
+	s.govDbPendingEval = false
+
+	if curMovesPerDec < s.govDbRefMovesPerDec*(1.0-s.govDbMargin) {
+		// Reduction helped (watch-moves per decision dropped): keep it, go deeper.
+		s.govDbFactorBase = s.dbCapFactor
+		s.govDbRefMovesPerDec = curMovesPerDec
+		next := s.dbCapFactor * s.govDbStepFactor
+		if next < s.govDbFloor {
+			next = s.govDbFloor
+		}
+		if next < s.dbCapFactor {
+			s.dbCapFactor = next
+			s.govDbSteps++
+			s.govDbPendingEval = true
+		}
+		s.Log("c [governor] Det5 DB-cost: improvement moves/dec %.0f->%.0f, cap ->%.2f\n",
+			s.govDbRefMovesPerDec, curMovesPerDec, s.dbCapFactor)
+	} else {
+		// Stall/regress: undo the last step and stop (per-instance self-correct).
+		s.dbCapFactor = s.govDbFactorBase
+		s.govDbReverts++
+		s.Log("c [governor] Det5 DB-cost: stall moves/dec %.0f->%.0f, revert cap ->%.2f (stop)\n",
+			s.govDbRefMovesPerDec, curMovesPerDec, s.dbCapFactor)
+	}
+	s.govDbActive = s.dbCapFactor < 1.0
+	s.govDbFinalFactor = s.dbCapFactor
 }

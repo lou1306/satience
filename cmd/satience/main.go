@@ -29,6 +29,8 @@ func run() int {
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	rndInit := flag.Float64("rnd-init", 0.0, "Magnitude of random noise added to initial VSIDS activity (MiniSat-style, default=0=disabled)")
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
+	dbCapMult := flag.Float64("db-cap-mult", 1.0, "Scale the learned-DB deletion target (experimental: DB-size vs per-propagation cost)")
+	govDB := flag.Bool("gov-db", true, "Enable Detector 5: per-instance self-correcting learned-DB reduction on binary-heavy cost-bound instances")
 	vivifyPeriod := flag.Int("vivify-period", 50, "Run clause vivification every Nth restart (default=50, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
@@ -166,6 +168,8 @@ func run() int {
 
 	// Configure recursive clause minimization depth
 	s.SetMinimizeMaxDepth(*minimizeDepth)
+	s.SetDBCapFactor(*dbCapMult)
+	s.SetGovernorDB(*govDB)
 
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)

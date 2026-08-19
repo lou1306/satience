@@ -336,6 +336,7 @@ type CDCLSolver struct {
 	levelRestartGap            int     // Min conflicts between level-capped restarts (anti-thrashing)
 	minimizeMaxDepth           int     // Max recursion depth for recursive clause minimization (default 0=unlimited)
 	unitPropBudget             int     // Max literal visits for unit propagation preprocess (0=unlimited)
+	dbCapFactor                float64 // Multiplier on the learned-DB deletion target (1.0 = baseline/indexical)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
 	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
 	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 50)
@@ -426,10 +427,30 @@ type CDCLSolver struct {
 	govStartGlue    uint64 // cumulative glue at last snapshot
 	govStartLbd     uint64 // cumulative LBD sum at last snapshot
 	govStartLbdC    uint64 // cumulative LBD-clause count at last snapshot
+	govStartMoves   uint64 // Det5: cumulative watch-moves at last snapshot
 	govNextConflict int    // next conflict count at which to evaluate the governor
 	govGlucoseOn    bool   // Detector 3 fired: reactive Glucose enabled
 	govGearRaised   bool   // Detector 1 fired: restart base already lowered
 	govStagFired    bool   // Detector 4 fired: restart base already lowered on LBD stagnation
+	// Detector 5 (DB cost): progressive, per-instance self-correcting learned-DB
+	// reduction. Only fires on binary-heavy formulas whose per-propagation cost
+	// is elevated; steps dbCapFactor down while a window's watch-moves/decision
+	// keeps improving, reverting the last step and stopping when it stops.
+	govDbEnabled        bool    // Det5 enabled (default off; -gov-db to enable)
+	govDbMinBinary      float64 // require binaryRatio > this (excludes deep-search non-binary 30eb)
+	govDbStartPDec      float64 // require elevated sustained props/dec to consider starting
+	govDbStartConf      int     // min conflicts before Det5 may launch
+	govDbStepFactor     float64 // per-step multiplier on dbCapFactor when a step helps
+	govDbFloor          float64 // floor for dbCapFactor (never shrink below)
+	govDbMargin         float64 // min fractional moves/decision improvement to keep stepping
+	govDbLaunched       bool    // Det5 has launched
+	govDbPendingEval    bool    // a step was applied; evaluate after next window
+	govDbFactorBase     float64 // dbCapFactor in effect before the pending step (revert target)
+	govDbRefMovesPerDec float64 // moves/decision of the window before the pending step
+	govDbSteps          int     // Det5: DB-reduction steps applied (diagnostic)
+	govDbReverts        int     // Det5: DB-reduction reverts (diagnostic)
+	govDbActive         bool    // Det5 currently holding a reduced cap (diagnostic)
+	govDbFinalFactor    float64 // Det5: final dbCapFactor (diagnostic)
 
 	// Detector 4 LBD-stagnation history (last govStagWin window avgLBDs).
 	govLbdHist    [8]float64
@@ -590,6 +611,16 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govNextConflict:      500,
 		randomPhaseRate:      0,
 		restartPhaseFlipRate: 0,
+		// Detector 5 (DB cost) defaults.
+		govDbEnabled:     true,
+		govDbMinBinary:   0.4,
+		govDbStartPDec:   25.0,
+		govDbStartConf:   30000,
+		govDbStepFactor:  0.75,
+		govDbFloor:       0.5,
+		govDbMargin:      0.08,
+		govDbFinalFactor: 1.0,
+		dbCapFactor:      1.0,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -932,6 +963,20 @@ func (s *CDCLSolver) SetVivifyPeriod(p int) {
 	s.vivifyPeriod = p
 }
 
+// SetDBCapFactor manually scales the learned-DB deletion target (1.0 = baseline).
+func (s *CDCLSolver) SetDBCapFactor(f float64) {
+	if f <= 0 {
+		f = 1.0
+	}
+	s.dbCapFactor = f
+}
+
+// SetGovernorDB enables/disables Detector 5 (per-instance self-correcting DB
+// reduction). Default off (bit-identical baseline with dbCapFactor=1.0).
+func (s *CDCLSolver) SetGovernorDB(on bool) {
+	s.govDbEnabled = on
+}
+
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
@@ -1194,12 +1239,13 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d cap=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
+		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbFinalFactor,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
@@ -6069,6 +6115,9 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 	// - Delete clauses with high LBD when database grows too large
 
 	dynamicLimit := s.maxLearned + s.conflicts/s.dbGrowthDivisor
+	if s.dbCapFactor > 0 && s.dbCapFactor != 1.0 {
+		dynamicLimit = int(float64(dynamicLimit) * s.dbCapFactor)
+	}
 	targetCount := dynamicLimit
 
 	currentActive := s.learnedActiveCount
