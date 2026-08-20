@@ -1,4 +1,4 @@
-.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all debug test test-verbose test-race vet lint bench clean install profile help
+.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout debug test test-verbose test-race vet lint bench clean install profile help
 
 # Default target: build release solver binary
 all: satience
@@ -26,6 +26,17 @@ fuzz-random:
 # Env: ITERATIONS=100 TIMEOUT=10 JOBS=6
 fuzz-structured:
 	bash benchmark/fuzz_structured.sh
+
+# Distributional held-out generalization gate. Paired A/B over parametric
+# CNFgen families with fresh random draws; accepts VARIANT_BINARY vs
+# CONTROL_BINARY only if it generalizes across families (no new TMO, bounded
+# per-instance regression, no median regression) on a seed-partitioned
+# validation rail. Requires: cnfgen.
+# Env: CONTROL_BINARY, VARIANT_BINARY, DEV_ITERATIONS=10, VALIDATION_ITERATIONS=50,
+#      TIMEOUT=30, JOBS=6, REGRESS_MAX_FRAC=0.10, REGRESS_MAX_PCT=25,
+#      MEDIAN_REGRESS_PCT=5, NOISE_FLOOR=0.25
+heldout:
+	bash benchmark/heldout.sh
 
 # Go native parser fuzz (no external deps)
 fuzz-parser:

@@ -1353,6 +1353,14 @@ type InstanceStructure struct {
 	SmallClauseRatio  float64 // (binary + ternary) / total
 	StructuredScore   float64 // 0.0 = random, 1.0 = highly structured
 	PolarityImbalance float64 // mean per-variable |pos-neg|/(pos+neg); 0=balanced, 1=pure
+	// RegularOccurrence is true when every appearing variable occurs the same
+	// number of times (within a small relative tolerance). Holds throughout for
+	// k-regular structured formulas (Tseitin on a regular graph, regular graph
+	// coloring), whose variables all have identical occurrence counts. Random
+	// k-SAT essentially never satisfies it. It distinguishes provably-regular
+	// uniform-long structured families from random k-SAT so the uniform-long
+	// random penalty (longSizeVaried) does not misroute them to random handling.
+	RegularOccurrence bool
 }
 
 // PreprocessingConfig controls which preprocessing techniques are enabled
@@ -1439,6 +1447,37 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 		structure.PolarityImbalance = imbSum / float64(imbCount)
 	}
 
+	// Regular-occurrence detection. In a k-regular structured formula every
+	// appearing variable occurs exactly the same number of times (identical
+	// node degree structure). Random k-SAT (Poisson-distributed occurrences)
+	// never has near-equal per-variable counts. This is a high-precision,
+	// low-recall signal: it only exempts provably-regular instances, so random
+	// families are never touched by the exemption.
+	minOcc := -1
+	maxOcc := -1
+	for i := uint32(0); i < s.cnf.NumVars; i++ {
+		n := posCount[i] + negCount[i]
+		if n == 0 {
+			continue
+		}
+		if minOcc < 0 {
+			minOcc, maxOcc = n, n
+		} else {
+			if n < minOcc {
+				minOcc = n
+			}
+			if n > maxOcc {
+				maxOcc = n
+			}
+		}
+	}
+	if minOcc > 0 {
+		meanOcc := float64(minOcc+maxOcc) / 2.0
+		if float64(maxOcc-minOcc)/meanOcc < 0.02 {
+			structure.RegularOccurrence = true
+		}
+	}
+
 	// Structured score: weighted combination of metrics
 	// Key insight: structured instances have EITHER many binary clauses OR many
 	// long (>3 literal) clauses with varied sizes. Random k-SAT has uniform clause
@@ -1459,7 +1498,14 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 	// path. Penalizing to 0.3 drops the score to ~0.38, below the 0.70
 	// threshold. Structured instances (e.g. 274099073, density 15.6, 99.4%
 	// long with VARIED sizes) keep full longScore.
-	if longCount > 0 && !longSizeVaried {
+	// EXEMPTION: provably-regular uniform-long families (e.g. Tseitin on a
+	// regular graph — all clauses same size AND every variable occurs equally
+	// often) are structured parity/theory instances, not random k-SAT. Without
+	// the exemption they are misclassified as "random k-SAT k≥4" (wrong decay,
+	// preprocessing disabled). RegularOccurrence is high-precision (random
+	// instances never satisfy it), so routing these to the structured path is
+	// safe and does not reintroduce the rand4sat misclassification.
+	if longCount > 0 && !longSizeVaried && !structure.RegularOccurrence {
 		longScore *= 0.3
 	}
 	// Ternary-heavy structured instances (e.g., graph coloring) score low on
