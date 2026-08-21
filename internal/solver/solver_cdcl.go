@@ -281,6 +281,10 @@ type CDCLSolver struct {
 
 	// Reusable buffer for vivification results (avoid per-round allocation)
 	tmpVivifyResults []vivifyResult
+	// Reusable buffer for the clause being vivified (defensive copy so trial
+	// propagation's watch-swaps on the learned-clause pool cannot corrupt the
+	// vivify iteration). Avoids a per-clause allocation on the cold path.
+	tmpVivifySrc []cnf.Literal
 
 	// Reusable buffers for learned-clause subsumption (avoid per-round allocation)
 	tmpLearnedSubOcc     [][]int             // occurrence lists: occ[litIdx] = learned clause indices
@@ -337,7 +341,7 @@ type CDCLSolver struct {
 	dbCapFactor                float64 // Multiplier on the learned-DB deletion target (1.0 = baseline/indexical)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
 	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
-	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 50)
+	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 100)
 	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
@@ -586,8 +590,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Subsumption budget: 0 = unlimited. Sized adaptively before preprocessing
 		// (in preprocessAggressive) to bound the O(n²)-ish clause-pair scans.
 		subsumptionBudget: 0,
-		// Vivification: run every 50 restarts (configurable via CLI)
-		vivifyPeriod:  50,
+		// Vivification: run every 100 restarts (configurable via CLI). Default
+		// raised from 50: the defensive-copy vivify fix (for the watch-swap
+		// aliasing unsoundness) shifts trajectories, and period=100 keeps the
+		// corrected vivification at a 0-TMO operating point on the 72-suite.
+		vivifyPeriod:  100,
 		vivifyEnabled: true,
 		// Min conflicts between vivify rounds. Without this gate, small/fast-restart
 		// instances fire vivify every ~50 restarts = every few hundred conflicts,
@@ -2839,14 +2846,22 @@ func (s *CDCLSolver) vivifyClause(learnedIdx int) bool {
 	loc := s.learnedLoc[learnedIdx]
 	offset := int(loc.Offset)
 	size := int(loc.Size)
-	literals := s.learnedLiterals[offset : offset+size]
 
 	if size <= 2 {
 		return false
 	}
 
-	// Copy literals to a local buffer — propagation may swap literals in the
-	// clause's storage (watch replacement), which would corrupt our iteration.
+	// Copy literals to a private buffer — trial propagation may swap literals
+	// in the clause's shared pool storage (watch replacement on the watched
+	// positions), which would otherwise corrupt our iteration by overwriting a
+	// not-yet-read literal of this same clause in s.learnedLiterals.
+	src := s.tmpVivifySrc
+	if cap(src) < size {
+		src = make([]cnf.Literal, size)
+	}
+	literals := src[:size]
+	copy(literals, s.learnedLiterals[offset:offset+size])
+	s.tmpVivifySrc = literals
 	// We reuse tmpLearnedLits (it's not in use during restart).
 	newLits := s.tmpLearnedLits[:0]
 	s.level = 0

@@ -70,6 +70,11 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 		repLit[i] = i
 	}
 
+	// Reused scratch for "is this literal in the current SCC" membership, used
+	// solely to detect l and ¬l in the same SCC. Allocated once and reset via
+	// touched entries only, so detection stays O(V+E) rather than O(#SCCs × V).
+	inSCC := make([]bool, numLits)
+
 	mergedCount := 0
 
 	type frame struct {
@@ -137,7 +142,6 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 					}
 
 					// Check for l and ¬l in same SCC → UNSAT.
-					inSCC := make([]bool, numLits)
 					for _, lit := range scc {
 						inSCC[lit] = true
 					}
@@ -147,6 +151,9 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 							unsat = true
 							break
 						}
+					}
+					for _, lit := range scc {
+						inSCC[lit] = false
 					}
 					if unsat {
 						s.Log("c [equiv] Contradiction detected: l and ¬l in same SCC\n")
