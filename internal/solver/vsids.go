@@ -79,15 +79,6 @@ func (h *vsidsHeap) down(heapPos []int, i int) {
 	}
 }
 
-// insert adds a variable to the heap with the given score.
-func (h *vsidsHeap) insert(heapPos []int, varIdx uint32, score float64) {
-	pos := len(h.scores)
-	h.scores = append(h.scores, score)
-	h.varIdxs = append(h.varIdxs, varIdx)
-	heapPos[varIdx] = pos
-	h.up(heapPos, pos)
-}
-
 // removeMax removes the maximum element (root). Return value is unused by
 // callers; kept minimal.
 func (h *vsidsHeap) removeMax(heapPos []int) {
@@ -105,26 +96,6 @@ func (h *vsidsHeap) removeMax(heapPos []int) {
 		h.scores = h.scores[:0]
 		h.varIdxs = h.varIdxs[:0]
 	}
-}
-
-// increaseKey updates the score of varIdx (must be in heap) and sifts up.
-func (h *vsidsHeap) increaseKey(heapPos []int, varIdx uint32, score float64) {
-	pos := heapPos[varIdx]
-	if pos < 0 {
-		return
-	}
-	h.scores[pos] = score
-	h.up(heapPos, pos)
-}
-
-// decreaseKey updates the score of varIdx (must be in heap) and sifts down.
-func (h *vsidsHeap) decreaseKey(heapPos []int, varIdx uint32, score float64) {
-	pos := heapPos[varIdx]
-	if pos < 0 {
-		return
-	}
-	h.scores[pos] = score
-	h.down(heapPos, pos)
 }
 
 // init builds a heap from unsorted arrays in O(n) time.
@@ -352,11 +323,6 @@ func (v *VSIDS) SetDecayParams(initial, max float64, rampUpConflicts int) {
 	v.decayFactor = initial
 	v.decayRampUpConflicts = rampUpConflicts
 	v.decayIncrement = (max - initial) / float64(rampUpConflicts)
-}
-
-// Much more aggressive decay to prevent any single variable from dominating
-func (v *VSIDS) SetAggressiveDecay() {
-	v.SetDecayParams(0.30, 0.60, 5000)
 }
 
 // SetClauseInitWeights sets the initialization weights for clauses

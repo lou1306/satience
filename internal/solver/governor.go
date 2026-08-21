@@ -43,10 +43,8 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	s.govStartDec = uint64(s.decisions)
 	s.govStartProps = uint64(s.propagations)
 	s.govStartMoves = s.numWatchMoves
-	s.govStartGlue = s.glueLearned
 	s.govStartLbd = s.totalLbdSum
 	s.govStartLbdC = s.totalLbdCount
-	s.govWindows++
 	// Skip very short windows (search may be about to conclude anyway).
 	if winConf < 2000 {
 		return

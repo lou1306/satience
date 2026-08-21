@@ -192,7 +192,6 @@ type CDCLSolver struct {
 	restartReasons       [5]int  // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
 	restartSegStartConf  int     // conflicts at the start of the current restart segment
 	restartSegStartDec   int     // decisions at the start of the current restart segment
-	restartSegStartProps int     // propagations at the start of the current restart segment
 	restartSegProdRatio  float64 // conflicts per 1000 decisions over the last segment (negative=unset)
 	restartSegGlueCount  int     // glue clauses learned in the current segment
 	restartSegStartGlue  int     // glueLearned at the start of the current segment
@@ -279,7 +278,6 @@ type CDCLSolver struct {
 	tmpLearnedLits      []cnf.Literal // Reusable buffer for learned clause literals
 	tmpMinSeenVars      []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
-	conflictLitsBuf     []cnf.Literal // Pre-allocated buffer for conflict clause literal copies
 
 	// Reusable buffer for vivification results (avoid per-round allocation)
 	tmpVivifyResults []vivifyResult
@@ -420,11 +418,9 @@ type CDCLSolver struct {
 	// classifier misclassification WITHOUT static per-instance gates. Evaluated
 	// at restart boundaries (cold path) using rolling-window deltas of live
 	// search signals. See governor.go / maybeAdaptSearch.
-	govWindows      int    // number of governor windows evaluated
 	govStartConf    uint64 // cumulative conflicts at last window snapshot
 	govStartDec     uint64 // cumulative decisions at last window snapshot
 	govStartProps   uint64 // cumulative propagations at last window snapshot
-	govStartGlue    uint64 // cumulative glue at last snapshot
 	govStartLbd     uint64 // cumulative LBD sum at last snapshot
 	govStartLbdC    uint64 // cumulative LBD-clause count at last snapshot
 	govStartMoves   uint64 // Det5: cumulative watch-moves at last snapshot
@@ -484,8 +480,7 @@ type lazyInitState struct {
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
 type resolveCandidate struct {
-	varIdx     uint32
-	reasonSize int // Size of reason clause (for optional sorting heuristics)
+	varIdx uint32
 }
 
 // vivifyResult holds a vivified clause's new literals pending application
@@ -572,7 +567,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:   make([]cnf.Literal, 0, 256),
 		tmpMinSeenVars:   make([]uint32, 0, 256),
-		conflictLitsBuf:  make([]cnf.Literal, 0, 256),
 		tmpVivifyResults: make([]vivifyResult, 0, 64),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
 		tmpDeleted:            make([]bool, maxLearned),
@@ -3382,7 +3376,6 @@ func (s *CDCLSolver) restart() bool {
 	}
 	s.restartSegStartConf = s.conflicts
 	s.restartSegStartDec = s.decisions
-	s.restartSegStartProps = s.propagations
 	s.restartSegStartGlue = int(s.glueLearned)
 
 	// Adaptive restart gear governor. Advance only when BOTH hold:
@@ -4640,9 +4633,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					learnedLoc := s.learnedLoc
 					learnedLiterals := s.learnedLiterals
 					loc := learnedLoc[clauseID]
-					s.conflictLitsBuf = s.conflictLitsBuf[:0]
-					s.conflictLitsBuf = append(s.conflictLitsBuf, learnedLiterals[int(loc.Offset):int(loc.Offset)+int(loc.Size)]...)
-					s.conflictClauseBuf.Literals = s.conflictLitsBuf
+					s.conflictClauseBuf.Literals = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
 					s.conflictClauseBuf.Learned = true
 				}
 				s.propagations = propagations
@@ -4850,9 +4841,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					conflictClause = &s.conflictClauseBuf
 				} else {
 					literals := s.getLearnedClauseLiterals(clauseID)
-					s.conflictLitsBuf = s.conflictLitsBuf[:0]
-					s.conflictLitsBuf = append(s.conflictLitsBuf, literals...)
-					s.conflictClauseBuf.Literals = s.conflictLitsBuf
+					s.conflictClauseBuf.Literals = literals
 					s.conflictClauseBuf.Learned = true
 					conflictClause = &s.conflictClauseBuf
 				}
@@ -5575,36 +5564,30 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// CRITICAL FIX: Level 0 is preprocessing - not a decision level for LBD
 	lbd := 0
 	maxLevel := 0
+	// Build learned clause — exclude level-0 literals (always-true root facts).
+	// Level-0 literals are preprocessing assignments and root-level learned units.
+	// They are always true during search, so including them in learned clauses
+	// wastes storage and watch slots without adding constraint value.
+	//
+	// LBD/maxLevel accumulation and learned-literal construction iterate the same
+	// tmpLiteralInClause-filtered touched set and read the same assignments[].Level,
+	// so fold them into a single pass (compute lvl once) instead of two O(touched)
+	// scans per conflict.
+	s.tmpLearnedLits = s.tmpLearnedLits[:0]
 	for _, varIdx := range s.tmpTouchedVars {
 		if s.tmpLiteralInClause[varIdx] {
 			lvl := int(s.assignments[varIdx].Level)
+			s.tmpLiteralInClause[varIdx] = false
 			if lvl > 0 {
 				if !s.tmpLevelSetUsed[lvl] {
 					s.tmpLevelSetUsed[lvl] = true
 					s.tmpLevelSet = append(s.tmpLevelSet, lvl)
 					lbd++
 				}
+				s.tmpLearnedLits = append(s.tmpLearnedLits, cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx]))
 			}
 			if lvl > maxLevel && lvl < s.level {
 				maxLevel = lvl
-			}
-		}
-	}
-
-	// Build learned clause — exclude level-0 literals (always-true root facts).
-	// Level-0 literals are preprocessing assignments and root-level learned units.
-	// They are always true during search, so including them in learned clauses
-	// wastes storage and watch slots without adding constraint value. The old
-	// propLevel=1 hack resolved root-level propagated units away via 1-UIP
-	// (their reason was a unit clause, so resolution removed them and added
-	// nothing); Level 0 skips them, so we filter here to produce equally short
-	// clauses.
-	s.tmpLearnedLits = s.tmpLearnedLits[:0]
-	for _, varIdx := range s.tmpTouchedVars {
-		if s.tmpLiteralInClause[varIdx] {
-			s.tmpLiteralInClause[varIdx] = false
-			if s.assignments[varIdx].Level > 0 {
-				s.tmpLearnedLits = append(s.tmpLearnedLits, cnf.NewLiteral(varIdx, s.tmpLiteralIsNegated[varIdx]))
 			}
 		}
 	}

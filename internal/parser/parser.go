@@ -104,7 +104,7 @@ func processLine(line string, numVars *uint32, numClauses *int, headerFound *boo
 			i++
 		}
 		// Read numClauses
-		nc, ni, err := parseUint32From(line, i)
+		nc, _, err := parseUint32From(line, i)
 		if err != nil {
 			return fmt.Errorf("invalid numClauses: %v", err)
 		}
@@ -223,12 +223,4 @@ func parseIntFrom(s string, i int) (int, int, error) {
 		val = -val
 	}
 	return val, i, nil
-}
-
-func parseUint32(s string) (uint32, error) {
-	val, err := strconv.ParseUint(s, 10, 32)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(val), nil
 }
