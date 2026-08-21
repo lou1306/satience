@@ -483,6 +483,17 @@ type CDCLSolver struct {
 	govLbdHistN   int
 	govLbdHistIdx int
 
+	// Unified runtime governor (A/B, -gov-unified; off by default). Replaces the
+	// separate Det1/Det3/Det4/Det5 actuation with a single windowed controller
+	// that maps normalized search-health signals onto bounded, trend-aware
+	// actuators, plus adaptive vivify cadence.
+	govUnified      bool
+	govLbdEma       float64 // EMA of window avgLBD (clause-quality trend)
+	govMovesEma     float64 // EMA of window watch-moves/decision (propagation-cost trend)
+	govVivify       int     // current adaptive vivify period (center default 200)
+	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
+	govDepthChanged bool
+
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
 	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
@@ -850,6 +861,12 @@ func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, s
 	if stagBase >= 1 {
 		s.govStagBase = stagBase
 	}
+}
+
+// SetGovernorUnified switches maybeAdaptSearch to the unified runtime controller
+// instead of the separate Det1/Det3/Det4/Det5 detectors. A/B (off by default).
+func (s *CDCLSolver) SetGovernorUnified(on bool) {
+	s.govUnified = on
 }
 
 func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {

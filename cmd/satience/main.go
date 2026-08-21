@@ -55,6 +55,7 @@ func run() int {
 	govStagGlue := flag.Float64("gov-stag-glue", 0.05, "Governor Det4: max window glue ratio to qualify as unguided")
 	govStagWin := flag.Int("gov-stag-win", 3, "Governor Det4: consecutive windows with no LBD improvement to confirm")
 	govStagBase := flag.Int("gov-stag-base", 20, "Governor Det4: target restartBase when LBD-stagnation fires")
+	govUnified := flag.Bool("gov-unified", false, "Use the unified runtime governor (single trend-aware controller + adaptive vivify, A/B; default off)")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
@@ -156,6 +157,7 @@ func run() int {
 	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
 	s.SetGovernorParams(*govGrindBase, *govGrindPDec, *govGrindConf, *govWanderDecC, *govWanderGlue, *govWindow)
 	s.SetGovernorDet4Params(*govStagLBD, *govStagGlue, *govStagWin, *govStagBase)
+	s.SetGovernorUnified(*govUnified)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters

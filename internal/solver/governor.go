@@ -71,10 +71,104 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 		winLBD = float64(lbdDelta) / float64(winLbdC)
 	}
 
+	if s.govUnified {
+		s.unifiedGovernor(winProps, winDec, winConf, winMoves, lbdDelta, winLbdC)
+		return
+	}
 	s.detector4LbdStagnation(winLBD, glueRatio)
 	s.detector1Grind(propsPerDec)
 	s.detector3Wander(decPerConf, glueRatio)
 	s.detector5DBCost(winMoves, winDec, propsPerDec)
+}
+// unifiedGovernor is the consolidated runtime controller (A/B, -gov-unified).
+// Unlike the separate one-way Det1/Det3/Det4 ratchets it:
+//   - runs ONE windowed loop,
+//   - tracks EMA trends (clause-quality and propagation-cost) so thresholds are
+//     relative to the instance's own trajectory rather than absolute constants,
+//   - makes restart-base corrections bounded and REVERSIBLE (heals toward the
+//     default when the pathology clears), and
+//   - adds adaptive vivify cadence keyed on the measured DB-bloat signal
+//     (rising propagation cost with weak glue guidance => vivify less).
+//
+// Deliberately conservative: each actuator moves in bounded steps with
+// hysteresis and self-corrects, so a wrong call is undone rather than locked.
+func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lbdDelta uint64, winLbdC uint64) {
+	if s.govVivify == 0 {
+		s.govVivify = s.vivifyPeriod
+	}
+	if winConf < 2000 {
+		return
+	}
+	pd := float64(winProps) / float64(max(winDec, 1))
+	dcd := float64(winDec) / float64(max(winConf, 1))
+	winLBD := float64(lbdDelta) / float64(max(winLbdC, 1))
+	glue := 0.0
+	if s.totalLbdCount > 0 {
+		glue = float64(s.glueLearned) / float64(s.totalLbdCount)
+	}
+	mpd := float64(winMoves) / float64(max(winDec, 1))
+
+	// Trend EMAs.
+	if s.govLbdEma == 0 {
+		s.govLbdEma = winLBD
+	}
+	s.govLbdEma = 0.9*s.govLbdEma + 0.1*winLBD
+	prevMoves := s.govMovesEma
+	if s.govMovesEma == 0 {
+		s.govMovesEma = mpd
+	}
+	s.govMovesEma = 0.8*s.govMovesEma + 0.2*mpd
+	movesRising := s.govMovesEma > prevMoves*1.05
+
+	// ----- 1) Restart-depth actuator (consolidates Det1 cascade + Det4 stagnation) -----
+	// Deep pathology: enormous per-decision propagation (binary cascade) OR
+	// high-flat LBD stagnation with weak phase guidance and no deep-search need.
+	deepPathology := pd > 120.0 ||
+		(s.govLbdEma >= 12.0 && glue < 0.05 && s.polarityImbalance < 0.4 &&
+			s.longClauseRatio <= 0.8 && s.structureScore >= 0.7)
+	if s.conflicts >= 30000 {
+		if deepPathology && s.restartBase > s.govGrindBase {
+			s.restartBase = max(s.govGrindBase, s.restartBase-15)
+			s.govDepthTrend = -1
+			s.Log("c [gov-u] depth pathology (pd=%.0f, LBD=%.1f, glue=%.3f) -> restartBase=%d\n",
+				pd, s.govLbdEma, glue, s.restartBase)
+		} else if !deepPathology && s.govDepthTrend == -1 && s.restartBase < 200 {
+			s.restartBase = min(200, s.restartBase+10)
+			s.govDepthTrend = 0
+			s.Log("c [gov-u] depth healthy -> heal restartBase=%d\n", s.restartBase)
+		}
+	}
+
+	// ----- 2) Glucose wander actuator (consolidates Det3) -----
+	if !s.govGlucoseOn && dcd > 40.0 && glue < 0.10 && s.emaLBD >= 20.0 {
+		s.govGlucoseOn = true
+		if !s.flagSet("restart-glucose-ratio") {
+			s.restartGlucoseRatio = 1.5
+		}
+		if !s.flagSet("restart-glucose-min") {
+			s.restartGlucoseMinConflicts = 100
+		}
+		s.Log("c [gov-u] wander (%.0f dec/conf, glue=%.3f) -> Glucose on\n", dcd, glue)
+	}
+
+	// ----- 3) DB-cost actuator (reuse the self-correcting moves/dec logic) -----
+	s.detector5DBCost(winMoves, winDec, pd)
+
+	// ----- 4) Adaptive vivify cadence -----
+	// Rising propagation cost with weak glue guidance => the learned DB output
+	// (incl. vivify-inflated short clauses) is the bottleneck => vivify less.
+	// Healthy trend => vivify more eagerly. Bounded [50,400].
+	if movesRising && glue < 0.10 && s.govVivify < 400 {
+		s.govVivify += 25
+		s.Log("c [gov-u] vivify: moves rising, glue=%.3f -> period %d\n", glue, s.govVivify)
+	} else if !movesRising && glue >= 0.10 && s.govVivify > 50 {
+		s.govVivify -= 25
+		s.Log("c [gov-u] vivify: healthy -> period %d\n", s.govVivify)
+	}
+	if s.govVivify != s.vivifyPeriod {
+		s.vivifyPeriod = s.govVivify
+		s.conflictsAtLastVivify = s.conflicts
+	}
 }
 
 // detector1Grind targets the deep-binary-cascade / timeout-cliff signature
