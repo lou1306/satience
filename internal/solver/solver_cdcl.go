@@ -255,7 +255,7 @@ type CDCLSolver struct {
 	// implication graph). Built once from original binary clauses in buildBIG.
 	// Used for transitive BIG-based clause minimization (see bigReachableInClause).
 	bigAdjData []int32
-	bigAdjOff  []int32
+	bigAdjOff  []int64
 	// bigBfsBudget bounds the per-call transitive-reduction BFS node budget in
 	// bigReachableInClause. Larger budgets find more multi-hop binary reductions
 	// at higher per-minimize cost. Exposed for A/B (see -big-bfs).
@@ -4052,7 +4052,11 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 // (Kissat-style).
 func (s *CDCLSolver) buildBIG() {
 	numLits := int(s.cnf.NumVars) * 2
-	off := make([]int32, numLits+1)
+	// Offset/cursor arrays are int64: total binary-implication edges
+	// (= 2 x #binary clauses) can exceed MaxInt32 on very large binary-heavy
+	// instances, and the prefix-sum/offsets would silently overflow int32.
+	// Adjacency targets stay int32 (literal indices < numLits always fit).
+	off := make([]int64, numLits+1)
 	for i := range s.cnf.Clauses {
 		lits := s.cnf.Clauses[i].Literals
 		if len(lits) != 2 {
@@ -4069,8 +4073,8 @@ func (s *CDCLSolver) buildBIG() {
 	for i := 1; i <= numLits; i++ {
 		off[i] += off[i-1]
 	}
-	data := make([]int32, off[numLits])
-	cur := make([]int32, numLits)
+	data := make([]int32, int(off[numLits]))
+	cur := make([]int64, numLits)
 	copy(cur, off[:numLits])
 	for i := range s.cnf.Clauses {
 		lits := s.cnf.Clauses[i].Literals
@@ -4082,9 +4086,9 @@ func (s *CDCLSolver) buildBIG() {
 		if a == b || a == b^1 {
 			continue
 		}
-		data[cur[a^1]] = int32(b)
+		data[int(cur[a^1])] = int32(b)
 		cur[a^1]++
-		data[cur[b^1]] = int32(a)
+		data[int(cur[b^1])] = int32(a)
 		cur[b^1]++
 	}
 	s.bigAdjData = data

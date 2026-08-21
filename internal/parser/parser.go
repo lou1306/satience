@@ -22,11 +22,18 @@ func Parse(r io.Reader) (*cnf.CNF, error) {
 	// Reusable buffer for current clause literals
 	var currentLits []cnf.Literal
 
+	// Largest variable index actually referenced by any clause (for the
+	// declared-numVars plausibility guard against OOM: a DIMACS header may
+	// claim billions of vars with a tiny body, and downstream solver code
+	// allocates O(numVars) arrays, so an implausibly large declared count
+	// relative to the referenced variables is rejected as malformed).
+	var maxVarReferenced uint32
+
 	for {
 		line, err := br.ReadString('\n')
 		if len(line) > 0 {
 			// Process the line
-			if err := processLine(line, &numVars, &numClauses, &headerFound, &cnfFormula, &currentLits); err != nil {
+			if err := processLine(line, &numVars, &numClauses, &headerFound, &cnfFormula, &currentLits, &maxVarReferenced); err != nil {
 				return nil, err
 			}
 		}
@@ -47,12 +54,24 @@ func Parse(r io.Reader) (*cnf.CNF, error) {
 		return nil, fmt.Errorf("unterminated clause at end of input (missing 0)")
 	}
 
+	// Declared-numVars plausibility guard against OOM: the header can claim
+	// billions of variables while the body references only a handful; the solver
+	// then allocates O(numVars) arrays from a tiny input. Reject when the
+	// declared count is implausibly larger than the max variable actually used.
+	// Generous slack preserves legitimate DIMACS (where numVars is the max
+	// referenced index, sometimes with a few isolated trailing variables).
+	const plausibleFloor = 1 << 20 // 1,048,576
+	if numVars > plausibleFloor && uint64(numVars) > uint64(maxVarReferenced)+1+plausibleFloor {
+		return nil, fmt.Errorf("declared %d variables but only referenced up to %d (implausible count)",
+			numVars, maxVarReferenced+1)
+	}
+
 	return cnfFormula, nil
 }
 
 // processLine handles a single line of DIMACS CNF input
 func processLine(line string, numVars *uint32, numClauses *int, headerFound *bool,
-	cnfFormula **cnf.CNF, currentLits *[]cnf.Literal) error {
+	cnfFormula **cnf.CNF, currentLits *[]cnf.Literal, maxVarReferenced *uint32) error {
 
 	// Skip leading whitespace
 	i := 0
@@ -156,6 +175,9 @@ func processLine(line string, numVars *uint32, numClauses *int, headerFound *boo
 			}
 			if varIdx >= *numVars {
 				return fmt.Errorf("variable %d exceeds declared max %d", varIdx+1, *numVars)
+			}
+			if varIdx > *maxVarReferenced {
+				*maxVarReferenced = varIdx
 			}
 			*currentLits = append(*currentLits, cnf.NewLiteral(varIdx, negated))
 		}
