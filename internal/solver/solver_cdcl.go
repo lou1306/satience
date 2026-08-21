@@ -367,7 +367,7 @@ type CDCLSolver struct {
 	dbCapFactor                float64 // Multiplier on the learned-DB deletion target (1.0 = baseline/indexical)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
 	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
-	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 100)
+	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 200)
 	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (default 5000)
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
@@ -618,11 +618,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Subsumption budget: 0 = unlimited. Sized adaptively before preprocessing
 		// (in preprocessAggressive) to bound the O(n²)-ish clause-pair scans.
 		subsumptionBudget: 0,
-		// Vivification: run every 100 restarts (configurable via CLI). Default
-		// raised from 50: the defensive-copy vivify fix (for the watch-swap
-		// aliasing unsoundness) shifts trajectories, and period=100 keeps the
-		// corrected vivification at a 0-TMO operating point on the 72-suite.
-		vivifyPeriod:  100,
+		// Vivification: run every 200 restarts (configurable via CLI). Default
+		// raised from 100 after the resweep: vivify=200 is a 0-TMO operating
+		// point with lower PAR2 (1.37 vs 1.42) and flat median on the 72-suite —
+		// it trades a big win on the long-clause 274099073 (23.3->6.7s) for a
+		// moderate loss on the phase-transition 30eb4ef44 (11.7->20.7s).
+		vivifyPeriod:  200,
 		vivifyEnabled: true,
 		// Min conflicts between vivify rounds. Without this gate, small/fast-restart
 		// instances fire vivify every ~50 restarts = every few hundred conflicts,
