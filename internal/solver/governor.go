@@ -154,20 +154,27 @@ func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lb
 	// ----- 3) DB-cost actuator (reuse the self-correcting moves/dec logic) -----
 	s.detector5DBCost(winMoves, winDec, pd)
 
-	// ----- 4) Adaptive vivify cadence -----
-	// Rising propagation cost with weak glue guidance => the learned DB output
-	// (incl. vivify-inflated short clauses) is the bottleneck => vivify less.
-	// Healthy trend => vivify more eagerly. Bounded [50,400].
-	if movesRising && glue < 0.10 && s.govVivify < 400 {
-		s.govVivify += 25
-		s.Log("c [gov-u] vivify: moves rising, glue=%.3f -> period %d\n", glue, s.govVivify)
-	} else if !movesRising && glue >= 0.10 && s.govVivify > 50 {
-		s.govVivify -= 25
-		s.Log("c [gov-u] vivify: healthy -> period %d\n", s.govVivify)
-	}
-	if s.govVivify != s.vivifyPeriod {
-		s.vivifyPeriod = s.govVivify
-		s.conflictsAtLastVivify = s.conflicts
+	// ----- 4) Adaptive vivify cadence (gated; structural-keyed) -----
+	// Only active when -gov-univ-vivify. Live behavior alone cannot separate
+	// the two poles, so the direction is keyed on the structural axis Det4
+	// already uses:
+	//   - vivify LESS (raise period) for deep-stable long-clause grinders
+	//     (274099073) when propagation cost is rising with weak glue guidance;
+	//   - vivify MORE (lower period) for phase-transition random instances
+	//     (30eb4ef44) that need more diversity, or when the trend is healthy.
+	// Otherwise leave the anchored period untouched (no perturbation).
+	if s.govUnifiedVivify {
+		if movesRising && glue < 0.10 && s.longClauseRatio > 0.8 && s.govVivify < 400 {
+			s.govVivify += 25
+			s.Log("c [gov-u] vivify: long-clause moves rising, glue=%.3f -> period %d\n", glue, s.govVivify)
+		} else if !movesRising && (glue >= 0.10 || s.structureScore < 0.7) && s.govVivify > 50 {
+			s.govVivify -= 25
+			s.Log("c [gov-u] vivify: more diversity (score=%.2f) -> period %d\n", s.structureScore, s.govVivify)
+		}
+		if s.govVivify != s.vivifyPeriod {
+			s.vivifyPeriod = s.govVivify
+			s.conflictsAtLastVivify = s.conflicts
+		}
 	}
 }
 
