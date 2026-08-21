@@ -83,19 +83,14 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 // unifiedGovernor is the consolidated runtime controller (A/B, -gov-unified).
 // Unlike the separate one-way Det1/Det3/Det4 ratchets it:
 //   - runs ONE windowed loop,
-//   - tracks EMA trends (clause-quality and propagation-cost) so thresholds are
-//     relative to the instance's own trajectory rather than absolute constants,
+//   - tracks an EMA trend (clause quality) so thresholds are relative to the
+//     instance's own trajectory rather than absolute constants,
 //   - makes restart-base corrections bounded and REVERSIBLE (heals toward the
-//     default when the pathology clears), and
-//   - adds adaptive vivify cadence keyed on the measured DB-bloat signal
-//     (rising propagation cost with weak glue guidance => vivify less).
+//     default when the pathology clears).
 //
 // Deliberately conservative: each actuator moves in bounded steps with
 // hysteresis and self-corrects, so a wrong call is undone rather than locked.
 func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lbdDelta uint64, winLbdC uint64) {
-	if s.govVivify == 0 {
-		s.govVivify = s.vivifyPeriod
-	}
 	if winConf < 2000 {
 		return
 	}
@@ -106,19 +101,12 @@ func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lb
 	if s.totalLbdCount > 0 {
 		glue = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
-	mpd := float64(winMoves) / float64(max(winDec, 1))
 
-	// Trend EMAs.
+	// Trend EMA for clause quality (restart-pathology heuristic).
 	if s.govLbdEma == 0 {
 		s.govLbdEma = winLBD
 	}
 	s.govLbdEma = 0.9*s.govLbdEma + 0.1*winLBD
-	prevMoves := s.govMovesEma
-	if s.govMovesEma == 0 {
-		s.govMovesEma = mpd
-	}
-	s.govMovesEma = 0.8*s.govMovesEma + 0.2*mpd
-	movesRising := s.govMovesEma > prevMoves*1.05
 
 	// ----- 1) Restart-depth actuator (consolidates Det1 cascade + Det4 stagnation) -----
 	// Deep pathology: enormous per-decision propagation (binary cascade) OR
@@ -153,29 +141,6 @@ func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lb
 
 	// ----- 3) DB-cost actuator (reuse the self-correcting moves/dec logic) -----
 	s.detector5DBCost(winMoves, winDec, pd)
-
-	// ----- 4) Adaptive vivify cadence (gated; structural-keyed) -----
-	// Only active when -gov-univ-vivify. Live behavior alone cannot separate
-	// the two poles, so the direction is keyed on the structural axis Det4
-	// already uses:
-	//   - vivify LESS (raise period) for deep-stable long-clause grinders
-	//     (274099073) when propagation cost is rising with weak glue guidance;
-	//   - vivify MORE (lower period) for phase-transition random instances
-	//     (30eb4ef44) that need more diversity, or when the trend is healthy.
-	// Otherwise leave the anchored period untouched (no perturbation).
-	if s.govUnifiedVivify {
-		if movesRising && glue < 0.10 && s.longClauseRatio > 0.8 && s.govVivify < 400 {
-			s.govVivify += 25
-			s.Log("c [gov-u] vivify: long-clause moves rising, glue=%.3f -> period %d\n", glue, s.govVivify)
-		} else if !movesRising && (glue >= 0.10 || s.structureScore < 0.7) && s.govVivify > 50 {
-			s.govVivify -= 25
-			s.Log("c [gov-u] vivify: more diversity (score=%.2f) -> period %d\n", s.structureScore, s.govVivify)
-		}
-		if s.govVivify != s.vivifyPeriod {
-			s.vivifyPeriod = s.govVivify
-			s.conflictsAtLastVivify = s.conflicts
-		}
-	}
 }
 
 // detector1Grind targets the deep-binary-cascade / timeout-cliff signature

@@ -488,10 +488,7 @@ type CDCLSolver struct {
 	// that maps normalized search-health signals onto bounded, trend-aware
 	// actuators, plus adaptive vivify cadence.
 	govUnified      bool
-	govUnifiedVivify bool // gate the adaptive-vivify-cadence branch independently (A/B)
 	govLbdEma       float64 // EMA of window avgLBD (clause-quality trend)
-	govMovesEma     float64 // EMA of window watch-moves/decision (propagation-cost trend)
-	govVivify       int     // current adaptive vivify period (center default 200)
 	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
 	govDepthChanged bool
 
@@ -868,12 +865,6 @@ func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, s
 // instead of the separate Det1/Det3/Det4/Det5 detectors. A/B (off by default).
 func (s *CDCLSolver) SetGovernorUnified(on bool) {
 	s.govUnified = on
-}
-
-// SetGovernorUnifiedVivify gates the adaptive-vivify-cadence branch of the
-// unified controller independently (so its contribution can be A/B'd). A/B.
-func (s *CDCLSolver) SetGovernorUnifiedVivify(on bool) {
-	s.govUnifiedVivify = on
 }
 
 func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
