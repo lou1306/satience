@@ -82,6 +82,7 @@ func run() int {
 	bigBfs := flag.Int("big-bfs", 16, "Per-call BIG transitive-minimization BFS node budget (default 16)")
 	bigForce := flag.Bool("big-force", false, "Force BIG minimization on mixed-binary low-structure instances (A/B; default off)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
+	glueEvict := flag.Bool("glue-evict", false, "Evict over-represented glue/short clauses (A/B; tests small-clause-DB management, default off)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	minisatRestart := flag.Bool("minisat-restart", false, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD)")
 	minisatBumps := flag.Bool("minisat-bumps", false, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor)")
@@ -201,6 +202,9 @@ func run() int {
 	}
 	if *bigLearn {
 		s.SetBigLearn(true)
+	}
+	if *glueEvict {
+		s.SetGlueEvict(true)
 	}
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)

@@ -341,6 +341,13 @@ type CDCLSolver struct {
 	// level-0 literal filter changed clause DB composition.
 	lbdTier1Threshold          int     // Pass 1 deletion: delete LBD > threshold (default 5)
 	lbdTier2Threshold          int     // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
+	// Glue/short-clause eviction (A/B, off by default): strong minimization
+	// inflates the LBD≤tier2 population (accepted here, unlike Glucose). This
+	// optionally evicts over-represented glue so the small-clause DB can be
+	// trimmed; tests whether that unlocks minimization gains.
+	glueEvict          bool
+	glueEvictMaxFrac   float64 // max glue fraction of targetCount before eviction (default 0.5)
+	glueEvictExtraFrac float64 // max extra deletions as fraction of targetCount per pass (default 0.2)
 	dbGrowthDivisor            int     // dynamicLimit = maxLearned + conflicts/divisor (default 50)
 	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
 	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
@@ -673,6 +680,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decayCeil:                  0.80,
 		lbdTier1Threshold:          5,
 		lbdTier2Threshold:          2,
+		glueEvict:                  false,
+		glueEvictMaxFrac:           0.5,
+		glueEvictExtraFrac:         0.2,
 		dbGrowthDivisor:            50,
 		deletionTriggerRatio:       1.5,
 		dbShrinkThreshold:          10,
@@ -928,6 +938,11 @@ func (s *CDCLSolver) SetClauseDBParams(lbdTier1, lbdTier2, dbGrowthDiv int, delT
 func (s *CDCLSolver) SetDBMaxLen(dbMaxLen int) {
 	s.dbMaxLen = dbMaxLen
 }
+
+// SetGlueEvict enables eviction of over-represented glue/short clauses (A/B).
+func (s *CDCLSolver) SetGlueEvict(on bool) {
+	s.glueEvict = on
+} 
 
 func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
 	s.occurrenceWeight = w
@@ -6396,6 +6411,50 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			}
 			deleted[idx] = true
 			deletedCount++
+		}
+	}
+
+	// Pass 2.5 (glue eviction, A/B): when the LBD≤tier2 (glue/short) population
+	// over-represents the DB, evict the lowest-activity glue beyond the normal
+	// toDelete budget. Strong minimization inflates this population; trimming
+	// it tests whether the small-clause bloat (rather than the trajectory) is
+	// what makes aggressive minimization net-negative. Gated off by default.
+	if s.glueEvict && deletedCount <= toDelete {
+		glueCount := 0
+		for i := 0; i < s.learnedCapacity; i++ {
+			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
+				continue
+			}
+			if int(s.learnedMetadata[i].LBD) <= s.lbdTier2Threshold {
+				glueCount++
+			}
+		}
+		maxGlue := int(float64(targetCount) * s.glueEvictMaxFrac)
+		if glueCount > maxGlue {
+			budget := glueCount - maxGlue
+			if extra := int(float64(targetCount) * s.glueEvictExtraFrac); budget > extra {
+				budget = extra
+			}
+			candidates = candidates[:0]
+			for i := 0; i < s.learnedCapacity; i++ {
+				if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
+					continue
+				}
+				if int(s.learnedMetadata[i].LBD) <= s.lbdTier2Threshold {
+					candidates = append(candidates, i)
+				}
+			}
+			if len(candidates) > 1 {
+				s.sortDeletionCandidates(candidates)
+			}
+			for _, idx := range candidates {
+				if budget <= 0 {
+					break
+				}
+				deleted[idx] = true
+				deletedCount++
+				budget--
+			}
 		}
 	}
 
