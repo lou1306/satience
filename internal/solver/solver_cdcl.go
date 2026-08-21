@@ -477,6 +477,9 @@ type CDCLSolver struct {
 	govDbReverts        int     // Det5: DB-reduction reverts (diagnostic)
 	govDbActive         bool    // Det5 currently holding a reduced cap (diagnostic)
 	govDbFinalFactor    float64 // Det5: final dbCapFactor (diagnostic)
+	govDbGrow           bool    // gate: continuous bidirectional (thermostat) DB variant (A/B; default off)
+	govDbGrowAnchor     float64 // dbCapFactor at launch; the max the continuous governor may regrow toward
+	govDbGrows          int     // continuous: DB-regrowth steps applied (diagnostic)
 
 	// Detector 4 LBD-stagnation history (last govStagWin window avgLBDs).
 	govLbdHist    [8]float64
@@ -659,6 +662,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govDbFloor:       0.5,
 		govDbMargin:      0.08,
 		govDbFinalFactor: 1.0,
+		govDbGrowAnchor:  1.0,
 		dbCapFactor:      1.0,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
@@ -1030,6 +1034,12 @@ func (s *CDCLSolver) SetGovernorDB(on bool) {
 	s.govDbEnabled = on
 }
 
+// SetGovernorDBGrow selects the continuous bidirectional (thermostat) DB
+// governor variant in place of the one-shot Det5 ratchet. A/B; default off.
+func (s *CDCLSolver) SetGovernorDBGrow(on bool) {
+	s.govDbGrow = on
+}
+
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
@@ -1313,13 +1323,13 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d cap=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
-		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbFinalFactor,
+		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,

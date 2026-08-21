@@ -320,6 +320,10 @@ func (s *CDCLSolver) detector5DBCost(winMoves, winDec int, propsPerDec float64) 
 	if !s.govDbEnabled {
 		return
 	}
+	if s.govDbGrow {
+		s.continuousDBCost(winMoves, winDec, propsPerDec)
+		return
+	}
 	if s.binaryRatio <= s.govDbMinBinary {
 		return
 	}
@@ -381,6 +385,100 @@ func (s *CDCLSolver) detector5DBCost(winMoves, winDec int, propsPerDec float64) 
 		s.govDbReverts++
 		s.Log("c [governor] Det5 DB-cost: stall moves/dec %.0f->%.0f, revert cap ->%.2f (stop)\n",
 			s.govDbRefMovesPerDec, curMovesPerDec, s.dbCapFactor)
+	}
+	s.govDbActive = s.dbCapFactor < 1.0
+	s.govDbFinalFactor = s.dbCapFactor
+}
+
+// continuousDBCost is the bidirectional ("thermostat") variant of Det5 (A/B,
+// -gov-db-grow). It keeps the same direction-clear precondition — binary-heavy,
+// elevated per-propagation cost => a leaner DB is never wrong — but instead of
+// ratcheting down one step and stopping, it RE-EVALUATES every window and can
+// both shrink further (on sustained improvement) and grow back a bounded step
+// (on over-correction), all relative to a per-window moves/decision reference
+// and never above the launch-time anchor. Fully reversible and bounded: a wrong
+// call is walked back rather than locked, so the leaner-DB benefit is captured
+// without the one-shot ratchet's risk.
+func (s *CDCLSolver) continuousDBCost(winMoves, winDec int, propsPerDec float64) {
+	if s.binaryRatio <= s.govDbMinBinary {
+		return
+	}
+	if s.conflicts < s.govDbStartConf {
+		return
+	}
+	if winDec <= 0 {
+		return
+	}
+	cur := float64(winMoves) / float64(winDec)
+
+	if !s.govDbLaunched {
+		if propsPerDec < s.govDbStartPDec {
+			return
+		}
+		s.govDbLaunched = true
+		s.govDbFactorBase = s.dbCapFactor
+		s.govDbGrowAnchor = s.dbCapFactor
+		s.govDbRefMovesPerDec = cur
+		next := s.dbCapFactor * s.govDbStepFactor
+		if next < s.govDbFloor {
+			next = s.govDbFloor
+		}
+		if next < s.dbCapFactor {
+			s.dbCapFactor = next
+			s.govDbSteps++
+			s.govDbPendingEval = true
+		}
+		s.govDbActive = s.dbCapFactor < 1.0
+		s.govDbFinalFactor = s.dbCapFactor
+		s.Log("c [gov-db] continuous: launch (props/dec=%.0f, binary=%.2f) cap %.2f->%.2f\n",
+			propsPerDec, s.binaryRatio, s.govDbGrowAnchor, s.dbCapFactor)
+		return
+	}
+
+	// Continuously re-evaluate on the window cadence rather than stopping.
+	if !s.govDbPendingEval {
+		s.govDbPendingEval = true
+		return
+	}
+	s.govDbPendingEval = false
+
+	switch {
+	case cur < s.govDbRefMovesPerDec*(1.0-s.govDbMargin):
+		// Reduction kept helping: go one step deeper.
+		s.govDbFactorBase = s.dbCapFactor
+		s.govDbRefMovesPerDec = cur
+		next := s.dbCapFactor * s.govDbStepFactor
+		if next < s.govDbFloor {
+			next = s.govDbFloor
+		}
+		if next < s.dbCapFactor {
+			s.dbCapFactor = next
+			s.govDbSteps++
+			s.govDbPendingEval = true
+		}
+		s.Log("c [gov-db] continuous: improve moves/dec %.0f->%.0f cap ->%.2f\n",
+			s.govDbRefMovesPerDec, cur, s.dbCapFactor)
+	case cur > s.govDbRefMovesPerDec*(1.0+s.govDbMargin):
+		// Over-correction: watch-moves/decision climbed after shrinking, step
+		// the cap back up a bounded amount (never past the launch anchor).
+		next := s.dbCapFactor / s.govDbStepFactor
+		if next > s.govDbGrowAnchor {
+			next = s.govDbGrowAnchor
+		}
+		if next > s.dbCapFactor {
+			s.dbCapFactor = next
+			s.govDbGrows++
+			s.govDbPendingEval = true
+		}
+		s.govDbFactorBase = s.dbCapFactor
+		s.govDbRefMovesPerDec = cur
+		s.Log("c [gov-db] continuous: over-correct moves/dec %.0f->%.0f cap ->%.2f\n",
+			s.govDbRefMovesPerDec, cur, s.dbCapFactor)
+	default:
+		// Stall: hold in place; monitor next window (thermostat stays live).
+		s.govDbRefMovesPerDec = 0.5*(s.govDbRefMovesPerDec+cur)
+		s.govDbPendingEval = true
+		s.Log("c [gov-db] continuous: hold moves/dec %.0f cap %.2f\n", cur, s.dbCapFactor)
 	}
 	s.govDbActive = s.dbCapFactor < 1.0
 	s.govDbFinalFactor = s.dbCapFactor
