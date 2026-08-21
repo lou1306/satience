@@ -256,6 +256,25 @@ type CDCLSolver struct {
 	// Used for transitive BIG-based clause minimization (see bigReachableInClause).
 	bigAdjData []int32
 	bigAdjOff  []int32
+	// bigBfsBudget bounds the per-call transitive-reduction BFS node budget in
+	// bigReachableInClause. Larger budgets find more multi-hop binary reductions
+	// at higher per-minimize cost. Exposed for A/B (see -big-bfs).
+	bigBfsBudget int
+	// bigDisableGate when true forces the BIG minimization fast-path on even for
+	// mixed-binary low-structure instances that the heuristic gate normally
+	// excludes. Exposed for A/B (see -big-force).
+	bigDisableGate bool
+	// bigLearnAdj augments the static original-binary BIG with implication
+	// edges from LEARNED binary clauses. Learned clauses are permanent logical
+	// consequences of the formula, so edges are never removed after addition
+	// (even if the clause is later deleted) — resolution over them is always
+	// sound. Per-literal growable slices; bigLearnEdgeCount/cap bound memory.
+	bigLearnAdj       [][]int32
+	bigLearnEdgeCount int
+	bigLearnCap       int
+	bigLearnEnabled   bool
+	bigLearnFlag      bool // off by default: enabling shifts search trajectory (net wall-time regression on the suite)
+	bigLearnAdded     uint64 // diagnostic: learned-binary edges added
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
 	// increments). The queue is reused across calls (sliced to [:0]).
@@ -560,6 +579,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLiteralIsNegated: make([]bool, formula.NumVars),
 		bigBfsVisited:       make([]uint16, int(formula.NumVars)*2),
 		bigBfsQueue:         make([]int, 0, 256),
+		bigBfsBudget:        16,
+		bigDisableGate:      false,
 		tmpLevelCount:       make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
 		tmpCandidates:       make([]resolveCandidate, 0, 200), // Increased from 100
@@ -982,6 +1003,27 @@ func (s *CDCLSolver) SetGovernorDB(on bool) {
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
 	s.vivifyMinConflictGap = g
+}
+
+// SetBigBfsBudget sets the per-call BFS node budget for BIG transitive
+// minimization (default 16). Larger budgets find more reductions at higher cost.
+func (s *CDCLSolver) SetBigBfsBudget(n int) {
+	if n > 0 {
+		s.bigBfsBudget = n
+	}
+}
+
+// SetBigForce disables the heuristic gate on BIG minimization so the fast-path
+// also runs on mixed-binary low-structure instances (A/B only).
+func (s *CDCLSolver) SetBigForce(force bool) {
+	s.bigDisableGate = force
+}
+
+// SetBigLearn enables the learned-binary BIG augmentation for transitive
+// minimization. Stricter minimization (BIG hits +) but shifts search trajectory
+// with net wall-time regression on the suite — off by default (A/B only).
+func (s *CDCLSolver) SetBigLearn(on bool) {
+	s.bigLearnFlag = on
 }
 
 // SetSubsumptionPeriod sets how often learned-clause subsumption runs (every
@@ -4014,6 +4056,51 @@ func (s *CDCLSolver) buildBIG() {
 	}
 	s.bigAdjData = data
 	s.bigAdjOff = off
+	// Learned-binary adjacency: per-literal growable slices supplementing the
+	// static CSR. Heuristically cap total edges to bound memory on grinders;
+	// exceeding the cap only reduces fast-path effectiveness (never soundness).
+	s.bigLearnAdj = nil
+	if s.bigLearnFlag {
+		s.bigLearnAdj = make([][]int32, numLits)
+	}
+	s.bigLearnEdgeCount = 0
+	s.bigLearnEnabled = s.bigLearnFlag
+	s.bigLearnAdded = 0
+	if !s.bigLearnFlag {
+		s.bigLearnCap = 0
+		return
+	}
+	cap := 4_000_000
+	if edgeCap := 32 * numLits; edgeCap > cap {
+		cap = edgeCap
+	}
+	if cap > 16_000_000 {
+		cap = 16_000_000
+	}
+	s.bigLearnCap = cap
+}
+
+// addLearnedBinaryToBIG registers the implication edges of a newly-learned
+// binary clause (l0 ∨ l1): ¬l0 → l1 and ¬l1 → l0. Sound to retain forever even
+// after the clause is deleted because learned clauses are permanent logical
+// consequences of the formula; resolution over them stays valid.
+func (s *CDCLSolver) addLearnedBinaryToBIG(l0, l1 cnf.Literal) {
+	if !s.bigLearnEnabled || s.bigLearnAdj == nil {
+		return
+	}
+	a := cnf.LitToIndex(l0)
+	b := cnf.LitToIndex(l1)
+	if a == b || a == b^1 {
+		return
+	}
+	if s.bigLearnEdgeCount >= s.bigLearnCap {
+		return // cap reached — stop growing (effectiveness only)
+	}
+	s.bigLearnAdj[a^1] = append(s.bigLearnAdj[a^1], int32(b))
+	s.bigLearnEdgeCount++
+	s.bigLearnAdj[b^1] = append(s.bigLearnAdj[b^1], int32(a))
+	s.bigLearnEdgeCount++
+	s.bigLearnAdded++
 }
 
 // bigReachableInClause returns true if lit can reach, via forward BIG edges
@@ -4064,27 +4151,40 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	q = append(q, litIdx)
 	head := 0
 	found := false
-	const maxBigBfsVisited = 16
+	maxVisited := s.bigBfsBudget
+	if maxVisited <= 0 {
+		maxVisited = 16
+	}
 	visitedCount := 0
+	bigLearnAdj := s.bigLearnAdj
 	for head < len(q) && !found {
 		cur := q[head]
 		head++
 		start := int(bigAdjOff[cur])
 		end := int(bigAdjOff[cur+1])
-		for i := start; i < end; i++ {
-			m := int(bigAdjData[i])
+		process := func(m int) bool {
 			if visited[m] == ep {
-				continue
+				return false
 			}
 			visited[m] = ep
 			visitedCount++
 			mVar := uint32(m >> 1)
 			if mVar != litVar && tmpInClause[mVar] && tmpIsNeg[mVar] == ((m&1) == 1) {
-				found = true
-				break
+				return true
 			}
-			if visitedCount < maxBigBfsVisited {
+			if visitedCount < maxVisited {
 				q = append(q, m)
+			}
+			return false
+		}
+		for i := start; i < end && !found; i++ {
+			found = process(int(bigAdjData[i]))
+		}
+		if !found && bigLearnAdj != nil && cur < len(bigLearnAdj) && len(bigLearnAdj[cur]) > 0 {
+			for _, m := range bigLearnAdj[cur] {
+				if found = process(int(m)); found {
+					break
+				}
 			}
 		}
 	}
@@ -5869,6 +5969,12 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 		learnedIdx := s.learnedCapacity - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
 		s.lastLearnedClauseIdx = learnedIdx
+		// Register learned binary clauses into the dynamic BIG for stronger
+		// transitive minimization (sound even after deletion — see
+		// addLearnedBinaryToBIG).
+		if len(literals) == 2 {
+			s.addLearnedBinaryToBIG(literals[0], literals[1])
+		}
 
 		// Store watch indices for all clauses to maintain array consistency
 		if len(literals) >= 2 {
@@ -5983,7 +6089,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		// the derivation uses only the binary clauses, which are in the formula.
 		// Intermediate tautologies in the resolvent are harmless — only the
 		// final clause (C\{lit}) matters, and it is non-tautological.
-		if s.bigAdjOff != nil && !(s.structureScore < 0.7 && s.binaryRatio > 0.4) { // GATE: disable BIG for mixed-binary sub-0.7
+		if s.bigAdjOff != nil && (s.bigDisableGate || !(s.structureScore < 0.7 && s.binaryRatio > 0.4)) { // GATE: disable BIG for mixed-binary sub-0.7
 			s.bigMinimizeCalls++
 			if s.bigReachableInClause(lit) {
 				s.bigMinimizeHits++
