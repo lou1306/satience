@@ -793,8 +793,21 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 
 	// Mark protected clauses (used as reasons). At level 0 after restart, no
 	// learned clause is in use as a reason, so this is all false. Built for
-	// safety in case the function is ever called at a non-level-0 state.
-	protected := s.markProtectedClauses()
+	// safety in case the function is ever called at a non-level-0 state. The
+	// bitmap is consumed ONLY by the protected check below, so skip the
+	// O(learnedCapacity) zero + O(numVars) scan entirely unless some assignment
+	// actually holds a learned reason.
+	var protected []bool
+	anyLearnedReason := false
+	for _, asg := range s.assignments {
+		if asg.Reason <= -5 {
+			anyLearnedReason = true
+			break
+		}
+	}
+	if anyLearnedReason {
+		protected = s.markProtectedClauses()
+	}
 
 	if cap(s.tmpLearnedSubSeen) < numLits {
 		s.tmpLearnedSubSeen = make([]bool, numLits)
@@ -810,7 +823,7 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 		if size <= 2 {
 			continue
 		}
-		if protected[i] {
+		if protected != nil && protected[i] {
 			continue
 		}
 		if checkedCount >= maxCheckPerRound {

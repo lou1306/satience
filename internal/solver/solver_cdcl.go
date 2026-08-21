@@ -4598,8 +4598,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			clauseIdxRaw := uint32(watch.ClauseIdx)
 			isLearned := clauseIdxRaw&watchLearnedBit != 0
 			clauseID := int(clauseIdxRaw & watchIdxMask)
-			myPos := int((clauseIdxRaw >> 30) & 1)
-			blitPos := 1 - myPos
 
 			// BINARY FAST PATH: For size-2 clauses, the Blit field already has
 			// the blocking literal. No replacement search is possible (only 2
@@ -4681,7 +4679,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// Re-read the actual blocking literal from clause data (Blit may be stale).
 			// The fast-path Blit check already filtered out the true case; here we
 			// need the actual literal for the replacement guard, propagation, and
-			// conflict detection.
+			// conflict detection. myPos/blitPos are derived only from clauseIdxRaw
+			// and are consumed ONLY on this non-binary path, so decode them here
+			// (not before the binary fast-path check above).
+			myPos := int((clauseIdxRaw >> 30) & 1)
+			blitPos := 1 - myPos
 			blitLit := clauseLits[blitPos]
 			blitVarIdx := int(blitLit.Var())
 			blitNegated := blitLit.IsNegated()
@@ -5188,20 +5190,25 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 	// 1-UIP: Resolve until exactly 1 literal at current level
 	currentCount = s.tmpLevelCount[s.level]
 
-	// Build candidate list from trail (most recent first). Only the current
-	// decision level's trail slice can contain level==s.level literals (the
-	// level starts at trailHead[s.level]), so scan that slice only — O(current-
-	// level trail) instead of O(total trail) per conflict.
-	s.tmpCandidates = s.tmpCandidates[:0]
-	startIdx := s.trailHead[s.level]
-	for i := len(s.trail) - 1; i >= startIdx; i-- {
-		varIdx := s.trail[i]
-		if s.assignments[varIdx].Level == int32(s.level) && s.tmpLiteralInClause[varIdx] {
-			s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx})
+	// Resolve on candidates until 1 UIP remains. The O(current-level trail)
+	// reverse-scan below feeds ONLY the resolution loop (which runs only when
+	// currentCount > 1). When currentCount <= 1 the conflict is already
+	// asserting/non-asserting and the candidate list is never read, so gate the
+	// scan inside the branch to avoid the per-conflict waste on the dominant path.
+	if currentCount > 1 {
+		// Build candidate list from trail (most recent first). Only the current
+		// decision level's trail slice can contain level==s.level literals (the
+		// level starts at trailHead[s.level]), so scan that slice only — O(current-
+		// level trail) instead of O(total trail) per conflict.
+		s.tmpCandidates = s.tmpCandidates[:0]
+		startIdx := s.trailHead[s.level]
+		for i := len(s.trail) - 1; i >= startIdx; i-- {
+			varIdx := s.trail[i]
+			if s.assignments[varIdx].Level == int32(s.level) && s.tmpLiteralInClause[varIdx] {
+				s.tmpCandidates = append(s.tmpCandidates, resolveCandidate{varIdx: varIdx})
+			}
 		}
 	}
-
-	// Resolve on candidates until 1 UIP remains
 	candidateIdx := 0
 	resolveStep := 0
 	resolvedCount := 0
