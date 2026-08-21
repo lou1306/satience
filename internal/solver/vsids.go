@@ -447,8 +447,7 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 		}
 	} else {
 		bumpAmount := v.varInc / float64(len(literals))
-		minBump := v.varInc * 0.04
-		if bumpAmount < minBump {
+		if minBump := v.varInc * 0.04; bumpAmount < minBump {
 			bumpAmount = minBump
 		}
 		for _, lit := range literals {
@@ -481,8 +480,7 @@ func (v *VSIDS) bumpAnalyze(vars []uint32) {
 		}
 	} else {
 		bumpAmount := v.varInc / float64(len(vars))
-		minBump := v.varInc * 0.04
-		if bumpAmount < minBump {
+		if minBump := v.varInc * 0.04; bumpAmount < minBump {
 			bumpAmount = minBump
 		}
 		for _, varIdx := range vars {

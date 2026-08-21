@@ -895,12 +895,16 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 		// occ[not-l] for binary clause (not-l or m) where m is in C. If found,
 		// remove l from C (the resolvent C-minus-l subsumes C). After removing
 		// l, the next literal shifts to position j, so re-check position j.
-		newLits := make([]cnf.Literal, len(lits))
-		copy(newLits, lits)
+		// The defensive copy (newLits) feeds ONLY the strengthening removal and
+		// the result persist below, neither of which a non-strengthened clause
+		// hits; so scan the original lits slice and materialize the copy lazily
+		// on the first removal instead of allocating it for every checked clause.
+		var newLits []cnf.Literal
+		work := lits
 
 		j := 0
-		for j < len(newLits) {
-			lit := newLits[j]
+		for j < len(work) {
+			lit := work[j]
 			lIdx := cnf.LitToIndex(lit)
 			negLIdx := lIdx ^ 1
 
@@ -928,7 +932,12 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 					continue
 				}
 				if seenLit[otherIdx] {
+					if newLits == nil {
+						newLits = make([]cnf.Literal, len(lits))
+						copy(newLits, lits)
+					}
 					newLits = append(newLits[:j], newLits[j+1:]...)
+					work = newLits
 					seenLit[lIdx] = false
 					strengthenedHere = true
 					s.subsumptionClausesStrengthened++
@@ -940,7 +949,7 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 			}
 		}
 
-		if len(newLits) < len(lits) && len(newLits) >= 2 {
+		if newLits != nil && len(newLits) < len(lits) && len(newLits) >= 2 {
 			results = append(results, subsumptionResult{idx: i, newLits: newLits})
 		}
 

@@ -5635,10 +5635,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// CRITICAL FIX: Apply clause minimization via self-subsumption
 	// This reduces learned clause size and LBD, enabling propagation
-	// Disabled for clauses ≤2 literals (already minimal)
-	originalSize := len(s.tmpLearnedLits)
-	originalLBD := lbd
+	// Disabled for clauses ≤2 literals (already minimal). originalSize and
+	// originalLBD feed ONLY the verbose minimize log inside this branch, so
+	// capture them here rather than per-learn unconditionally.
 	if len(s.tmpLearnedLits) > 2 {
+		originalSize := len(s.tmpLearnedLits)
+		originalLBD := lbd
 		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
 
 		// Recalculate LBD after minimization (CRITICAL - LBD may have decreased)
