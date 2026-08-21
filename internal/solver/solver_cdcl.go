@@ -5339,21 +5339,26 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 		resolveStep++
 	}
 
-	// FIX: If 1-UIP didn't converge (currentCount > 1) after exhausting all candidates,
-	// check if remaining literals are all decisions or if some are propagations with buggy reasons
-	decisionsAtCurrentLevel := 0
-	propagationsAtCurrentLevel := 0
-	for _, varIdx := range s.tmpTouchedVars {
-		if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
-			if s.assignments[varIdx].Reason == -1 {
-				decisionsAtCurrentLevel++
-			} else {
-				propagationsAtCurrentLevel++
+	// FIX: If 1-UIP didn't converge (currentCount > 1) after exhausting all
+	// candidates, check if remaining literals are all decisions or if some are
+	// propagations with buggy reasons. The decisions/propagations counts are
+	// consumed ONLY by the fallback diagnostic (logUIPFallback), and the fallback
+	// is empirically never entered (uipFallback==0 across the 72-suite and all
+	// held-out cnfgen families; the held-out gate FAILs any family that fires it).
+	// So the O(touched) counting scan is behavior-neutral waste on the dominant
+	// path: gate it inside the fallback branch to eliminate the per-conflict cost.
+	if currentCount > 1 {
+		decisionsAtCurrentLevel := 0
+		propagationsAtCurrentLevel := 0
+		for _, varIdx := range s.tmpTouchedVars {
+			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
+				if s.assignments[varIdx].Reason == -1 {
+					decisionsAtCurrentLevel++
+				} else {
+					propagationsAtCurrentLevel++
+				}
 			}
 		}
-	}
-
-	if currentCount > 1 {
 		s.uipFallbackCount++
 		// 1-UIP did not converge: there is more than one literal at the current
 		// decision level remaining after resolution. In a correct CDCL this never
