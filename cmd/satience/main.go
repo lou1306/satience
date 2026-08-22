@@ -43,6 +43,9 @@ func run() int {
 	parityMaxLen := flag.Int("parity-max-len", 6, "Parity: max support size (clause length) for a detected parity family")
 	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
 	parityOnTheFly := flag.Bool("parity-on-fly", false, "Parity: on-the-fly insearch propagation over detected rows (A/B, default off; requires -parity)")
+	hle := flag.Bool("hle", false, "Hidden literal elimination: remove a literal l from clause C when C\\{l} is implied by the rest (probe-based; A/B, default off)")
+	hleMaxLen := flag.Int("hle-max-len", 5, "HLE: max clause size probed (>=3)")
+	hleBudget := flag.Int("hle-budget", 20000, "HLE: hard cap on probes (<=0 disables)")
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
@@ -207,6 +210,7 @@ func run() int {
 	}
 	s.SetParityParams(*parity, *parityMaxLen, *parityBudget)
 	s.SetParityOnTheFly(*parityOnTheFly, *parityBudget)
+	s.SetHiddenLiteralParams(*hle, *hleMaxLen, *hleBudget)
 
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)

@@ -531,6 +531,14 @@ type CDCLSolver struct {
 	parityRows      [][]uint32   // detected row supports (snapshot, ascending vars)
 	parityRowParity []bool       // per-row XOR constant
 
+	// Hidden literal elimination (P2, A/B, -hle; off by default). Removes a
+	// literal l from a clause C when C\{l} is implied by the rest of the formula,
+	// detected by a probe excluding C (see hle.go).
+	hleEnabled  bool // gate: enable hidden-literal elimination
+	hleMaxSize  int  // largest clause size probed (>=3)
+	hleBudget   int  // hard cap on probes (<=0 = off)
+	hleRemoved  int  // diagnostic: literals removed
+
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
 	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
@@ -712,6 +720,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		parityEnabled:  false,
 		parityMaxArity: 6,
 		parityBudget:   2000,
+		// Hidden literal elimination (-hle; off by default -> bit-identical).
+		hleEnabled: false,
+		hleMaxSize: 5,
+		hleBudget:  20000,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -1132,6 +1144,19 @@ func (s *CDCLSolver) SetParityOnTheFly(on bool, budget int) {
 	}
 }
 
+// SetHiddenLiteralParams gates hidden-literal elimination (A/B, -hle; off by
+// default). maxSize is the largest clause probed (>=3); budget caps probe count
+// (<=0 = off).
+func (s *CDCLSolver) SetHiddenLiteralParams(on bool, maxSize, budget int) {
+	s.hleEnabled = on
+	if maxSize >= 3 {
+		s.hleMaxSize = maxSize
+	}
+	if budget >= 0 {
+		s.hleBudget = budget
+	}
+}
+
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
@@ -1415,7 +1440,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d pfr=%d | vivify: rounds=%d hle=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1424,7 +1449,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.chronoFires,
 		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityLearned, s.parityRounds,
-		s.vivifyRoundsRun,
+		s.vivifyRoundsRun, s.hleRemoved,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
@@ -2392,6 +2417,19 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 	ppMark("pure-literal elimination")
 
+	// Hidden literal elimination (P2, -hle; off by default). Removes a literal l
+	// from a clause C when C\{l} is implied by the rest of the formula (probe with
+	// C excluded). Runs early so the probe sees clean assumptions before unit
+	// propagation assigns root variables. Add-only strengthening; bounded by probe
+	// budget; see hle.go.
+	if s.hleEnabled {
+		if hleRemoved := s.hiddenLiteralElimination(); hleRemoved > 0 {
+			s.Log("c [preprocessing] Hidden literal elimination removed %d literals\n", hleRemoved)
+			s.cnf.RebuildLiteralPool()
+		}
+	}
+	ppMark("hidden-literal elimination")
+
 	// Empty clause may have appeared from dedup (e.g. a clause of all-identical
 	// literals becomes a unit, not empty — but check defensively).
 	if s.hasEmptyClause() {
@@ -2729,7 +2767,7 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 		tmpAssigned[v] = true
 		tmpValue[v] = true
 		s.probeTrail = append(s.probeTrail, int(v)*2)
-		conflict := s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
+		conflict := s.probePropagate(occ, tmpValue, tmpAssigned, trailLen, -1)
 		for i := trailLen; i < len(s.probeTrail); i++ {
 			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
 		}
@@ -2745,7 +2783,7 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 		tmpAssigned[v] = true
 		tmpValue[v] = false
 		s.probeTrail = append(s.probeTrail, int(v)*2+1)
-		conflict = s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
+		conflict = s.probePropagate(occ, tmpValue, tmpAssigned, trailLen, -1)
 		for i := trailLen; i < len(s.probeTrail); i++ {
 			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
 		}
@@ -2797,7 +2835,10 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 // Scans occurrence lists read-only, appending newly derived literals to
 // s.probeTrail. Returns true if a conflict is detected.
 // tmpValue/tmpAssigned are modified in-place; the caller restores them after.
-func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []bool, trailStart int) bool {
+// skipClause: if >= 0, that clause index is excluded from propagation (used by
+// hidden-literal elimination to test implication "without C", since otherwise C
+// self-satisfies the probe). Pass -1 to scan all clauses.
+func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []bool, trailStart int, skipClause int) bool {
 	clauses := s.cnf.Clauses
 	head := trailStart
 	for head < len(s.probeTrail) {
@@ -2806,6 +2847,9 @@ func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []
 
 		negIdx := litIdx ^ 1
 		for _, ci := range occ[negIdx] {
+			if ci == skipClause {
+				continue
+			}
 			clauseLits := clauses[ci].Literals
 			unassignedCount := 0
 			unassignedLitIdx := 0
