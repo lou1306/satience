@@ -495,20 +495,6 @@ type CDCLSolver struct {
 	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
 	govDepthChanged bool
 
-	// Chronological backtracking hybrid (A/B, -chrono; off by default).
-	// NB (non-chronological) remains the per-conflict default; CB retains a
-	// bounded window of the top decision levels, firing on an alternation stride
-	// plus an LBD-stagnation trigger. The learned clause stays unit at the
-	// retained level (1-UIP places its only level-`level` literal at the UIP and
-	// none in (maxLevel, level)), so propagateAssertingLiteral still asserts it.
-	chronoEnabled    bool    // gate: enable the CB/NB hybrid
-	chronoKeep       int     // decision levels retained at the top when CB fires (>=1)
-	chronoMinGap     int     // only CB when the NB skip (level-maxLevel) exceeds this
-	chronoNth        int     // alternation stride: CB fires on every Nth eligible conflict
-	chronoStagFactor float64 // CB also fires when lbd > factor*emaLBD (stagnation; <=0 disables)
-	chronoCounter    int     // per-solve eligibility stride counter
-	chronoFires      int     // diagnostic: conflicts where CB raised the backjump target
-
 	// XOR / parity preprocessing (-parity; ON by default). Add-only
 	// Gaussian elimination over detected parity families (see parity.go).
 	parityEnabled   bool // gate: enable parity detection + GF(2) derivation
@@ -517,27 +503,7 @@ type CDCLSolver struct {
 	parityRowsFound int  // diagnostic: parity families detected
 	parityUnits     int  // diagnostic: derived unit clauses
 	parityBinaries  int  // diagnostic: derived binary clauses appended
-
-	// On-the-fly parity propagation (A/B, -parity-on-fly; off by default).
-	// During search, detected parity rows are watched against the current trail:
-	// a row reduced to a single unassigned variable forces that variable (reason =
-	// a synthesized size-d clause, stored as a normal learned clause); a row fully
-	// assigned with the wrong parity is a conflict (synthesized all-false clause).
-	// Sound because every synthesized clause forbids exactly one corner of the
-	// hypercube that the corresponding XOR row forbids -> a universal implicate.
-	parityOnTheFly  bool
-	parityLearned   int          // diagnostic: clauses synthesized on-the-fly
-	parityRounds    int          // diagnostic: in-loop parity re-derivations that fired
-	parityRows      [][]uint32   // detected row supports (snapshot, ascending vars)
-	parityRowParity []bool       // per-row XOR constant
-
-	// Hidden literal elimination (P2, A/B, -hle; off by default). Removes a
-	// literal l from a clause C when C\{l} is implied by the rest of the formula,
-	// detected by a probe excluding C (see hle.go).
-	hleEnabled  bool // gate: enable hidden-literal elimination
-	hleMaxSize  int  // largest clause size probed (>=3)
-	hleBudget   int  // hard cap on probes (<=0 = off)
-	hleRemoved  int  // diagnostic: literals removed
+	parityRounds    int  // diagnostic: in-loop parity re-derivations that fired (P4 fixpoint)
 
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
@@ -708,24 +674,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govDbFinalFactor: 1.0,
 		govDbGrowAnchor:  1.0,
 		dbCapFactor:      1.0,
-		// Chronological backtracking hybrid (-chrono; off by default).
-		chronoEnabled:    false,
-		chronoKeep:       2,
-		chronoMinGap:     2,
-		chronoNth:        4,
-		chronoStagFactor: 1.15,
-		chronoCounter:    0,
-		chronoFires:      0,
 		// Parity preprocessing (-parity; ON by default after the distributional
 		// held-out gate passed on all validation families — no new TMO, no
 		// median regression, ~5700x median-PAR2 win on Tseitin families).
 		parityEnabled:  true,
 		parityMaxArity: 6,
 		parityBudget:   2000,
-		// Hidden literal elimination (-hle; off by default -> bit-identical).
-		hleEnabled: false,
-		hleMaxSize: 5,
-		hleBudget:  20000,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -1102,28 +1056,6 @@ func (s *CDCLSolver) SetGovernorDBGrow(on bool) {
 	s.govDbGrow = on
 }
 
-// SetChronoEnabled gates the chronological-backtracking hybrid (A/B, -chrono).
-// Off by default; the default path is bit-identical.
-func (s *CDCLSolver) SetChronoEnabled(on bool) {
-	s.chronoEnabled = on
-}
-
-// SetChronoParams configures the CB/NB hybrid tuning knobs.
-func (s *CDCLSolver) SetChronoParams(keep, minGap, nth int, stagFactor float64) {
-	if keep >= 1 {
-		s.chronoKeep = keep
-	}
-	if minGap >= 0 {
-		s.chronoMinGap = minGap
-	}
-	if nth >= 1 {
-		s.chronoNth = nth
-	}
-	if stagFactor > 0 {
-		s.chronoStagFactor = stagFactor
-	}
-}
-
 // SetParityParams gates XOR/parity preprocessing (-parity, default ON). maxArity
 // is the max support size (>=3); budget caps derived binary clauses (<=0 = off).
 func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
@@ -1133,29 +1065,6 @@ func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
 	}
 	if budget >= 0 {
 		s.parityBudget = budget
-	}
-}
-
-// SetParityOnTheFly gates on-the-fly parity propagation during search (A/B,
-// -parity-on-fly; off by default). Requires parityEnabled for the rows to be
-// detected at search start. budget caps on-the-fly synthesized clauses.
-func (s *CDCLSolver) SetParityOnTheFly(on bool, budget int) {
-	s.parityOnTheFly = on
-	if budget >= 0 {
-		s.parityBudget = budget
-	}
-}
-
-// SetHiddenLiteralParams gates hidden-literal elimination (A/B, -hle; off by
-// default). maxSize is the largest clause probed (>=3); budget caps probe count
-// (<=0 = off).
-func (s *CDCLSolver) SetHiddenLiteralParams(on bool, maxSize, budget int) {
-	s.hleEnabled = on
-	if maxSize >= 3 {
-		s.hleMaxSize = maxSize
-	}
-	if budget >= 0 {
-		s.hleBudget = budget
 	}
 }
 
@@ -1442,16 +1351,15 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d pfr=%d | vivify: rounds=%d hle=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
-		s.chronoFires,
-		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityLearned, s.parityRounds,
-		s.vivifyRoundsRun, s.hleRemoved,
+		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityRounds,
+		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
@@ -2419,19 +2327,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	}
 	ppMark("pure-literal elimination")
 
-	// Hidden literal elimination (P2, -hle; off by default). Removes a literal l
-	// from a clause C when C\{l} is implied by the rest of the formula (probe with
-	// C excluded). Runs early so the probe sees clean assumptions before unit
-	// propagation assigns root variables. Add-only strengthening; bounded by probe
-	// budget; see hle.go.
-	if s.hleEnabled {
-		if hleRemoved := s.hiddenLiteralElimination(); hleRemoved > 0 {
-			s.Log("c [preprocessing] Hidden literal elimination removed %d literals\n", hleRemoved)
-			s.cnf.RebuildLiteralPool()
-		}
-	}
-	ppMark("hidden-literal elimination")
-
 	// Empty clause may have appeared from dedup (e.g. a clause of all-identical
 	// literals becomes a unit, not empty — but check defensively).
 	if s.hasEmptyClause() {
@@ -2769,7 +2664,7 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 		tmpAssigned[v] = true
 		tmpValue[v] = true
 		s.probeTrail = append(s.probeTrail, int(v)*2)
-		conflict := s.probePropagate(occ, tmpValue, tmpAssigned, trailLen, -1)
+		conflict := s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
 		for i := trailLen; i < len(s.probeTrail); i++ {
 			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
 		}
@@ -2785,7 +2680,7 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 		tmpAssigned[v] = true
 		tmpValue[v] = false
 		s.probeTrail = append(s.probeTrail, int(v)*2+1)
-		conflict = s.probePropagate(occ, tmpValue, tmpAssigned, trailLen, -1)
+		conflict = s.probePropagate(occ, tmpValue, tmpAssigned, trailLen)
 		for i := trailLen; i < len(s.probeTrail); i++ {
 			tmpAssigned[uint32(s.probeTrail[i])>>1] = false
 		}
@@ -2837,10 +2732,7 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 // Scans occurrence lists read-only, appending newly derived literals to
 // s.probeTrail. Returns true if a conflict is detected.
 // tmpValue/tmpAssigned are modified in-place; the caller restores them after.
-// skipClause: if >= 0, that clause index is excluded from propagation (used by
-// hidden-literal elimination to test implication "without C", since otherwise C
-// self-satisfies the probe). Pass -1 to scan all clauses.
-func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []bool, trailStart int, skipClause int) bool {
+func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []bool, trailStart int) bool {
 	clauses := s.cnf.Clauses
 	head := trailStart
 	for head < len(s.probeTrail) {
@@ -2849,9 +2741,6 @@ func (s *CDCLSolver) probePropagate(occ [][]int, tmpValue []bool, tmpAssigned []
 
 		negIdx := litIdx ^ 1
 		for _, ci := range occ[negIdx] {
-			if ci == skipClause {
-				continue
-			}
 			clauseLits := clauses[ci].Literals
 			unassignedCount := 0
 			unassignedLitIdx := 0
@@ -4454,20 +4343,6 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 
 		// Propagate all clauses (unit learned clauses handled in propagateWatched)
 		conflict, conflictClause := s.propagateWatched()
-		if !conflict && s.parityOnTheFly && len(s.parityRows) > 0 {
-			// On-the-fly parity: sweep parity rows against the trail. If a unit was
-			// enqueued, re-propagate to reach the joint fixpoint; if a parity row is
-			// fully assigned and violated, that's a normal (clause) conflict.
-			acted, pcc := s.parityPropagate()
-			if acted {
-				if pcc != nil {
-					conflict = true
-					conflictClause = pcc
-				} else {
-					continue
-				}
-			}
-		}
 		if conflict {
 			s.handleConflict(conflictClause)
 			if s.conflicts%50 == 0 && s.verbose {
@@ -4625,11 +4500,6 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		s.printStats()
 		return flpResult
 	}
-
-	// Snapshot on-the-fly parity rows from the (post-preprocessing) original
-	// clause DB BEFORE it is released. Rows detected here are implicates of the
-	// reduced formula, so the insearch parity engine (cdclLoop) is sound.
-	s.cacheParityRows()
 
 	// Release the Clauses slice (32B/clause) — all solving-path access now
 	// goes through originalClauseLocs + literalPool. Preprocessing modified
@@ -6064,39 +5934,6 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	} else if backjumpLevel == 0 {
 		backjumpLevel = 1
-	}
-
-	// Chronological backtracking hybrid (A/B, -chrono; off by default).
-	// NB remains the per-conflict default; CB retains a bounded window of the
-	// top decision levels (backtracking to level-chronoKeep instead of all the
-	// way to maxLevel) so more search context survives. The learned clause is
-	// still unit at the retained level - 1-UIP places exactly one clause literal
-	// at `level` (the UIP) and none in (maxLevel, level) - so backtrack() sets
-	// level=cbLevel and propagateAssertingLiteral still asserts the UIP.
-	// CB fires only when the NB skip would be large AND the alternation stride
-	// selects this conflict (or LBD is stagnating), keeping NB dominant.
-	if s.chronoEnabled && !s.emptyClauseFound && len(s.tmpLearnedLits) > 1 && maxLevel < s.level {
-		if skip := s.level - maxLevel; skip > s.chronoMinGap {
-			cbLevel := s.level - s.chronoKeep
-			if cbLevel <= maxLevel {
-				cbLevel = maxLevel + 1
-			}
-			if cbLevel > maxLevel && cbLevel < s.level {
-				s.chronoCounter++
-				useCB := s.chronoCounter%s.chronoNth == 0
-				if !useCB && s.chronoStagFactor > 0 && s.emaLBD > 0 && float64(lbd) > s.chronoStagFactor*s.emaLBD {
-					useCB = true
-				}
-				if useCB {
-					backjumpLevel = cbLevel
-					s.chronoFires++
-					if s.verbose && s.conflicts <= 10 {
-						s.Log("c [chrono] CB conflict=%d: backjump %d->%d (retain %d), LBD=%d\n",
-							s.conflicts, maxLevel, cbLevel, cbLevel-maxLevel, lbd)
-					}
-				}
-			}
-		}
 	}
 
 	if s.verbose {
