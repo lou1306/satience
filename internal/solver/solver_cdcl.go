@@ -189,12 +189,12 @@ type CDCLSolver struct {
 	// bounded, level-capped, or MiniSat geometric. Used to diagnose where
 	// search time goes (flat-high-LBD instances never fire Glucose, so the
 	// Luby fallback dominates).
-	restartReasons       [5]int  // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
-	restartSegStartConf  int     // conflicts at the start of the current restart segment
-	restartSegStartDec   int     // decisions at the start of the current restart segment
-	restartSegProdRatio  float64 // conflicts per 1000 decisions over the last segment (negative=unset)
-	restartSegGlueCount  int     // glue clauses learned in the current segment
-	restartSegStartGlue  int     // glueLearned at the start of the current segment
+	restartReasons      [5]int  // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
+	restartSegStartConf int     // conflicts at the start of the current restart segment
+	restartSegStartDec  int     // decisions at the start of the current restart segment
+	restartSegProdRatio float64 // conflicts per 1000 decisions over the last segment (negative=unset)
+	restartSegGlueCount int     // glue clauses learned in the current segment
+	restartSegStartGlue int     // glueLearned at the start of the current segment
 	// Branch-quality telemetry (instrumentation): which VSIDS bump scheme and
 	// init mode were actually in effect. 1=analyze_toclear (bump all touched),
 	// 0=bumpClause only; initMode 1=clause/occurrence-weighted, 0=zero-init.
@@ -273,7 +273,7 @@ type CDCLSolver struct {
 	bigLearnEdgeCount int
 	bigLearnCap       int
 	bigLearnEnabled   bool
-	bigLearnFlag      bool // off by default: enabling shifts search trajectory (net wall-time regression on the suite)
+	bigLearnFlag      bool   // off by default: enabling shifts search trajectory (net wall-time regression on the suite)
 	bigLearnAdded     uint64 // diagnostic: learned-binary edges added
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
@@ -339,15 +339,15 @@ type CDCLSolver struct {
 	// Clause DB deletion thresholds (Tier 1 tunables). These control which
 	// learned clauses are deleted and when. Sweeping them matters because the
 	// level-0 literal filter changed clause DB composition.
-	lbdTier1Threshold          int     // Pass 1 deletion: delete LBD > threshold (default 5)
-	lbdTier2Threshold          int     // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
+	lbdTier1Threshold int // Pass 1 deletion: delete LBD > threshold (default 5)
+	lbdTier2Threshold int // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
 	// Glue/short-clause eviction (A/B, off by default): strong minimization
 	// inflates the LBD≤tier2 population (accepted here, unlike Glucose). This
 	// optionally evicts over-represented glue so the small-clause DB can be
 	// trimmed; tests whether that unlocks minimization gains.
-	glueEvict          bool
-	glueEvictMaxFrac   float64 // max glue fraction of targetCount before eviction (default 0.5)
-	glueEvictExtraFrac float64 // max extra deletions as fraction of targetCount per pass (default 0.2)
+	glueEvict                  bool
+	glueEvictMaxFrac           float64 // max glue fraction of targetCount before eviction (default 0.5)
+	glueEvictExtraFrac         float64 // max extra deletions as fraction of targetCount per pass (default 0.2)
 	dbGrowthDivisor            int     // dynamicLimit = maxLearned + conflicts/divisor (default 50)
 	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
 	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
@@ -508,6 +508,15 @@ type CDCLSolver struct {
 	chronoStagFactor float64 // CB also fires when lbd > factor*emaLBD (stagnation; <=0 disables)
 	chronoCounter    int     // per-solve eligibility stride counter
 	chronoFires      int     // diagnostic: conflicts where CB raised the backjump target
+
+	// XOR / parity preprocessing (A/B, -parity; off by default). Add-only
+	// Gaussian elimination over detected parity families (see parity.go).
+	parityEnabled   bool // gate: enable parity detection + GF(2) derivation
+	parityMaxArity  int  // max support size (clause length) for a parity family (>=3)
+	parityBudget    int  // hard cap on derived binary clauses appended (<=0 = off)
+	parityRowsFound int  // diagnostic: parity families detected
+	parityUnits     int  // diagnostic: derived unit clauses
+	parityBinaries  int  // diagnostic: derived binary clauses appended
 
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
@@ -686,6 +695,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		chronoStagFactor: 1.15,
 		chronoCounter:    0,
 		chronoFires:      0,
+		// Parity preprocessing (-parity; off by default -> bit-identical).
+		parityEnabled:  false,
+		parityMaxArity: 6,
+		parityBudget:   2000,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -984,7 +997,7 @@ func (s *CDCLSolver) SetDBMaxLen(dbMaxLen int) {
 // SetGlueEvict enables eviction of over-represented glue/short clauses (A/B).
 func (s *CDCLSolver) SetGlueEvict(on bool) {
 	s.glueEvict = on
-} 
+}
 
 func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
 	s.occurrenceWeight = w
@@ -1081,6 +1094,18 @@ func (s *CDCLSolver) SetChronoParams(keep, minGap, nth int, stagFactor float64) 
 	}
 	if stagFactor > 0 {
 		s.chronoStagFactor = stagFactor
+	}
+}
+
+// SetParityParams gates XOR/parity preprocessing (A/B, -parity). maxArity is
+// the max support size (>=3); budget caps derived binary clauses (<=0 = off).
+func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
+	s.parityEnabled = on
+	if maxArity >= 3 {
+		s.parityMaxArity = maxArity
+	}
+	if budget >= 0 {
+		s.parityBudget = budget
 	}
 }
 
@@ -1367,7 +1392,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1375,6 +1400,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.chronoFires,
+		s.parityRowsFound, s.parityUnits, s.parityBinaries,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
@@ -2365,6 +2391,22 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		s.printStats()
 		return equivResult
 	}
+
+	// XOR/parity precondition (sound, add-only; -parity, gated). Detect parity
+	// families and derive units/binary equivalences via GF(2) Gaussian, appended
+	// to the DB as consequences; unit-propagation below then assigns them. Only
+	// for structured instances (EnableUnitProp path). Runs after equiv so binary
+	// equivalences are already factored out.
+	added := false
+	if parityResult := s.analyzeParity(); parityResult != UNKNOWN {
+		s.printStats()
+		return parityResult
+	}
+	if s.parityEnabled && (s.parityBinaries > 0 || s.parityUnits > 0) {
+		s.cnf.RebuildLiteralPool()
+		added = true
+	}
+	_ = added
 
 	// For large instances, bound preprocessing with literal-visit/resolvent budgets.
 	// Must be set BEFORE BVE and unit propagation so the budgets actually apply.

@@ -39,6 +39,9 @@ func run() int {
 	chronoMinGap := flag.Int("chrono-min-gap", 2, "Chronological backtracking: min NB skip (level-maxLevel) required to consider CB")
 	chronoNth := flag.Int("chrono-nth", 4, "Chronological backtracking: CB fires on every Nth eligible conflict (alternation stride)")
 	chronoStag := flag.Float64("chrono-stag", 1.15, "Chronological backtracking: CB also fires when lbd > factor*emaLBD (<=0 disables)")
+	parity := flag.Bool("parity", false, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; A/B, default off)")
+	parityMaxLen := flag.Int("parity-max-len", 6, "Parity: max support size (clause length) for a detected parity family")
+	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
@@ -201,6 +204,7 @@ func run() int {
 	if *chrono {
 		s.SetChronoParams(*chronoKeep, *chronoMinGap, *chronoNth, *chronoStag)
 	}
+	s.SetParityParams(*parity, *parityMaxLen, *parityBudget)
 
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)
