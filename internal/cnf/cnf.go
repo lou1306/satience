@@ -48,7 +48,7 @@ func NewLiteral(varIdx uint32, negated bool) Literal {
 // bit 30, avoiding a clause-data cache miss to derive it at propagation
 // time. Watch is 8 bytes (8 per cache line).
 type Watch struct {
-	ClauseIdx int32  // Bit 31: learned flag, bit 30: myPos, bits 0-29: clause index
+	ClauseIdx int32  // Bit 31: learned flag, bit 30: myPos, bit 29: binary (size-2 fast path), bits 0-28: clause index
 	Blit      uint32 // Blocking literal (the other watched literal), cached for fast skip
 }
 

@@ -2789,6 +2789,12 @@ func (s *CDCLSolver) initWatches() {
 // watched-literal invariant (at most one watched literal is false) holds
 // after setup. Returns positions (-1 if fewer than two candidates found).
 // Shared by original/learned clause watch setup and compaction rebuild.
+// chooseWatchPositions picks two literal positions to watch, preferring
+// unassigned then true over false literals. When every literal is already
+// assigned false it returns two false watches — valid for LEARNED clauses
+// added mid-conflict (one watch turns true after backjump and the WB scheme
+// self-corrects on the next scan), and impossible for original clauses, which
+// are only watched at level 0 where all literals are unassigned.
 func (s *CDCLSolver) chooseWatchPositions(literals []cnf.Literal) (int, int) {
 	watch0 := -1
 	watch1 := -1
@@ -2820,8 +2826,13 @@ func (s *CDCLSolver) chooseWatchPositions(literals []cnf.Literal) (int, int) {
 	return watch0, watch1
 }
 
-// addOriginalClauseToWatches adds an original clause to the watch lists
-// Watches the first two literals that are not both false
+// addOriginalClauseToWatches adds an original clause to the watch lists.
+// Original clauses are watched during initWatches at level 0, where every
+// variable is unassigned, so both chosen watches are always unassigned
+// (never false). The generic chooseWatchPositions prioritizes unassigned/true
+// over false but, for LEARNED-clause adds, may legitimately return two false
+// watches pre-backjump (one becomes true post-backjump; WB self-corrects).
+// That two-false state does not occur here because all literals are unassigned.
 func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Clause, literals []cnf.Literal) {
 	if len(literals) < 2 {
 		return
@@ -2831,6 +2842,7 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	if watch0 < 0 || watch1 < 0 {
 		return
 	}
+	verifyOriginalWatchNotBothFalse(s, literals, watch0, watch1)
 
 	// Swap watched literals into positions 0 and 1 (MiniSat-style).
 	// This lets us find the blocking literal at position 1-WatchPos without storing Blit.
@@ -2849,6 +2861,10 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	// Pack myPos into ClauseIdx bit 30: watch on idx0 (lit0 at position 0) has myPos=0,
 	// watch on idx1 (lit1 at position 1) has myPos=1.
 	// Set binary bit (bit 29) for size-2 clauses to enable binary fast path.
+	// Bit layout: 31=learned(0 here), 30=myPos, 29=binary, bits 0-28=clause index.
+	if clauseIdx < 0 || clauseIdx >= int(watchIdxMask) {
+		panic(fmt.Sprintf("satience: original clause index %d exceeds the %d-entry watch packing budget (bits 0-28); watch layout cannot represent more clauses", clauseIdx, int(watchIdxMask)))
+	}
 	binaryBit := int32(0)
 	if len(literals) == 2 {
 		binaryBit = int32(watchBinaryBit)
@@ -2891,6 +2907,10 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	idx1 := cnf.LitToIndex(lit1)
 
 	// Pack learned flag (bit 31) + myPos (bit 30) + binary (bit 29) into ClauseIdx.
+	// Bit layout: 31=learned, 30=myPos, 29=binary, bits 0-28=clause index.
+	if learnedIdx < 0 || learnedIdx >= int(watchIdxMask) {
+		panic(fmt.Sprintf("satience: learned clause index %d exceeds the %d-entry watch packing budget (bits 0-28); watch layout cannot represent more clauses", learnedIdx, int(watchIdxMask)))
+	}
 	clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx)) // myPos=0
 	clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)           // myPos=1
 	if len(literals) == 2 {

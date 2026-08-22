@@ -3,7 +3,11 @@
 
 package solver
 
-import "fmt"
+import (
+	"fmt"
+
+	"satience/internal/cnf"
+)
 
 // verifyClauseIndices validates that all clause references are consistent after deletion
 // This is a DEBUG-ONLY verification function for validating swap-remove correctness
@@ -73,4 +77,32 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 			s.learnedActiveCount, s.learnedCapacity)
 	}
 	return true
+}
+
+// verifyOriginalWatchNotBothFalse checks the watched-literal invariant for an
+// ORIGINAL clause add. Original clauses are watched at level 0 (all variables
+// unassigned), so both chosen watches must never be false. If they were, the
+// clause would be watched with two false literals - a WB invariant violation
+// that could desync propagation. Learned-clause adds legitimately watch two
+// false literals pre-backjump (one turns true post-backjump), so this check is
+// intentionally scoped to original clauses only. DEBUG-ONLY: no-op in release.
+func verifyOriginalWatchNotBothFalse(s *CDCLSolver, literals []cnf.Literal, watch0, watch1 int) {
+	for _, wi := range []int{watch0, watch1} {
+		if wi < 0 || wi >= len(literals) {
+			fmt.Printf("c [VERIFY ERROR] original watch index %d out of range (len=%d)\n", wi, len(literals))
+			return
+		}
+	}
+	falseCount := 0
+	for _, wi := range []int{watch0, watch1} {
+		lit := literals[wi]
+		vi := lit.Var()
+		asg := s.assignments[vi]
+		if asg.Level >= 0 && (lit.IsNegated() != asg.Value) {
+			falseCount++
+		}
+	}
+	if falseCount == 2 {
+		fmt.Printf("c [VERIFY ERROR] original clause watching two false literals (pos %d,%d)\n", watch0, watch1)
+	}
 }

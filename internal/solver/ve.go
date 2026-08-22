@@ -49,6 +49,13 @@ func (s *CDCLSolver) boundedVarElimination() int {
 	// Occurrence lists contain stale entries (removed clauses); these are filtered
 	// by checking removed[ci] during resolvent generation. posCount/negCount track
 	// active (non-removed) counts for O(1) cheapest-variable scanning.
+	//
+	// Note: these lists are function-local and discarded when this pass returns
+	// (and BVE is re-invoked as a fresh preprocessing pass per simplification
+	// round), so stale entries never accumulate across calls. Within a pass the
+	// lists only ever grow (removed clauses are filtered lazily, never purged),
+	// which is a bounded scan cost, not a correctness issue: counts stay exact and
+	// every use re-checks removed[ci].
 	posOcc := make([][]int, numVars)
 	negOcc := make([][]int, numVars)
 	posCount := make([]int, numVars)
