@@ -33,7 +33,6 @@ func run() int {
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
 	dbCapMult := flag.Float64("db-cap-mult", 1.0, "Scale the learned-DB deletion target (experimental: DB-size vs per-propagation cost)")
 	govDB := flag.Bool("gov-db", true, "Enable Detector 5: per-instance self-correcting learned-DB reduction on binary-heavy cost-bound instances")
-	govDBGrow := flag.Bool("gov-db-grow", false, "Use continuous bidirectional (thermostat) DB governor instead of one-shot Det5 (A/B; default off)")
 	parity := flag.Bool("parity", true, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; default ON after distributional held-out gate; use -parity=false to disable)")
 	parityMaxLen := flag.Int("parity-max-len", 6, "Parity: max support size (clause length) for a detected parity family")
 	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
@@ -61,7 +60,6 @@ func run() int {
 	govStagGlue := flag.Float64("gov-stag-glue", 0.05, "Governor Det4: max window glue ratio to qualify as unguided")
 	govStagWin := flag.Int("gov-stag-win", 3, "Governor Det4: consecutive windows with no LBD improvement to confirm")
 	govStagBase := flag.Int("gov-stag-base", 20, "Governor Det4: target restartBase when LBD-stagnation fires")
-	govUnified := flag.Bool("gov-unified", false, "Use the unified runtime governor (single trend-aware controller, A/B; default off)")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
@@ -87,9 +85,7 @@ func run() int {
 	dbMaxLen := flag.Int("db-max-len", 25, "reduceDB length gate: evict clauses strictly longer than this first on binary-heavy formulas (0 = disabled)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
 	bigBfs := flag.Int("big-bfs", 16, "Per-call BIG transitive-minimization BFS node budget (default 16)")
-	bigForce := flag.Bool("big-force", false, "Force BIG minimization on mixed-binary low-structure instances (A/B; default off)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
-	glueEvict := flag.Bool("glue-evict", false, "Evict over-represented glue/short clauses (A/B; tests small-clause-DB management, default off)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	minisatRestart := flag.Bool("minisat-restart", false, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD)")
 	minisatBumps := flag.Bool("minisat-bumps", false, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor)")
@@ -175,7 +171,6 @@ func run() int {
 	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
 	s.SetGovernorParams(*govGrindBase, *govGrindPDec, *govGrindConf, *govWanderDecC, *govWanderGlue, *govWindow)
 	s.SetGovernorDet4Params(*govStagLBD, *govStagGlue, *govStagWin, *govStagBase)
-	s.SetGovernorUnified(*govUnified)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
 	// Configure VSIDS parameters
@@ -194,7 +189,6 @@ func run() int {
 	s.SetMinimizeMaxDepth(*minimizeDepth)
 	s.SetDBCapFactor(*dbCapMult)
 	s.SetGovernorDB(*govDB)
-	s.SetGovernorDBGrow(*govDBGrow)
 	s.SetParityParams(*parity, *parityMaxLen, *parityBudget)
 
 	// Configure clause vivification
@@ -219,14 +213,8 @@ func run() int {
 	s.SetDBMaxLen(*dbMaxLen)
 	s.SetOccurrenceWeight(*occurrenceWeight)
 	s.SetBigBfsBudget(*bigBfs)
-	if *bigForce {
-		s.SetBigForce(true)
-	}
 	if *bigLearn {
 		s.SetBigLearn(true)
-	}
-	if *glueEvict {
-		s.SetGlueEvict(true)
 	}
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)

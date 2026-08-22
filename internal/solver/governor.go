@@ -71,77 +71,12 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 		winLBD = float64(lbdDelta) / float64(winLbdC)
 	}
 
-	if s.govUnified {
-		s.unifiedGovernor(winProps, winDec, winConf, winMoves, lbdDelta, winLbdC)
-		return
-	}
 	s.detector4LbdStagnation(winLBD, glueRatio)
 	s.detector1Grind(propsPerDec)
 	s.detector3Wander(decPerConf, glueRatio)
 	s.detector5DBCost(winMoves, winDec, propsPerDec)
 }
-// unifiedGovernor is the consolidated runtime controller (A/B, -gov-unified).
-// Unlike the separate one-way Det1/Det3/Det4 ratchets it:
-//   - runs ONE windowed loop,
-//   - tracks an EMA trend (clause quality) so thresholds are relative to the
-//     instance's own trajectory rather than absolute constants,
-//   - makes restart-base corrections bounded and REVERSIBLE (heals toward the
-//     default when the pathology clears).
-//
-// Deliberately conservative: each actuator moves in bounded steps with
-// hysteresis and self-corrects, so a wrong call is undone rather than locked.
-func (s *CDCLSolver) unifiedGovernor(winProps, winDec, winConf, winMoves int, lbdDelta uint64, winLbdC uint64) {
-	if winConf < 2000 {
-		return
-	}
-	pd := float64(winProps) / float64(max(winDec, 1))
-	dcd := float64(winDec) / float64(max(winConf, 1))
-	winLBD := float64(lbdDelta) / float64(max(winLbdC, 1))
-	glue := 0.0
-	if s.totalLbdCount > 0 {
-		glue = float64(s.glueLearned) / float64(s.totalLbdCount)
-	}
 
-	// Trend EMA for clause quality (restart-pathology heuristic).
-	if s.govLbdEma == 0 {
-		s.govLbdEma = winLBD
-	}
-	s.govLbdEma = 0.9*s.govLbdEma + 0.1*winLBD
-
-	// ----- 1) Restart-depth actuator (consolidates Det1 cascade + Det4 stagnation) -----
-	// Deep pathology: enormous per-decision propagation (binary cascade) OR
-	// high-flat LBD stagnation with weak phase guidance and no deep-search need.
-	deepPathology := pd > 120.0 ||
-		(s.govLbdEma >= 12.0 && glue < 0.05 && s.polarityImbalance < 0.4 &&
-			s.longClauseRatio <= 0.8 && s.structureScore >= 0.7)
-	if s.conflicts >= 30000 {
-		if deepPathology && s.restartBase > s.govGrindBase {
-			s.restartBase = max(s.govGrindBase, s.restartBase-15)
-			s.govDepthTrend = -1
-			s.Log("c [gov-u] depth pathology (pd=%.0f, LBD=%.1f, glue=%.3f) -> restartBase=%d\n",
-				pd, s.govLbdEma, glue, s.restartBase)
-		} else if !deepPathology && s.govDepthTrend == -1 && s.restartBase < 200 {
-			s.restartBase = min(200, s.restartBase+10)
-			s.govDepthTrend = 0
-			s.Log("c [gov-u] depth healthy -> heal restartBase=%d\n", s.restartBase)
-		}
-	}
-
-	// ----- 2) Glucose wander actuator (consolidates Det3) -----
-	if !s.govGlucoseOn && dcd > 40.0 && glue < 0.10 && s.emaLBD >= 20.0 {
-		s.govGlucoseOn = true
-		if !s.flagSet("restart-glucose-ratio") {
-			s.restartGlucoseRatio = 1.5
-		}
-		if !s.flagSet("restart-glucose-min") {
-			s.restartGlucoseMinConflicts = 100
-		}
-		s.Log("c [gov-u] wander (%.0f dec/conf, glue=%.3f) -> Glucose on\n", dcd, glue)
-	}
-
-	// ----- 3) DB-cost actuator (reuse the self-correcting moves/dec logic) -----
-	s.detector5DBCost(winMoves, winDec, pd)
-}
 
 // detector1Grind targets the deep-binary-cascade / timeout-cliff signature
 // (e.g. bb34f22f: props/dec ~160+, no Glucose-guided convergence, sits at the
@@ -320,10 +255,6 @@ func (s *CDCLSolver) detector5DBCost(winMoves, winDec int, propsPerDec float64) 
 	if !s.govDbEnabled {
 		return
 	}
-	if s.govDbGrow {
-		s.continuousDBCost(winMoves, winDec, propsPerDec)
-		return
-	}
 	if s.binaryRatio <= s.govDbMinBinary {
 		return
 	}
@@ -385,100 +316,6 @@ func (s *CDCLSolver) detector5DBCost(winMoves, winDec int, propsPerDec float64) 
 		s.govDbReverts++
 		s.Log("c [governor] Det5 DB-cost: stall moves/dec %.0f->%.0f, revert cap ->%.2f (stop)\n",
 			s.govDbRefMovesPerDec, curMovesPerDec, s.dbCapFactor)
-	}
-	s.govDbActive = s.dbCapFactor < 1.0
-	s.govDbFinalFactor = s.dbCapFactor
-}
-
-// continuousDBCost is the bidirectional ("thermostat") variant of Det5 (A/B,
-// -gov-db-grow). It keeps the same direction-clear precondition — binary-heavy,
-// elevated per-propagation cost => a leaner DB is never wrong — but instead of
-// ratcheting down one step and stopping, it RE-EVALUATES every window and can
-// both shrink further (on sustained improvement) and grow back a bounded step
-// (on over-correction), all relative to a per-window moves/decision reference
-// and never above the launch-time anchor. Fully reversible and bounded: a wrong
-// call is walked back rather than locked, so the leaner-DB benefit is captured
-// without the one-shot ratchet's risk.
-func (s *CDCLSolver) continuousDBCost(winMoves, winDec int, propsPerDec float64) {
-	if s.binaryRatio <= s.govDbMinBinary {
-		return
-	}
-	if s.conflicts < s.govDbStartConf {
-		return
-	}
-	if winDec <= 0 {
-		return
-	}
-	cur := float64(winMoves) / float64(winDec)
-
-	if !s.govDbLaunched {
-		if propsPerDec < s.govDbStartPDec {
-			return
-		}
-		s.govDbLaunched = true
-		s.govDbFactorBase = s.dbCapFactor
-		s.govDbGrowAnchor = s.dbCapFactor
-		s.govDbRefMovesPerDec = cur
-		next := s.dbCapFactor * s.govDbStepFactor
-		if next < s.govDbFloor {
-			next = s.govDbFloor
-		}
-		if next < s.dbCapFactor {
-			s.dbCapFactor = next
-			s.govDbSteps++
-			s.govDbPendingEval = true
-		}
-		s.govDbActive = s.dbCapFactor < 1.0
-		s.govDbFinalFactor = s.dbCapFactor
-		s.Log("c [gov-db] continuous: launch (props/dec=%.0f, binary=%.2f) cap %.2f->%.2f\n",
-			propsPerDec, s.binaryRatio, s.govDbGrowAnchor, s.dbCapFactor)
-		return
-	}
-
-	// Continuously re-evaluate on the window cadence rather than stopping.
-	if !s.govDbPendingEval {
-		s.govDbPendingEval = true
-		return
-	}
-	s.govDbPendingEval = false
-
-	switch {
-	case cur < s.govDbRefMovesPerDec*(1.0-s.govDbMargin):
-		// Reduction kept helping: go one step deeper.
-		s.govDbFactorBase = s.dbCapFactor
-		s.govDbRefMovesPerDec = cur
-		next := s.dbCapFactor * s.govDbStepFactor
-		if next < s.govDbFloor {
-			next = s.govDbFloor
-		}
-		if next < s.dbCapFactor {
-			s.dbCapFactor = next
-			s.govDbSteps++
-			s.govDbPendingEval = true
-		}
-		s.Log("c [gov-db] continuous: improve moves/dec %.0f->%.0f cap ->%.2f\n",
-			s.govDbRefMovesPerDec, cur, s.dbCapFactor)
-	case cur > s.govDbRefMovesPerDec*(1.0+s.govDbMargin):
-		// Over-correction: watch-moves/decision climbed after shrinking, step
-		// the cap back up a bounded amount (never past the launch anchor).
-		next := s.dbCapFactor / s.govDbStepFactor
-		if next > s.govDbGrowAnchor {
-			next = s.govDbGrowAnchor
-		}
-		if next > s.dbCapFactor {
-			s.dbCapFactor = next
-			s.govDbGrows++
-			s.govDbPendingEval = true
-		}
-		s.govDbFactorBase = s.dbCapFactor
-		s.govDbRefMovesPerDec = cur
-		s.Log("c [gov-db] continuous: over-correct moves/dec %.0f->%.0f cap ->%.2f\n",
-			s.govDbRefMovesPerDec, cur, s.dbCapFactor)
-	default:
-		// Stall: hold in place; monitor next window (thermostat stays live).
-		s.govDbRefMovesPerDec = 0.5*(s.govDbRefMovesPerDec+cur)
-		s.govDbPendingEval = true
-		s.Log("c [gov-db] continuous: hold moves/dec %.0f cap %.2f\n", cur, s.dbCapFactor)
 	}
 	s.govDbActive = s.dbCapFactor < 1.0
 	s.govDbFinalFactor = s.dbCapFactor

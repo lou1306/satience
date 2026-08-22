@@ -260,10 +260,7 @@ type CDCLSolver struct {
 	// bigReachableInClause. Larger budgets find more multi-hop binary reductions
 	// at higher per-minimize cost. Exposed for A/B (see -big-bfs).
 	bigBfsBudget int
-	// bigDisableGate when true forces the BIG minimization fast-path on even for
-	// mixed-binary low-structure instances that the heuristic gate normally
-	// excludes. Exposed for A/B (see -big-force).
-	bigDisableGate bool
+
 	// bigLearnAdj augments the static original-binary BIG with implication
 	// edges from LEARNED binary clauses. Learned clauses are permanent logical
 	// consequences of the formula, so edges are never removed after addition
@@ -341,13 +338,6 @@ type CDCLSolver struct {
 	// level-0 literal filter changed clause DB composition.
 	lbdTier1Threshold int // Pass 1 deletion: delete LBD > threshold (default 5)
 	lbdTier2Threshold int // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
-	// Glue/short-clause eviction (A/B, off by default): strong minimization
-	// inflates the LBD≤tier2 population (accepted here, unlike Glucose). This
-	// optionally evicts over-represented glue so the small-clause DB can be
-	// trimmed; tests whether that unlocks minimization gains.
-	glueEvict                  bool
-	glueEvictMaxFrac           float64 // max glue fraction of targetCount before eviction (default 0.5)
-	glueEvictExtraFrac         float64 // max extra deletions as fraction of targetCount per pass (default 0.2)
 	dbGrowthDivisor            int     // dynamicLimit = maxLearned + conflicts/divisor (default 50)
 	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
 	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
@@ -477,8 +467,6 @@ type CDCLSolver struct {
 	govDbReverts        int     // Det5: DB-reduction reverts (diagnostic)
 	govDbActive         bool    // Det5 currently holding a reduced cap (diagnostic)
 	govDbFinalFactor    float64 // Det5: final dbCapFactor (diagnostic)
-	govDbGrow           bool    // gate: continuous bidirectional (thermostat) DB variant (A/B; default off)
-	govDbGrowAnchor     float64 // dbCapFactor at launch; the max the continuous governor may regrow toward
 	govDbGrows          int     // continuous: DB-regrowth steps applied (diagnostic)
 
 	// Detector 4 LBD-stagnation history (last govStagWin window avgLBDs).
@@ -490,7 +478,6 @@ type CDCLSolver struct {
 	// separate Det1/Det3/Det4/Det5 actuation with a single windowed controller
 	// that maps normalized search-health signals onto bounded, trend-aware
 	// actuators, plus adaptive vivify cadence.
-	govUnified      bool
 	govLbdEma       float64 // EMA of window avgLBD (clause-quality trend)
 	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
 	govDepthChanged bool
@@ -609,7 +596,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		bigBfsVisited:       make([]uint16, int(formula.NumVars)*2),
 		bigBfsQueue:         make([]int, 0, 256),
 		bigBfsBudget:        16,
-		bigDisableGate:      false,
 		tmpLevelCount:       make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
 		tmpCandidates:       make([]resolveCandidate, 0, 200), // Increased from 100
@@ -672,7 +658,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govDbFloor:       0.5,
 		govDbMargin:      0.08,
 		govDbFinalFactor: 1.0,
-		govDbGrowAnchor:  1.0,
 		dbCapFactor:      1.0,
 		// Parity preprocessing (-parity; ON by default after the distributional
 		// held-out gate passed on all validation families — no new TMO, no
@@ -710,9 +695,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		decayCeil:                  0.80,
 		lbdTier1Threshold:          5,
 		lbdTier2Threshold:          2,
-		glueEvict:                  false,
-		glueEvictMaxFrac:           0.5,
-		glueEvictExtraFrac:         0.2,
 		dbGrowthDivisor:            50,
 		deletionTriggerRatio:       1.5,
 		dbShrinkThreshold:          10,
@@ -881,12 +863,6 @@ func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, s
 	}
 }
 
-// SetGovernorUnified switches maybeAdaptSearch to the unified runtime controller
-// instead of the separate Det1/Det3/Det4/Det5 detectors. A/B (off by default).
-func (s *CDCLSolver) SetGovernorUnified(on bool) {
-	s.govUnified = on
-}
-
 func (s *CDCLSolver) SetAdaptivePhaseFlipRate(rate float64) {
 	if rate < 0 {
 		rate = 0
@@ -975,11 +951,6 @@ func (s *CDCLSolver) SetDBMaxLen(dbMaxLen int) {
 	s.dbMaxLen = dbMaxLen
 }
 
-// SetGlueEvict enables eviction of over-represented glue/short clauses (A/B).
-func (s *CDCLSolver) SetGlueEvict(on bool) {
-	s.glueEvict = on
-}
-
 func (s *CDCLSolver) SetOccurrenceWeight(w float64) {
 	s.occurrenceWeight = w
 }
@@ -1050,11 +1021,6 @@ func (s *CDCLSolver) SetGovernorDB(on bool) {
 	s.govDbEnabled = on
 }
 
-// SetGovernorDBGrow selects the continuous bidirectional (thermostat) DB
-// governor variant in place of the one-shot Det5 ratchet. A/B; default off.
-func (s *CDCLSolver) SetGovernorDBGrow(on bool) {
-	s.govDbGrow = on
-}
 
 // SetParityParams gates XOR/parity preprocessing (-parity, default ON). maxArity
 // is the max support size (>=3); budget caps derived binary clauses (<=0 = off).
@@ -1080,12 +1046,6 @@ func (s *CDCLSolver) SetBigBfsBudget(n int) {
 	if n > 0 {
 		s.bigBfsBudget = n
 	}
-}
-
-// SetBigForce disables the heuristic gate on BIG minimization so the fast-path
-// also runs on mixed-binary low-structure instances (A/B only).
-func (s *CDCLSolver) SetBigForce(force bool) {
-	s.bigDisableGate = force
 }
 
 // SetBigLearn enables the learned-binary BIG augmentation for transitive
@@ -6219,7 +6179,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 		// the derivation uses only the binary clauses, which are in the formula.
 		// Intermediate tautologies in the resolvent are harmless — only the
 		// final clause (C\{lit}) matters, and it is non-tautological.
-		if s.bigAdjOff != nil && (s.bigDisableGate || !(s.structureScore < 0.7 && s.binaryRatio > 0.4)) { // GATE: disable BIG for mixed-binary sub-0.7
+		if s.bigAdjOff != nil && !(s.structureScore < 0.7 && s.binaryRatio > 0.4) { // GATE: disable BIG for mixed-binary sub-0.7
 			s.bigMinimizeCalls++
 			if s.bigReachableInClause(lit) {
 				s.bigMinimizeHits++
@@ -6526,50 +6486,6 @@ func (s *CDCLSolver) deleteLearnedClauses() {
 			}
 			deleted[idx] = true
 			deletedCount++
-		}
-	}
-
-	// Pass 2.5 (glue eviction, A/B): when the LBD≤tier2 (glue/short) population
-	// over-represents the DB, evict the lowest-activity glue beyond the normal
-	// toDelete budget. Strong minimization inflates this population; trimming
-	// it tests whether the small-clause bloat (rather than the trajectory) is
-	// what makes aggressive minimization net-negative. Gated off by default.
-	if s.glueEvict && deletedCount <= toDelete {
-		glueCount := 0
-		for i := 0; i < s.learnedCapacity; i++ {
-			if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
-				continue
-			}
-			if int(s.learnedMetadata[i].LBD) <= s.lbdTier2Threshold {
-				glueCount++
-			}
-		}
-		maxGlue := int(float64(targetCount) * s.glueEvictMaxFrac)
-		if glueCount > maxGlue {
-			budget := glueCount - maxGlue
-			if extra := int(float64(targetCount) * s.glueEvictExtraFrac); budget > extra {
-				budget = extra
-			}
-			candidates = candidates[:0]
-			for i := 0; i < s.learnedCapacity; i++ {
-				if s.learnedLoc[i].Size == 0 || protected[i] || deleted[i] {
-					continue
-				}
-				if int(s.learnedMetadata[i].LBD) <= s.lbdTier2Threshold {
-					candidates = append(candidates, i)
-				}
-			}
-			if len(candidates) > 1 {
-				s.sortDeletionCandidates(candidates)
-			}
-			for _, idx := range candidates {
-				if budget <= 0 {
-					break
-				}
-				deleted[idx] = true
-				deletedCount++
-				budget--
-			}
 		}
 	}
 
