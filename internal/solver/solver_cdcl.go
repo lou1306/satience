@@ -518,6 +518,18 @@ type CDCLSolver struct {
 	parityUnits     int  // diagnostic: derived unit clauses
 	parityBinaries  int  // diagnostic: derived binary clauses appended
 
+	// On-the-fly parity propagation (A/B, -parity-on-fly; off by default).
+	// During search, detected parity rows are watched against the current trail:
+	// a row reduced to a single unassigned variable forces that variable (reason =
+	// a synthesized size-d clause, stored as a normal learned clause); a row fully
+	// assigned with the wrong parity is a conflict (synthesized all-false clause).
+	// Sound because every synthesized clause forbids exactly one corner of the
+	// hypercube that the corresponding XOR row forbids -> a universal implicate.
+	parityOnTheFly  bool
+	parityLearned   int          // diagnostic: clauses synthesized on-the-fly
+	parityRows      [][]uint32   // detected row supports (snapshot, ascending vars)
+	parityRowParity []bool       // per-row XOR constant
+
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
 	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
@@ -1109,6 +1121,16 @@ func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
 	}
 }
 
+// SetParityOnTheFly gates on-the-fly parity propagation during search (A/B,
+// -parity-on-fly; off by default). Requires parityEnabled for the rows to be
+// detected at search start. budget caps on-the-fly synthesized clauses.
+func (s *CDCLSolver) SetParityOnTheFly(on bool, budget int) {
+	s.parityOnTheFly = on
+	if budget >= 0 {
+		s.parityBudget = budget
+	}
+}
+
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
@@ -1392,7 +1414,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1400,7 +1422,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.chronoFires,
-		s.parityRowsFound, s.parityUnits, s.parityBinaries,
+		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityLearned,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
@@ -4365,6 +4387,20 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 
 		// Propagate all clauses (unit learned clauses handled in propagateWatched)
 		conflict, conflictClause := s.propagateWatched()
+		if !conflict && s.parityOnTheFly && len(s.parityRows) > 0 {
+			// On-the-fly parity: sweep parity rows against the trail. If a unit was
+			// enqueued, re-propagate to reach the joint fixpoint; if a parity row is
+			// fully assigned and violated, that's a normal (clause) conflict.
+			acted, pcc := s.parityPropagate()
+			if acted {
+				if pcc != nil {
+					conflict = true
+					conflictClause = pcc
+				} else {
+					continue
+				}
+			}
+		}
 		if conflict {
 			s.handleConflict(conflictClause)
 			if s.conflicts%50 == 0 && s.verbose {
@@ -4522,6 +4558,11 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 		s.printStats()
 		return flpResult
 	}
+
+	// Snapshot on-the-fly parity rows from the (post-preprocessing) original
+	// clause DB BEFORE it is released. Rows detected here are implicates of the
+	// reduced formula, so the insearch parity engine (cdclLoop) is sound.
+	s.cacheParityRows()
 
 	// Release the Clauses slice (32B/clause) — all solving-path access now
 	// goes through originalClauseLocs + literalPool. Preprocessing modified

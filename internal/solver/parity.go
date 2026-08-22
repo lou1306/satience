@@ -352,6 +352,127 @@ func (s *CDCLSolver) detectParityRows() ([]parityRow, bool) {
 	return rows, true
 }
 
+// cacheParityRows detects parity families over the CURRENT (post-preprocessing)
+// original clause database and snapshots their supports + constants for on-the-fly
+// use during search. Rows detected here are implicates of the formula the search
+// works on, so deriving from them at any point is sound. Call before cnf.Clauses
+// is released (SolveWithResult sets it nil at search start).
+func (s *CDCLSolver) cacheParityRows() {
+	if !s.parityOnTheFly || s.parityMaxArity < 3 {
+		return
+	}
+	rows, ok := s.detectParityRows()
+	if !ok || len(rows) == 0 {
+		return
+	}
+	s.parityRows = make([][]uint32, len(rows))
+	s.parityRowParity = make([]bool, len(rows))
+	for i, r := range rows {
+		v := make([]uint32, len(r.vars))
+		copy(v, r.vars)
+		s.parityRows[i] = v
+		s.parityRowParity[i] = r.parity
+	}
+	s.parityRowsFound = len(rows)
+	s.Log("c [parity] on-the-fly: %d rows cached for insearch propagation\n", len(rows))
+}
+
+// parityPropagate is the on-the-fly parity engine. It sweeps the cached parity
+// rows against the current trail and (a) forces a residual unit when a row has
+// exactly one unassigned variable, storing a synthesized size-d reason clause,
+// or (b) signals a conflict when a row is fully assigned with the wrong parity.
+//
+// SOUNDNESS: a row  XOR(vars)==p  forbids all true-sets of parity != p. With all
+// but one var assigned (acc = XOR of their values), the last var u is forced to
+// p XOR acc; the corner "others as-assigned, u != forced" violates the row, so
+// the clause  { u=forced } ∪ { v = current }  forbids exactly that forbidden
+// corner -> a universal implicate, valid everywhere. Fully-assigned mismatched
+// rows give an all-false implicate = a valid conflict clause. Because these are
+// ordinary clauses stored through storeLearnedClause, reasons and the BIG work
+// normally and reason clauses are protected from deletion.
+//
+// Returns (acted, conflictClause): acted=true if something happened (a unit was
+// enqueued or a conflict found); conflictClause non-nil iff that something is a
+// conflict. The caller re-runs propagation after acted to reach the joint fixpoint.
+func (s *CDCLSolver) parityPropagate() (bool, *cnf.Clause) {
+	if !s.parityOnTheFly || len(s.parityRows) == 0 || s.parityBudget <= 0 {
+		return false, nil
+	}
+	acted := false
+	for ri := range s.parityRows {
+		if s.parityLearned >= s.parityBudget {
+			break
+		}
+		r := s.parityRows[ri]
+		acc := false
+		var un uint32
+		unCount := 0
+		for _, v := range r {
+			a := s.assignments[v]
+			if a.Level < 0 {
+				un = v
+				unCount++
+			} else if a.Value {
+				acc = !acc
+			}
+		}
+		if unCount > 1 {
+			continue
+		}
+		rowParity := s.parityRowParity[ri]
+
+		if unCount == 0 {
+			// Fully assigned. Violated iff XOR of values != rowParity.
+			if acc == rowParity {
+				continue
+			}
+			// Conflict: all-false implicate over the row's current literals.
+			lits := make([]cnf.Literal, 0, len(r))
+			for _, v := range r {
+				lits = append(lits, cnf.NewLiteral(v, s.assignments[v].Value))
+			}
+			s.conflictClauseBuf.Literals = lits
+			s.conflictClauseBuf.Learned = true
+			if s.level == 0 {
+				s.emptyClauseFound = true
+			}
+			return true, &s.conflictClauseBuf
+		}
+
+		// unCount == 1: force u = rowParity XOR acc.
+		if u, val := un, rowParity != acc; s.assignments[u].Level >= 0 {
+			_ = val
+			continue
+		} else {
+			// Synthesize reason clause: position 0 = u's forced literal
+			// (unassigned), then each other var's currently-false literal.
+			reason := make([]cnf.Literal, 0, len(r))
+			reason = append(reason, cnf.NewLiteral(u, !val))
+			for _, v := range r {
+				if v == u {
+					continue
+				}
+				reason = append(reason, cnf.NewLiteral(v, s.assignments[v].Value))
+			}
+			s.tmpLearnedLits = s.tmpLearnedLits[:0]
+			s.tmpLearnedLits = append(s.tmpLearnedLits, reason...)
+			if !s.storeLearnedClause(2) {
+				continue
+			}
+			learnedIdx := s.lastLearnedClauseIdx
+			s.parityLearned++
+			s.assignments[u] = Assignment{Value: val, Level: int32(s.level), Reason: int32(-learnedIdx - 5), SavedPhase: !val}
+			s.litTrue[u*2] = val
+			s.litTrue[u*2+1] = !val
+			s.trail = append(s.trail, u)
+			s.numUnassigned--
+			s.propagations++
+			acted = true
+		}
+	}
+	return acted, nil
+}
+
 func supportKey(sup []uint32) string {
 	buf := make([]byte, 0, len(sup)*4)
 	for _, v := range sup {
