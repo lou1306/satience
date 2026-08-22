@@ -96,6 +96,12 @@ func (s *CDCLSolver) boundedVarElimination() int {
 	seenVar := make([]bool, numVars)
 	var touchedVars []int
 
+	// Reusable resolvent build buffer. Each resolvent (A∨B from (x∨A)×(¬x∨B)) is
+	// assembled here and then COPIED once into a persistent slice for the clause DB.
+	// This removes the per-append reallocation of a fresh per-resolvent slice
+	// (the dominant allocation source in BVE — ~3.3M objects on bb34f22f).
+	var resScratch []cnf.Literal
+
 	totalResolvents := 0
 	eliminated := 0
 
@@ -170,7 +176,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 				touched = touched[:0]
 
 				isTautology := false
-				var resolvent []cnf.Literal
+				resScratch = resScratch[:0]
 				for _, lit := range posClause {
 					if lit.Var() == v {
 						continue
@@ -181,7 +187,7 @@ func (s *CDCLSolver) boundedVarElimination() int {
 					}
 					seenLit[idx] = true
 					touched = append(touched, idx)
-					resolvent = append(resolvent, lit)
+					resScratch = append(resScratch, lit)
 				}
 				for _, lit := range negClause {
 					if lit.Var() == v {
@@ -197,16 +203,20 @@ func (s *CDCLSolver) boundedVarElimination() int {
 						isTautology = true
 						break
 					}
-					resolvent = append(resolvent, lit)
+					resScratch = append(resScratch, lit)
 				}
 				if isTautology {
 					continue
 				}
 				// Empty resolvent (both clauses were units {x} and {¬x}) → UNSAT
-				if len(resolvent) == 0 {
+				if len(resScratch) == 0 {
 					return -1
 				}
-				resolvents = append(resolvents, resolvent)
+				// Copy the assembled resolvent once into a persistent slice; the
+				// scratch is reused for the next (x∨A)×(¬x∨B) pair.
+				stored := make([]cnf.Literal, len(resScratch))
+				copy(stored, resScratch)
+				resolvents = append(resolvents, stored)
 				totalResolvents++
 			}
 			if s.veBudget > 0 && totalResolvents >= s.veBudget {
@@ -303,14 +313,12 @@ func (s *CDCLSolver) boundedVarElimination() int {
 
 		// Add resolvents to the clause database + occurrence lists
 		for _, res := range resolvents {
-			resCopy := make([]cnf.Literal, len(res))
-			copy(resCopy, res)
 			newCi := len(s.cnf.Clauses)
-			s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: resCopy})
+			s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: res})
 			s.cnf.NumClauses++
 			removed = append(removed, false)
 			// Update occurrence lists + counts for the resolvent's variables
-			for _, lit := range resCopy {
+			for _, lit := range res {
 				lv := lit.Var()
 				if lit.IsNegated() {
 					negOcc[lv] = append(negOcc[lv], newCi)

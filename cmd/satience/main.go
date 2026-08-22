@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
 	"satience/internal/cnf"
@@ -26,6 +27,7 @@ func run() int {
 	maxIter := flag.Int("max-iter", 0, "Maximum iterations (0=unlimited)")
 	verbose := flag.Bool("verbose", false, "Show solving statistics")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "Write heap (allocation) profile to file")
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	rndInit := flag.Float64("rnd-init", 0.0, "Magnitude of random noise added to initial VSIDS activity (MiniSat-style, default=0=disabled)")
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
@@ -112,6 +114,18 @@ func run() int {
 	}
 
 	var profileFile *os.File
+	if *memprofile != "" {
+		runtime.MemProfileRate = 1
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating memprofile: %v\n", err)
+				return
+			}
+			pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+		}()
+	}
 	if *cpuprofile != "" {
 		var err error
 		profileFile, err = os.Create(*cpuprofile)
