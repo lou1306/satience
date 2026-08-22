@@ -509,7 +509,7 @@ type CDCLSolver struct {
 	chronoCounter    int     // per-solve eligibility stride counter
 	chronoFires      int     // diagnostic: conflicts where CB raised the backjump target
 
-	// XOR / parity preprocessing (A/B, -parity; off by default). Add-only
+	// XOR / parity preprocessing (-parity; ON by default). Add-only
 	// Gaussian elimination over detected parity families (see parity.go).
 	parityEnabled   bool // gate: enable parity detection + GF(2) derivation
 	parityMaxArity  int  // max support size (clause length) for a parity family (>=3)
@@ -716,8 +716,10 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		chronoStagFactor: 1.15,
 		chronoCounter:    0,
 		chronoFires:      0,
-		// Parity preprocessing (-parity; off by default -> bit-identical).
-		parityEnabled:  false,
+		// Parity preprocessing (-parity; ON by default after the distributional
+		// held-out gate passed on all validation families — no new TMO, no
+		// median regression, ~5700x median-PAR2 win on Tseitin families).
+		parityEnabled:  true,
 		parityMaxArity: 6,
 		parityBudget:   2000,
 		// Hidden literal elimination (-hle; off by default -> bit-identical).
@@ -1122,8 +1124,8 @@ func (s *CDCLSolver) SetChronoParams(keep, minGap, nth int, stagFactor float64) 
 	}
 }
 
-// SetParityParams gates XOR/parity preprocessing (A/B, -parity). maxArity is
-// the max support size (>=3); budget caps derived binary clauses (<=0 = off).
+// SetParityParams gates XOR/parity preprocessing (-parity, default ON). maxArity
+// is the max support size (>=3); budget caps derived binary clauses (<=0 = off).
 func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
 	s.parityEnabled = on
 	if maxArity >= 3 {

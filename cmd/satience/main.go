@@ -39,7 +39,7 @@ func run() int {
 	chronoMinGap := flag.Int("chrono-min-gap", 2, "Chronological backtracking: min NB skip (level-maxLevel) required to consider CB")
 	chronoNth := flag.Int("chrono-nth", 4, "Chronological backtracking: CB fires on every Nth eligible conflict (alternation stride)")
 	chronoStag := flag.Float64("chrono-stag", 1.15, "Chronological backtracking: CB also fires when lbd > factor*emaLBD (<=0 disables)")
-	parity := flag.Bool("parity", false, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; A/B, default off)")
+	parity := flag.Bool("parity", true, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; default ON after distributional held-out gate; use -parity=false to disable)")
 	parityMaxLen := flag.Int("parity-max-len", 6, "Parity: max support size (clause length) for a detected parity family")
 	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
 	parityOnTheFly := flag.Bool("parity-on-fly", false, "Parity: on-the-fly insearch propagation over detected rows (A/B, default off; requires -parity)")

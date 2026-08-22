@@ -19,7 +19,7 @@ package solver
 // appending it cannot change satisfiability. This is the safe, decidable first
 // increment (full variable substitution / Shatter is a follow-up).
 //
-// Gated: -parity (default off -> bit-identical), -parity-max-len,
+// Gated: -parity (default ON; -parity=false disables), -parity-max-len,
 // -parity-budget (hard cap on derived binaries).
 
 import (
