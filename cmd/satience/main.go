@@ -32,6 +32,11 @@ func run() int {
 	dbCapMult := flag.Float64("db-cap-mult", 1.0, "Scale the learned-DB deletion target (experimental: DB-size vs per-propagation cost)")
 	govDB := flag.Bool("gov-db", true, "Enable Detector 5: per-instance self-correcting learned-DB reduction on binary-heavy cost-bound instances")
 	govDBGrow := flag.Bool("gov-db-grow", false, "Use continuous bidirectional (thermostat) DB governor instead of one-shot Det5 (A/B; default off)")
+	chrono := flag.Bool("chrono", false, "Chronological-backtracking hybrid: retain a bounded window of top decision levels, alternating with non-chronological backjump (A/B; default off)")
+	chronoKeep := flag.Int("chrono-keep", 2, "Chronological backtracking: decision levels retained at the top when CB fires")
+	chronoMinGap := flag.Int("chrono-min-gap", 2, "Chronological backtracking: min NB skip (level-maxLevel) required to consider CB")
+	chronoNth := flag.Int("chrono-nth", 4, "Chronological backtracking: CB fires on every Nth eligible conflict (alternation stride)")
+	chronoStag := flag.Float64("chrono-stag", 1.15, "Chronological backtracking: CB also fires when lbd > factor*emaLBD (<=0 disables)")
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
@@ -178,6 +183,10 @@ func run() int {
 	s.SetDBCapFactor(*dbCapMult)
 	s.SetGovernorDB(*govDB)
 	s.SetGovernorDBGrow(*govDBGrow)
+	s.SetChronoEnabled(*chrono)
+	if *chrono {
+		s.SetChronoParams(*chronoKeep, *chronoMinGap, *chronoNth, *chronoStag)
+	}
 
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)

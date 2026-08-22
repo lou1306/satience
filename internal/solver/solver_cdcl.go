@@ -495,6 +495,20 @@ type CDCLSolver struct {
 	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
 	govDepthChanged bool
 
+	// Chronological backtracking hybrid (A/B, -chrono; off by default).
+	// NB (non-chronological) remains the per-conflict default; CB retains a
+	// bounded window of the top decision levels, firing on an alternation stride
+	// plus an LBD-stagnation trigger. The learned clause stays unit at the
+	// retained level (1-UIP places its only level-`level` literal at the UIP and
+	// none in (maxLevel, level)), so propagateAssertingLiteral still asserts it.
+	chronoEnabled    bool    // gate: enable the CB/NB hybrid
+	chronoKeep       int     // decision levels retained at the top when CB fires (>=1)
+	chronoMinGap     int     // only CB when the NB skip (level-maxLevel) exceeds this
+	chronoNth        int     // alternation stride: CB fires on every Nth eligible conflict
+	chronoStagFactor float64 // CB also fires when lbd > factor*emaLBD (stagnation; <=0 disables)
+	chronoCounter    int     // per-solve eligibility stride counter
+	chronoFires      int     // diagnostic: conflicts where CB raised the backjump target
+
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
 	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
@@ -664,6 +678,14 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govDbFinalFactor: 1.0,
 		govDbGrowAnchor:  1.0,
 		dbCapFactor:      1.0,
+		// Chronological backtracking hybrid (-chrono; off by default).
+		chronoEnabled:    false,
+		chronoKeep:       2,
+		chronoMinGap:     2,
+		chronoNth:        4,
+		chronoStagFactor: 1.15,
+		chronoCounter:    0,
+		chronoFires:      0,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -1040,6 +1062,28 @@ func (s *CDCLSolver) SetGovernorDBGrow(on bool) {
 	s.govDbGrow = on
 }
 
+// SetChronoEnabled gates the chronological-backtracking hybrid (A/B, -chrono).
+// Off by default; the default path is bit-identical.
+func (s *CDCLSolver) SetChronoEnabled(on bool) {
+	s.chronoEnabled = on
+}
+
+// SetChronoParams configures the CB/NB hybrid tuning knobs.
+func (s *CDCLSolver) SetChronoParams(keep, minGap, nth int, stagFactor float64) {
+	if keep >= 1 {
+		s.chronoKeep = keep
+	}
+	if minGap >= 0 {
+		s.chronoMinGap = minGap
+	}
+	if nth >= 1 {
+		s.chronoNth = nth
+	}
+	if stagFactor > 0 {
+		s.chronoStagFactor = stagFactor
+	}
+}
+
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
 // between two vivification rounds. 0 disables the gap gate (restart-based only).
 func (s *CDCLSolver) SetVivifyMinConflictGap(g int) {
@@ -1323,13 +1367,14 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
+		s.chronoFires,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
@@ -5869,6 +5914,39 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		}
 	} else if backjumpLevel == 0 {
 		backjumpLevel = 1
+	}
+
+	// Chronological backtracking hybrid (A/B, -chrono; off by default).
+	// NB remains the per-conflict default; CB retains a bounded window of the
+	// top decision levels (backtracking to level-chronoKeep instead of all the
+	// way to maxLevel) so more search context survives. The learned clause is
+	// still unit at the retained level - 1-UIP places exactly one clause literal
+	// at `level` (the UIP) and none in (maxLevel, level) - so backtrack() sets
+	// level=cbLevel and propagateAssertingLiteral still asserts the UIP.
+	// CB fires only when the NB skip would be large AND the alternation stride
+	// selects this conflict (or LBD is stagnating), keeping NB dominant.
+	if s.chronoEnabled && !s.emptyClauseFound && len(s.tmpLearnedLits) > 1 && maxLevel < s.level {
+		if skip := s.level - maxLevel; skip > s.chronoMinGap {
+			cbLevel := s.level - s.chronoKeep
+			if cbLevel <= maxLevel {
+				cbLevel = maxLevel + 1
+			}
+			if cbLevel > maxLevel && cbLevel < s.level {
+				s.chronoCounter++
+				useCB := s.chronoCounter%s.chronoNth == 0
+				if !useCB && s.chronoStagFactor > 0 && s.emaLBD > 0 && float64(lbd) > s.chronoStagFactor*s.emaLBD {
+					useCB = true
+				}
+				if useCB {
+					backjumpLevel = cbLevel
+					s.chronoFires++
+					if s.verbose && s.conflicts <= 10 {
+						s.Log("c [chrono] CB conflict=%d: backjump %d->%d (retain %d), LBD=%d\n",
+							s.conflicts, maxLevel, cbLevel, cbLevel-maxLevel, lbd)
+					}
+				}
+			}
+		}
 	}
 
 	if s.verbose {
