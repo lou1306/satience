@@ -527,6 +527,7 @@ type CDCLSolver struct {
 	// hypercube that the corresponding XOR row forbids -> a universal implicate.
 	parityOnTheFly  bool
 	parityLearned   int          // diagnostic: clauses synthesized on-the-fly
+	parityRounds    int          // diagnostic: in-loop parity re-derivations that fired
 	parityRows      [][]uint32   // detected row supports (snapshot, ascending vars)
 	parityRowParity []bool       // per-row XOR constant
 
@@ -1414,7 +1415,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | chrono: fires=%d | parity: rows=%d units=%d bins=%d otf=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1422,7 +1423,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.chronoFires,
-		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityLearned,
+		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityLearned, s.parityRounds,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
@@ -2511,6 +2512,26 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			}
 		}
 		ppMark("unit propagation")
+
+		// P4 — parity as part of the preprocessing fixpoint. After BVE/subsumption/
+		// unit-prop change the clause DB, previously-incomplete parity families can
+		// become COMPLETE (root units assign variables, BVE removes variables),
+		// exposing XOR structure that yields NEW units/binaries. Re-derive each
+		// pass. Add-only and sound (see analyzeParity); bounded by the loop's pass
+		// cap and the global -parity-budget. Gated -parity (default off).
+		if s.parityEnabled && s.parityMaxArity >= 3 && s.parityBudget > 0 {
+			beforeParity := s.parityBinaries + s.parityUnits
+			if pr := s.analyzeParity(); pr != UNKNOWN {
+				s.printStats()
+				return pr
+			}
+			if s.parityBinaries+s.parityUnits > beforeParity {
+				s.cnf.RebuildLiteralPool()
+				passChanged = true
+				s.parityRounds++
+			}
+		}
+		ppMark("parity re-derivation pass")
 
 		if !passChanged {
 			break // Fixpoint reached
