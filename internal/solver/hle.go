@@ -90,12 +90,14 @@ clauseLoop:
 			conflict := s.probePropagate(occ, tmpValue, tmpAssigned, base, ci)
 			probes++
 
-			// Restore assumption state.
-			for m := 0; m < d; m++ {
-				if m == li {
-					continue
-				}
-				tmpAssigned[clauseLits[m].Var()] = false
+			// Restore probe state: clear tmpAssigned for EVERY var assigned during
+			// this probe — both the assumption vars and any vars that probePropagate
+			// DERIVED via unit propagation. The trail from base..end holds exactly
+			// the assigned vars (assumptions followed by derived units). Leaving a
+			// derived var marked assigned would leak stale values into the NEXT
+			// probe, producing spurious conflicts (unsound removals -> false UNSAT).
+			for k := base; k < len(s.probeTrail); k++ {
+				tmpAssigned[uint32(s.probeTrail[k])>>1] = false
 			}
 			s.probeTrail = s.probeTrail[:base]
 			if conflict {
