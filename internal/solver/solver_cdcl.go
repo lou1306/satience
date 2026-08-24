@@ -90,11 +90,16 @@ const (
 	//   Bits 0-28: clause index (supports up to 33M clauses)
 	// Packing myPos into ClauseIdx eliminates the clauseLits[0] != falseLit cache miss
 	// that was the #1 hotspot in propagation (13-14% of CPU).
+	//
+	// myPos is packed ONLY for general (size>=3) clauses. Binary (size==2) watches
+	// live in a structurally separate region (watchListsBinary) and their slow path
+	// never reads myPos, so it is not packed for them. There is no binary bit: the
+	// region a clause belongs to is immutable and is carried by which watch list
+	// holds it, not by a per-watch flag.
 	watchLearnedBit uint32 = 0x80000000
 	watchMyPosBit   uint32 = 0x40000000
-	watchBinaryBit  uint32 = 0x20000000 // Set for size-2 clauses: enables binary fast path
 	watchIdxMask    uint32 = 0x1FFFFFFF
-	watchMyPosMask  uint32 = 0x9FFFFFFF // bits 0-28 + bit 31 (clears myPos + binary for identity comparison)
+	watchMyPosMask  uint32 = 0x9FFFFFFF // bits 0-28 + bit 31 (clears myPos for identity comparison)
 )
 
 // litToBlit converts a Literal to a litTrue index for storage in Watch.Blit.
@@ -2600,26 +2605,33 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Pack myPos into ClauseIdx bit 30: watch on idx0 (lit0 at position 0) has myPos=0,
-	// watch on idx1 (lit1 at position 1) has myPos=1.
-	// Set binary bit (bit 29) for size-2 clauses to enable binary fast path.
-	// Bit layout: 31=learned(0 here), 30=myPos, 29=binary, bits 0-28=clause index.
+	// Pack myPos into ClauseIdx bit 30 for GENERAL (size>=3) clauses: the watch
+	// on idx0 (lit0 at position 0) has myPos=0, the watch on idx1 (lit1 at
+	// position 1) has myPos=1. Binary (size==2) watches live in their own
+	// structural region and never decode myPos, so neither watch packs it.
+	// Bit layout: 31=learned(0 here), 30=myPos, bits 0-28=clause index.
 	if clauseIdx < 0 || clauseIdx >= int(watchIdxMask) {
 		panic(fmt.Sprintf("satience: original clause index %d exceeds the %d-entry watch packing budget (bits 0-28); watch layout cannot represent more clauses", clauseIdx, int(watchIdxMask)))
 	}
-	binaryBit := int32(0)
 	if len(literals) == 2 {
-		binaryBit = int32(watchBinaryBit)
+		s.appendWatch(idx0, cnf.Watch{
+			ClauseIdx: int32(clauseIdx),
+			Blit:      litToBlit(lit1),
+		}, true)
+		s.appendWatch(idx1, cnf.Watch{
+			ClauseIdx: int32(clauseIdx),
+			Blit:      litToBlit(lit0),
+		}, true)
+	} else {
+		s.appendWatch(idx0, cnf.Watch{
+			ClauseIdx: int32(clauseIdx),
+			Blit:      litToBlit(lit1),
+		}, false)
+		s.appendWatch(idx1, cnf.Watch{
+			ClauseIdx: int32(clauseIdx) | int32(watchMyPosBit),
+			Blit:      litToBlit(lit0),
+		}, false)
 	}
-	s.appendWatch(idx0, cnf.Watch{
-		ClauseIdx: int32(clauseIdx) | binaryBit,
-		Blit:      litToBlit(lit1),
-	}, len(literals) == 2)
-
-	s.appendWatch(idx1, cnf.Watch{
-		ClauseIdx: int32(clauseIdx) | int32(watchMyPosBit) | binaryBit,
-		Blit:      litToBlit(lit0),
-	}, len(literals) == 2)
 }
 
 // addLearnedClauseToWatches adds a learned clause to the watch lists.
@@ -2648,27 +2660,35 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 	idx0 := cnf.LitToIndex(lit0)
 	idx1 := cnf.LitToIndex(lit1)
 
-	// Pack learned flag (bit 31) + myPos (bit 30) + binary (bit 29) into ClauseIdx.
-	// Bit layout: 31=learned, 30=myPos, 29=binary, bits 0-28=clause index.
+	// Pack learned flag (bit 31) + myPos (bit 30) into ClauseIdx. myPos is packed
+	// only for GENERAL (size>=3) watches; binary watches live in their own region
+	// and never decode it.
+	// Bit layout: 31=learned, 30=myPos, bits 0-28=clause index.
 	if learnedIdx < 0 || learnedIdx >= int(watchIdxMask) {
 		panic(fmt.Sprintf("satience: learned clause index %d exceeds the %d-entry watch packing budget (bits 0-28); watch layout cannot represent more clauses", learnedIdx, int(watchIdxMask)))
 	}
 	clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx)) // myPos=0
 	clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)           // myPos=1
+
 	if len(literals) == 2 {
-		clauseIdx0 |= int32(watchBinaryBit)
-		clauseIdx1 |= int32(watchBinaryBit)
+		s.appendWatch(idx0, cnf.Watch{
+			ClauseIdx: clauseIdx0,
+			Blit:      litToBlit(lit1),
+		}, true)
+		s.appendWatch(idx1, cnf.Watch{
+			ClauseIdx: clauseIdx0,
+			Blit:      litToBlit(lit0),
+		}, true)
+	} else {
+		s.appendWatch(idx0, cnf.Watch{
+			ClauseIdx: clauseIdx0,
+			Blit:      litToBlit(lit1),
+		}, false)
+		s.appendWatch(idx1, cnf.Watch{
+			ClauseIdx: clauseIdx1,
+			Blit:      litToBlit(lit0),
+		}, false)
 	}
-
-	s.appendWatch(idx0, cnf.Watch{
-		ClauseIdx: clauseIdx0,
-		Blit:      litToBlit(lit1),
-	}, len(literals) == 2)
-
-	s.appendWatch(idx1, cnf.Watch{
-		ClauseIdx: clauseIdx1,
-		Blit:      litToBlit(lit0),
-	}, len(literals) == 2)
 
 	return idx0, idx1
 }
@@ -5896,11 +5916,12 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 				clauseIdx0 := int32(watchLearnedBit | uint32(learnedIdx))
 				clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)
 				if len(literals) == 2 {
-					clauseIdx0 |= int32(watchBinaryBit)
-					clauseIdx1 |= int32(watchBinaryBit)
+					s.appendWatch(idx0, cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)}, true)
+					s.appendWatch(idx1, cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit0)}, true)
+				} else {
+					s.appendWatch(idx0, cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)}, false)
+					s.appendWatch(idx1, cnf.Watch{ClauseIdx: clauseIdx1, Blit: litToBlit(lit0)}, false)
 				}
-				s.appendWatch(idx0, cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)}, len(literals) == 2)
-				s.appendWatch(idx1, cnf.Watch{ClauseIdx: clauseIdx1, Blit: litToBlit(lit0)}, len(literals) == 2)
 			} else {
 				// Watches not yet initialized (preprocessing); store positions 0,1
 				// as placeholder — initWatches will choose correct positions later
@@ -6468,19 +6489,26 @@ func (s *CDCLSolver) compactLearnedClauses() {
 		}
 		clauseIdx0 := int32(watchLearnedBit | uint32(i))
 		clauseIdx1 := clauseIdx0 | int32(watchMyPosBit)
-		if len(literals) == 2 {
-			clauseIdx0 |= int32(watchBinaryBit)
-			clauseIdx1 |= int32(watchBinaryBit)
-		}
 
-		s.appendWatch(idx0, cnf.Watch{
-			ClauseIdx: clauseIdx0,
-			Blit:      litToBlit(lit1),
-		}, len(literals) == 2)
-		s.appendWatch(idx1, cnf.Watch{
-			ClauseIdx: clauseIdx1,
-			Blit:      litToBlit(lit0),
-		}, len(literals) == 2)
+		if len(literals) == 2 {
+			s.appendWatch(idx0, cnf.Watch{
+				ClauseIdx: clauseIdx0,
+				Blit:      litToBlit(lit1),
+			}, true)
+			s.appendWatch(idx1, cnf.Watch{
+				ClauseIdx: clauseIdx0,
+				Blit:      litToBlit(lit0),
+			}, true)
+		} else {
+			s.appendWatch(idx0, cnf.Watch{
+				ClauseIdx: clauseIdx0,
+				Blit:      litToBlit(lit1),
+			}, false)
+			s.appendWatch(idx1, cnf.Watch{
+				ClauseIdx: clauseIdx1,
+				Blit:      litToBlit(lit0),
+			}, false)
+		}
 
 		// Update stored watch indices to the chosen literals
 		s.learnedWatchIdx0[i] = idx0
