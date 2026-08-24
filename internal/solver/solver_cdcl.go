@@ -165,7 +165,6 @@ type CDCLSolver struct {
 	vsids              *VSIDS
 	numUnassigned      int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
 	watchLists         [][]cnf.Watch // watchLists[lit] = clauses watching lit
-	originalSearchHint []int32       // Per-original-clause search hint for replacement scan (0=no hint)
 	qhead              int           // Watched literals: next trail index to process
 	litTrue            []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
@@ -176,9 +175,22 @@ type CDCLSolver struct {
 	iterations        int
 	propagations      int    // Total propagations (assignments by unit propagation)
 	numWatchMoves     uint64 // Instrumentation: count of watch replacement moves in propagateWatched (diagnostic/witness)
+	// Tier counters for the propagation fast/slow split (diagnostic). Count how
+	// many watch visits /entries each tier handles per solve, to attribute wall
+	// time and measure the value of the split without profiling:
+	//   blitFastHits  - watch skipped because blocking literal is already true (fast path)
+	//   binarySlow    - non-satisfied size-2 watch handled without clause-data load
+	//   generalSlow   - non-satisfied non-binary watch (replacement scan / conflict)
+	blitFastHits  uint64
+	binarySlow    uint64
+	generalSlow   uint64
+	generalMoves  uint64 // of generalSlow, the count that end in a replacement-move (vs propagate/conflict)
+	originalSearchHint []int32       // Per-original-clause search hint for replacement scan (0=no hint)
+	learnedSearchHint  []int32              // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
 	maxIter           int
 	decisions         int
 	uipFallbackCount  int // Number of times 1-UIP resolution didn't converge (diagnostic)
+	debugCC           bool // SAT_DEBUG_CC: assert unit-clause completeness on every propagate
 	uipFallbackLogged int // Counter for capping per-solve fallback diagnostic output (diagnostic)
 	backjumpLevel     int
 	maxLearned        int
@@ -242,7 +254,6 @@ type CDCLSolver struct {
 	learnedLiterals    []cnf.Literal        // All learned clause literals in one contiguous slice
 	learnedLoc         []LearnedClauseLoc   // Packed (Offset, Size) per learned clause; Size=0 means tombstone
 	learnedMetadata    []cnf.ClauseMetadata // Per-clause metadata (LBD, Activity) — cold path only (deletion/rescale)
-	learnedSearchHint  []int32              // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
 	learnedWatchIdx0   []int                // First watched literal index (for fast watch removal)
 	learnedWatchIdx1   []int                // Second watched literal index (for fast watch removal)
 	learnedActiveCount int                  // Number of active clauses (excludes tombstones)
@@ -329,10 +340,7 @@ type CDCLSolver struct {
 	claDecayFactor     float64 // 0.99 (slower than MiniSat 0.95 to preserve activity longer)
 	claActivityEnabled bool    // false = pure FIFO within LBD tiers
 	maxLearnedShrunk   bool    // True if maxLearned has been shrunk (one-way, no grow-back)
-	skipClassify       bool    // Skip classifyInstance (keep CLI defaults for tuning)
 	explicitFlags      map[string]bool
-	decayFloor         float64 // Random-like mixed t=0 initial decay (default 0.50)
-	decayCeil          float64 // Random-like mixed t=0 max decay (default 0.80)
 	// Clause DB deletion thresholds (Tier 1 tunables). These control which
 	// learned clauses are deleted and when. Sweeping them matters because the
 	// level-0 literal filter changed clause DB composition.
@@ -344,7 +352,6 @@ type CDCLSolver struct {
 	dbShrinkFloorMultiplier    int     // Shrink floor = numVars × multiplier (default 3)
 	dbMaxLen                   int     // reduceDB: clauses strictly longer than this get eviction priority (0 = disabled)
 	restartBase                int     // Luby restart base (default 200; classifier may override)
-	lubyThresholdCap           int     // Max Luby threshold before resetting lubyIndex to 0 (prevents Luby exhaustion)
 	restartPropsDecLimit       int     // Props/dec threshold for restart (0=disabled, default 100)
 	adaptPropDecLimit          int     // Tier-2 low props/dec threshold for deep-search escape restart
 	adaptPropDecDeepGate       int     // Tier-2 gate: deep-search escape fires when conflict level exceeds this (0=disabled)
@@ -419,20 +426,11 @@ type CDCLSolver struct {
 	// so classifyInstance should not overwrite it.
 	useBumpAnalyzeOverride bool
 
-	// Runtime decay adaptation (periodic re-check with rolling windows).
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
-	// search start; decayAdapted gates the one-way override (once fired, stays).
-	// adaptNextConflict is the next conflict count at which to re-evaluate.
-	// *AtLastAdapt snapshots cumulative counters at the previous check for
-	// rolling-window delta computation. See maybeAdaptDecay for the rationale.
+	// search start. Consumed by the behavioral governor.
 	// Placed at struct end with other cold fields to avoid shifting hot/warm
 	// cache lines (69d72f81 regressed from 9s to TMO when these were mid-struct).
 	glueLearned       uint64
-	decayAdapted      bool
-	adaptNextConflict int
-	glueAtLastAdapt   uint64
-	lbdSumAtLastAdapt uint64
-	countAtLastAdapt  uint64
 
 	// Unified search governor: runtime self-correction compensating for
 	// classifier misclassification WITHOUT static per-instance gates. Evaluated
@@ -478,9 +476,6 @@ type CDCLSolver struct {
 	// separate Det1/Det3/Det4/Det5 actuation with a single windowed controller
 	// that maps normalized search-health signals onto bounded, trend-aware
 	// actuators, plus adaptive vivify cadence.
-	govLbdEma       float64 // EMA of window avgLBD (clause-quality trend)
-	govDepthTrend   int     // -1 lowering Luby base, +1 raising, 0 neutral (hysteresis)
-	govDepthChanged bool
 
 	// XOR / parity preprocessing (-parity; ON by default). Add-only
 	// Gaussian elimination over detected parity families (see parity.go).
@@ -557,6 +552,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		qhead:                0,
 		lastLearnedClauseIdx: -1,
 		level:                0,
+		debugCC:              os.Getenv("SAT_DEBUG_CC") != "",
 		vsids:                NewVSIDS(formula.NumVars),
 		conflicts:            0,
 		iterations:           0,
@@ -566,9 +562,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedLiterals:     make([]cnf.Literal, 0, maxLearned*8),
 		learnedLoc:          make([]LearnedClauseLoc, 0, maxLearned),
 		learnedMetadata:     make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
-		learnedSearchHint:   make([]int32, 0, maxLearned),              // Hot-path search hints
 		learnedWatchIdx0:    make([]int, 0, maxLearned),                // Watched literal indices
 		learnedWatchIdx1:    make([]int, 0, maxLearned),
+		learnedSearchHint:   make([]int32, 0, maxLearned),              // Hot-path search hints
 		learnedActiveCount:  0,
 		learnedCapacity:     0,
 		unitLearnedList:     make([]int, 0, 64), // Pre-allocate for unit clause tracking
@@ -580,7 +576,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartCount:        0,
 		adaptiveRestartGear: 1.0,
 		lubyIndex:           0,
-		lubyThresholdCap:    0, // Disabled by default; enabled for structured instances in classifyInstance
 		lbdSum:              0,
 		lbdCount:            0,
 		// Clause-activity deletion: VSIDS-style decayed activity for within-tier
@@ -645,7 +640,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
-		adaptNextConflict:    500,
 		govNextConflict:      500,
 		randomPhaseRate:      0,
 		restartPhaseFlipRate: 0,
@@ -691,8 +685,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		restartLevelCap:            40,  // Force restart when conflict level > 40 on long-clause instances
 		levelRestartGap:            100, // Min 100 conflicts between level-capped restarts
 		litTrue:                    make([]bool, int(formula.NumVars)*2),
-		decayFloor:                 0.50,
-		decayCeil:                  0.80,
 		lbdTier1Threshold:          5,
 		lbdTier2Threshold:          2,
 		dbGrowthDivisor:            50,
@@ -898,21 +890,10 @@ func (s *CDCLSolver) SetClaActivityEnabled(enabled bool) {
 	s.claActivityEnabled = enabled
 }
 
-// SetSkipClassify disables instance classification, keeping CLI defaults for
-// all search parameters. Used for tuning: tests whether the classifier's
-// parameter overrides (tuned for the previous propLevel=1 behavior) are
-// harmful under the corrected Level-0 root propagation.
-func (s *CDCLSolver) SetSkipClassify(skip bool) {
-	s.skipClassify = skip
-}
-
 // SetExplicitFlags records which CLI flags were explicitly set by the user.
-// classifyInstance respects user-set flags: it skips clobbering any parameter
-// whose flag appears in this set. Without this, the classifier's per-category
-// overrides would unconditionally overwrite CLI values, making most search
-// flags no-ops for the categories where tuning matters most (Cat B decay and
-// Glucose, Cat A/B/C-binary-heavy restartBase). The map keys are the CLI flag
-// names (e.g. "restart-base", "initial-decay").
+// The behavioral governor respects user-set restart/Glucose flags: it skips
+// overriding any parameter whose flag appears in this set. The map keys are
+// the CLI flag names (e.g. "restart-base", "restart-glucose-min").
 func (s *CDCLSolver) SetExplicitFlags(flags map[string]bool) {
 	s.explicitFlags = flags
 }
@@ -921,14 +902,6 @@ func (s *CDCLSolver) SetExplicitFlags(flags map[string]bool) {
 // Returns false if SetExplicitFlags was never called (no flags recorded).
 func (s *CDCLSolver) flagSet(name string) bool {
 	return s.explicitFlags != nil && s.explicitFlags[name]
-}
-
-// SetDecayFloorCeil sets the random-like mixed decay floor and ceiling. At
-// t=0 (pure aggressive), initialDecay=floor, maxDecay=ceil. At t=1
-// (near-default), both interpolate to 0.95. Defaults: floor=0.50, ceil=0.80.
-func (s *CDCLSolver) SetDecayFloorCeil(floor, ceil float64) {
-	s.decayFloor = floor
-	s.decayCeil = ceil
 }
 
 // SetClauseDBParams sets the clause DB deletion thresholds. All default to
@@ -1064,7 +1037,7 @@ func (s *CDCLSolver) SetSubsumptionPeriod(p int) {
 
 // SetSubsumptionMinConflictGap sets the minimum number of conflicts that must
 // occur between two subsumption rounds. 0 disables the gap gate (restart-based
-// only).
+// only). Used by tests to force subsumption cadence; no CLI flag wires it.
 func (s *CDCLSolver) SetSubsumptionMinConflictGap(g int) {
 	s.subsumptionMinConflictGap = g
 }
@@ -1130,6 +1103,62 @@ func (s *CDCLSolver) GetMemoryPoolStats() (activeClauses, poolLiterals, poolMemo
 func (s *CDCLSolver) getLearnedClauseLiterals(clauseIdx int) []cnf.Literal {
 	loc := s.learnedLoc[clauseIdx]
 	return s.learnedLiterals[loc.Offset : int(loc.Offset)+int(loc.Size)]
+}
+
+// assertTrueUnitComplete is a SAT_DEBUG_CC canary for the two-watched-literal
+// completeness invariant: after a conflict-free propagation, no clause may be a
+// true unit (exactly one unassigned literal, all others false) that was not
+// propagated. If one is, a watch was dropped/missed upstream -> search can stall
+// or become unsound. Scans original + learned clauses; debugging only.
+func (s *CDCLSolver) assertTrueUnitComplete() {
+	for ci := 0; ci < s.cnf.NumOriginalClauses(); ci++ {
+		off, sz := s.cnf.GetOriginalClauseInfo(ci)
+		lits := s.cnf.GetLiteralPool()[off : off+sz]
+		un := int(-1)
+		nun := 0
+		hasTrue := false
+		for _, lit := range lits {
+			a := s.assignments[lit.Var()]
+			if a.Level < 0 {
+				un = int(lit.Var())
+				nun++
+				if nun > 1 {
+					break
+				}
+			} else if lit.IsNegated() != a.Value {
+				hasTrue = true
+			}
+		}
+		if nun == 1 && !hasTrue {
+			fmt.Fprintf(os.Stderr, "CC-MISS: original clause %d is a UNIT on var %d not propagated; lits=%v\n", ci, un, lits)
+			panic("completeness: missed unit in original clause")
+		}
+	}
+	for cid := 0; cid < len(s.learnedLoc); cid++ {
+		if s.learnedLoc[cid].Size == 0 {
+			continue
+		}
+		lits := s.getLearnedClauseLiterals(cid)
+		un := int(-1)
+		nun := 0
+		hasTrue := false
+		for _, lit := range lits {
+			a := s.assignments[lit.Var()]
+			if a.Level < 0 {
+				un = int(lit.Var())
+				nun++
+				if nun > 1 {
+					break
+				}
+			} else if lit.IsNegated() != a.Value {
+				hasTrue = true
+			}
+		}
+		if nun == 1 && !hasTrue {
+			fmt.Fprintf(os.Stderr, "CC-MISS: learned clause %d is a UNIT on var %d not propagated; lits=%v\n", cid, un, lits)
+			panic("completeness: missed unit in learned clause")
+		}
+	}
 }
 
 // getReasonLitsForVar returns the reason clause literals for a variable whose
@@ -1311,7 +1340,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1322,6 +1351,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
+		s.blitFastHits, s.binarySlow, s.generalSlow, s.generalMoves,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5],
 		liveHist[0], liveHist[1], liveHist[2], liveHist[3], liveHist[4], liveHist[5], liveLong)
@@ -1641,20 +1671,10 @@ func (s *CDCLSolver) analyzeInstanceStructure() InstanceStructure {
 func (s *CDCLSolver) classifyInstance() {
 	structure := s.analyzeInstanceStructure()
 
-	// When minisatRestart is enabled, skip all classifier restart tuning —
-	// use MiniSat's fixed geometric base=100 for all instances.
-	if s.minisatRestart {
-		s.structureScore = structure.StructuredScore
-		s.polarityImbalance = structure.PolarityImbalance
-		s.longClauseRatio = structure.LongClauseRatio
-		s.binaryRatio = structure.BinaryRatio
-		s.restartBase = 100
-		return
-	}
-
 	// Cache classifier output for downstream consumers (initVSIDSOccurrenceBonus
 	// gates the polarity-based initial phase on these metrics; the level-capped
-	// restart gate reads longClauseRatio).
+	// restart gate reads longClauseRatio; the governor gates on binaryRatio and
+	// structureScore).
 	s.structureScore = structure.StructuredScore
 	s.polarityImbalance = structure.PolarityImbalance
 	s.longClauseRatio = structure.LongClauseRatio
@@ -1686,384 +1706,27 @@ func (s *CDCLSolver) classifyInstance() {
 	// highest-density suite instance (32baec6a, density 49).
 	s.skipSubsumption = structure.Density > 60.0
 
-	// Fix 1: Size-adaptive subsumption period. Small instances (numVars < 500)
+	// Size-adaptive subsumption period. Small instances (numVars < 500)
 	// benefit from period=50 (subsumption fires at restart 50 vs 100); op_18
 	// regresses +1.6s and rand3sat_200 +1.4s with period=100. Large instances
-	// keep period=100 to avoid subsumption overhead on instances that don't
-	// reach 50 restarts before solving. Skipped if the caller explicitly set
-	// the period via SetSubsumptionPeriod (CLI or tests).
+	// keep period=100. Skipped if the caller explicitly set the period via
+	// SetSubsumptionPeriod (CLI or tests).
 	if !s.subsumptionPeriodSet && s.cnf.NumVars < 500 {
 		s.subsumptionPeriod = 50
 	}
 
-	// Activity-based clause deletion gate. Activity-based deletion (VSIDS-style
-	// decayed activity for within-LBD-tier deletion ordering) helps structured
-	// instances with enough clause diversity but hurts instances whose search
-	// trajectories were carefully tuned by other optimizations (D2 pure k-SAT
-	// split, B11 adaptive phase flip, etc.). The gate disables activity for:
-	//   - Random-like/Pure k-SAT instances (StructuredScore < 0.7): phase-transition
-	//     ternary (30eb4ef4) and random 3-SAT (566f366c) timeout with activity.
-	//   - Low-density binary-heavy instances (binaryRatio > 0.5 AND density < 4.0):
-	//     bb34f22f (binary 67%, density 3.12) regresses from 18s to 31s with activity.
-	// The 44092fcc help (binary 97.6%, density 4.61, -12.36s) is preserved because
-	// density 4.61 > 4.0.
-	if structure.StructuredScore < 0.7 ||
-		(structure.BinaryRatio > 0.5 && structure.Density < 4.0) {
-		s.claActivityEnabled = false
-	}
-
-	s.Log("c [structure] Density=%.2f, Binary=%.1f%%, Ternary=%.1f%%, Long=%.1f%%, Structured=%.2f, PolImb=%.3f\n",
-		structure.Density,
-		structure.BinaryRatio*100,
-		structure.TernaryRatio*100,
-		structure.LongClauseRatio*100,
-		structure.StructuredScore,
-		structure.PolarityImbalance)
-	if s.skipPolarityPhase {
-		s.Log("c [structure] Dense binary instance (density=%.1f, binary=%.1f%%) - skipping polarity phase\n",
-			structure.Density, structure.BinaryRatio*100)
-	}
-
-	// Random-like instances (StructuredScore < 0.7). Split into two sub-branches
-	// by binaryRatio because they need opposite decay schedules:
-	//   - Pure k-SAT (binaryRatio == 0, density > 4.0): default decay 0.95.
-	//     density > 4.5: restartBase=20 (swept: 6x faster than 5 on 566f366c).
-	//     density 4.0-4.5: restartBase=100, Glucose=1.5 (phase transition needs
-	//     deep search; base≤50 times out on 30eb4ef4).
-	//   - Mixed (binaryRatio > 0): D4 smooth threshold interpolation. Instead of
-	//     a hard 0.7 cliff, decay interpolates from aggressive (0.50→0.80) to
-	//     near-default (0.95). Below 0.60: fully aggressive (D1: needed by 15+
-	//     mixed instances). Above 0.70: structured path.
-	//     The floor/ceiling were re-tuned after the level-0 literal filter fix:
-	//     shorter clauses (no level-0 literals) give a cleaner VSIDS signal, so
-	//     less aggressive decay (longer memory) works better. 0.30→0.60 was the
-	//     optimum with level-0 literals in clauses; 0.50→0.80 is the optimum
-	//     without them. 30eb4ef4: 11s→6.5s, daf59d67: 7s→4.3s.
-	// Unit propagation on random/mixed instances causes 76x more conflicts, so
-	// preprocessing is disabled in getAdaptivePreprocessingConfig for both.
-	if structure.StructuredScore < 0.7 {
-		// Pure k-SAT: random 3-SAT (binaryRatio==0, ternaryRatio>0, density>4.0).
-		// Uses default decay 0.95. Restart params depend on density:
-		//   - density > 4.5 (easy, above phase transition): restartBase=20. Swept
-		//     {5,20,50,100} on 566f366c: 5=0.12s, 20=0.02s, 50=0.31s, 100=5.9s.
-		//     20 is 6x faster than 5 — the old value was never optimal.
-		//   - density 4.0-4.5 (hard, at phase transition): restartBase=100,
-		//     Glucose=1.5. restartBase≤50 times out (30eb4ef4: base=20 → 87s,
-		//     base=50 → TMO). Only base=100 builds enough search depth.
-		//
-		// Gate: ternaryRatio > 0. Random k-SAT with k≥4 (all long clauses,
-		// uniform size, penalized by Fix 3) needs aggressive decay (0.50→0.80),
-		// not default — rand4sat_75: 0.58s aggressive vs 1.45s default.
-		// These fall through to the D4 interpolation with t=0 (fully aggressive).
-		if structure.BinaryRatio == 0 && structure.TernaryRatio > 0 && structure.Density > 4.0 {
-			if structure.Density > 4.5 {
-				s.Log("c [classification] Pure k-SAT instance (score=%.2f, density=%.2f) - default decay, restartBase=20\n",
-					structure.StructuredScore, structure.Density)
-				if !s.flagSet("restart-base") {
-					s.restartBase = 20
-				}
-				if !s.useBumpAnalyzeOverride {
-					s.useBumpAnalyze = true
-				}
-			} else {
-				s.Log("c [classification] Pure k-SAT phase-transition (score=%.2f, density=%.2f) - default decay, restartBase=100, Glucose=1.5\n",
-					structure.StructuredScore, structure.Density)
-				if !s.flagSet("restart-base") {
-					s.restartBase = 100
-				}
-				if !s.flagSet("restart-glucose-ratio") {
-					s.restartGlucoseRatio = 1.5
-				}
-				if !s.flagSet("restart-glucose-min") {
-					s.restartGlucoseMinConflicts = 100
-				}
-				// Analyze_toclear (bump all touched vars, like MiniSat) is the
-				// dominant branching-quality lever for random 3-SAT at phase
-				// transition: rand3sat_200 drops 99K->21K conflicts (matches
-				// minisat 22K). Enabled here for the phase-transition branch,
-				// mirroring the density>4.5 pure-k-SAT branch above.
-				if !s.useBumpAnalyzeOverride {
-					s.useBumpAnalyze = true
-				}
-			}
-			return
-		}
-		// Random k-SAT k≥4 (binaryRatio==0, ternaryRatio==0, all long clauses
-		// with uniform size). Fix 3 penalizes these to score < 0.7. Needs
-		// aggressive initial decay (0.50) for quick exploration but high max
-		// decay (0.999) so activities persist — long clauses mean more
-		// variables per conflict, and forgetting important ones hurts. The D4
-		// path's max 0.80 is too aggressive: rand4sat_75 0.5s with 0.999 vs
-		// 6.8s with 0.80.
-		if structure.BinaryRatio == 0 && structure.TernaryRatio == 0 {
-			if !s.flagSet("initial-decay") && !s.flagSet("max-decay") && !s.flagSet("decay-rampup") {
-				s.vsids.SetDecayParams(0.50, 0.999, 5000)
-			}
-			if !s.flagSet("restart-base") {
-				s.restartBase = 20
-			}
-			if !s.flagSet("restart-glucose-ratio") {
-				s.restartGlucoseRatio = 100.0
-			}
-			if !s.flagSet("restart-glucose-min") {
-				s.restartGlucoseMinConflicts = 1000000
-			}
-			s.Log("c [classification] Random k-SAT k≥4 (score=%.2f, density=%.2f) - decay 0.50→0.999, restartBase=20\n",
-				structure.StructuredScore, structure.Density)
-			return
-		}
-		// D4: Smooth threshold interpolation in [0.60, 0.70].
-		// t=0 (score ≤ 0.60): fully aggressive (0.30→0.60) — D1's 15+ instances.
-		// t=1 (score ≥ 0.70): near-default (0.95) — but falls through to structured.
-		// In between: smooth interpolation. restartBase=50, Glucose disabled
-		// throughout (decay is the main lever; D1 showed decay dominates).
-		// Swept {5,20,50,100} on 8 hard mixed instances (1-5s each): total
-		// 5=26.5s, 20=24.3s, 50=22.9s, 100=25.5s. 50 is best overall; 5 was
-		// never optimal for any instance.
-		// Pure ternary instances (binaryRatio=0, density>4.0) are handled by
-		// the pure k-SAT path above. This path handles mixed instances only.
-		// Gate: binaryRatio > 0.4 for t>0 interpolation. rphp (62% binary) has
-		// strong binary implication structure that benefits from longer conflict
-		// memory. D1 mixed cluster (23-34% binary) stays fully aggressive (t=0).
-		t := 0.0
-		if structure.BinaryRatio > 0.4 && structure.StructuredScore > 0.60 {
-			t = (structure.StructuredScore - 0.60) / 0.10
-			if t > 1.0 {
-				t = 1.0
-			}
-		}
-		initialDecay := s.decayFloor + t*(0.95-s.decayFloor)
-		maxDecay := s.decayCeil + t*(0.95-s.decayCeil)
-		// The decay interpolation is a unit: if the user set any of the decay
-		// flags, skip the whole SetDecayParams call and keep CLI values for all
-		// three. Partial override produces a nonsensical mix.
-		if !s.flagSet("initial-decay") && !s.flagSet("max-decay") && !s.flagSet("decay-rampup") {
-			s.vsids.SetDecayParams(initialDecay, maxDecay, 5000)
-		}
-		if !s.flagSet("restart-base") {
-			s.restartBase = 50
-		}
-		// High-density ternary-heavy mixed instances (e.g. course-timetabling:
-		// daf59d, 262ba88b) score 0.62-0.69, just under the structured threshold,
-		// but are genuinely structured: they wander in decision space (~200
-		// decisions/conflict during SAT model search) and benefit critically
-		// from Glucose restarts. The generic D4 path disables Glucose (ratio=100,
-		// min=1e6) because aggressive decay is the dominant lever for low-density
-		// mixed/random instances, but that leaves these wanderers unguided.
-		// Gate on Density>4.5 && TernaryRatio>0.7: captures all four 0.69
-		// wanderers, excludes lower-density mixed instances (66e6fea density
-		// 3.91, which regresses with Glucose: 4.41s->4.79s) and never touches
-		// pure-k-SAT/random (density<=4.5 or ternary<=0.7).
-		wanderer := structure.Density > 4.5 && structure.TernaryRatio > 0.7
-		if !s.flagSet("restart-glucose-ratio") {
-			if wanderer {
-				s.restartGlucoseRatio = 1.5
-			} else {
-				s.restartGlucoseRatio = 100.0
-			}
-		}
-		if !s.flagSet("restart-glucose-min") {
-			if wanderer {
-				s.restartGlucoseMinConflicts = 100
-			} else {
-				s.restartGlucoseMinConflicts = 1000000
-			}
-		}
-		if wanderer {
-			s.Log("c [classification] Mixed wanderer (density=%.2f, ternary=%.1f%%) - Glucose restarts enabled (1.5/%d)\n",
-				structure.Density, structure.TernaryRatio*100, s.restartGlucoseMinConflicts)
-		}
-		s.Log("c [classification] Random-like mixed (score=%.2f, t=%.2f) - decay %.2f→%.2f, restartBase=50\n",
-			structure.StructuredScore, t, initialDecay, maxDecay)
-		return
-	}
-
-	s.Log("c [classification] Structured instance (score=%.2f)\n", structure.StructuredScore)
-
-	// Enable bumpAnalyze for structured non-binary instances (default decay).
-	// Binary-heavy instances (binaryRatio > 0.5) are excluded to protect
-	// bb34f22f's phase-flip escape dynamics.
-	// High-density + low-PolImb instances are excluded: 274099073 (density=15.6,
-	// PolImb=0.015, 99.4% long) regresses -8.8s — balanced polarities mean VSIDS
-	// is the sole guidance signal; diluting it across all touched vars hurts.
-	// 69d72f81 (density=11.6, PolImb=0.839) is kept — high PolImb means phase
-	// saving provides strong guidance, so broader VSIDS exploration helps.
+	// Single principled search signal: the analyze_toclear variable-bumping
+	// gate (useBumpAnalyze). VSIDS decay, restartBase, and Glucose restarts are
+	// global (constructor/CLI); the ONLY per-instance decision is whether to
+	// bump all touched vars during conflict analysis (MiniSat analyze_toclear):
+	//   ON  for random / low-structure families (the dominant hard case) —
+	//       brings hard random k-SAT from TMO to ~0.8s on the dev rail.
+	//   OFF for binary-heavy and dense/long-clause structured instances,
+	//       where VSIDS is the sole guidance signal and diluting it across
+	//       all touched vars degrades the search.
 	if !s.useBumpAnalyzeOverride {
 		s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
 			(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
-	}
-
-	// Cap Luby threshold growth to prevent Luby exhaustion on very long-clause
-	// instances. The Luby sequence grows unboundedly; without a cap, the
-	// threshold eventually exceeds the conflict budget and Luby restarts stop.
-	// Gated on longClauseRatio > 0.95: instances with >95% long clauses (e.g.
-	// 274099073, 99.4% long) benefit from the cap's frequent small restarts
-	// (+48% faster). Instances at 80-95% long (e.g. 822378be, 83.9%) are hurt
-	// by the disruption — their level-capped restarts inflate lubyIndex, causing
-	// the cap to fire and reset to 0, triggering spurious frequent Luby restarts
-	// that disrupt the search. Random instances (handled above, early return)
-	// are exempt — their Luby growth aids convergence.
-	if s.longClauseRatio > 0.95 {
-		s.lubyThresholdCap = 10000
-	}
-
-	// Adaptive restart base for binary-heavy instances. Binary cascades produce
-	// low-LBD glue clauses that prevent the Glucose restart criterion from firing
-	// (EMA never exceeds avg×1.5). More frequent Luby restarts help escape
-	// these cascades. MiniSat restarts 5-10x more on binary-heavy instances.
-	// Skipped for dense binary instances (skipBVE): without BVE reshaping the
-	// clause DB, restartBase=20 sends the search into a bad trajectory (de2b584e
-	// times out). The default 200 matches the -no-preprocess behavior that
-	// solves these instances in <2s.
-	if structure.BinaryRatio > 0.5 && !s.skipBVE {
-		if !s.flagSet("restart-base") {
-			s.restartBase = 20
-		}
-		s.Log("c [classification] Binary-heavy (%.0f%%) - restartBase=20\n", structure.BinaryRatio*100)
-	}
-
-	// Ternary-heavy structured instances: the default Luby restartBase=200 runs
-	// far too deeply, producing high-LBD non-glue learned clauses that give no
-	// propagation guidance — a deep-search → high-LBD → no-guidance cycle that
-	// spirals (ordering-principle family: op_20 is TMO at base=200, 0.4s at 20).
-	// Frequent restarts keep learned clauses tight (LBD≤2 glue), restoring
-	// convergence. Swept {10,20,30,50} on op_18/19/20: base=20 is the most
-	// consistent. Gate: structured & ternary-heavy (>70%) & not binary-heavy
-	// (binary-heavy already handled above) AND low polarity imbalance.
-	// PolImb is the key separator: high PolImb (69d72f81, 0.84) means phase
-	// saving provides strong decision guidance, so that instance needs DEEP
-	// search (base=200: 6.6s vs base=20: 8.6s) — frequent restarts disrupt it.
-	// Low PolImb (op, 0.32) means phase-saving guidance is weak, so frequent
-	// restarts are needed to escape the high-LBD spiral. Threshold 0.4 matches
-	// the existing bumpAnalyze PolImb boundary.
-	// This is a static gate (acts at t=0) because the behavioral governor
-	// detector cannot match its latency: Det4 observes behavior over ~20K-conflict
-	// windows, by which time op-family instances have largely solved at base=200.
-	if structure.TernaryRatio > 0.7 && structure.BinaryRatio <= 0.5 &&
-		structure.PolarityImbalance < 0.4 {
-		if !s.flagSet("restart-base") {
-			s.restartBase = 20
-		}
-		s.Log("c [classification] Ternary-heavy low-PolImb structured (%.0f%% ternary, PolImb=%.2f) - restartBase=20\n",
-			structure.TernaryRatio*100, structure.PolarityImbalance)
-	}
-}
-
-// maybeAdaptDecay is the runtime correction layer for the static classifier.
-//
-// Motivation: classifyInstance predicts search behavior from SYNTACTIC features
-// (clause-size histogram, density). The prediction is fragile — a single
-// off-size clause among 1000 uniform-k clauses flips longSizeVaried=true and
-// misclassifies random k-SAT as structured (wrong decay, restartBase=200,
-// Glucose active → slow or TMO). Random 4-SAT needed Fix 3; random 5-SAT and
-// noisier variants are one accident away from the same failure.
-//
-// This layer measures BEHAVIORAL structure (glue ratio = fraction of learned
-// clauses with LBD ≤ 2) over rolling windows and corrects the decay schedule
-// when behavior disagrees with the syntactic prediction. Glue ratio is the
-// canonical structured-vs-random discriminator: structured instances (Tseitin,
-// hardware, combinatorial) produce many glues via tight implication chains;
-// random k-SAT produces almost none.
-//
-// Periodic re-check with rolling windows: instead of a single one-shot at
-// conflict 500, we re-evaluate every adaptWindowSize conflicts. Each window
-// sees only RECENT behavior (delta of cumulative counters), not diluted
-// cumulative stats. This catches instances whose behavior shifts mid-search
-// (starts structured, becomes random) and instances where the first window
-// was borderline. The one-shot version could miss both.
-//
-// Safety scoping (one-way forward guard):
-//   - Exempt when structureScore < 0.7: random branches (pure 3-SAT, random
-//     k≥4, D4-mixed) already have appropriate aggressive decay set by the
-//     classifier. Pure 3-SAT (566f366c) correctly uses default 0.95 and has a
-//     low glue ratio — overriding it to aggressive decay would regress 118×
-//     (per existing tuning notes). The score < 0.7 gate exempts it.
-//   - Exempt when the user set any decay flag: respect explicit CLI.
-//   - One-way: once decayAdapted is set, the override is permanent. Reverting
-//     aggressive→default would distort VSIDS — under aggressive decay, varInc
-//     grows huge (÷0.5 each conflict); switching back to 0.95 would leave a
-//     massive varInc that freezes scores until rescaling. The aggressive
-//     ramp's max (0.999) self-heals for the reverse case.
-func (s *CDCLSolver) maybeAdaptDecay() {
-	if s.decayAdapted {
-		return
-	}
-
-	// Respect explicit CLI decay flags (initial-decay, max-decay, decay-rampup).
-	if s.flagSet("initial-decay") || s.flagSet("max-decay") || s.flagSet("decay-rampup") {
-		return
-	}
-
-	// Only correct the STRUCTURED branch. Random branches (score < 0.7) were
-	// tuned with aggressive decay that low glue ratio would (wrongly) confirm.
-	if s.structureScore < 0.7 {
-		return
-	}
-
-	// Exempt binary-heavy instances. Binary cascades produce high-LBD learned
-	// clauses (spanning many decision levels), so few are glue (LBD≤2) — the
-	// low glue ratio means "binary cascade," not "random." bb34f22f (67% binary,
-	// glue ratio 0.04) and de2b584e (99.8% binary, glue ratio 0.00) are genuine
-	// structured instances that need default decay. The target (noisy random
-	// k-SAT) always has binaryRatio ≈ 0 (pure k-SAT has no binary clauses), so
-	// exempting binaryRatio > 0.5 doesn't weaken the guard's coverage.
-	if s.binaryRatio > 0.5 {
-		return
-	}
-
-	// Not time to re-check yet. adaptNextConflict starts at the warmup (500)
-	// and advances by adaptWindowSize after each evaluation.
-	if s.conflicts < s.adaptNextConflict {
-		return
-	}
-
-	// Rolling window: compute stats from the delta of cumulative counters since
-	// the last check. This isolates recent behavior rather than diluting it
-	// with cumulative stats from earlier (possibly different) search phases.
-	const adaptWindowSize = 500
-	winCount := s.totalLbdCount - s.countAtLastAdapt
-	if winCount == 0 {
-		s.adaptNextConflict += adaptWindowSize
-		return
-	}
-	winGlue := s.glueLearned - s.glueAtLastAdapt
-	winLbdSum := s.totalLbdSum - s.lbdSumAtLastAdapt
-	glueRatio := float64(winGlue) / float64(winCount)
-	avgLBD := float64(winLbdSum) / float64(winCount)
-
-	// Snapshot cumulative counters for the next window's delta computation.
-	s.glueAtLastAdapt = s.glueLearned
-	s.lbdSumAtLastAdapt = s.totalLbdSum
-	s.countAtLastAdapt = s.totalLbdCount
-	s.adaptNextConflict = s.conflicts + adaptWindowSize
-
-	// Two-signal test: BOTH must indicate random behavior.
-	//   - glueRatio < 0.10: few glue clauses (LBD ≤ 2). Necessary but not
-	//     sufficient — long-clause structured instances also have low glue
-	//     ratios because long clauses naturally produce high-LBD learned clauses.
-	//   - avgLBD > 25: conflicts span ~25+ decision levels with no tight
-	//     implication chains. This separates random k-SAT (avgLBD 30-40, no
-	//     structure) from long-clause structured instances (avgLBD ~15, structure
-	//     exists but is obscured by clause length). Measured: noisy random 5-SAT
-	//     avgLBD=34.4 → fires; 274099073 avgLBD=15.9 → correctly exempt.
-	//
-	// The conjunction prevents false positives on structured instances that
-	// happen to have low glue ratios (binary cascades, long clauses) while
-	// still catching genuinely random search behavior.
-	const glueRatioThreshold = 0.10
-	const avgLBDThreshold = 25.0
-	if glueRatio < glueRatioThreshold && avgLBD > avgLBDThreshold {
-		s.vsids.SetDecayParams(0.50, 0.999, 5000)
-		s.decayAdapted = true
-		s.Log("c [adapt] decay override at conflict %d: window glueRatio=%.3f avgLBD=%.1f → decay 0.50→0.999\n",
-			s.conflicts, glueRatio, avgLBD)
-		return
-	}
-	// Verbose-only: confirm each window so structured instances don't spam the
-	// log. The override log above always fires (it's rare and actionable).
-	if s.verbose {
-		s.Log("c [adapt] window at conflict %d: glueRatio=%.3f avgLBD=%.1f — keeping default decay\n",
-			s.conflicts, glueRatio, avgLBD)
 	}
 }
 
@@ -3389,11 +3052,6 @@ func (s *CDCLSolver) shouldRestart() bool {
 			return true
 		}
 
-		// If the threshold exceeds the cap, reset the index so the sequence
-		// restarts from the beginning on the next restart.
-		if s.lubyThresholdCap > 0 && threshold > float64(s.lubyThresholdCap) {
-			s.lubyIndex = 0
-		}
 	}
 
 	// Props/dec-bounded restart: if the solver is going too deep per decision
@@ -3726,16 +3384,13 @@ func (s *CDCLSolver) restart() bool {
 	// means the function is called every 10th restart; internally it early-
 	// returns if s.conflicts < s.adaptNextConflict, so most calls are a single
 	// comparison + return.
-	const adaptRestartPeriod = 10
-	if !s.decayAdapted && s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
-		s.maybeAdaptDecay()
-	}
 
 	// Unified search governor: runtime self-correction compensating for
 	// classifier misclassification. Same cadence as decay adaptation (every
 	// adaptRestartPeriod restarts, cold path); internally window-gated on
 	// govNextConflict (govWindowConfScope conflicts), so it is effectively a
 	// compare+return plus a cheap window eval every 20K conflicts.
+	const adaptRestartPeriod = 10
 	if s.lubyIndex > 0 && s.lubyIndex%adaptRestartPeriod == 0 {
 		s.maybeAdaptSearch()
 	}
@@ -4344,6 +3999,10 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			continue
 		}
 
+		if s.debugCC {
+			s.assertTrueUnitComplete()
+		}
+
 		if s.allAssigned() {
 			// CRITICAL: Verify model before declaring SAT
 			// All variables assigned doesn't guarantee all clauses satisfied
@@ -4391,9 +4050,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// search-parameter tuning is available even when preprocessing is skipped
 	// (SolveWithoutPreprocessing), so -no-preprocess is a clean search-quality
 	// diagnostic axis rather than also disabling adaptive tuning.
-	if !s.skipClassify {
-		s.classifyInstance()
-	}
+	s.classifyInstance()
 	// Adaptive preprocessing: structure analysis selects techniques and
 	// tunes VSIDS/restart parameters. See preprocessAggressive.
 	preprocResult := s.preprocessAggressive()
@@ -4488,9 +4145,7 @@ func (s *CDCLSolver) SolveWithoutPreprocessing() SolveResult {
 	// -no-preprocess a polluted diagnostic that conflated "no preprocessing" with
 	// "no adaptive tuning". classifyInstance is read-only on s.cnf, so it cannot
 	// change the search trajectory the way forced unit propagation does.
-	if !s.skipClassify {
-		s.classifyInstance()
-	}
+	s.classifyInstance()
 	if s.hasEmptyClause() {
 		s.printStats()
 		return UNSAT
@@ -4725,6 +4380,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// writing through s pointer each time. Write back at returns.
 	propagations := s.propagations
 	numUnassigned := s.numUnassigned
+	blitFast := s.blitFastHits
+	binarySlow := s.binarySlow
+	generalSlow := s.generalSlow
+	generalMoves := s.generalMoves
 
 	// Cache the trail slice header. trail grows via append below; the cached
 	// header must be written back to s.trail at every return so subsequent
@@ -4744,6 +4403,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// all-at-unsafe-entry hoist was a different, regressing arrangement).
 	origClauseLocs := s.cnf.GetOriginalClauseLocs()
 	origLiteralPool := s.cnf.GetLiteralPool()
+	numOriginalClauses := len(origClauseLocs)
 	origSearchHint := s.originalSearchHint
 	lrnLoc := s.learnedLoc
 	lrnLiterals := s.learnedLiterals
@@ -4767,16 +4427,30 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			watchIdx |= 1 // negated literal watches false when var is true
 		}
 
-		// Process watches for this literal using swap-with-last deletion
+		// Process watches for this literal using write-pointer compaction: each
+		// surviving watch is copied forward to wIdx as the scan advances; moved
+		// watches are skipped. On a conflict-return the never-scanned suffix is
+		// shifted down (never dropped) so no live watch is lost. Bounds-check-free
+		// via wlBase: reads span [0,wlLen), writes only to wIdx<=readIdx.
 		watchList := watchLists[watchIdx]
+		wlLen := len(watchList)
+		wIdx := 0
+		const wSize = 8 // cnf.Watch{ClauseIdx int32; Blit uint32}
+		var wlBase unsafe.Pointer
+		if wlLen > 0 {
+			wlBase = unsafe.Pointer(&watchList[0])
+		}
 
-		for readIdx := 0; readIdx < len(watchList); readIdx++ {
-			watch := watchList[readIdx]
+		for readIdx := 0; readIdx < wlLen; readIdx++ {
+			watch := *(*cnf.Watch)(unsafe.Add(wlBase, readIdx*wSize))
 
 			// FAST PATH: Blit stores the litTrue index directly (varIdx*2 + negated).
 			// unsafe.Add skips the bounds check — the invariant Blit < len(litValue)
 			// always holds (Blit = varIdx*2+negated, varIdx < NumVars).
 			if *(*bool)(unsafe.Add(litValueBase, watch.Blit)) {
+				blitFast++
+				*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+				wIdx++
 				continue
 			}
 
@@ -4802,6 +4476,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// literals), so we skip the clause data load entirely and go straight
 			// to propagate/conflict.
 			if clauseIdxRaw&watchBinaryBit != 0 {
+				binarySlow++
 				blitVarIdx := int(watch.Blit >> 1)
 				blitNegated := watch.Blit&1 == 1
 				blitAsg := assignments[blitVarIdx]
@@ -4819,6 +4494,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					trail = append(trail, uint32(blitVarIdx))
 					numUnassigned--
 					propagations++
+					*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+					wIdx++
 					continue
 				}
 
@@ -4832,7 +4509,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if !isLearned {
 					originalClauseLocs := origClauseLocs
 					originalLiteralPool := origLiteralPool
-					s.conflictClauseBuf.Literals = originalLiteralPool[int(originalClauseLocs[clauseID].Offset) : int(originalClauseLocs[clauseID].Offset)+int(originalClauseLocs[clauseID].Size)]
+					loc := originalClauseLocs[clauseID]
+					s.conflictClauseBuf.Literals = originalLiteralPool[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
 					s.conflictClauseBuf.Learned = false
 				} else {
 					learnedLoc := s.learnedLoc
@@ -4841,17 +4519,33 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					s.conflictClauseBuf.Literals = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
 					s.conflictClauseBuf.Learned = true
 				}
+				// The conflicting watch survives — write it into the compacted list.
+				*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+				wIdx++
+				// Never-scanned suffix [readIdx+1, wlLen) preserved on early return:
+				// shift it down after the compacted survivors so no live watch drops.
+				n := wIdx
+				for k := readIdx + 1; k < wlLen; k++ {
+					*(*cnf.Watch)(unsafe.Add(wlBase, n*wSize)) = *(*cnf.Watch)(unsafe.Add(wlBase, k*wSize))
+					n++
+				}
+				watchList = watchList[:n]
+				watchLists[watchIdx] = watchList
 				s.propagations = propagations
 				s.numUnassigned = numUnassigned
 				s.trail = trail
+				s.blitFastHits = blitFast
+				s.binarySlow = binarySlow
+				s.generalSlow = generalSlow
+				s.generalMoves = generalMoves
 				return true, &s.conflictClauseBuf
 			}
 
+			generalSlow++
 			// NON-BINARY clause: all six slow-path headers are already cached in
 			// function-entry locals (origClauseLocs, origLiteralPool, ...).
 			originalClauseLocs := origClauseLocs
 			originalLiteralPool := origLiteralPool
-			numOriginalClauses := len(origClauseLocs)
 			originalSearchHint := origSearchHint
 			learnedLoc := lrnLoc
 			learnedLiterals := lrnLiterals
@@ -4860,6 +4554,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			var clauseLits []cnf.Literal
 			if !isLearned {
 				if clauseID >= numOriginalClauses {
+					*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+					wIdx++
 					continue
 				}
 				loc := originalClauseLocs[clauseID]
@@ -4867,6 +4563,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			} else {
 				loc := learnedLoc[clauseID]
 				if int(loc.Size) == 0 {
+					*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+					wIdx++
 					continue
 				}
 				clauseLits = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
@@ -4890,12 +4588,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			foundJ := -1
 			var newWatchIdx int
 
-			// Probe the search hint first (probe-then-scan). The hint caches the
-			// position where a replacement was found last time. After a backjump,
-			// the old watched literal at that position may be unassigned → O(1)
-			// replacement without scanning from position 2. The probe always
-			// verifies the literal's assignment — a miss falls through to the
-			// full scan, so soundness is preserved.
 			var hint int32
 			if !isLearned {
 				if clauseID < len(originalSearchHint) {
@@ -4912,7 +4604,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				clauseAsg := assignments[clauseLitVar]
 				litNegated := clauseLit.IsNegated()
 				if clauseAsg.Level < 0 {
-					// Unassigned — usable as replacement
 					foundJ = int(hint)
 					newWatchIdx = clauseLitVar << 1
 					if litNegated {
@@ -4921,7 +4612,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				} else {
 					litTrue := litNegated != clauseAsg.Value
 					if litTrue {
-						// Assigned-and-true — usable as replacement, cache as blit
 						trueReplacementLit = litToBlit(clauseLit)
 						foundJ = int(hint)
 						newWatchIdx = clauseLitVar << 1
@@ -4982,10 +4672,6 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					}
 				}
 
-				// Update the search hint to the found position. After the swap,
-				// position foundJ holds the old false watched literal. Next time
-				// this clause's watch fires, the hint probe checks if that literal
-				// is now non-false (e.g., unassigned after a backjump) → O(1) repl.
 				if !isLearned {
 					if clauseID < len(originalSearchHint) {
 						originalSearchHint[clauseID] = int32(foundJ)
@@ -5001,14 +4687,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if foundReplacement {
 				s.numWatchMoves++
-				// Watch moved - remove old watch using swap-with-last
-				lastIdx := len(watchList) - 1
-				if readIdx != lastIdx {
-					watchList[readIdx] = watchList[lastIdx]
-					readIdx--
-				}
-				watchList = watchList[:lastIdx]
-				watchLists[watchIdx] = watchList
+				generalMoves++
+				// Watch moved to another literal's list — drop it here (slot skipped).
 				continue
 			}
 
@@ -5017,6 +4697,23 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if blitAsg.Level < 0 {
 				// Unassigned blit - propagate it (inlined assignLiteralByClause)
+				if s.debugCC {
+					// Completeness canary: propagating var blitVarIdx via clauseID is
+					// sound ONLY if every other literal is already false. If any is not
+					// false (unassigned or true), a watch was missed upstream and the
+					// reason clause would be inconsistent -> 1-UIP fails to converge.
+					for j, lit := range clauseLits {
+						if j == blitPos {
+							continue
+						}
+						asg := assignments[lit.Var()]
+						if asg.Level < 0 || (lit.IsNegated() != asg.Value) {
+							fmt.Fprintf(os.Stderr, "CC-HOLE: prop var %d via clause %d (lrn=%v) but lit %v (var %d lvl %d val %v) not false; lits=%v myPos=%d blitPos=%d\n",
+								blitVarIdx, clauseID, isLearned, lit, lit.Var(), asg.Level, asg.Value, clauseLits, myPos, blitPos)
+							panic("completeness hole: unit-implied literal has a non-false antecedent")
+						}
+					}
+				}
 				if blitAsg.Reason == -1 {
 					reasonIdx := clauseID
 					if isLearned {
@@ -5030,6 +4727,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					numUnassigned--
 				}
 				propagations++
+				*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+				wIdx++
 				continue
 			}
 
@@ -5058,12 +4757,35 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					s.Log("c [PROP CONFLICT] Watch idx=%d, clauseIdx=%d, level=%d\n",
 						watchIdx, clauseID, level)
 				}
+				// The conflicting watch survives — write it into the compacted list.
+				*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+				wIdx++
+				// Never-scanned suffix [readIdx+1, wlLen) preserved on early return:
+				// shift it down after the compacted survivors so no live watch drops.
+				n := wIdx
+				for k := readIdx + 1; k < wlLen; k++ {
+					*(*cnf.Watch)(unsafe.Add(wlBase, n*wSize)) = *(*cnf.Watch)(unsafe.Add(wlBase, k*wSize))
+					n++
+				}
+				watchList = watchList[:n]
+				watchLists[watchIdx] = watchList
 				s.propagations = propagations
 				s.numUnassigned = numUnassigned
 				s.trail = trail
+				s.blitFastHits = blitFast
+				s.binarySlow = binarySlow
+				s.generalSlow = generalSlow
+				s.generalMoves = generalMoves
 				return true, conflictClause
 			}
+			// Actual blit literal evaluated TRUE (top-of-loop cached Blit was stale)
+			// -> clause satisfied, this watch survives silently. Must be written or
+			// loop-end truncation drops a live watch (missed unit).
+			*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
+			wIdx++
 		}
+		// Normal completion: whole list scanned, compacted [0,wIdx) is complete.
+		watchLists[watchIdx] = watchList[:wIdx]
 	}
 
 	// Update qhead to end of trail
@@ -5071,6 +4793,10 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	s.trail = trail
 	s.propagations = propagations
 	s.numUnassigned = numUnassigned
+	s.blitFastHits = blitFast
+	s.binarySlow = binarySlow
+	s.generalSlow = generalSlow
+	s.generalMoves = generalMoves
 
 	return false, nil
 }
@@ -5863,10 +5589,7 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	s.emaLBD = 0.9*s.emaLBD + 0.1*float64(lbd)
 	s.totalLbdSum += uint64(lbd)
 	s.totalLbdCount++
-	// Glue clause (LBD ≤ 2) counter for runtime decay adaptation. See
-	// maybeAdaptDecay: structured instances produce many glues (tight
-	// implication chains → low LBD); random instances produce almost none.
-	// The ratio is the canonical structured-vs-random behavioral signal.
+	// Glue clause (LBD ≤ 2) counter, consumed by the behavioral governor.
 	if lbd <= 2 {
 		s.glueLearned++
 	}

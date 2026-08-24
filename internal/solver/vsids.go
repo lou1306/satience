@@ -315,16 +315,6 @@ func (v *VSIDS) SetMinisatBumps(enabled bool) {
 	v.minisatBumps = enabled
 }
 
-// SetDecayParams sets VSIDS decay parameters (initial, max, ramp-up conflicts).
-// Generalized form of SetAggressiveDecay for smooth threshold interpolation.
-func (v *VSIDS) SetDecayParams(initial, max float64, rampUpConflicts int) {
-	v.initialDecayFactor = initial
-	v.maxDecayFactor = max
-	v.decayFactor = initial
-	v.decayRampUpConflicts = rampUpConflicts
-	v.decayIncrement = (max - initial) / float64(rampUpConflicts)
-}
-
 // SetClauseInitWeights sets the initialization weights for clauses
 // baseWeight: base weight for all clauses (default 10.0)
 // binaryWeight: weight multiplier for binary clauses (default 100.0)

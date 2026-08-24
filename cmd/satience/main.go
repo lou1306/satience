@@ -73,9 +73,6 @@ func run() int {
 	levelRestartGap := flag.Int("restart-level-gap", 100, "Min conflicts between level-capped restarts")
 	claDecay := flag.Float64("cla-decay", 0.99, "Clause activity decay factor for deletion ordering (default=0.99, slower than MiniSat 0.95)")
 	noClaActivity := flag.Bool("no-cla-activity", false, "Disable activity-based clause deletion (use FIFO within LBD tiers)")
-	noClassify := flag.Bool("no-classify", false, "Skip instance classification (keep CLI defaults for all search parameters)")
-	decayFloor := flag.Float64("decay-floor", 0.50, "Random-like mixed t=0 initial decay floor (default 0.50)")
-	decayCeil := flag.Float64("decay-ceil", 0.80, "Random-like mixed t=0 max decay ceiling (default 0.80)")
 	lbdTier1 := flag.Int("lbd-tier1", 5, "Pass 1 deletion: delete LBD > threshold (default 5)")
 	lbdTier2 := flag.Int("lbd-tier2", 2, "Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)")
 	dbGrowthDiv := flag.Int("db-growth-div", 50, "dynamicLimit = maxLearned + conflicts/div (default 50)")
@@ -93,8 +90,8 @@ func run() int {
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
 	flag.Parse()
 
-	// Collect explicitly-set flags so classifyInstance knows which CLI values
-	// to respect instead of clobbering with per-category overrides. flag.Visit
+	// Collect explicitly-set flags so the behavioral governor knows which CLI
+	// restart/Glucose values to respect instead of overriding. flag.Visit
 	// only yields flags that were actually passed on the command line, not
 	// flags at their default values.
 	explicitFlags := make(map[string]bool)
@@ -204,11 +201,7 @@ func run() int {
 	if *noClaActivity {
 		s.SetClaActivityEnabled(false)
 	}
-	if *noClassify {
-		s.SetSkipClassify(true)
-	}
 	s.SetExplicitFlags(explicitFlags)
-	s.SetDecayFloorCeil(*decayFloor, *decayCeil)
 	s.SetClauseDBParams(*lbdTier1, *lbdTier2, *dbGrowthDiv, *delTriggerRatio, *dbShrinkThresh, *dbShrinkFloorMult)
 	s.SetDBMaxLen(*dbMaxLen)
 	s.SetOccurrenceWeight(*occurrenceWeight)
