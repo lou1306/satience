@@ -4530,11 +4530,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				wIdx++
 				// Never-scanned suffix [readIdx+1, wlLen) preserved on early return:
 				// shift it down after the compacted survivors so no live watch drops.
-				n := wIdx
-				for k := readIdx + 1; k < wlLen; k++ {
-					*(*cnf.Watch)(unsafe.Add(wlBase, n*wSize)) = *(*cnf.Watch)(unsafe.Add(wlBase, k*wSize))
-					n++
-				}
+				// copy() is a single memmove (dst starts at wIdx <= readIdx+1).
+				n := wIdx + copy(watchList[wIdx:], watchList[readIdx+1:wlLen])
 				watchList = watchList[:n]
 				watchLists[watchIdx] = watchList
 				s.propagations = propagations
@@ -4768,11 +4765,8 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				wIdx++
 				// Never-scanned suffix [readIdx+1, wlLen) preserved on early return:
 				// shift it down after the compacted survivors so no live watch drops.
-				n := wIdx
-				for k := readIdx + 1; k < wlLen; k++ {
-					*(*cnf.Watch)(unsafe.Add(wlBase, n*wSize)) = *(*cnf.Watch)(unsafe.Add(wlBase, k*wSize))
-					n++
-				}
+				// copy() is a single memmove (dst starts at wIdx <= readIdx+1).
+				n := wIdx + copy(watchList[wIdx:], watchList[readIdx+1:wlLen])
 				watchList = watchList[:n]
 				watchLists[watchIdx] = watchList
 				s.propagations = propagations
