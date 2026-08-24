@@ -4339,15 +4339,21 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		}
 	}
 
-	// CRITICAL FIX: After unit propagation, reset qhead to process newly added trail elements
-	// Without this, trail elements from unit clauses are never processed through watch lists
-	if s.level < len(s.trailHead) {
-		s.qhead = s.trailHead[s.level]
-	} else {
-		s.qhead = 0
-	}
-
-	// Use persistent qhead pointer (MiniSat-style) to avoid re-processing trail elements
+	// qhead is positioned by the trail-appenders, not reset here:
+	//   - decide()  -> successful propagateWatched sets s.qhead = len(trail)
+	//                 (:4792), which equals trailHead[level], covering the new
+	//                 decision literal.
+	//   - backtrack() -> s.qhead = decisionPoint (:6537), covering the asserting
+	//                 literal and any unit-scan-appended elements.
+	//   - cancelUntil() -> s.qhead = len(trail) (:3154) (restart/level-cap).
+	//   - compactLearnedClauses() -> s.qhead = 0 (:3348), the watch-DB rebuild
+	//                 safety net that forces full re-propagation.
+	// Previously this function rewound qhead to trailHead[level] on entry, which
+	// re-scanned the entire already-processed kept decision level after every
+	// backjump (redundant re-propagation on every conflict). It was a no-op for
+	// the decision path (where qhead already == trailHead[level]). Removing it
+	// relies on the four setters above to cover all newly-appended trail
+	// elements; correctness is asserted by the debugCC watch-completeness canary.
 	if s.qhead >= len(s.trail) {
 		return false, nil
 	}
