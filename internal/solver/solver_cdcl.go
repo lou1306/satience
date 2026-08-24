@@ -6482,7 +6482,6 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 // This skips exploring the entire subtree under (x=1, y=1, z=1) at level 3,
 // which would all lead to the same conflict.
 func (s *CDCLSolver) backtrack() bool {
-	s.unitsDirty = true // Backtrack may unassign unit-propagated variables
 	// Check for empty learned clause (UNSAT detected during 1-UIP analysis)
 	if s.emptyClauseFound {
 		s.Log("c [BACKTRACK] Empty clause found - returning UNSAT\n")
@@ -6528,10 +6527,27 @@ func (s *CDCLSolver) backtrack() bool {
 
 	// Clear all assignments above bjLevel.
 	// No preprocessing check needed — preprocessing vars are on preprocessTrail (not s.trail).
+	// Only mark unitsDirty if we actually unassign a variable that is the target
+	// of a learned unit clause (Reason encodes -learnedIdx-5 for a size-1 clause).
+	// Reading Reason BEFORE unassignVar (which resets it to -1) is required.
+	// This avoids an O(unitLearnedList) re-scan on every conflict when no learned
+	// unit became unassigned (typically all units sit at root/level 0 and survive
+	// a backjump unchanged).
+	var unitVarUnassigned bool
 	for i := decisionPoint; i < len(s.trail); i++ {
 		varIdx := s.trail[i]
+		reason := s.assignments[varIdx].Reason
+		if reason <= -5 {
+			ui := int(-reason - 5)
+			if ui < len(s.learnedLoc) && s.learnedLoc[ui].Size == 1 {
+				unitVarUnassigned = true
+			}
+		}
 		s.unassignVar(varIdx)
 		s.vsids.onUnassign(varIdx)
+	}
+	if unitVarUnassigned {
+		s.unitsDirty = true
 	}
 	s.trail = s.trail[:decisionPoint]
 	s.qhead = decisionPoint
