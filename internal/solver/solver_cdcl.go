@@ -191,6 +191,13 @@ type CDCLSolver struct {
 	binarySlow    uint64
 	generalSlow   uint64
 	generalMoves  uint64 // of generalSlow, the count that end in a replacement-move (vs propagate/conflict)
+	// F-measure diagnostics: attribute the move-dominated generalSlow tier.
+	//   moveReallocCast   - moves whose destination watch list hit cap (append grew it)
+	//   moveHintMiss      - moves where the cached search hint missed and a full scan ran
+	//   moveScanLits      - total literals scanned across all post-miss replacement scans
+	moveReallocCast uint64
+	moveHintMiss    uint64
+	moveScanLits    uint64
 	originalSearchHint []int32       // Per-original-clause search hint for replacement scan (0=no hint)
 	learnedSearchHint  []int32              // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
 	maxIter           int
@@ -1346,7 +1353,7 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | move: recast=%d hintMiss=%d scanLits=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
@@ -1358,6 +1365,7 @@ func (s *CDCLSolver) printFinalStats() {
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
 		s.uipFallbackCount,
 		s.blitFastHits, s.binarySlow, s.generalSlow, s.generalMoves,
+		s.moveReallocCast, s.moveHintMiss, s.moveScanLits,
 		s.learnedLenHist[0], s.learnedLenHist[1], s.learnedLenHist[2],
 		s.learnedLenHist[3], s.learnedLenHist[4], s.learnedLenHist[5],
 		liveHist[0], liveHist[1], liveHist[2], liveHist[3], liveHist[4], liveHist[5], liveLong)
@@ -4738,7 +4746,9 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			}
 
 			if foundJ < 0 {
+				s.moveHintMiss++
 				for j := 2; j < len(clauseLits); j++ {
+					s.moveScanLits++
 					clauseLit := clauseLits[j]
 					clauseLitVar := int(clauseLit.Var())
 
@@ -4773,7 +4783,11 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 					newBlit = litToBlit(clauseLits[1-myPos])
 				}
 
-				watchLists[newWatchIdx] = append(watchLists[newWatchIdx], cnf.Watch{
+				dst := watchLists[newWatchIdx]
+				if cap(dst) == len(dst) {
+					s.moveReallocCast++
+				}
+				watchLists[newWatchIdx] = append(dst, cnf.Watch{
 					ClauseIdx: watch.ClauseIdx,
 					Blit:      newBlit,
 				})
