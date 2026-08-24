@@ -41,6 +41,7 @@ func run() int {
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
+	preferTrueCap := flag.Int("prefer-true-cap", 10, "Learned-clause replacement-scan prefer-true hunt budget (positions to search for a true literal before falling back to the first unassigned; 0=disabled)")
 	// Restart policy parameters
 	restartBase := flag.Int("restart-base", 200, "Luby restart sequence base multiplier (default=200)")
 	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (default=10.0; classifier overrides per-instance)")
@@ -194,6 +195,7 @@ func run() int {
 	s.SetSubsumptionPeriod(*subsumptionPeriod)
 	s.SetRandomPhaseRate(*randomPhaseRate)
 	s.SetRestartPhaseFlipRate(*restartPhaseFlip)
+	s.SetPreferTrueCap(*preferTrueCap)
 	s.SetStatsInterval(*statsInterval)
 	s.SetRestartLevelCap(*restartLevelCap)
 	s.SetLevelRestartGap(*levelRestartGap)

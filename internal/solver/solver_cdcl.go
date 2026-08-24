@@ -161,36 +161,36 @@ type CDCLSolver struct {
 	// field (e.g., vivify counters) shifts the cache lines of the hottest fields,
 	// perturbing borderline instances (30eb4ef4 SAT ~12s ↔ TIMEOUT 30s — see
 	// V1/V5 in AGENTS.md). Keep this block contiguous at the top of the struct.
-	cnf                *cnf.CNF
-	assignments        []Assignment
-	trail              []uint32
-	trailHead          []int
-	trailPos           []int // trailPos[varIdx] = position in trail (-1 if not on trail); O(1) lookup for 1-UIP fallback
-	level              int
-	vsids              *VSIDS
-	numUnassigned      int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	watchLists         [][]cnf.Watch // watchLists[lit] = general (size>=3) clauses watching lit
-	watchListsBinary   [][]cnf.Watch // watchListsBinary[lit] = binary (size==2) clauses watching lit
-	qhead              int           // Watched literals: next trail index to process
-	litTrue            []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
+	cnf              *cnf.CNF
+	assignments      []Assignment
+	trail            []uint32
+	trailHead        []int
+	trailPos         []int // trailPos[varIdx] = position in trail (-1 if not on trail); O(1) lookup for 1-UIP fallback
+	level            int
+	vsids            *VSIDS
+	numUnassigned    int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
+	watchLists       [][]cnf.Watch // watchLists[lit] = general (size>=3) clauses watching lit
+	watchListsBinary [][]cnf.Watch // watchListsBinary[lit] = binary (size==2) clauses watching lit
+	qhead            int           // Watched literals: next trail index to process
+	litTrue          []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
-	preprocessTrail   []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
-	probeTrail        []int    // Reusable trail for FLP non-watch BCP (literal indices)
-	conflicts         int
-	iterations        int
-	propagations      int    // Total propagations (assignments by unit propagation)
-	numWatchMoves     uint64 // Instrumentation: count of watch replacement moves in propagateWatched (diagnostic/witness)
+	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
+	probeTrail      []int    // Reusable trail for FLP non-watch BCP (literal indices)
+	conflicts       int
+	iterations      int
+	propagations    int    // Total propagations (assignments by unit propagation)
+	numWatchMoves   uint64 // Instrumentation: count of watch replacement moves in propagateWatched (diagnostic/witness)
 	// Tier counters for the propagation fast/slow split (diagnostic). Count how
 	// many watch visits /entries each tier handles per solve, to attribute wall
 	// time and measure the value of the split without profiling:
 	//   blitFastHits  - watch skipped because blocking literal is already true (fast path)
 	//   binarySlow    - non-satisfied size-2 watch handled without clause-data load
 	//   generalSlow   - non-satisfied non-binary watch (replacement scan / conflict)
-	blitFastHits  uint64
-	binarySlow    uint64
-	generalSlow   uint64
-	generalMoves  uint64 // of generalSlow, the count that end in a replacement-move (vs propagate/conflict)
+	blitFastHits uint64
+	binarySlow   uint64
+	generalSlow  uint64
+	generalMoves uint64 // of generalSlow, the count that end in a replacement-move (vs propagate/conflict)
 	// F-measure diagnostics: attribute the move-dominated generalSlow tier.
 	//   moveReallocCast   - moves whose destination watch list hit cap (append grew it)
 	//   moveHintMiss      - moves where the cached search hint missed and a full scan ran
@@ -198,17 +198,25 @@ type CDCLSolver struct {
 	moveReallocCast uint64
 	moveHintMiss    uint64
 	moveScanLits    uint64
-	originalSearchHint []int32       // Per-original-clause search hint for replacement scan (0=no hint)
-	learnedSearchHint  []int32              // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
-	maxIter           int
-	decisions         int
-	uipFallbackCount  int // Number of times 1-UIP resolution didn't converge (diagnostic)
-	debugCC           bool // SAT_DEBUG_CC: assert unit-clause completeness on every propagate
-	uipFallbackLogged int // Counter for capping per-solve fallback diagnostic output (diagnostic)
-	backjumpLevel     int
-	maxLearned        int
-	restartCount      int
-	lubyIndex         int
+	// preferTrueCap bounds how far the replacement scan hunts for a currently-TRUE
+	// literal before falling back to the first unassigned one, restricted to
+	// LEARNED clauses (original clauses keep the first-non-false policy). A true
+	// watch is "parked" (satisfied, stable until backtrack) so preferring it
+	// reduces watch-move churn; the cap prevents the prefer-true hunt from
+	// scanning a long clause end-to-end. 0 = old behavior (first non-false, no
+	// prefer-true on any clause).
+	preferTrueCap      int
+	originalSearchHint []int32 // Per-original-clause search hint for replacement scan (0=no hint)
+	learnedSearchHint  []int32 // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
+	maxIter            int
+	decisions          int
+	uipFallbackCount   int  // Number of times 1-UIP resolution didn't converge (diagnostic)
+	debugCC            bool // SAT_DEBUG_CC: assert unit-clause completeness on every propagate
+	uipFallbackLogged  int  // Counter for capping per-solve fallback diagnostic output (diagnostic)
+	backjumpLevel      int
+	maxLearned         int
+	restartCount       int
+	lubyIndex          int
 	// Restart-reason attribution counters (instrumentation). Which mechanism
 	// triggered each restart: Luby fallback, Glucose LBD restarts, props/dec
 	// bounded, level-capped, or MiniSat geometric. Used to diagnose where
@@ -357,8 +365,8 @@ type CDCLSolver struct {
 	// Clause DB deletion thresholds (Tier 1 tunables). These control which
 	// learned clauses are deleted and when. Sweeping them matters because the
 	// level-0 literal filter changed clause DB composition.
-	lbdTier1Threshold int // Pass 1 deletion: delete LBD > threshold (default 5)
-	lbdTier2Threshold int // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
+	lbdTier1Threshold          int     // Pass 1 deletion: delete LBD > threshold (default 5)
+	lbdTier2Threshold          int     // Pass 2 deletion: delete LBD > threshold (default 2; glue ≤ threshold never deleted)
 	dbGrowthDivisor            int     // dynamicLimit = maxLearned + conflicts/divisor (default 50)
 	deletionTriggerRatio       float64 // Trigger deletion when activeCount > ratio × dynamicLimit (default 1.5)
 	dbShrinkThreshold          int     // Shrink maxLearned when avgLBD > threshold (default 10)
@@ -443,7 +451,7 @@ type CDCLSolver struct {
 	// search start. Consumed by the behavioral governor.
 	// Placed at struct end with other cold fields to avoid shifting hot/warm
 	// cache lines (69d72f81 regressed from 9s to TMO when these were mid-struct).
-	glueLearned       uint64
+	glueLearned uint64
 
 	// Unified search governor: runtime self-correction compensating for
 	// classifier misclassification WITHOUT static per-instance gates. Evaluated
@@ -577,8 +585,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedMetadata:     make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
 		learnedWatchIdx0:    make([]int, 0, maxLearned),                // Watched literal indices
 		learnedWatchIdx1:    make([]int, 0, maxLearned),
-		learnedSearchHint:   make([]int32, 0, maxLearned),              // Hot-path search hints
+		learnedSearchHint:   make([]int32, 0, maxLearned), // Hot-path search hints
 		learnedActiveCount:  0,
+		preferTrueCap:       10, // CLI overrides; keep pre-true hunt on by default
 		learnedCapacity:     0,
 		unitLearnedList:     make([]int, 0, 64), // Pre-allocate for unit clause tracking
 		verbose:             false,
@@ -1007,7 +1016,6 @@ func (s *CDCLSolver) SetGovernorDB(on bool) {
 	s.govDbEnabled = on
 }
 
-
 // SetParityParams gates XOR/parity preprocessing (-parity, default ON). maxArity
 // is the max support size (>=3); budget caps derived binary clauses (<=0 = off).
 func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
@@ -1039,6 +1047,16 @@ func (s *CDCLSolver) SetBigBfsBudget(n int) {
 // with net wall-time regression on the suite — off by default (A/B only).
 func (s *CDCLSolver) SetBigLearn(on bool) {
 	s.bigLearnFlag = on
+}
+
+// SetPreferTrueCap sets how far the replacement scan hunts for a currently-TRUE
+// literal before falling back to the first unassigned one, restricted to learned
+// clauses. 0 = old behavior (first non-false, no prefer-true).
+func (s *CDCLSolver) SetPreferTrueCap(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.preferTrueCap = n
 }
 
 // SetSubsumptionPeriod sets how often learned-clause subsumption runs (every
@@ -4758,7 +4776,32 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 				if int(hint) >= 2 && int(hint) < nLits {
 					start = int(hint)
 				}
-				for j := start; j < nLits; j++ {
+
+				// Bounded prefer-true hunt, restricted to learned clauses: learned
+				// clauses are short so the cap cost is trivially bounded (no long
+				// original-clause scan bloat), and they are the propagation hot
+				// ones where parking a satisfied watch pays. For original clauses
+				// keep the classic first-non-false policy. Within preferTrueCap
+				// positions (wrap order) prefer a currently-TRUE literal: a true
+				// watch is "parked" (satisfied, stable until backtrack) so it is
+				// not re-visited/re-scanned. Track the first unassigned literal
+				// (the classic live unit candidate) as a fallback; it is used once
+				// the hunt budget is spent.
+				var firstUnassignedJ int
+				firstSet := false
+				searchN := nLits - 2
+				limit := 0
+				if s.preferTrueCap > 0 && isLearned {
+					limit = searchN
+					if s.preferTrueCap < limit {
+						limit = s.preferTrueCap
+					}
+				}
+				for k := 0; k < limit; k++ {
+					j := start + k
+					if j >= nLits {
+						j -= searchN // wrap within [2, nLits)
+					}
 					s.moveScanLits++
 					clauseLit := clauseLits[j]
 					clauseLitVar := int(clauseLit.Var())
@@ -4771,16 +4814,36 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 							continue
 						}
 						trueReplacementLit = litToBlit(clauseLit)
+						foundJ = j
+						newWatchIdx = clauseLitVar << 1
+						if litNegated {
+							newWatchIdx |= 1
+						}
+						break
 					}
-					foundJ = j
-					newWatchIdx = clauseLitVar << 1
-					if litNegated {
+					if !firstSet {
+						firstSet = true
+						firstUnassignedJ = j
+					}
+				}
+				// Any unassigned seen (within or past the budget for short
+				// clauses) is a valid replacement; prefer true was already
+				// exhaustively checked above.
+				if foundJ < 0 && firstSet {
+					foundJ = firstUnassignedJ
+					newWatchIdx = int(clauseLits[firstUnassignedJ].Var()) << 1
+					if clauseLits[firstUnassignedJ].IsNegated() {
 						newWatchIdx |= 1
 					}
-					break
 				}
-				if foundJ < 0 {
-					for j := 2; j < start; j++ {
+				// Completeness: if the budget ran out before reaching any
+				// unassigned/true literal (a long clause whose leading literals are
+				// all false), resume the classic first-non-false full-domain scan so
+				// a valid replacement is found wherever it lives, and so that a
+				// clause with no non-false replacement still falls through to
+				// unit/conflict handling below.
+				if foundJ < 0 && !firstSet && limit < searchN {
+					for j := start; j < nLits; j++ {
 						s.moveScanLits++
 						clauseLit := clauseLits[j]
 						clauseLitVar := int(clauseLit.Var())
@@ -4800,6 +4863,29 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 							newWatchIdx |= 1
 						}
 						break
+					}
+					if foundJ < 0 {
+						for j := 2; j < start; j++ {
+							s.moveScanLits++
+							clauseLit := clauseLits[j]
+							clauseLitVar := int(clauseLit.Var())
+
+							clauseAsg := assignments[clauseLitVar]
+							litNegated := clauseLit.IsNegated()
+							if clauseAsg.Level >= 0 {
+								litTrue := litNegated != clauseAsg.Value
+								if !litTrue {
+									continue
+								}
+								trueReplacementLit = litToBlit(clauseLit)
+							}
+							foundJ = j
+							newWatchIdx = clauseLitVar << 1
+							if litNegated {
+								newWatchIdx |= 1
+							}
+							break
+						}
 					}
 				}
 			}
