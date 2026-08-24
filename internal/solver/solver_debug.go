@@ -32,27 +32,25 @@ func verifyClauseIndices(s *CDCLSolver) bool {
 		}
 	}
 
-	// Check 2: All watch lists reference existing clauses
-	for litIdx := range s.watchLists {
-		for i, watch := range s.watchLists[litIdx] {
-			if watch.ClauseIdx < 0 {
-				learnedIdx := -watch.ClauseIdx - 1
-				if int(learnedIdx) >= s.learnedCapacity {
-					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
-						litIdx, i, learnedIdx, s.learnedCapacity)
-					errors++
-				} else if s.learnedLoc[learnedIdx].Size == 0 {
-					fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> deleted clause %d (size=0)\n",
-						litIdx, i, learnedIdx)
-					errors++
+	// Check 2: All watch lists reference existing clauses (general and binary)
+	for _, wls := range [2][][]cnf.Watch{s.watchLists, s.watchListsBinary} {
+		for litIdx := range wls {
+			for i, watch := range wls[litIdx] {
+				if watch.ClauseIdx < 0 {
+					learnedIdx := -watch.ClauseIdx - 1
+					if int(learnedIdx) >= s.learnedCapacity {
+						fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> clause %d (>= learnedCapacity %d)\n",
+							litIdx, i, learnedIdx, s.learnedCapacity)
+						errors++
+					} else if s.learnedLoc[learnedIdx].Size == 0 {
+						fmt.Printf("c [VERIFY ERROR] Watch[%d][%d] -> deleted clause %d (size=0)\n",
+							litIdx, i, learnedIdx)
+						errors++
+					}
 				}
 			}
 		}
 	}
-
-	// Check 3 (removed): Binary watch lists reference existing clauses
-	// The CDCLSolver has no watchListsBinary field; this check referenced a
-	// nonexistent struct member and prevented `make debug` from compiling.
 
 	// Check 4: unitLearnedList only contains size=1 clauses
 	for i, learnedIdx := range s.unitLearnedList {

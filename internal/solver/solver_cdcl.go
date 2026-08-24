@@ -164,7 +164,8 @@ type CDCLSolver struct {
 	level              int
 	vsids              *VSIDS
 	numUnassigned      int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	watchLists         [][]cnf.Watch // watchLists[lit] = clauses watching lit
+	watchLists         [][]cnf.Watch // watchLists[lit] = general (size>=3) clauses watching lit
+	watchListsBinary   [][]cnf.Watch // watchListsBinary[lit] = binary (size==2) clauses watching lit
 	qhead              int           // Watched literals: next trail index to process
 	litTrue            []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
@@ -2410,6 +2411,7 @@ func (s *CDCLSolver) initWatches() {
 		return
 	}
 	s.watchLists = make([][]cnf.Watch, numLits)
+	s.watchListsBinary = make([][]cnf.Watch, numLits)
 
 	// Pre-allocate each watch list to its actual original-clause load rather
 	// than a uniform estimate. At init (post-preprocessing) most literals are
@@ -2419,13 +2421,19 @@ func (s *CDCLSolver) initWatches() {
 	// under-count, e.g. clauses containing level-0-assigned literals whose watch
 	// position differs). Headroom covers learned-clause growth during the solve.
 	occ := make([]int, numLits)
+	occBin := make([]int, numLits)
 	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
 		lits := s.cnf.Clauses[clauseID].Literals
 		if len(lits) < 2 {
 			continue
 		}
-		occ[cnf.LitToIndex(lits[0])]++
-		occ[cnf.LitToIndex(lits[1])]++
+		if len(lits) == 2 {
+			occBin[cnf.LitToIndex(lits[0])]++
+			occBin[cnf.LitToIndex(lits[1])]++
+		} else {
+			occ[cnf.LitToIndex(lits[0])]++
+			occ[cnf.LitToIndex(lits[1])]++
+		}
 	}
 	for i := range s.watchLists {
 		capEst := occ[i]*2 + 16
@@ -2436,6 +2444,15 @@ func (s *CDCLSolver) initWatches() {
 			capEst = 1024
 		}
 		s.watchLists[i] = make([]cnf.Watch, 0, capEst)
+
+		capEst = occBin[i]*2 + 16
+		if capEst < 8 {
+			capEst = 8
+		}
+		if capEst > 1024 {
+			capEst = 1024
+		}
+		s.watchListsBinary[i] = make([]cnf.Watch, 0, capEst)
 	}
 
 	for clauseID := 0; clauseID < s.cnf.NumClauses; clauseID++ {
@@ -2466,9 +2483,12 @@ func (s *CDCLSolver) initWatches() {
 		for _, wl := range s.watchLists {
 			totalWatches += len(wl)
 		}
+		for _, wl := range s.watchListsBinary {
+			totalWatches += len(wl)
+		}
 		avgWatches := float64(totalWatches) / float64(numLits)
 		s.Log("c [verbose] Watched literals enabled: %d watch lists, %d total watches, %.1f avg per lit\n",
-			len(s.watchLists), totalWatches, avgWatches)
+			len(s.watchLists)+len(s.watchListsBinary), totalWatches, avgWatches)
 	}
 }
 
@@ -2514,6 +2534,40 @@ func (s *CDCLSolver) chooseWatchPositions(literals []cnf.Literal) (int, int) {
 	return watch0, watch1
 }
 
+// appendWatch literally appends a watch to lit's general (size>=3) or binary
+
+// appendWatch literally appends a watch to lit's general (size>=3) or binary
+// (size==2) watch list by clause size. The region a clause belongs to is
+// immutable — a clause never changes size across its lifetime — so appends
+// always target a stable region (never crossing between lists). This is what
+// the write-pointer compaction in propagateWatched relies on: surviving
+// watches keep their in-list relative order, and a clause is always in exactly
+// one of the two per-literal lists.
+func (s *CDCLSolver) appendWatch(litIdx int, w cnf.Watch, isBinary bool) {
+	if isBinary {
+		s.watchListsBinary[litIdx] = append(s.watchListsBinary[litIdx], w)
+	} else {
+		s.watchLists[litIdx] = append(s.watchLists[litIdx], w)
+	}
+}
+
+// watchListOf returns the general or binary watch list for a literal.
+func (s *CDCLSolver) watchListOf(litIdx int, isBinary bool) []cnf.Watch {
+	if isBinary {
+		return s.watchListsBinary[litIdx]
+	}
+	return s.watchLists[litIdx]
+}
+
+// setWatchList writes back a (possibly re-sliced/swapped) watch list.
+func (s *CDCLSolver) setWatchList(litIdx int, isBinary bool, wl []cnf.Watch) {
+	if isBinary {
+		s.watchListsBinary[litIdx] = wl
+	} else {
+		s.watchLists[litIdx] = wl
+	}
+}
+
 // addOriginalClauseToWatches adds an original clause to the watch lists.
 // Original clauses are watched during initWatches at level 0, where every
 // variable is unassigned, so both chosen watches are always unassigned
@@ -2557,15 +2611,15 @@ func (s *CDCLSolver) addOriginalClauseToWatches(clauseIdx int, clause *cnf.Claus
 	if len(literals) == 2 {
 		binaryBit = int32(watchBinaryBit)
 	}
-	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+	s.appendWatch(idx0, cnf.Watch{
 		ClauseIdx: int32(clauseIdx) | binaryBit,
 		Blit:      litToBlit(lit1),
-	})
+	}, len(literals) == 2)
 
-	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+	s.appendWatch(idx1, cnf.Watch{
 		ClauseIdx: int32(clauseIdx) | int32(watchMyPosBit) | binaryBit,
 		Blit:      litToBlit(lit0),
-	})
+	}, len(literals) == 2)
 }
 
 // addLearnedClauseToWatches adds a learned clause to the watch lists.
@@ -2606,15 +2660,15 @@ func (s *CDCLSolver) addLearnedClauseToWatches(learnedIdx int, clause *cnf.Claus
 		clauseIdx1 |= int32(watchBinaryBit)
 	}
 
-	s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+	s.appendWatch(idx0, cnf.Watch{
 		ClauseIdx: clauseIdx0,
 		Blit:      litToBlit(lit1),
-	})
+	}, len(literals) == 2)
 
-	s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+	s.appendWatch(idx1, cnf.Watch{
 		ClauseIdx: clauseIdx1,
 		Blit:      litToBlit(lit0),
-	})
+	}, len(literals) == 2)
 
 	return idx0, idx1
 }
@@ -2894,6 +2948,10 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 		return
 	}
 
+	// Region is immutable: a size-2 learned clause lives in watchListsBinary
+	// for both its watched literals, a size>=3 clause in watchLists.
+	isBinary := s.learnedLoc[learnedIdx].Size == 2
+
 	// Clause identity for comparison: mask out myPos bit (bit 30) and binary bit
 	// (bit 29) since the stored watches may have either myPos value.
 	clauseID := uint32(watchLearnedBit | uint32(learnedIdx))
@@ -2906,7 +2964,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 	}
 
 	// Remove watch from lit0's watch list (swap-remove, no Blit update needed)
-	wl0 := s.watchLists[idx0]
+	wl0 := s.watchListOf(idx0, isBinary)
 	for i := range wl0 {
 		if uint32(wl0[i].ClauseIdx)&watchMyPosMask == clauseID {
 			lastIdx := len(wl0) - 1
@@ -2917,10 +2975,10 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 			break
 		}
 	}
-	s.watchLists[idx0] = wl0
+	s.setWatchList(idx0, isBinary, wl0)
 
 	// Remove watch from lit1's watch list
-	wl1 := s.watchLists[idx1]
+	wl1 := s.watchListOf(idx1, isBinary)
 	for i := range wl1 {
 		if uint32(wl1[i].ClauseIdx)&watchMyPosMask == clauseID {
 			lastIdx := len(wl1) - 1
@@ -2931,7 +2989,7 @@ func (s *CDCLSolver) removeLearnedClauseWatches(learnedIdx int) {
 			break
 		}
 	}
-	s.watchLists[idx1] = wl1
+	s.setWatchList(idx1, isBinary, wl1)
 }
 
 func luby(i int) int {
@@ -4371,6 +4429,7 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 	// the s → s.watchLists pointer chase on every append (930ms) and write-back
 	// (370ms) in the hot loop.
 	watchLists := s.watchLists
+	watchListsBinary := s.watchListsBinary
 
 	// litTrue cache: backing array never reallocated, writes through local visible
 	// to s.litTrue automatically. litValueBase provides bounds-check-free access
@@ -4437,11 +4496,112 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 		// surviving watch is copied forward to wIdx as the scan advances; moved
 		// watches are skipped. On a conflict-return the never-scanned suffix is
 		// shifted down (never dropped) so no live watch is lost. Bounds-check-free
-		// via wlBase: reads span [0,wlLen), writes only to wIdx<=readIdx.
+		// via pointer base: reads span [0,len), writes only to wIdx<=readIdx.
+		//
+		// Binary (size-2) and general (size>=3) clauses live in SEPARATE per-
+		// literal lists (watchListsBinary vs watchLists). Region membership is
+		// immutable (a clause never changes size), so a watch never crosses lists
+		// and each region is scanned with a specialized body: the binary region
+		// needs no clause-data load and no replacement search; the general region
+		// needs no binary-bit test or size-2 handling.
+		const wSize = 8 // cnf.Watch{ClauseIdx int32; Blit uint32}
+
+		// ---- BINARY PASS ----
+		binList := watchListsBinary[watchIdx]
+		bLen := len(binList)
+		bIdx := 0
+		var binBase unsafe.Pointer
+		if bLen > 0 {
+			binBase = unsafe.Pointer(&binList[0])
+		}
+
+		for readIdx := 0; readIdx < bLen; readIdx++ {
+			watch := *(*cnf.Watch)(unsafe.Add(binBase, readIdx*wSize))
+
+			// FAST PATH: Blit stores the litTrue index directly (varIdx*2 + negated).
+			// unsafe.Add skips the bounds check — the invariant Blit < len(litValue)
+			// always holds (Blit = varIdx*2+negated, varIdx < NumVars).
+			if *(*bool)(unsafe.Add(litValueBase, watch.Blit)) {
+				blitFast++
+				*(*cnf.Watch)(unsafe.Add(binBase, bIdx*wSize)) = watch
+				bIdx++
+				continue
+			}
+
+			// BINARY SLOW PATH: For a size-2 clause the Blit field already holds the
+			// blocking literal. No replacement search is possible (only 2 literals)
+			// and no clause-data load is needed except on the rare conflict branch.
+			binarySlow++
+			// Bit 31: learned flag, bit 30: myPos, bit 29: binary, bits 0-28: index.
+			clauseIdxRaw := uint32(watch.ClauseIdx)
+			isLearned := clauseIdxRaw&watchLearnedBit != 0
+			clauseID := int(clauseIdxRaw & watchIdxMask)
+			blitVarIdx := int(watch.Blit >> 1)
+			blitNegated := watch.Blit&1 == 1
+			blitAsg := assignments[blitVarIdx]
+
+			if blitAsg.Level < 0 {
+				// Unassigned — propagate the blocking literal
+				reasonIdx := clauseID
+				if isLearned {
+					reasonIdx = -clauseID - 5
+				}
+				blitValue := !blitNegated
+				assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel), Reason: int32(reasonIdx), SavedPhase: blitNegated}
+				litValue[blitVarIdx*2] = blitValue
+				litValue[blitVarIdx*2+1] = !blitValue
+				trail = append(trail, uint32(blitVarIdx))
+				numUnassigned--
+				propagations++
+				*(*cnf.Watch)(unsafe.Add(binBase, bIdx*wSize)) = watch
+				bIdx++
+				continue
+			}
+
+			// Assigned — check for conflict (blit is false since fast path already
+			// filtered out the true case). Build conflict clause (rare path — clause
+			// data load OK here).
+			if level == 0 {
+				s.emptyClauseFound = true
+			}
+			if !isLearned {
+				originalClauseLocs := origClauseLocs
+				originalLiteralPool := origLiteralPool
+				loc := originalClauseLocs[clauseID]
+				s.conflictClauseBuf.Literals = originalLiteralPool[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
+				s.conflictClauseBuf.Learned = false
+			} else {
+				learnedLoc := s.learnedLoc
+				learnedLiterals := s.learnedLiterals
+				loc := learnedLoc[clauseID]
+				s.conflictClauseBuf.Literals = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
+				s.conflictClauseBuf.Learned = true
+			}
+			// The conflicting watch survives — write it into the compacted list.
+			*(*cnf.Watch)(unsafe.Add(binBase, bIdx*wSize)) = watch
+			bIdx++
+			// Never-scanned suffix [readIdx+1, bLen) preserved on early return:
+			// shift it down after the compacted survivors so no live watch drops.
+			// copy() is a single memmove (dst starts at bIdx <= readIdx+1).
+			n := bIdx + copy(binList[bIdx:], binList[readIdx+1:bLen])
+			binList = binList[:n]
+			watchListsBinary[watchIdx] = binList
+			s.propagations = propagations
+			s.numUnassigned = numUnassigned
+			s.trail = trail
+			s.blitFastHits = blitFast
+			s.binarySlow = binarySlow
+			s.generalSlow = generalSlow
+			s.generalMoves = generalMoves
+			return true, &s.conflictClauseBuf
+		}
+		// Normal completion: whole binary list scanned, compacted [0,bIdx) complete.
+		watchListsBinary[watchIdx] = binList[:bIdx]
+
+		// ---- GENERAL PASS ----
 		watchList := watchLists[watchIdx]
 		wlLen := len(watchList)
 		wIdx := 0
-		const wSize = 8 // cnf.Watch{ClauseIdx int32; Blit uint32}
 		var wlBase unsafe.Pointer
 		if wlLen > 0 {
 			wlBase = unsafe.Pointer(&watchList[0])
@@ -4468,81 +4628,13 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 			// extra slice headers that would otherwise force litValueBase/watchList/
 			// readIdx to spill to the stack.
 			//
-			// First decode ClauseIdx (no header loads — pure bit ops), and handle
-			// the BINARY fast path immediately: binary clauses need NO clause-data
-			// headers except on the rare conflict branch, so loading them before the
-			// binary check was pure waste for the dominant binary propagation case.
+			// Decode ClauseIdx (no header loads — pure bit ops). This is a GENERAL
+			// (size>=3) watch — binary clauses live in the separate watchListsBinary
+			// pass above — so no binary-bit test and no size-2 propagation body.
 			// Bit 31: learned flag, bit 30: myPos, bit 29: binary, bits 0-28: clause index.
 			clauseIdxRaw := uint32(watch.ClauseIdx)
 			isLearned := clauseIdxRaw&watchLearnedBit != 0
 			clauseID := int(clauseIdxRaw & watchIdxMask)
-
-			// BINARY FAST PATH: For size-2 clauses, the Blit field already has
-			// the blocking literal. No replacement search is possible (only 2
-			// literals), so we skip the clause data load entirely and go straight
-			// to propagate/conflict.
-			if clauseIdxRaw&watchBinaryBit != 0 {
-				binarySlow++
-				blitVarIdx := int(watch.Blit >> 1)
-				blitNegated := watch.Blit&1 == 1
-				blitAsg := assignments[blitVarIdx]
-
-				if blitAsg.Level < 0 {
-					// Unassigned — propagate the blocking literal
-					reasonIdx := clauseID
-					if isLearned {
-						reasonIdx = -clauseID - 5
-					}
-					blitValue := !blitNegated
-					assignments[blitVarIdx] = Assignment{Value: blitValue, Level: int32(propLevel), Reason: int32(reasonIdx), SavedPhase: blitNegated}
-					litValue[blitVarIdx*2] = blitValue
-					litValue[blitVarIdx*2+1] = !blitValue
-					trail = append(trail, uint32(blitVarIdx))
-					numUnassigned--
-					propagations++
-					*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
-					wIdx++
-					continue
-				}
-
-				// Assigned — check for conflict (blit is false since fast path
-				// already filtered out the true case)
-				if level == 0 {
-					s.emptyClauseFound = true
-				}
-				// Build conflict clause (rare path — clause data load OK here).
-				// Load only the pool this clause needs.
-				if !isLearned {
-					originalClauseLocs := origClauseLocs
-					originalLiteralPool := origLiteralPool
-					loc := originalClauseLocs[clauseID]
-					s.conflictClauseBuf.Literals = originalLiteralPool[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
-					s.conflictClauseBuf.Learned = false
-				} else {
-					learnedLoc := s.learnedLoc
-					learnedLiterals := s.learnedLiterals
-					loc := learnedLoc[clauseID]
-					s.conflictClauseBuf.Literals = learnedLiterals[int(loc.Offset) : int(loc.Offset)+int(loc.Size)]
-					s.conflictClauseBuf.Learned = true
-				}
-				// The conflicting watch survives — write it into the compacted list.
-				*(*cnf.Watch)(unsafe.Add(wlBase, wIdx*wSize)) = watch
-				wIdx++
-				// Never-scanned suffix [readIdx+1, wlLen) preserved on early return:
-				// shift it down after the compacted survivors so no live watch drops.
-				// copy() is a single memmove (dst starts at wIdx <= readIdx+1).
-				n := wIdx + copy(watchList[wIdx:], watchList[readIdx+1:wlLen])
-				watchList = watchList[:n]
-				watchLists[watchIdx] = watchList
-				s.propagations = propagations
-				s.numUnassigned = numUnassigned
-				s.trail = trail
-				s.blitFastHits = blitFast
-				s.binarySlow = binarySlow
-				s.generalSlow = generalSlow
-				s.generalMoves = generalMoves
-				return true, &s.conflictClauseBuf
-			}
 
 			generalSlow++
 			// NON-BINARY clause: all six slow-path headers are already cached in
@@ -5807,8 +5899,8 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 					clauseIdx0 |= int32(watchBinaryBit)
 					clauseIdx1 |= int32(watchBinaryBit)
 				}
-				s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)})
-				s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{ClauseIdx: clauseIdx1, Blit: litToBlit(lit0)})
+				s.appendWatch(idx0, cnf.Watch{ClauseIdx: clauseIdx0, Blit: litToBlit(lit1)}, len(literals) == 2)
+				s.appendWatch(idx1, cnf.Watch{ClauseIdx: clauseIdx1, Blit: litToBlit(lit0)}, len(literals) == 2)
 			} else {
 				// Watches not yet initialized (preprocessing); store positions 0,1
 				// as placeholder — initWatches will choose correct positions later
@@ -6336,6 +6428,16 @@ func (s *CDCLSolver) compactLearnedClauses() {
 			}
 		}
 		s.watchLists[litIdx] = wl[:writeIdx]
+
+		bl := s.watchListsBinary[litIdx]
+		writeIdx = 0
+		for _, watch := range bl {
+			if watch.ClauseIdx >= 0 {
+				bl[writeIdx] = watch
+				writeIdx++
+			}
+		}
+		s.watchListsBinary[litIdx] = bl[:writeIdx]
 	}
 
 	// Re-add learned clauses (with freshly chosen watch positions)
@@ -6371,14 +6473,14 @@ func (s *CDCLSolver) compactLearnedClauses() {
 			clauseIdx1 |= int32(watchBinaryBit)
 		}
 
-		s.watchLists[idx0] = append(s.watchLists[idx0], cnf.Watch{
+		s.appendWatch(idx0, cnf.Watch{
 			ClauseIdx: clauseIdx0,
 			Blit:      litToBlit(lit1),
-		})
-		s.watchLists[idx1] = append(s.watchLists[idx1], cnf.Watch{
+		}, len(literals) == 2)
+		s.appendWatch(idx1, cnf.Watch{
 			ClauseIdx: clauseIdx1,
 			Blit:      litToBlit(lit0),
-		})
+		}, len(literals) == 2)
 
 		// Update stored watch indices to the chosen literals
 		s.learnedWatchIdx0[i] = idx0
