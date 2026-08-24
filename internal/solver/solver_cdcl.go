@@ -4747,7 +4747,18 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 
 			if foundJ < 0 {
 				s.moveHintMiss++
-				for j := 2; j < len(clauseLits); j++ {
+				// Resume the scan past the known-non-good frontier instead of
+				// restarting at 2. searchHint records the frontier: everything in
+				// [2, hint) was verified non-good when the last move happened, so
+				// [hint, n) is scanned first, then wraps to cover [2, hint) for
+				// completeness (slots 0/1 are the two watched positions and are
+				// never part of the replacement domain).
+				nLits := len(clauseLits)
+				start := 2
+				if int(hint) >= 2 && int(hint) < nLits {
+					start = int(hint)
+				}
+				for j := start; j < nLits; j++ {
 					s.moveScanLits++
 					clauseLit := clauseLits[j]
 					clauseLitVar := int(clauseLit.Var())
@@ -4767,6 +4778,29 @@ func (s *CDCLSolver) propagateWatched() (bool, *cnf.Clause) {
 						newWatchIdx |= 1
 					}
 					break
+				}
+				if foundJ < 0 {
+					for j := 2; j < start; j++ {
+						s.moveScanLits++
+						clauseLit := clauseLits[j]
+						clauseLitVar := int(clauseLit.Var())
+
+						clauseAsg := assignments[clauseLitVar]
+						litNegated := clauseLit.IsNegated()
+						if clauseAsg.Level >= 0 {
+							litTrue := litNegated != clauseAsg.Value
+							if !litTrue {
+								continue
+							}
+							trueReplacementLit = litToBlit(clauseLit)
+						}
+						foundJ = j
+						newWatchIdx = clauseLitVar << 1
+						if litNegated {
+							newWatchIdx |= 1
+						}
+						break
+					}
 				}
 			}
 
