@@ -203,8 +203,11 @@ type CDCLSolver struct {
 	// LEARNED clauses (original clauses keep the first-non-false policy). A true
 	// watch is "parked" (satisfied, stable until backtrack) so preferring it
 	// reduces watch-move churn; the cap prevents the prefer-true hunt from
-	// scanning a long clause end-to-end. 0 = old behavior (first non-false, no
-	// prefer-true on any clause).
+	// scanning a long clause end-to-end. Default 0 = old behavior (first
+	// non-false, no prefer-true on any clause): a hard-rail DEV sweep
+	// (randkcnf150/200, rand4 100, tseitin grid17/gnd80, parity off) showed no
+	// net win at any cap (cap=8 even adds a new TMO), so it is off by default and
+	// only enabled via the -prefer-true-cap CLI flag.
 	preferTrueCap      int
 	originalSearchHint []int32 // Per-original-clause search hint for replacement scan (0=no hint)
 	learnedSearchHint  []int32 // Per-learned-clause search hint for replacement scan (0=no hint) — hot path
@@ -587,7 +590,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		learnedWatchIdx1:    make([]int, 0, maxLearned),
 		learnedSearchHint:   make([]int32, 0, maxLearned), // Hot-path search hints
 		learnedActiveCount:  0,
-		preferTrueCap:       10, // CLI overrides; keep pre-true hunt on by default
+		preferTrueCap:       0, // Disabled by default (CLI -prefer-true-cap overrides)
 		learnedCapacity:     0,
 		unitLearnedList:     make([]int, 0, 64), // Pre-allocate for unit clause tracking
 		verbose:             false,
