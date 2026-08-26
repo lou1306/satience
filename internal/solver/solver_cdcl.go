@@ -523,6 +523,24 @@ type CDCLSolver struct {
 	govStagGlue   float64 // Det4: max window glue ratio to qualify as stagnation (default 0.05)
 	govStagWin    int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
 	govStagBase   int     // Det4: target restartBase when stagnation fires (default 20)
+	// Det6 (geometric-spiral -> Luby mechanism flip): fires once when running
+	// geometric (minisat-restart) restarts on a STRUCTURED unguided deep-spiral
+	// signature (chain/ordering-principle-like: weak phase guidance, high flat
+	// LBD, no glue, deep propagation cascade) and switches the restart MECHANISM
+	// to Luby/Glucose, where the base-lowering detectors (Det1/Det4) and recurring
+	// short segments can actually rescue the spiral. Geometric deepens unboundedly
+	// (threshold = base·1.5^i) so it can never cut the spiral short.
+	geoFlipFired        bool       // Det6 fired: restart mechanism already flipped to Luby
+	govSpiralPDec       float64    // Det6: min props/dec to qualify as a deep unguided cascade (default 8)
+	govSpiralHist       [8]float64 // Det6: ring buffer of recent window avgLBD values
+	govSpiralIdx        int        // Det6: ring cursor
+	govSpiralN          int        // Det6: number of windows accumulated
+	govSpiralNext       int        // Det6: next conflict at which to evaluate (window cadence)
+	govSpiralStartConf  uint64     // Det6: window-delta start (conflicts)
+	govSpiralStartDec   uint64     // Det6: window-delta start (decisions)
+	govSpiralStartProps uint64     // Det6: window-delta start (propagations)
+	govSpiralStartLbd   uint64     // Det6: window-delta start (LBD sum)
+	govSpiralStartLbdC  uint64     // Det6: window-delta start (LBD count)
 }
 
 // lazyInitState holds lazy init detection state. Heap-allocated only when
@@ -698,6 +716,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govStagGlue:   0.05,
 		govStagWin:    3,
 		govStagBase:   20,
+		govSpiralPDec: 8.0, // Det6: deep unguided cascade threshold for geo->Luby flip
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
@@ -877,6 +896,14 @@ func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, s
 	}
 	if stagBase >= 1 {
 		s.govStagBase = stagBase
+	}
+}
+
+// SetGovernorSpiralPDec sets the Det6 (geometric-spiral -> Luby flip) minimum
+// props/dec qualifying as a deep unguided cascade.
+func (s *CDCLSolver) SetGovernorSpiralPDec(pdec float64) {
+	if pdec > 0 {
+		s.govSpiralPDec = pdec
 	}
 }
 
@@ -4062,6 +4089,10 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			s.printStats()
 			return UNKNOWN
 		}
+
+		// Det6: geometric->Luby rest-mechanism flip on conflict-window cadence
+		// (independent of restart count, which geometric restarts starve).
+		s.maybeGeoSpiral()
 
 		// Propagate all clauses (unit learned clauses handled in propagateWatched)
 		conflict, conflictClause := s.propagateWatched()

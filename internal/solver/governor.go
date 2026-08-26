@@ -77,6 +77,54 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	s.detector5DBCost(winMoves, winDec, propsPerDec)
 }
 
+// maybeGeoSpiral is the Det6 evaluation path driven by a CONFLICT-WINDOW cadence
+// rather than the restart-boundary cadence used by maybeAdaptSearch. Under
+// geometric (minisat-restart) restarts the Luby/Glucose-oriented governor is
+// starved: geometric deepens by design and restarts are rare, so the
+// maybeAdaptSearch gate (lubyIndex%10==0) fires too late (op_20 TMOs before
+// restart #10). Here we evaluate the deep-unguided-spiral signature every
+// govWindow conflicts and flip geometric->Luby when it matches. One compare
+// per loop iteration (returns early until the window elapses).
+func (s *CDCLSolver) maybeGeoSpiral() {
+	if !s.minisatRestart || s.geoFlipFired {
+		return
+	}
+	if s.conflicts < s.govSpiralNext {
+		return
+	}
+	// Evaluate on a sub-window cadence (governor window / 4) so the flip fires
+	// early in the spiral, before geometric pollution accumulates. Firing at
+	// ~60K conflicts (three full govWindow steps) was too late: Luby then had
+	// to recover from a badly-polluted learned DB (~28s on op_20).
+	s.govSpiralNext = s.conflicts + s.govWindow/4
+
+	winConf := s.conflicts - int(s.govSpiralStartConf)
+	winDec := s.decisions - int(s.govSpiralStartDec)
+	winProps := s.propagations - int(s.govSpiralStartProps)
+	lbdDelta := s.totalLbdSum - s.govSpiralStartLbd
+	winLbdC := s.totalLbdCount - s.govSpiralStartLbdC
+	s.govSpiralStartConf = uint64(s.conflicts)
+	s.govSpiralStartDec = uint64(s.decisions)
+	s.govSpiralStartProps = uint64(s.propagations)
+	s.govSpiralStartLbd = s.totalLbdSum
+	s.govSpiralStartLbdC = s.totalLbdCount
+	if winConf < 2000 {
+		return
+	}
+	propsPerDec := 0.0
+	if winDec > 0 {
+		propsPerDec = float64(winProps) / float64(winDec)
+	}
+	glueRatio := 0.0
+	if s.totalLbdCount > 0 {
+		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
+	}
+	winLBD := 0.0
+	if winLbdC > 0 {
+		winLBD = float64(lbdDelta) / float64(winLbdC)
+	}
+	s.detector6GeoSpiral(winLBD, glueRatio, propsPerDec)
+}
 
 // detector1Grind targets the deep-binary-cascade / timeout-cliff signature
 // (e.g. bb34f22f: props/dec ~160+, no Glucose-guided convergence, sits at the
@@ -243,6 +291,74 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 	s.restartBase = s.govStagBase
 	s.Log("c [governor] Det4 LBD-stagnation: win LBD=%.1f (min %.1f), glue=%.3f -> drop restartBase %d->%d\n",
 		winLBD, minLBD, glueRatio, save, s.govStagBase)
+}
+
+// detector6GeoSpiral flips the restart MECHANISM from geometric to Luby/Glucose
+// when geometric restarts are pathological. Geometric thresholds grow as
+// base·1.5^i with no way to recur to short segments, so it can never rescue a
+// deep unguided spiral (the Ordering-Principle / chain family: op_20 TMO under
+// geometric, 96k conflicts under Luby). Only a mechanism flip — not a base
+// tweak — helps, because restart() caches geometricRestartThreshold and ignores
+// subsequent restartBase changes.
+//
+// Signature (all required) — deliberately conservative to avoid flipping
+// instances that legitimately want deep geometric search:
+//   - geometric restarts active (s.minisatRestart), not yet flipped;
+//   - structured instance (structureScore >= 0.7): excludes hard random k-SAT
+//     / phase-transition rails that are tuned for deep search;
+//   - weak phase guidance (polarityImbalance < 0.4): strong phase saving can
+//     guide deep search (69d72f81 PolImb 0.84) so we must not flip those;
+//   - no glue (glueRatio < govStagGlue): there is no LBD/Glu cose guidance;
+//   - sustained HIGH and FLAT window avgLBD (like Det4's stagnation): rules out
+//     healthy structured instances whose LBD improves;
+//   - deep cascade (props/dec >= govSpiralPDec): the spiral grinds deep.
+func (s *CDCLSolver) detector6GeoSpiral(winLBD, glueRatio, propsPerDec float64) {
+	if !s.minisatRestart || s.geoFlipFired {
+		return
+	}
+	// Structured-only gate (mirrors Det4's guard: excludes random k-SAT rails).
+	if s.structureScore < 0.7 {
+		return
+	}
+	// Weak phase guidance required — strong polarity saving guides deep search.
+	if s.polarityImbalance >= 0.4 {
+		return
+	}
+	if glueRatio >= s.govStagGlue {
+		return
+	}
+	// Ring-buffer this window's avgLBD; require govStagWin consecutive windows.
+	s.govSpiralHist[s.govSpiralIdx] = winLBD
+	s.govSpiralIdx = (s.govSpiralIdx + 1) % len(s.govSpiralHist)
+	if s.govSpiralN < len(s.govSpiralHist) {
+		s.govSpiralN++
+	}
+	if s.govSpiralN < s.govStagWin {
+		return
+	}
+	minLBD, maxLBD := 1e18, 0.0
+	for i := 0; i < int(s.govSpiralN); i++ {
+		if s.govSpiralHist[i] < minLBD {
+			minLBD = s.govSpiralHist[i]
+		}
+		if s.govSpiralHist[i] > maxLBD {
+			maxLBD = s.govSpiralHist[i]
+		}
+	}
+	// Stagnation: consistently high and flat (no meaningful LBD improvement).
+	if maxLBD < s.govStagLBD || maxLBD-minLBD > 6.0 {
+		return
+	}
+	// Deep unguided cascade — distinguishes op-like spirals from shallow solves.
+	if propsPerDec < s.govSpiralPDec {
+		return
+	}
+
+	s.geoFlipFired = true
+	s.minisatRestart = false
+	s.geometricRestartThreshold = 0
+	s.Log("c [governor] Det6 geometric-spiral: structure=%.2f winLBD=%.1f (min %.1f) glue=%.3f props/dec=%.0f -> flip geo->Luby\n",
+		s.structureScore, winLBD, minLBD, glueRatio, propsPerDec)
 }
 
 // detector5DBCost progressively reduces the learned-DB cap on binary-heavy
