@@ -2072,11 +2072,28 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 
 	// For large instances, bound preprocessing with literal-visit/resolvent budgets.
 	// Must be set BEFORE BVE and unit propagation so the budgets actually apply.
+	// Budgets are scaled to instance size rather than fixed: a fixed 5M/2M is
+	// proportionally ~7x tighter on a 700k-clause industrial instance than on a
+	// 200k-clause one, exactly when industrial encodings need the deeper
+	// simplification to prune model-finding/refutation. Deterministic (based on
+	// the literal count, like subsumptionBudget below) and ceiling-bounded so
+	// preprocessing cannot run away. Small (covered-family) instances never
+	// reach this branch, so their preprocessing is unchanged.
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars || s.cnf.NumClauses > s.preprocessingMaxClauses {
-		s.unitPropBudget = 5000000 // ~5M literal visits, bounded at ~50ms
-		s.veBudget = 2000000       // ~2M resolvents, bounded at ~200ms
-		s.Log("c [verbose] Large instance (%d vars, %d clauses) — unit prop budget=%d, ve budget=%d\n",
-			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
+		totalLits := len(s.cnf.GetLiteralPool())
+		if totalLits <= 0 {
+			totalLits = int(s.cnf.NumClauses) * 10
+		}
+		s.unitPropBudget = 20 * totalLits
+		if s.unitPropBudget > 100000000 {
+			s.unitPropBudget = 100000000 // ~100M literal visits ceiling
+		}
+		s.veBudget = 10 * totalLits
+		if s.veBudget > 50000000 {
+			s.veBudget = 50000000 // ~50M resolvents ceiling (VE is the expensive pass)
+		}
+		s.Log("c [verbose] Large instance (%d vars, %d clauses, %d lits) — unit prop budget=%d, ve budget=%d\n",
+			s.cnf.NumVars, s.cnf.NumClauses, totalLits, s.unitPropBudget, s.veBudget)
 	}
 
 	// Bound subsumption's O(n²)-ish clause-pair scans adaptively. Subsumption
