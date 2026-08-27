@@ -84,6 +84,7 @@ func run() int {
 	dbMaxLen := flag.Int("db-max-len", 25, "reduceDB length gate: evict clauses strictly longer than this first on binary-heavy formulas (0 = disabled)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
 	bigBfs := flag.Int("big-bfs", 16, "Per-call BIG transitive-minimization BFS node budget (default 16)")
+	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: disable BIG after this many 0-hit per-conflict attempts (0=never; default 50000)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	minisatRestart := flag.Bool("minisat-restart", true, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Disable with -minisat-restart=false to revert to Glucose/Luby.")
@@ -210,6 +211,7 @@ func run() int {
 	s.SetDBMaxLen(*dbMaxLen)
 	s.SetOccurrenceWeight(*occurrenceWeight)
 	s.SetBigBfsBudget(*bigBfs)
+	s.SetBigHitWindow(*bigHitWindow)
 	if *bigLearn {
 		s.SetBigLearn(true)
 	}
