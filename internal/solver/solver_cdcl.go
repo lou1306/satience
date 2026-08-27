@@ -411,8 +411,8 @@ type CDCLSolver struct {
 	skipPolarityPhase          bool
 	occurrenceWeight           float64
 	skipVSIDSInit              bool
-	minisatRestart             bool
-	geometricRestartThreshold  float64 // Cached threshold for minisatRestart (= restartBase × 1.5^lubyIndex)
+	geometricRestarts             bool
+	geometricRestartThreshold  float64 // Cached threshold for geometricRestarts (= restartBase × 1.5^lubyIndex)
 	lazyInit                   *lazyInitState
 	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
 	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
@@ -534,7 +534,7 @@ type CDCLSolver struct {
 	govStagWin    int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
 	govStagBase   int     // Det4: target restartBase when stagnation fires (default 20)
 	// Det6 (geometric-spiral -> Luby mechanism flip): fires once when running
-	// geometric (minisat-restart) restarts on a STRUCTURED unguided deep-spiral
+	// geometric (geometric-restarts) restarts on a STRUCTURED unguided deep-spiral
 	// signature (chain/ordering-principle-like: weak phase guidance, high flat
 	// LBD, no glue, deep propagation cascade) and switches the restart MECHANISM
 	// to Luby/Glucose, where the base-lowering detectors (Det1/Det4) and recurring
@@ -995,8 +995,8 @@ func (s *CDCLSolver) SetSkipVSIDSInit(skip bool) {
 	s.skipVSIDSInit = skip
 }
 
-func (s *CDCLSolver) SetMinisatRestart(enabled bool) {
-	s.minisatRestart = enabled
+func (s *CDCLSolver) SetGeometricRestarts(enabled bool) {
+	s.geometricRestarts = enabled
 }
 
 func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
@@ -3156,7 +3156,7 @@ func (s *CDCLSolver) shouldRestart() bool {
 	// threshold = restartBase * 1.5^lubyIndex. Cached incrementally in
 	// geometricRestartThreshold (updated in restart() alongside lubyIndex) to
 	// avoid math.Pow on every conflict. With base=100: 100, 150, 225, 337, ...
-	if s.minisatRestart {
+	if s.geometricRestarts {
 		if s.geometricRestartThreshold == 0 {
 			s.geometricRestartThreshold = float64(s.restartBase)
 		}
@@ -3404,7 +3404,7 @@ func (s *CDCLSolver) restart() bool {
 
 	// Reset restart counters
 	s.lubyIndex++
-	if s.minisatRestart {
+	if s.geometricRestarts {
 		if s.geometricRestartThreshold == 0 {
 			s.geometricRestartThreshold = float64(s.restartBase)
 		}

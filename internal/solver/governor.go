@@ -79,14 +79,14 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 
 // maybeGeoSpiral is the Det6 evaluation path driven by a CONFLICT-WINDOW cadence
 // rather than the restart-boundary cadence used by maybeAdaptSearch. Under
-// geometric (minisat-restart) restarts the Luby/Glucose-oriented governor is
+// geometric (geometricRestarts) restarts the Luby/Glucose-oriented governor is
 // starved: geometric deepens by design and restarts are rare, so the
 // maybeAdaptSearch gate (lubyIndex%10==0) fires too late (op_20 TMOs before
 // restart #10). Here we evaluate the deep-unguided-spiral signature every
 // govWindow conflicts and flip geometric->Luby when it matches. One compare
 // per loop iteration (returns early until the window elapses).
 func (s *CDCLSolver) maybeGeoSpiral() {
-	if !s.minisatRestart || s.geoFlipFired {
+	if !s.geometricRestarts || s.geoFlipFired {
 		return
 	}
 	if s.conflicts < s.govSpiralNext {
@@ -303,7 +303,7 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 //
 // Signature (all required) — deliberately conservative to avoid flipping
 // instances that legitimately want deep geometric search:
-//   - geometric restarts active (s.minisatRestart), not yet flipped;
+//   - geometric restarts active (s.geometricRestarts), not yet flipped;
 //   - structured instance (structureScore >= 0.7): excludes hard random k-SAT
 //     / phase-transition rails that are tuned for deep search;
 //   - weak phase guidance (polarityImbalance < 0.4): strong phase saving can
@@ -313,7 +313,7 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 //     healthy structured instances whose LBD improves;
 //   - deep cascade (props/dec >= govSpiralPDec): the spiral grinds deep.
 func (s *CDCLSolver) detector6GeoSpiral(winLBD, glueRatio, propsPerDec float64) {
-	if !s.minisatRestart || s.geoFlipFired {
+	if !s.geometricRestarts || s.geoFlipFired {
 		return
 	}
 	// Structured-only gate (mirrors Det4's guard: excludes random k-SAT rails).
@@ -355,7 +355,7 @@ func (s *CDCLSolver) detector6GeoSpiral(winLBD, glueRatio, propsPerDec float64) 
 	}
 
 	s.geoFlipFired = true
-	s.minisatRestart = false
+	s.geometricRestarts = false
 	s.geometricRestartThreshold = 0
 	s.Log("c [governor] Det6 geometric-spiral: structure=%.2f winLBD=%.1f (min %.1f) glue=%.3f props/dec=%.0f -> flip geo->Luby\n",
 		s.structureScore, winLBD, minLBD, glueRatio, propsPerDec)

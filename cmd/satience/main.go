@@ -87,7 +87,7 @@ func run() int {
 	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: disable BIG after this many 0-hit per-conflict attempts (0=never; default 50000)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
-	minisatRestart := flag.Bool("minisat-restart", true, "Use MiniSat-style geometric restarts (base=100, mult=1.5, no Glucose LBD). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Disable with -minisat-restart=false to revert to Glucose/Luby.")
+	geometricRestarts := flag.Bool("geometric", true, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
 	minisatBumps := flag.Bool("minisat-bumps", true, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor). Default on: full-48-rail DEV win with -bump-amount=35 (-6.6% PAR2, net -1 TMO). Disable with -minisat-bumps=false.")
 	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
@@ -218,8 +218,8 @@ func run() int {
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)
 	}
-	if *minisatRestart {
-		s.SetMinisatRestart(true)
+	if *geometricRestarts {
+		s.SetGeometricRestarts(true)
 	}
 	if *minisatBumps {
 		s.SetMinisatBumps(true)
