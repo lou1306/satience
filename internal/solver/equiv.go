@@ -4,6 +4,19 @@ import (
 	"satience/internal/cnf"
 )
 
+// minEquivMergeRatioPct is the minimum equivalence-merge rate (as a percentage
+// of total variables) required before literal substitution is performed.
+//
+// This is a PERFORMANCE / SEARCH-TRAJECTORY gate only, NOT a soundness gate:
+// the l / ¬l-in-same-SCC UNSAT check runs inside the SCC loop (see
+// detectEquivalences) and is returned before this gate, so correctness never
+// depends on it. Small merges change the clause structure (and thus the search
+// trajectory) for little reduction, which empirically flips borderline
+// instances (e.g. daf59d67 SAT@13s -> TIMEOUT at a 0.09% merge rate; bb34f22f at
+// 35.7% is well above). Value is a corpus-derived tuning constant; adjust only
+// on the DEV rail per AGENTS.md.
+const minEquivMergeRatioPct = 1
+
 // detectEquivalences finds equivalent literals via SCC on the binary implication
 // graph and merges them. Two literals l1, l2 are equivalent iff l1 → l2 and
 // l2 → l1 in the implication graph. For a binary clause (a ∨ b), the graph has
@@ -189,9 +202,9 @@ func (s *CDCLSolver) detectEquivalences() SolveResult {
 	// bb34f22f (7807 vars, 2790 merged = 35.7%) is well above the threshold.
 	// Note: the UNSAT check (l and ¬l in same SCC) already ran inside the SCC
 	// loop above, so we only skip the substitution, not the contradiction detection.
-	if mergedCount*100 < int(s.cnf.NumVars) {
-		s.Log("c [equiv] Skipping insignificant merge: %d < %d/100 (0.01%% threshold)\n",
-			mergedCount, s.cnf.NumVars)
+	if mergedCount*100 < int(s.cnf.NumVars)*minEquivMergeRatioPct {
+		s.Log("c [equiv] Skipping insignificant merge: %d vars merged < %d%% of %d\n",
+			mergedCount, minEquivMergeRatioPct, s.cnf.NumVars)
 		return UNKNOWN
 	}
 
