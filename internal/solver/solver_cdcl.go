@@ -5587,67 +5587,36 @@ func (s *CDCLSolver) runOneUIPResolution(conflictLits []cnf.Literal) (currentCou
 		}
 		s.uipFallbackCount++
 		// 1-UIP did not converge: there is more than one literal at the current
-		// decision level remaining after resolution. In a correct CDCL this never
-		// happens (each level has exactly one decision, so resolving non-decision
-		// literals always reduces to that single decision = the UIP). Non-convergence
-		// indicates inconsistent reason clauses (e.g. a propagated literal whose
-		// reason contains an unassigned literal, or more than one decision at one
-		// level), which were skipped above.
+		// decision level still in the clause after resolution. In a correct CDCL
+		// this never happens (each level has exactly one decision, so resolving
+		// non-decision literals always reduces to that single decision = the UIP).
+		// Non-convergence therefore indicates inconsistent reason clauses (e.g. a
+		// propagated literal whose reason contains an unassigned literal, or more
+		// than one decision at one level), which were skipped above.
 		//
-		// FALLBACK: Force a 1-UIP by keeping only the most recent literal at the
-		// current level (the UIP) and dropping all others. This produces an
-		// asserting clause (unit after backjump), which is essential for CDCL
-		// search. Without the fallback, non-convergent conflicts produce
-		// non-asserting clauses that are useless for propagation, crippling the
-		// search (200K+ conflicts with no UNSAT on instances that should solve
-		// in ~11K). The dropped literals are implied by the remaining clause in
-		// practice (they were propagated, not decided), so this is sound as long
-		// as the reason clauses are consistent.
+		// FAIL-SAFE: We do NOT try to force a 1-UIP by dropping the remaining
+		// current-level literals. The dropped literals would not be logically
+		// implied unless every reason clause is consistent — but non-convergence
+		// is precisely the signature of *inconsistent* reason clauses, so pruning
+		// them can produce an un-entailed learned clause that later rules out a
+		// satisfying assignment and turns a satisfiable formula into a false
+		// UNSAT. The safe action is to leave currentCount > 1 and let the caller
+		// (learnClause) skip learning entirely and backjump conservatively.
 		if s.verbose {
-			s.Log("c [1-UIP] FALLBACK: %d decisions + %d propagations at level %d\n",
+			s.Log("c [1-UIP] FALLBACK: %d decisions + %d propagations at level %d -> NO learn\n",
 				decisionsAtCurrentLevel, propagationsAtCurrentLevel, s.level)
 		}
 
-		// Find the most recent literal at current level (this will be the UIP).
-		// Build trailPos for the current-level trail slice (O(current-level trail))
-		// for O(1) position lookup, avoiding O(touched × total trail) scanning.
+		// Diagnostic: dump residual-literal state. Build trailPos for the
+		// current-level trail slice (O(current-level trail)) for O(1) position
+		// lookup, then clear it after the dump.
 		startIdx := s.trailHead[s.level]
 		for ti := startIdx; ti < len(s.trail); ti++ {
 			s.trailPos[s.trail[ti]] = ti
 		}
-
-		// Diagnostic: dump residual-literal state before fallback selection.
-		// trailPos is currently populated for the current-level slice.
 		s.logUIPFallback(decisionsAtCurrentLevel, propagationsAtCurrentLevel, startIdx)
-
-		var uipVar uint32 = 0
-		var uipTrailPos int = -1
-		for _, varIdx := range s.tmpTouchedVars {
-			if s.tmpLiteralInClause[varIdx] && s.assignments[varIdx].Level == int32(s.level) {
-				ti := s.trailPos[varIdx]
-				if ti >= startIdx && (uipTrailPos < 0 || ti > uipTrailPos) {
-					uipTrailPos = ti
-					uipVar = varIdx
-				}
-			}
-		}
-
-		// Clear trailPos for the current-level trail slice
 		for ti := startIdx; ti < len(s.trail); ti++ {
 			s.trailPos[s.trail[ti]] = 0
-		}
-
-		// Remove all other literals at current level (keep only the UIP)
-		if uipVar != 0 {
-			for _, varIdx := range s.tmpTouchedVars {
-				if s.tmpLiteralInClause[varIdx] &&
-					s.assignments[varIdx].Level == int32(s.level) &&
-					varIdx != uipVar {
-					s.tmpLiteralInClause[varIdx] = false
-					s.tmpLevelCount[s.level]--
-				}
-			}
-			currentCount = 1
 		}
 	}
 	return currentCount
@@ -5758,19 +5727,24 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// resolved vars; bumpClause bumps only the conflict clause vars. bumpAnalyze
 	// is gated to default-decay instances — under aggressive decay (0.30→0.60)
 	// the fast varInc growth flattens the VSIDS signal when distributed across
-	// many touched vars (30eb4ef4 regression). Must run before the currentCount==0
-	// early return so degenerate conflicts still bump involved variables.
+	// Must run before the currentCount != 1 early return so degenerate
+	// conflicts still bump involved variables.
 	if s.useBumpAnalyze {
 		s.vsids.bumpAnalyze(s.tmpTouchedVars)
 	} else {
 		s.vsids.bumpClause(conflictLits)
 	}
 
-	// NOTE: currentCount == 0 means resolution canceled all literals at the
-	// current decision level. The learned clause would be non-asserting (no
-	// literal at the current level to propagate after backjump). Skip learning
-	// it — the clause is sound but not useful, and backjump to s.level-1.
-	if currentCount == 0 {
+	// NOTE: currentCount != 1 means we do NOT have a genuine 1-UIP asserting
+	// clause, so we skip learning and backjump conservatively:
+	//   - currentCount == 0: resolution canceled all literal at the current
+	//     decision level -> non-asserting, no literal to propagate. Skip.
+	//   - currentCount > 1: resolution did not converge, i.e. reason clauses
+	//     were inconsistent. Learning the partially-derived clause would risk
+	//     an un-entailed clause (false UNSAT), so skip it (see runOneUIPResolution).
+	// The produced clause (sound or not) would be non-asserting anyway, so
+	// skipping it loses nothing real; backjump is always sound.
+	if currentCount != 1 {
 		// Compute maxLevel from remaining literals for a better backjump target
 		bjLevel := 0
 		for _, varIdx := range s.tmpTouchedVars {
@@ -5828,9 +5802,8 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	// CRITICAL: Verify 1-UIP property to catch soundness bugs
 	// If verification fails, the learned clause is invalid - skip learning (safer than wrong clause)
-	// NON-CONVERGE clauses (currentCount > 1) are sound but may have >1 literal at current level,
-	// so check 3 is skipped for them.
-	if !s.verifyLearnedClause(s.tmpLearnedLits, currentCount > 1) {
+	// This point is reached only for a genuine 1-UIP (currentCount == 1).
+	if !s.verifyLearnedClause(s.tmpLearnedLits, false) {
 		if s.verbose {
 			s.Log("c [learnClause] Skipping buggy learned clause due to 1-UIP violation\n")
 		}
