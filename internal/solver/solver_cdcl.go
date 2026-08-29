@@ -1064,6 +1064,9 @@ func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
 	if maxArity >= 3 {
 		s.parityMaxArity = maxArity
 	}
+	if s.parityMaxArity > parityMaxArityMax {
+		s.parityMaxArity = parityMaxArityMax
+	}
 	if budget >= 0 {
 		s.parityBudget = budget
 	}

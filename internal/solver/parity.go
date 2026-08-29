@@ -23,8 +23,22 @@ package solver
 // -parity-budget (hard cap on derived binaries).
 
 import (
+	"math/bits"
+
 	"satience/internal/cnf"
 )
+
+// parityMaxArityMax caps the maximum supported parity-family support size.
+// It bounds the family completeness expectation 2^(d-1) and the per-literal
+// code bitsets (cod) so `1 << (d-1)` and `1 << bi` can never overflow, and
+// keeps the family-size requirement (2^(d-1) clauses) feasible.
+const parityMaxArityMax = 20
+
+// verifyParityMaxArity bounds the per-family exhaustive verification oracle.
+// d <= 10 means at most 2^10 assignments per family — trivial. Larger families
+// are impractical to gather in the DB (2^(d-1) clauses) and are covered by the
+// integrated solver tests, so they are skipped by the oracle.
+const verifyParityMaxArity = 10
 
 // parityRow is a single GF(2) equation  XOR(vars) == parity. vars is sorted
 // ascending; duplicate vars never occur.
@@ -197,7 +211,12 @@ func rowKey(a, b uint32, p bool) string {
 	if p {
 		pb = 1
 	}
-	return string([]byte{byte(x), byte(x >> 8), byte(y), byte(y >> 8), pb})
+	// Full 32-bit width for both variables so vars > 65535 are not conflated
+	// (a 16-bit key silently collapses distinct rows on large instances).
+	return string([]byte{
+		byte(x), byte(x >> 8), byte(x >> 16), byte(x >> 24),
+		byte(y), byte(y >> 8), byte(y >> 16), byte(y >> 24),
+		pb})
 }
 
 // litForYParity builds the two binary-consequence clauses for n1⊕n2 == p.
@@ -213,18 +232,153 @@ func litForYParity(n1, n2 uint32, p bool) ([2]cnf.Literal, [2]cnf.Literal) {
 	return [2]cnf.Literal{a, b}, [2]cnf.Literal{na, nb}
 }
 
-// analyzeParity detects full parity families over the original clauses, runs
+// derivedBinaryKey canonicalizes an unordered pair of literals into a wide,
+// collision-free-and-non-overflowing key for deduplicating derived equivalence
+// clauses. The two literals are ordered by (Var, polarity) and all four Var
+// bytes are kept, so distinct pairs on large instances are never conflated.
+func derivedBinaryKey(a, b cnf.Literal) string {
+	if b.Var() < a.Var() || (b.Var() == a.Var() && b.IsNegated()) {
+		a, b = b, a
+	}
+	var k [9]byte
+	aV := uint32(a.ToDimacs())
+	bV := uint32(b.ToDimacs())
+	for i := 0; i < 4; i++ {
+		k[i] = byte(aV >> (8 * i))
+		k[4+i] = byte(bV >> (8 * i))
+	}
+	k[8] = 1
+	return string(k[:])
+}
+
+// verifyParityRows is the independent soundness oracle for parity detection.
+// detectParityRows encodes the family's XOR constant with a non-obvious `!p`
+// inversion; a sign error there would feed a wrong row into Gaussian
+// elimination and can produce a FALSE UNSAT (g.unsat). This function re-derives
+// each detected family's constant straight from the clause semantics WITHOUT
+// reusing that inversion, by exhaustive enumeration over the family support.
+//
+// For each detected row with support S (size d <= verifyParityMaxArity) it
+// gathers the clauses whose variable support is exactly S and checks that:
+//   - exactly 2^(d-1) of the 2^d assignments satisfy all those clauses (the
+//     family is complete), and
+//   - every satisfying assignment has the SAME true-count parity, and
+//   - that common parity equals the row's stored parity (the XOR constant).
+//
+// Returns false if any family fails, in which case callers must not derive or
+// trust any parity consequence (see analyzeParity).
+func (s *CDCLSolver) verifyParityRows(rows []parityRow) bool {
+	// Group original clauses by their (variable-ordered) support so each family
+	// is checked against exactly the clauses that gave rise to its row.
+	type gClause struct {
+		lits []cnf.Literal
+	}
+	fams := make(map[string][]gClause)
+	for i := range s.cnf.Clauses {
+		lits := s.cnf.Clauses[i].Literals
+		d := len(lits)
+		if d < 3 || d > verifyParityMaxArity {
+			continue
+		}
+		sup := make([]uint32, 0, d)
+		for _, l := range lits {
+			sup = append(sup, l.Var())
+		}
+		for i := 1; i < len(sup); i++ {
+			for j := i; j > 0 && sup[j] < sup[j-1]; j-- {
+				sup[j], sup[j-1] = sup[j-1], sup[j]
+			}
+		}
+		fams[supportKey(sup)] = append(fams[supportKey(sup)], gClause{lits: lits})
+	}
+
+	for _, r := range rows {
+		d := len(r.vars)
+		if d < 3 || d > verifyParityMaxArity {
+			continue // impractical to enumerate; covered by integrated tests
+		}
+		clauses := fams[supportKey(r.vars)]
+		if len(clauses) != 1<<(d-1) {
+			s.Log("c [parity] verify: family of size %d is not complete (%d clauses)\n", d, len(clauses))
+			return false
+		}
+		// var index of each support variable for assignment lookup.
+		varIndex := make(map[uint32]int, d)
+		for i, v := range r.vars {
+			varIndex[v] = i
+		}
+		nAllowed := 0
+		allowedParity := -1
+		for mask := 0; mask < 1<<d; mask++ {
+			satAll := true
+			for _, cl := range clauses {
+				cok := false
+				for _, l := range cl.lits {
+					iv := varIndex[l.Var()]
+					assigned := (mask>>iv)&1 == 1
+					if l.IsNegated() != assigned {
+						cok = true
+						break
+					}
+				}
+				if !cok {
+					satAll = false
+					break
+				}
+			}
+			if satAll {
+				nAllowed++
+				pc := bits.OnesCount(uint(mask)) & 1
+				if allowedParity == -1 {
+					allowedParity = pc
+				} else if allowedParity != pc {
+					s.Log("c [parity] verify: family support %v has mixed satisfying parities\n", r.vars)
+					return false
+				}
+			}
+		}
+		want := 1 << (d - 1)
+		if nAllowed != want {
+			s.Log("c [parity] verify: expected %d satisfying assignments, got %d for support %v\n",
+				want, nAllowed, r.vars)
+			return false
+		}
+		if allowedParity != -1 && (allowedParity == 1) != r.parity {
+			s.Log("c [parity] verify: row parity mismatch for support %v (got allowed parity %d)\n",
+				r.vars, allowedParity)
+			return false
+		}
+	}
+	return true
+}
+
+
 // Gaussian elimination, and appends derived unit/binary clauses to the DB.
 // Returns UNSAT on a parity contradiction, else UNKNOWN. SOUND and ADD-ONLY.
 func (s *CDCLSolver) analyzeParity() SolveResult {
 	if !s.parityEnabled || s.parityMaxArity < 3 {
 		return UNKNOWN
 	}
+	if s.parityMaxArity > parityMaxArityMax {
+		s.parityMaxArity = parityMaxArityMax
+	}
 	rows, ok := s.detectParityRows()
 	if !ok {
+		// detectParityRows currently always returns ok=true (see there); this
+		// path is retained for future use and would signal UNSAT directly.
 		return UNSAT
 	}
 	if len(rows) == 0 {
+		return UNKNOWN
+	}
+
+	// Independent soundness oracle: re-derive each detected family's equation
+	// constant straight from the clause semantics, without trusting the
+	// detectParityRows `!p` inversion. A wrong row constant, fed into Gaussian
+	// elimination, can produce a false UNSAT via g.unsat, so on any mismatch we
+	// refuse to derive anything rather than risk it.
+	if !s.verifyParityRows(rows) {
+		s.Log("c [parity] verifyParityRows failed -> skipping parity derivation (no risk of false UNSAT)\n")
 		return UNKNOWN
 	}
 
@@ -255,7 +409,7 @@ func (s *CDCLSolver) addDerivedParityClauses(g *gaussState) {
 	if s.parityBudget <= 0 {
 		return
 	}
-	seen := make(map[uint32]bool, len(g.binars))
+	seen := make(map[string]bool, len(g.binars))
 	for _, lit := range g.units {
 		s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: []cnf.Literal{lit}})
 		s.cnf.NumClauses++
@@ -273,7 +427,10 @@ func (s *CDCLSolver) addDerivedParityClauses(g *gaussState) {
 			if x.Var() == y.Var() {
 				continue
 			}
-			k := uint32(x)*31 + uint32(y)
+			// Canonical, full-width dedup key: order-normalized vars + polarity
+			// bits, so x∨y and y∨x (and the same pair of normally-polar vars) are
+			// never double-added and no 32-bit overflow can collapse distinct rows.
+			k := derivedBinaryKey(x, y)
 			if seen[k] {
 				continue
 			}
