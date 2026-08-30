@@ -36,6 +36,7 @@ func run() int {
 	parity := flag.Bool("parity", true, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; default ON after distributional held-out gate; use -parity=false to disable)")
 	parityMaxLen := flag.Int("parity-max-len", 6, "Parity: max support size (clause length) for a detected parity family")
 	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
+	paritySizeGate := flag.Int("parity-size-gate", 50000, "Parity: skip the O(clauses) scan above this many vars (0=always on)")
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
@@ -191,6 +192,7 @@ func run() int {
 	s.SetDBCapFactor(*dbCapMult)
 	s.SetGovernorDB(*govDB)
 	s.SetParityParams(*parity, *parityMaxLen, *parityBudget)
+	s.SetParitySizeGate(*paritySizeGate)
 
 	// Configure clause vivification
 	s.SetVivifyPeriod(*vivifyPeriod)

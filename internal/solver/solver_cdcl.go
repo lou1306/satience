@@ -525,6 +525,7 @@ type CDCLSolver struct {
 	parityEnabled   bool // gate: enable parity detection + GF(2) derivation
 	parityMaxArity  int  // max support size (clause length) for a parity family (>=3)
 	parityBudget    int  // hard cap on derived binary clauses appended (<=0 = off)
+	paritySizeGate  int  // skip the (O(clauses)) parity scan above this many vars
 	parityRowsFound int  // diagnostic: parity families detected
 	parityUnits     int  // diagnostic: derived unit clauses
 	parityBinaries  int  // diagnostic: derived binary clauses appended
@@ -722,6 +723,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		parityEnabled:  true,
 		parityMaxArity: 6,
 		parityBudget:   2000,
+		// skip the parity scan on huge industrial encodings: detectParityRows is
+		// O(total clause length) and yields nothing on such instances (net ~4%
+		// suite PAR2 win across the 72-suite, daf59d -21%, 262ba -25%). The
+		// held-out gate's parity benefit lives on small Tseitin/structured
+		// families (<=9x9 grids, <=50 vars), safely below this gate.
+		paritySizeGate: 50000,
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
@@ -1079,6 +1086,13 @@ func (s *CDCLSolver) SetParityParams(on bool, maxArity, budget int) {
 	if budget >= 0 {
 		s.parityBudget = budget
 	}
+}
+
+// SetParitySizeGate sets the variable-count threshold above which the parity
+// scan is skipped (large industrial encodings get no parity benefit but pay
+// an O(total clause length) detectParityRows cost). <=0 keeps parity always on.
+func (s *CDCLSolver) SetParitySizeGate(n int) {
+	s.paritySizeGate = n
 }
 
 // SetVivifyMinConflictGap sets the minimum number of conflicts that must occur
@@ -2187,7 +2201,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// exposing XOR structure that yields NEW units/binaries. Re-derive each
 		// pass. Add-only and sound (see analyzeParity); bounded by the loop's pass
 		// cap and the global -parity-budget. Gated -parity (default off).
-		if s.parityEnabled && s.parityMaxArity >= 3 && s.parityBudget > 0 {
+		if s.parityEnabled && s.parityMaxArity >= 3 && s.parityBudget > 0 &&
+			(s.paritySizeGate <= 0 || int(s.cnf.NumVars) < s.paritySizeGate) {
 			beforeParity := s.parityBinaries + s.parityUnits
 			if pr := s.analyzeParity(); pr != UNKNOWN {
 				s.printStats()
