@@ -1826,6 +1826,23 @@ func (s *CDCLSolver) classifyInstance() {
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
+	// Very large instances are industrial / reduction-friendly regardless of the
+	// borderline score: structureScore is tuned on small instances and
+	// under-weights huge regular encodings. E.g. course-timetabling instances at
+	// 105-222K vars score only 0.65-0.70 yet BVE eliminates ~27% of variables,
+	// so the score-based "random-like" early-out must not exclude them. A corpus
+	// scan shows the ONLY >50K-var instances with score<0.7 AND binaryRatio<=0.5
+	// are exactly those timetabling instances; true random instances are small
+	// (a few hundred vars) so the size gate never misroutes them into aggressive
+	// preprocessing. Dense-binary large instances are separately protected by
+	// skipBVE.
+	if int(s.cnf.NumVars) > s.preprocessingMaxVars {
+		s.Log("c [preprocessing] Large instance (%d vars) -> enabling aggressive preprocessing\n", s.cnf.NumVars)
+		return PreprocessingConfig{
+			EnableUnitProp: true,
+			MaxPasses:      1,
+		}
+	}
 	if s.structureScore < 0.7 && s.binaryRatio <= 0.5 {
 		s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", s.structureScore)
 		return PreprocessingConfig{
