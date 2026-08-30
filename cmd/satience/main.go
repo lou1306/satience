@@ -51,7 +51,7 @@ func run() int {
 	adaptPropDecDeepGate := flag.Int("restart-props-deep", 85, "Tier-2 deep-search escape fires when conflict level exceeds this (0=disabled)")
 	adaptivePhaseFlip := flag.Float64("adaptive-phase-flip", 0.5, "Phase flip rate when props/dec is high (0=disabled)")
 	// Search-governor tuning knobs (runtime self-correction parameter sweeps).
-	govGrindBase := flag.Int("gov-grind-base", 5, "Governor Det1: target restartBase when cascade grind fires")
+	govGrindBase := flag.Int("gov-grind-base", 4, "Governor Det1: target restartBase when cascade grind fires")
 	govGrindPDec := flag.Float64("gov-grind-pdec", 120.0, "Governor Det1: props/dec threshold to qualify as cascade grind")
 	govGrindConf := flag.Int("gov-grind-conf", 30000, "Governor Det1: min conflicts before Det1 may fire")
 	govWanderDecC := flag.Float64("gov-wander-decconf", 40.0, "Governor Det3: min decisions/conflict to qualify as wander")

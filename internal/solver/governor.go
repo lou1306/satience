@@ -161,6 +161,18 @@ func (s *CDCLSolver) detector1Grind(propsPerDec float64) {
 	// frequently, breaking the re-entry cycle.
 	save := s.restartBase
 	s.restartBase = s.govGrindBase
+	// Under geometric restarts the restartBase change below is ignored, because
+	// restart() caches geometricRestartThreshold and does not re-read restartBase.
+	// A sustained props/dec>120 cascade (bb34f22f-class) can then never get its
+	// cascade cut short, yet Det6 won't rescue it either (Det6 requires HIGH flat
+	// LBD, while these grinders have low near-glue LBD). So a Det1 cascade-grind
+	// also flips the mechanism to Luby, making the base reduction effective.
+	if s.geometricRestarts && !s.geoFlipFired {
+		s.geoFlipFired = true
+		s.geometricRestarts = false
+		s.geometricRestartThreshold = 0
+		s.Log("c [governor] Det1 grind flips geo->Luby restarts\n")
+	}
 	s.Log("c [governor] Det1 grind: props/dec=%.0f sustained past %d conflicts -> drop restartBase %d->%d\n",
 		propsPerDec, s.govGrindConf, save, s.govGrindBase)
 }
