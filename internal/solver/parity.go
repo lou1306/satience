@@ -359,6 +359,12 @@ func (s *CDCLSolver) analyzeParity() SolveResult {
 	if !s.parityEnabled || s.parityMaxArity < 3 {
 		return UNKNOWN
 	}
+	// Size gate: skip the O(total clause length) detectParityRows scan on huge
+	// industrial encodings (see paritySizeGate). Centralized here so both the
+	// initial pass and the fixpoint re-derivation pass skip together.
+	if s.paritySizeGate > 0 && int(s.cnf.NumVars) >= s.paritySizeGate {
+		return UNKNOWN
+	}
 	if s.parityMaxArity > parityMaxArityMax {
 		s.parityMaxArity = parityMaxArityMax
 	}

@@ -2201,8 +2201,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// exposing XOR structure that yields NEW units/binaries. Re-derive each
 		// pass. Add-only and sound (see analyzeParity); bounded by the loop's pass
 		// cap and the global -parity-budget. Gated -parity (default off).
-		if s.parityEnabled && s.parityMaxArity >= 3 && s.parityBudget > 0 &&
-			(s.paritySizeGate <= 0 || int(s.cnf.NumVars) < s.paritySizeGate) {
+		if s.parityEnabled && s.parityMaxArity >= 3 && s.parityBudget > 0 {
 			beforeParity := s.parityBinaries + s.parityUnits
 			if pr := s.analyzeParity(); pr != UNKNOWN {
 				s.printStats()
