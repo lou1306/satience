@@ -312,8 +312,18 @@ type CDCLSolver struct {
 	// learned clause changes, so the disabled search is trajectory-identical to
 	// the enabled one — this is a pure per-conflict-cost win, distinct from the
 	// (retired) watch trajectory thread.
-	bigDisabled  bool  // adaptive gate fired: skip BIG minimize + learned-binary maintenance
-	bigHitWindow int64 // call-count threshold: if 0 hits by here, disable BIG (0=never)
+	bigDisabled  bool    // adaptive gate fired: skip BIG minimize + learned-binary maintenance
+	bigHitWindow int64   // sliding-window length (ring size): 0 = never disable
+	bigMinHitRate float64 // disable BIG when recent (sliding-window) hit rate falls below this (fraction)
+	// Sliding-window ring tracks the outcome of the most recent bigHitWindow BIG
+	// attempts so the gate observes hit RATE rather than the historical cumulative
+	// 0-hit signal. Scattered hits no longer keep BIG alive forever on a low-yield
+	// instance (old gate: only disabled when TOTAL hits == 0, so a 0.5% hit rate
+	// never fired and BIG ran at ~99.5% BFS overhead for the whole solve).
+	bigWinRing  []bool // outcome of each recent BIG attempt (nil until first use)
+	bigWinPtr   int    // next ring write position
+	bigWinHits  int    // #hits currently present in the ring
+	bigWinFull  bool   // ring has been fully populated at least once
 
 	// bigLearnAdj augments the static original-binary BIG with implication
 	// edges from LEARNED binary clauses. Learned clauses are permanent logical
@@ -655,6 +665,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		bigBfsQueue:         make([]int, 0, 256),
 		bigBfsBudget:        16,
 		bigHitWindow:        50000,
+		bigMinHitRate:       0.05,
 		tmpLevelCount:       make([]int, formula.NumVars+1),
 		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
 		tmpCandidates:       make([]resolveCandidate, 0, 200), // Increased from 100
@@ -1115,6 +1126,51 @@ func (s *CDCLSolver) SetBigBfsBudget(n int) {
 // BIG changes no learned clause). 0 disables the gate (never auto-disable).
 func (s *CDCLSolver) SetBigHitWindow(n int64) {
 	s.bigHitWindow = n
+}
+
+// SetBigMinHitRate sets the sliding-window hit-rate threshold: BIG is disabled
+// once the most recent bigHitWindow attempts fall below this fraction of hits.
+// 0 keeps the historical behavior (disable only on a fully 0-hit window).
+func (s *CDCLSolver) SetBigMinHitRate(rate float64) {
+	if rate < 0 {
+		rate = 0
+	}
+	s.bigMinHitRate = rate
+}
+
+// recordBigOutcome feeds a BIG minimization attempt outcome into the
+// sliding-window ring and fires the rate gate. window<=0 disables the gate;
+// bigMinHitRate<=0 restores the historical "disable only on a fully 0-hit
+// window" behavior (a window with any hit never disables BIG).
+func (s *CDCLSolver) recordBigOutcome(hit bool) {
+	w := int(s.bigHitWindow)
+	if w <= 0 || s.bigDisabled {
+		return
+	}
+	if s.bigWinRing == nil {
+		s.bigWinRing = make([]bool, w)
+	}
+	if s.bigWinFull {
+		if s.bigWinRing[s.bigWinPtr] {
+			s.bigWinHits--
+		}
+	} else if s.bigWinPtr == w-1 {
+		s.bigWinFull = true
+	}
+	s.bigWinRing[s.bigWinPtr] = hit
+	if hit {
+		s.bigWinHits++
+	}
+	s.bigWinPtr++
+	if s.bigWinPtr == w {
+		s.bigWinPtr = 0
+	}
+	if s.bigMinHitRate > 0 && s.bigWinFull &&
+		float64(s.bigWinHits) < float64(w)*s.bigMinHitRate {
+		s.bigDisabled = true
+		s.Log("c [BIG] sliding-window gate: last %d attempts hit-rate %.2f%% < %.1f%% -> disabling BIG\n",
+			w, 100*float64(s.bigWinHits)/float64(w), 100*s.bigMinHitRate)
+	}
 }
 
 // SetBigLearn enables the learned-binary BIG augmentation for transitive
@@ -4070,8 +4126,7 @@ func (s *CDCLSolver) addLearnedBinaryToBIG(l0, l1 cnf.Literal) {
 // (fewer removals found), never soundness.
 func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	litIdx := cnf.LitToIndex(lit)
-	if litIdx >= len(s.bigAdjOff)-1 {
-		return false
+	if litIdx >= len(s.bigAdjOff)-1 {		return false
 	}
 	s.bigBfsEpoch++
 	if s.bigBfsEpoch == 0 {
@@ -6225,6 +6280,7 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 			s.bigMinimizeCalls++
 			if s.bigReachableInClause(lit) {
 				s.bigMinimizeHits++
+				s.recordBigOutcome(true)
 				s.tmpLiteralInClause[v] = false
 				// CRITICAL: Do NOT leave tmpSeenVar[v]=true for BIG-removed literals.
 				// Recursive minimization treats tmpSeenVar as a "covered" set (literal
@@ -6239,15 +6295,12 @@ func (s *CDCLSolver) minimizeLearnedClause(learnedLits []cnf.Literal) []cnf.Lite
 				reductionAchieved++
 				continue
 			}
-			// Adaptive hit-rate gate: if BIG has made bigHitWindow per-conflict
-			// attempts with zero literal-removals, disable it for the rest of the
-			// solve. A 0-hit BIG alters no learned clause, so this is
-			// trajectory-neutral (see field comment) — pure per-conflict cost win.
-			if s.bigHitWindow > 0 && !s.bigDisabled &&
-				s.bigMinimizeCalls >= uint64(s.bigHitWindow) && s.bigMinimizeHits == 0 {
-				s.bigDisabled = true
-				s.Log("c [BIG] adaptive gate: %d attempts, 0 hits -> disabling BIG\n", s.bigMinimizeCalls)
-			}
+			// Sliding-window hit-rate gate: disable BIG once the recent hit rate
+			// (measured over the last bigHitWindow attempts) falls below
+			// bigMinHitRate. The old cumulative gate only fired at total-hits==0,
+			// so a low-but-nonzero hit rate (e.g. 0.5% on large timetabling
+			// encodings) kept the ~99.5%-overhead BFS alive for the whole solve.
+			s.recordBigOutcome(false)
 		}
 		if s.recursiveTryRemove(v) {
 			s.tmpLiteralInClause[v] = false

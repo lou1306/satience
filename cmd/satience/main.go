@@ -85,7 +85,8 @@ func run() int {
 	dbMaxLen := flag.Int("db-max-len", 25, "reduceDB length gate: evict clauses strictly longer than this first on binary-heavy formulas (0 = disabled)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
 	bigBfs := flag.Int("big-bfs", 16, "Per-call BIG transitive-minimization BFS node budget (default 16)")
-	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: disable BIG after this many 0-hit per-conflict attempts (0=never; default 50000)")
+	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: sliding-window length for hit-rate gate (0=never; default 50000)")
+	bigMinHitRate := flag.Float64("big-min-hit-rate", 0.05, "Disable BIG when recent hit-rate falls below this fraction (0=0-hit-only)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	geometricRestarts := flag.Bool("geometric", true, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
@@ -214,6 +215,7 @@ func run() int {
 	s.SetOccurrenceWeight(*occurrenceWeight)
 	s.SetBigBfsBudget(*bigBfs)
 	s.SetBigHitWindow(*bigHitWindow)
+	s.SetBigMinHitRate(*bigMinHitRate)
 	if *bigLearn {
 		s.SetBigLearn(true)
 	}
