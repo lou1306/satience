@@ -5859,11 +5859,13 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)
 
 		// Recalculate LBD after minimization (CRITICAL - LBD may have decreased)
-		// Must reset tmpLevelSetUsed since it was used for original LBD calculation
+		// Must reset tmpLevelSetUsed since it was used for original LBD calculation.
+		// Reset only the levels that were marked (tracked in tmpLevelSet), avoiding
+		// an O(NumVars) sweep per conflict on the hot learnClause path.
 		lbd = 0
 		maxLevel = 0
-		for i := range s.tmpLevelSetUsed {
-			s.tmpLevelSetUsed[i] = false
+		for _, lvl := range s.tmpLevelSet {
+			s.tmpLevelSetUsed[lvl] = false
 		}
 		for _, lit := range s.tmpLearnedLits {
 			varIdx := lit.Var()
