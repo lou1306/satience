@@ -413,6 +413,7 @@ type CDCLSolver struct {
 	restartLevelCap            int     // Force restart when conflict level exceeds this on long-clause instances (0=disabled)
 	levelRestartGap            int     // Min conflicts between level-capped restarts (anti-thrashing)
 	minimizeMaxDepth           int     // Max recursion depth for recursive clause minimization (default 0=unlimited)
+	minimizeLBDGate            int     // Skip BIG+recursive minimization for learned clauses with pre-minimize LBD above this (0=always minimize)
 	unitPropBudget             int     // Max literal visits for unit propagation preprocess (0=unlimited)
 	dbCapFactor                float64 // Multiplier on the learned-DB deletion target (1.0 = baseline/indexical)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
@@ -687,6 +688,9 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Recursive minimization: max depth of reason-chain exploration (safety cap)
 		// 0 = unlimited (rely on DAG property for termination). MiniSat uses no cap.
 		minimizeMaxDepth: 0,
+		// LBD gate for BIG+recursive minimization: skip clauses with pre-minimize
+		// LBD > 16 (reduceDB eviction targets => mostly wasted minimization). 0 disables.
+		minimizeLBDGate: 16,
 		// Unit propagation budget: 0 = unlimited (small instances use fixpoint cap).
 		// Large instances set this to bound preprocessing time.
 		unitPropBudget: 0,
@@ -1062,6 +1066,19 @@ func (s *CDCLSolver) SetMinimizeMaxDepth(d int) {
 		d = 0
 	}
 	s.minimizeMaxDepth = d
+}
+
+// SetMinimizeLBDGate skips BIG+recursive minimization for learned clauses whose
+// pre-minimize LBD exceeds n. High-LBD clauses are reduceDB's first eviction
+// targets, so minimizing them is largely wasted cost; gating them preserves the
+// cost savings without weakening the low-LBD clauses that survive and drive the
+// search (so instances that depend on strong clauses are unaffected). 0 always
+// minimizes.
+func (s *CDCLSolver) SetMinimizeLBDGate(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.minimizeLBDGate = n
 }
 
 // SetVivifyPeriod sets how often vivification runs (every Nth restart).
@@ -5922,7 +5939,15 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 	// Disabled for clauses ≤2 literals (already minimal). originalSize and
 	// originalLBD feed ONLY the verbose minimize log inside this branch, so
 	// capture them here rather than per-learn unconditionally.
-	if len(s.tmpLearnedLits) > 2 {
+	//
+	// A/B LBD gate (SetMinimizeLBDGate): skip the expensive BIG BFS + recursive
+	// minimization for high-LBD clauses that reduceDB will evict anyway. Falling
+	// through leaves the clause unminimized (higher LBD, deleted sooner) — always
+	// sound, only trajectory/quality change. Low-LBD clauses are unaffected.
+	// The gate must cover the whole block (including the post-minimize LBD
+	// recompute) so lbd stays the unminimized (pre-minimize) value when skipped.
+	if len(s.tmpLearnedLits) > 2 &&
+		(s.minimizeLBDGate <= 0 || lbd <= s.minimizeLBDGate) {
 		originalSize := len(s.tmpLearnedLits)
 		originalLBD := lbd
 		s.tmpLearnedLits = s.minimizeLearnedClause(s.tmpLearnedLits)

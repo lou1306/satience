@@ -31,6 +31,7 @@ func run() int {
 	randomSeed := flag.Uint64("seed", 0, "Random seed for deterministic solving (default=0)")
 	rndInit := flag.Float64("rnd-init", 0.0, "Magnitude of random noise added to initial VSIDS activity (MiniSat-style, default=0=disabled)")
 	minimizeDepth := flag.Int("minimize-depth", 0, "Max recursion depth for recursive clause minimization (default=0=unlimited, relies on DAG property for termination)")
+	minimizeLBDGate := flag.Int("minimize-lbd-gate", 16, "Skip BIG+recursive minimization for clauses with pre-minimize LBD above this (0=always minimize; default 16)")
 	dbCapMult := flag.Float64("db-cap-mult", 1.0, "Scale the learned-DB deletion target (experimental: DB-size vs per-propagation cost)")
 	govDB := flag.Bool("gov-db", true, "Enable Detector 5: per-instance self-correcting learned-DB reduction on binary-heavy cost-bound instances")
 	parity := flag.Bool("parity", true, "XOR/parity preconditioning: detect parity families + GF(2)-derive units/binaries (add-only; default ON after distributional held-out gate; use -parity=false to disable)")
@@ -190,6 +191,7 @@ func run() int {
 
 	// Configure recursive clause minimization depth
 	s.SetMinimizeMaxDepth(*minimizeDepth)
+	s.SetMinimizeLBDGate(*minimizeLBDGate)
 	s.SetDBCapFactor(*dbCapMult)
 	s.SetGovernorDB(*govDB)
 	s.SetParityParams(*parity, *parityMaxLen, *parityBudget)
