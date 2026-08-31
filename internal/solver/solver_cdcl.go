@@ -418,9 +418,9 @@ type CDCLSolver struct {
 	dbCapFactor                float64 // Multiplier on the learned-DB deletion target (1.0 = baseline/indexical)
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
 	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
-	vivifyPeriod               int     // Run vivification every Nth restart (0=disabled, default 200)
-	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (default 5000)
-	conflictsAtLastVivify      int     // conflict count at last vivify round (for gap gate)
+	vivifyPeriod               int     // Master vivification switch (>0 enabled; cadence is conflict-based)
+	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (conflict-based cadence)
+	conflictsAtLastVivify      int     // conflict count at last vivify round (for conflict-cadence gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
 	subsumptionPeriodSet       bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
@@ -3675,11 +3675,16 @@ func (s *CDCLSolver) restart() bool {
 		s.qhead = 0
 	}
 
-	// Run vivification every Nth restart (after compaction, at level 0
-	// with no learned clause in use as a reason — same safety conditions
-	// as compaction). Gated by a minimum conflict gap so small/fast-restart
-	// instances don't thrash on low-yield vivify rounds.
-	if s.vivifyEnabled && s.vivifyPeriod > 0 && s.lubyIndex > 0 && s.lubyIndex%s.vivifyPeriod == 0 &&
+	// Vivification cadence, decoupled from the restart index. Under the old
+	// schedule (lubyIndex % vivifyPeriod == 0 AND the conflict gap), vivify was
+	// keyed to a flat restart counter that grows ~logarithmically with conflicts
+	// under geometric restarts (threshold = restartBase * 1.5^k with base 200),
+	// so it silently almost never fired on geometric-default instances and only
+	// engaged after the Det6 geometric->Luby flip. Vivify can only run at the
+	// level-0 restart boundary, so a true mode-independent cadence should be
+	// conflict-based: fire when vivifyMinConflictGap conflicts have elapsed since
+	// the last round. vivifyPeriod>0 is retained purely as the on/off switch.
+	if s.vivifyEnabled && s.vivifyPeriod > 0 &&
 		(s.vivifyMinConflictGap <= 0 || s.conflicts-s.conflictsAtLastVivify >= s.vivifyMinConflictGap) {
 		if s.runVivification() {
 			return true // UNSAT detected

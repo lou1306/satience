@@ -39,7 +39,7 @@ func run() int {
 	parityBudget := flag.Int("parity-budget", 2000, "Parity: hard cap on derived binary clauses appended (<=0 disables)")
 	paritySizeGate := flag.Int("parity-size-gate", 50000, "Parity: skip the O(clauses) scan above this many vars (0=always on)")
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
-	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Min conflicts between vivification rounds (default=20000, 0=restart-based only)")
+	vivifyMinConflictGap := flag.Int("vivify-min-gap", 20000, "Conflict-based vivification cadence: min conflicts between rounds (mode-independent; 0=off). Default 20000 (legacy; retune against DEV rail)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
