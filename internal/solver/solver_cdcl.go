@@ -444,6 +444,7 @@ type CDCLSolver struct {
 	polarityImbalance          float64 // Mean per-variable polarity imbalance (0=balanced, 1=pure)
 	maxLearnedClauseSize       int
 	preprocessingMaxVars       int     // Skip preprocessing if > N vars (default 50000)
+	structuredDensityGate      float64 // density >= this forces structured preprocessing even if score<0.7 & binRatio<=0.5 (0=disabled)
 	preprocessingMaxClauses    int     // Skip preprocessing if > N clauses (default 500000)
 	restartGlucoseRatio        float64 // Glucose-style restart when LBD > ratio × avg (default 1.5)
 	restartGlucoseMinConflicts int     // Min conflicts before Glucose restarts kick in (default 50)
@@ -747,6 +748,11 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// Configurable parameters with defaults
 		preprocessingMaxVars:    50000,
 		preprocessingMaxClauses: 500000,
+		// Density rescue: score<0.7 & binRatio<=0.5 can still be a structured
+		// industrial encoding (high clause/variable ratio); random k-SAT density
+		// is ~<=7. densityScore caps at /5 so dense formulas stay low-scored
+		// while being unmistakably structured. 0 disables.
+		structuredDensityGate: 15.0,
 		// Governor tuning knobs (CLI-exposed).
 		govGrindBase:  5,
 		govGrindPDec:  120.0,
@@ -1195,6 +1201,15 @@ func (s *CDCLSolver) recordBigOutcome(hit bool) {
 // with net wall-time regression on the suite — off by default (A/B only).
 func (s *CDCLSolver) SetBigLearn(on bool) {
 	s.bigLearnFlag = on
+}
+
+// SetStructuredDensityGate sets the density at/below which a score<0.7 &
+// binRatio<=0.5 instance is rescued onto structured preprocessing (0 disables).
+func (s *CDCLSolver) SetStructuredDensityGate(d float64) {
+	if d < 0 {
+		d = 0
+	}
+	s.structuredDensityGate = d
 }
 
 // SetPreferTrueCap sets how far the replacement scan hunts for a currently-TRUE
@@ -1908,6 +1923,35 @@ func (s *CDCLSolver) classifyInstance() {
 		s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
 			(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
 	}
+
+	// Classifier telemetry: emit every structural gate decision on stderr so the
+	// audit (and future regression checks) can read all decisions at once,
+	// independent of -verbose / -stats. Must stay read-only on s.cnf (as the rest
+	// of classifyInstance) and not perturb the search.
+	preproc := "on"
+	if s.structureScore < 0.7 && s.binaryRatio <= 0.5 &&
+		!(s.structuredDensityGate > 0 && s.cnf.NumVars > 0 && float64(s.cnf.NumClauses)/float64(s.cnf.NumVars) >= s.structuredDensityGate) &&
+		int(s.cnf.NumVars) <= s.preprocessingMaxVars {
+		preproc = "off"
+	}
+	flp := "off"
+	if s.structureScore < 0.7 && s.binaryRatio <= 0.5 {
+		flp = "on"
+	}
+	big := true
+	if s.structureScore < 0.7 && s.binaryRatio > 0.4 {
+		big = false
+	}
+	lbdScale := 200000.0 * s.binaryRatio / float64(s.cnf.NumVars)
+	if lbdScale < 10.0 {
+		lbdScale = 10.0
+	}
+	fmt.Fprintf(os.Stderr,
+		"c classify: score=%.3f binRatio=%.3f ternary=%.3f long=%.3f density=%.1f imb=%.2f regOcc=%t | preproc=%s bumpAnalyze=%t skipBVE=%t skipPolarity=%t skipSubsumption=%t FLP=%s BIG=%t subperiod=%d lbdScale=%.0f\n",
+		s.structureScore, s.binaryRatio, structure.TernaryRatio, s.longClauseRatio,
+		structure.Density, s.polarityImbalance, structure.RegularOccurrence,
+		preproc, s.useBumpAnalyze, s.skipBVE, s.skipPolarityPhase, s.skipSubsumption,
+		flp, big, s.subsumptionPeriod, lbdScale)
 }
 
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
@@ -1925,6 +1969,20 @@ func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
 	// skipBVE.
 	if int(s.cnf.NumVars) > s.preprocessingMaxVars {
 		s.Log("c [preprocessing] Large instance (%d vars) -> enabling aggressive preprocessing\n", s.cnf.NumVars)
+		return PreprocessingConfig{
+			EnableUnitProp: true,
+			MaxPasses:      1,
+		}
+	}
+	// Density rescue: a score<0.7 & binRatio<=0.5 formula with very high
+	// clause/variable density is a structured industrial encoding, not random
+	// k-SAT (random density stays ~<=7, and the uniform-long penalty forces
+	// rand4+/rand3 dense formulas low too). Route it onto preprocessing like a
+	// structured instance. Subsumption/BVE stay gated by their own density/
+	// ratio skip flags inside preprocessAggressive.
+	if s.structuredDensityGate > 0 && s.cnf.NumVars > 0 && float64(s.cnf.NumClauses)/float64(s.cnf.NumVars) >= s.structuredDensityGate {
+		s.Log("c [preprocessing] Density rescue (%.1f >= %.1f) -> structured preprocessing\n",
+			float64(s.cnf.NumClauses)/float64(s.cnf.NumVars), s.structuredDensityGate)
 		return PreprocessingConfig{
 			EnableUnitProp: true,
 			MaxPasses:      1,

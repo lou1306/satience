@@ -89,6 +89,7 @@ func run() int {
 	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: sliding-window length for hit-rate gate (0=never; default 50000)")
 	bigMinHitRate := flag.Float64("big-min-hit-rate", 0.05, "Disable BIG when recent hit-rate falls below this fraction (0=0-hit-only)")
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
+	structuredDensity := flag.Float64("structured-density", 15.0, "Density at/above which a score<0.7 & binaryRatio<=0.5 instance is rescued onto structured preprocessing (0=disable rescue)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	geometricRestarts := flag.Bool("geometric", true, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
 	minisatBumps := flag.Bool("minisat-bumps", true, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor). Default on: full-48-rail DEV win with -bump-amount=35 (-6.6% PAR2, net -1 TMO). Disable with -minisat-bumps=false.")
@@ -221,6 +222,7 @@ func run() int {
 	if *bigLearn {
 		s.SetBigLearn(true)
 	}
+	s.SetStructuredDensityGate(*structuredDensity)
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)
 	}
