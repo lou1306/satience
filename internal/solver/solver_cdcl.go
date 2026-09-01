@@ -426,6 +426,12 @@ type CDCLSolver struct {
 	subsumptionPeriodSet       bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
+	inprocessPeriod            int     // Re-simplify ORIGINAL clause DB every N conflicts at level 0 (in-processing; 0=off)
+	inprocessBudget            int     // BVE resolvent budget per in-processing round (0 = unlimited)
+	inprocessMinYield          int     // Min combined eliminations per round to keep in-processing enabled (0=any)
+	inprocessStalled           bool    // True once a round yields below inprocessMinYield (BVE saturated/unproductive)
+	inprocessExcluded          bool    // True when a static classifier (dense-binary) says in-processing is destructive here
+	conflictsAtLastInprocess   int     // conflict count at last in-processing round (for gap gate)
 	skipSubsumption            bool
 	skipBVE                    bool
 	skipPolarityPhase          bool
@@ -719,6 +725,8 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// is effectively free on random instances, so it is always enabled.
 		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
+		inprocessBudget:           2000000,
+		inprocessMinYield:         100,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
 		govNextConflict:      500,
 		randomPhaseRate:      0,
@@ -1091,6 +1099,22 @@ func (s *CDCLSolver) SetMinimizeLBDGate(n int) {
 // 0 disables vivification entirely.
 func (s *CDCLSolver) SetVivifyPeriod(p int) {
 	s.vivifyPeriod = p
+}
+
+// SetInprocess enables (period>0) in-processing: re-simplify the original
+// clause DB (subsumption + bounded VE) at restart boundaries every `period`
+// conflicts at level 0. budget is the per-round BVE resolvent cap (0=unlimited).
+func (s *CDCLSolver) SetInprocess(period, budget int) {
+	s.inprocessPeriod = period
+	if budget > 0 {
+		s.inprocessBudget = budget
+	}
+}
+
+// SetInprocessMinYield sets the per-round elimination threshold below which
+// in-processing stalls (stops scheduling future rounds). 0 = disable the gate.
+func (s *CDCLSolver) SetInprocessMinYield(y int) {
+	s.inprocessMinYield = y
 }
 
 // SetDBCapFactor manually scales the learned-DB deletion target (1.0 = baseline).
@@ -1891,6 +1915,11 @@ func (s *CDCLSolver) classifyInstance() {
 	// 24.5, 99.8% binary): 16.7s→1.4s. bb34f22f (density 3.12, 67% binary) is
 	// NOT gated (density ≤ 10) — it's the instance VE was tuned for.
 	s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
+	// In-processing classifier: in-process BVE has HIGH yield on dense-binary
+	// instances yet is destructive to search there (de2b: +2246 eliminations
+	// but TMO; same class as skipBVE). Exclude the dense-binary/BVE-hostile
+	// class outright so even an enabled in-processing never runs on them.
+	s.inprocessExcluded = s.skipBVE
 
 	// Subsumption is O(clauses × occurrences × clause-length). On very dense
 	// instances (density > 60) the occurrence lists are huge, making each pass
@@ -2303,7 +2332,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// when it reduces clause count. Model reconstruction by trying x=true/x=false.
 		// Skipped on dense binary instances (skipBVE) where it is pure overhead.
 		if config.EnableUnitProp && !s.skipBVE {
-			veResult := s.boundedVarElimination()
+			veResult := s.boundedVarElimination(false)
 			if veResult < 0 {
 				s.printStats()
 				return UNSAT
@@ -3481,6 +3510,75 @@ func (s *CDCLSolver) cancelUntil(level int) {
 	s.qhead = len(s.trail)
 }
 
+// simplifyOriginalDB re-runs original-clause simplification (subsumption +
+// bounded VE) at a level-0 restart boundary, then rebuilds the original-clause
+// SoA (literal pool + locs), rebuilds watches, and re-propagates unit clauses.
+// In-processing makes the (otherwise preprocessing-only) reduction available to
+// instances whose formula changes as search discovers unit clauses. Returns
+// true if the formula became UNSAT.
+func (s *CDCLSolver) simplifyOriginalDB() bool {
+	if s.cnf.NumClauses == 0 {
+		return false
+	}
+	// Materialize the original clause DB into slice form (it is nil during
+	// search; parser + pre-processing consumed it into the SoA pool/locs).
+	pool := s.cnf.GetLiteralPool()
+	locs := s.cnf.GetOriginalClauseLocs()
+	clauses := make([]cnf.Clause, 0, len(locs))
+	for i := range locs {
+		off := int(locs[i].Offset)
+		sz := int(locs[i].Size)
+		if sz == 0 {
+			continue
+		}
+		lits := make([]cnf.Literal, sz)
+		copy(lits, pool[off:off+sz])
+		clauses = append(clauses, cnf.Clause{Literals: lits})
+	}
+	s.cnf.Clauses = clauses
+	s.cnf.NumClauses = len(clauses)
+
+	saveBudget := s.veBudget
+	if s.inprocessBudget > 0 {
+		s.veBudget = s.inprocessBudget
+	}
+	defer func() { s.veBudget = saveBudget; s.cnf.Clauses = nil }()
+
+	subSubsumed, subStrengthened := s.subsumptionPass()
+	if s.hasEmptyClause() {
+		return true
+	}
+	elim := 0
+	if vr := s.boundedVarElimination(true); vr < 0 {
+		return true
+	} else if vr > 0 {
+		elim = vr
+	}
+
+	// Yield gate: if this round removed essentially nothing (BVE saturated or
+	// unproductive), stop scheduling future in-process rounds — the materialize
+	// + scan + watch-rebuild overhead is then pure cost. Reset on a productive
+	// round so a later stored-yield instance can resume.
+	roundYield := subSubsumed + subStrengthened + elim
+	if roundYield < s.inprocessMinYield {
+		s.inprocessStalled = true
+	} else {
+		s.inprocessStalled = false
+	}
+
+	s.cnf.RebuildLiteralPool()
+	s.originalUnitClauses = precomputeOriginalUnitClauses(s.cnf)
+
+	// Rebuild watches (original + learned) and re-propagate level-0 units so
+	// the reduced formula is fully consistent before search resumes.
+	s.watchInitialized = false
+	s.initWatches()
+	if s.propagateOriginalUnitsAndActivateWatches() {
+		return true
+	}
+	return false
+}
+
 func (s *CDCLSolver) restart() bool {
 	s.unitsDirty = true // Restart clears all assignments; units need re-propagation
 	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
@@ -4285,6 +4383,34 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			s.Log("c [verbose] Iteration limit reached (%d)\n", s.maxIter)
 			s.printStats()
 			return UNKNOWN
+		}
+
+		// In-processing: re-simplify the ORIGINAL clause DB on a predictable
+		// rolling >= conflict-gap cadence, INDEPENDENT of restarts. Level-0 is
+		// the true safety requirement (no clause in use as a reason) and is
+		// reached on demand via cancelUntil(0) rather than a scheduled restart
+		// (which carries Luby/geometric/phase bookkeeping we do not want).
+		// Gated OFF by default (inprocessPeriod=0) until proven net-positive; a
+		// future classifier may enable it per-instance like preprocessing. Two
+		// runtime/static classifiers further limit it: dense-binary exclusion
+		// (destructive BVE) and a yield gate (stops after a low-yield round).
+		if s.inprocessPeriod > 0 && !s.inprocessExcluded && !s.inprocessStalled &&
+			s.conflicts >= s.conflictsAtLastInprocess+s.inprocessPeriod {
+			if s.level > 0 {
+				s.cancelUntil(0)
+			}
+			if s.simplifyOriginalDB() {
+				s.printStats()
+				return UNSAT
+			}
+			s.conflictsAtLastInprocess = s.conflicts
+			// This level-0 reset wasn't a scheduled restart, so keep the
+			// governor's segment-productivity measurement honest by resetting
+			// its segment-start counters.
+			s.restartSegStartConf = s.conflicts
+			s.restartSegStartDec = s.decisions
+			s.restartSegStartGlue = int(s.glueLearned)
+			continue
 		}
 
 		// Det6: geometric->Luby rest-mechanism flip on conflict-window cadence

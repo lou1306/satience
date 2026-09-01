@@ -29,7 +29,7 @@ const maxVEPairCost = 1000
 // veBudget=0 means unlimited (small instances). For large instances, the
 // budget bounds total resolvents generated to prevent explosion.
 // Returns number of eliminated variables, or -1 if UNSAT detected (empty resolvent).
-func (s *CDCLSolver) boundedVarElimination() int {
+func (s *CDCLSolver) boundedVarElimination(skipAssigned bool) int {
 	numVars := int(s.cnf.NumVars)
 	if numVars == 0 || s.cnf.NumClauses == 0 {
 		return 0
@@ -142,6 +142,15 @@ func (s *CDCLSolver) boundedVarElimination() int {
 
 		if !found {
 			break // no eliminatable variables
+		}
+
+		// In-processing safety: never eliminate a currently-assigned variable
+		// (a level-0 unit / pre-processing assignment). Reconstruction of an
+		// eliminated-but-already-assigned variable would fight the existing
+		// assignment, so skip it instead.
+		if skipAssigned && s.assignments[v].Level >= 0 {
+			eliminatedFlag[v] = true
+			continue
 		}
 
 		// Budget check
