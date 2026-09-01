@@ -60,23 +60,6 @@ const (
 	// for productive shallow instances.
 	propsDecPhaseFlipBase = 100
 
-	// maxAdaptiveRestartGear caps the multiplicative gear on the Luby fallback
-	// base (see adaptiveRestartGear). Bounding ensures the fallback can never
-	// grow so rare that the solver loses all periodic diversification — the
-	// cap is a safety bound on the adaptive multiplier, not a per-instance
-	// threshold.
-	maxAdaptiveRestartGear = 16.0
-
-	// restartPatienceConflicts is the uniform accumulated-conflict horizon that
-	// must elapse before the adaptive gear may start deepening the Luby
-	// fallback. Instances that solve within an ordinary conflict budget (all
-	// suite instances solve below ~85K) never reach it and keep their tuned
-	// frequent-restart schedule untouched; only long grinders, whose default
-	// schedule has demonstrably failed to converge, are deepened. This is a
-	// single uniform horizon — a "give the default schedule a fair chance"
-	// rule — not a per-family or per-instance threshold.
-	restartPatienceConflicts = 120000
-
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
 
@@ -234,29 +217,19 @@ type CDCLSolver struct {
 	// bounded, level-capped, or MiniSat geometric. Used to diagnose where
 	// search time goes (flat-high-LBD instances never fire Glucose, so the
 	// Luby fallback dominates).
-	restartReasons      [5]int  // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
-	restartSegStartConf int     // conflicts at the start of the current restart segment
-	restartSegStartDec  int     // decisions at the start of the current restart segment
-	restartSegProdRatio float64 // conflicts per 1000 decisions over the last segment (negative=unset)
-	restartSegGlueCount int     // glue clauses learned in the current segment
-	restartSegStartGlue int     // glueLearned at the start of the current segment
+	restartReasons      [5]int // [0]=glucose, [1]=luby, [2]=propsdec, [3]=levelcap, [4]=geometric
+	restartSegStartConf int    // conflicts at the start of the current restart segment
+	restartSegStartDec  int    // decisions at the start of the current restart segment
+	restartSegGlueCount int    // glue clauses learned in the current segment
+	restartSegStartGlue int    // glueLearned at the start of the current segment
 	// Branch-quality telemetry (instrumentation): which VSIDS bump scheme and
 	// init mode were actually in effect. 1=analyze_toclear (bump all touched),
 	// 0=bumpClause only; initMode 1=clause/occurrence-weighted, 0=zero-init.
 	branchBumpScheme int
 	branchInitMode   int
-	// Adaptive restart gear: multiplier on the Luby fallback base. Starts at
-	// 1.0 (exact baseline). Raised to maxAdaptiveRestartGear by restart() when
-	// the search has ground past restartPatienceConflicts conflicts with no
-	// Glucose ever firing and no glue learned — the flat-LBD grinder signature
-	// (rphp). Decayed back to 1.0 whenever Glucose/glue activity appears, since
-	// healthy instances need their frequent diversification preserved.
-	adaptiveRestartGear      float64
-	restartSegTotalConflicts uint64 // accumulated conflicts across segments
-	restartSegSteps          int    // number of restart segments observed
-	lbdSum                   int
-	lbdCount                 int
-	emaLBD                   float64 // Exponential moving average of LBD (smooth restart signal)
+	lbdSum           int
+	lbdCount         int
+	emaLBD           float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
 	totalLbdSum   uint64
@@ -312,18 +285,18 @@ type CDCLSolver struct {
 	// learned clause changes, so the disabled search is trajectory-identical to
 	// the enabled one — this is a pure per-conflict-cost win, distinct from the
 	// (retired) watch trajectory thread.
-	bigDisabled  bool    // adaptive gate fired: skip BIG minimize + learned-binary maintenance
-	bigHitWindow int64   // sliding-window length (ring size): 0 = never disable
+	bigDisabled   bool    // adaptive gate fired: skip BIG minimize + learned-binary maintenance
+	bigHitWindow  int64   // sliding-window length (ring size): 0 = never disable
 	bigMinHitRate float64 // disable BIG when recent (sliding-window) hit rate falls below this (fraction)
 	// Sliding-window ring tracks the outcome of the most recent bigHitWindow BIG
 	// attempts so the gate observes hit RATE rather than the historical cumulative
 	// 0-hit signal. Scattered hits no longer keep BIG alive forever on a low-yield
 	// instance (old gate: only disabled when TOTAL hits == 0, so a 0.5% hit rate
 	// never fired and BIG ran at ~99.5% BFS overhead for the whole solve).
-	bigWinRing  []bool // outcome of each recent BIG attempt (nil until first use)
-	bigWinPtr   int    // next ring write position
-	bigWinHits  int    // #hits currently present in the ring
-	bigWinFull  bool   // ring has been fully populated at least once
+	bigWinRing []bool // outcome of each recent BIG attempt (nil until first use)
+	bigWinPtr  int    // next ring write position
+	bigWinHits int    // #hits currently present in the ring
+	bigWinFull bool   // ring has been fully populated at least once
 
 	// bigLearnAdj augments the static original-binary BIG with implication
 	// edges from LEARNED binary clauses. Learned clauses are permanent logical
@@ -426,18 +399,24 @@ type CDCLSolver struct {
 	subsumptionPeriodSet       bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
-	inprocessPeriod            int     // Re-simplify ORIGINAL clause DB every N conflicts at level 0 (in-processing; 0=off)
+	inprocessPeriod            int     // Master in-processing switch + initial conflict gap (0=off); cadence is adaptive
 	inprocessBudget            int     // BVE resolvent budget per in-processing round (0 = unlimited)
-	inprocessMinYield          int     // Min combined eliminations per round to keep in-processing enabled (0=any)
-	inprocessStalled           bool    // True once a round yields below inprocessMinYield (BVE saturated/unproductive)
+	inprocessMinYield          int     // Per-round yield (subsumed+strengthened+eliminated) below which the adaptive cadence backs off
+	inprocessMinUnits          int     // Min NEW root-level units since the last round required to justify a fire (trigger A)
+	inprocessGapCur            int     // Current adaptive conflict cadence (initialize = inprocessPeriod)
+	inprocessGapMin            int     // Adaptive floor for inprocessGapCur (high-yield rounds tighten toward this)
+	inprocessGapMax            int     // Adaptive ceiling (low-yield rounds back off to this, effectively stopping)
+	rootUnitsLearned           int     // Monotonic counter: size-1 learned clauses stored (root facts discovered)
+	unitsAtLastInprocess       int     // rootUnitsLearned snapshot at the last in-processing round
 	inprocessExcluded          bool    // True when a static classifier (dense-binary) says in-processing is destructive here
+	inprocessRoundsRun         uint64  // diagnostic: in-processing rounds actually executed
 	conflictsAtLastInprocess   int     // conflict count at last in-processing round (for gap gate)
 	skipSubsumption            bool
 	skipBVE                    bool
 	skipPolarityPhase          bool
 	occurrenceWeight           float64
 	skipVSIDSInit              bool
-	geometricRestarts             bool
+	geometricRestarts          bool
 	geometricRestartThreshold  float64 // Cached threshold for geometricRestarts (= restartBase × 1.5^lubyIndex)
 	lazyInit                   *lazyInitState
 	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
@@ -498,45 +477,15 @@ type CDCLSolver struct {
 	// at restart boundaries (cold path) using rolling-window deltas of live
 	// search signals. See governor.go / maybeAdaptSearch.
 	govStartConf    uint64 // cumulative conflicts at last window snapshot
-	govStartDec     uint64 // cumulative decisions at last window snapshot
-	govStartProps   uint64 // cumulative propagations at last window snapshot
 	govStartLbd     uint64 // cumulative LBD sum at last snapshot
 	govStartLbdC    uint64 // cumulative LBD-clause count at last snapshot
-	govStartMoves   uint64 // Det5: cumulative watch-moves at last snapshot
 	govNextConflict int    // next conflict count at which to evaluate the governor
-	govGlucoseOn    bool   // Detector 3 fired: reactive Glucose enabled
-	govGearRaised   bool   // Detector 1 fired: restart base already lowered
 	govStagFired    bool   // Detector 4 fired: restart base already lowered on LBD stagnation
-	// Detector 5 (DB cost): progressive, per-instance self-correcting learned-DB
-	// reduction. Only fires on binary-heavy formulas whose per-propagation cost
-	// is elevated; steps dbCapFactor down while a window's watch-moves/decision
-	// keeps improving, reverting the last step and stopping when it stops.
-	govDbEnabled        bool    // Det5 enabled (default off; -gov-db to enable)
-	govDbMinBinary      float64 // require binaryRatio > this (excludes deep-search non-binary 30eb)
-	govDbStartPDec      float64 // require elevated sustained props/dec to consider starting
-	govDbStartConf      int     // min conflicts before Det5 may launch
-	govDbStepFactor     float64 // per-step multiplier on dbCapFactor when a step helps
-	govDbFloor          float64 // floor for dbCapFactor (never shrink below)
-	govDbMargin         float64 // min fractional moves/decision improvement to keep stepping
-	govDbLaunched       bool    // Det5 has launched
-	govDbPendingEval    bool    // a step was applied; evaluate after next window
-	govDbFactorBase     float64 // dbCapFactor in effect before the pending step (revert target)
-	govDbRefMovesPerDec float64 // moves/decision of the window before the pending step
-	govDbSteps          int     // Det5: DB-reduction steps applied (diagnostic)
-	govDbReverts        int     // Det5: DB-reduction reverts (diagnostic)
-	govDbActive         bool    // Det5 currently holding a reduced cap (diagnostic)
-	govDbFinalFactor    float64 // Det5: final dbCapFactor (diagnostic)
-	govDbGrows          int     // continuous: DB-regrowth steps applied (diagnostic)
 
 	// Detector 4 LBD-stagnation history (last govStagWin window avgLBDs).
 	govLbdHist    [8]float64
 	govLbdHistN   int
 	govLbdHistIdx int
-
-	// Unified runtime governor (A/B, -gov-unified; off by default). Replaces the
-	// separate Det1/Det3/Det4/Det5 actuation with a single windowed controller
-	// that maps normalized search-health signals onto bounded, trend-aware
-	// actuators, plus adaptive vivify cadence.
 
 	// XOR / parity preprocessing (-parity; ON by default). Add-only
 	// Gaussian elimination over detected parity families (see parity.go).
@@ -551,16 +500,11 @@ type CDCLSolver struct {
 
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
-	govGrindBase  int     // Det1: target restartBase when cascade grind fires (default 5)
-	govGrindPDec  float64 // Det1: props/dec threshold to qualify as cascade grind (default 120)
-	govGrindConf  int     // Det1: min conflicts before Det1 may fire (default 30000)
-	govWanderDecC float64 // Det3: min decisions/conflict to qualify as wander (default 40)
-	govWanderGlue float64 // Det3: max glue ratio to qualify as wander (default 0.10)
-	govWindow     int     // window scope in conflicts per governor eval (default 20000)
-	govStagLBD    float64 // Det4: window avgLBD threshold to qualify as high (default 12)
-	govStagGlue   float64 // Det4: max window glue ratio to qualify as stagnation (default 0.05)
-	govStagWin    int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
-	govStagBase   int     // Det4: target restartBase when stagnation fires (default 20)
+	govWindow   int     // window scope in conflicts per governor eval (default 20000)
+	govStagLBD  float64 // Det4: window avgLBD threshold to qualify as high (default 12)
+	govStagGlue float64 // Det4: max window glue ratio to qualify as stagnation (default 0.05)
+	govStagWin  int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
+	govStagBase int     // Det4: target restartBase when stagnation fires (default 20)
 	// Det6 (geometric-spiral -> Luby mechanism flip): fires once when running
 	// geometric (geometric-restarts) restarts on a STRUCTURED unguided deep-spiral
 	// signature (chain/ordering-principle-like: weak phase guidance, high flat
@@ -639,26 +583,25 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		maxIter:              0,
 		// P0: Pre-allocate learned clause arrays with generous capacity to avoid growth
 		// learnedLiterals: 8 literals per clause average (covers most learned clauses)
-		learnedLiterals:     make([]cnf.Literal, 0, maxLearned*8),
-		learnedLoc:          make([]LearnedClauseLoc, 0, maxLearned),
-		learnedMetadata:     make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
-		learnedWatchIdx0:    make([]int, 0, maxLearned),                // Watched literal indices
-		learnedWatchIdx1:    make([]int, 0, maxLearned),
-		learnedSearchHint:   make([]int32, 0, maxLearned), // Hot-path search hints
-		learnedActiveCount:  0,
-		preferTrueCap:       0, // Disabled by default (CLI -prefer-true-cap overrides)
-		learnedCapacity:     0,
-		unitLearnedList:     make([]int, 0, 64), // Pre-allocate for unit clause tracking
-		verbose:             false,
-		decisions:           0,
-		backjumpLevel:       0,
-		maxLearned:          maxLearned,
-		restartBase:         restartBase,
-		restartCount:        0,
-		adaptiveRestartGear: 1.0,
-		lubyIndex:           0,
-		lbdSum:              0,
-		lbdCount:            0,
+		learnedLiterals:    make([]cnf.Literal, 0, maxLearned*8),
+		learnedLoc:         make([]LearnedClauseLoc, 0, maxLearned),
+		learnedMetadata:    make([]cnf.ClauseMetadata, 0, maxLearned), // Packed metadata
+		learnedWatchIdx0:   make([]int, 0, maxLearned),                // Watched literal indices
+		learnedWatchIdx1:   make([]int, 0, maxLearned),
+		learnedSearchHint:  make([]int32, 0, maxLearned), // Hot-path search hints
+		learnedActiveCount: 0,
+		preferTrueCap:      0, // Disabled by default (CLI -prefer-true-cap overrides)
+		learnedCapacity:    0,
+		unitLearnedList:    make([]int, 0, 64), // Pre-allocate for unit clause tracking
+		verbose:            false,
+		decisions:          0,
+		backjumpLevel:      0,
+		maxLearned:         maxLearned,
+		restartBase:        restartBase,
+		restartCount:       0,
+		lubyIndex:          0,
+		lbdSum:             0,
+		lbdCount:           0,
 		// Clause-activity deletion: VSIDS-style decayed activity for within-tier
 		// deletion ordering. Defaults enable activity (can be disabled via CLI).
 		claInc:             1.0,
@@ -671,17 +614,16 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpLiteralIsNegated: make([]bool, formula.NumVars),
 		bigBfsVisited:       make([]uint16, int(formula.NumVars)*2),
 		bigBfsQueue:         make([]int, 0, 256),
-		bigBfsBudget:        16,
-		bigHitWindow:        50000,
-		bigMinHitRate:       0.05,
-		tmpLevelCount:       make([]int, formula.NumVars+1),
-		tmpLevelCountUsed:   make([]bool, formula.NumVars+1),
-		tmpCandidates:       make([]resolveCandidate, 0, 200), // Increased from 100
-		tmpLevelSet:         make([]int, 0, formula.NumVars),
-		tmpLevelSetUsed:     make([]bool, formula.NumVars+1),
-		tmpResolved:         make([]bool, formula.NumVars),
-		tmpResolvedVars:     make([]uint32, 0, formula.NumVars),
-		tmpTouchedVars:      make([]uint32, 0, formula.NumVars),
+		bigBfsBudget:        16, bigHitWindow: 50000,
+		bigMinHitRate:     0.05,
+		tmpLevelCount:     make([]int, formula.NumVars+1),
+		tmpLevelCountUsed: make([]bool, formula.NumVars+1),
+		tmpCandidates:     make([]resolveCandidate, 0, 200), // Increased from 100
+		tmpLevelSet:       make([]int, 0, formula.NumVars),
+		tmpLevelSetUsed:   make([]bool, formula.NumVars+1),
+		tmpResolved:       make([]bool, formula.NumVars),
+		tmpResolvedVars:   make([]uint32, 0, formula.NumVars),
+		tmpTouchedVars:    make([]uint32, 0, formula.NumVars),
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:   make([]cnf.Literal, 0, 256),
 		tmpMinSeenVars:   make([]uint32, 0, 256),
@@ -727,20 +669,14 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		subsumptionMinConflictGap: 20000,
 		inprocessBudget:           2000000,
 		inprocessMinYield:         100,
+		inprocessMinUnits:         16,
+		inprocessGapMin:           5000,
+		inprocessGapMax:           200000,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
 		govNextConflict:      500,
 		randomPhaseRate:      0,
 		restartPhaseFlipRate: 0,
-		// Detector 5 (DB cost) defaults.
-		govDbEnabled:     true,
-		govDbMinBinary:   0.4,
-		govDbStartPDec:   25.0,
-		govDbStartConf:   30000,
-		govDbStepFactor:  0.75,
-		govDbFloor:       0.5,
-		govDbMargin:      0.08,
-		govDbFinalFactor: 1.0,
-		dbCapFactor:      1.0,
+		dbCapFactor:          1.0,
 		// Parity preprocessing (-parity; ON by default after the distributional
 		// held-out gate passed on all validation families — no new TMO, no
 		// median regression, ~5700x median-PAR2 win on Tseitin families).
@@ -761,18 +697,12 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// is ~<=7. densityScore caps at /5 so dense formulas stay low-scored
 		// while being unmistakably structured. 0 disables.
 		structuredDensityGate: 15.0,
-		// Governor tuning knobs (CLI-exposed).
-		govGrindBase:  5,
-		govGrindPDec:  120.0,
-		govGrindConf:  30000,
-		govWanderDecC: 40.0,
-		govWanderGlue: 0.10,
-		govWindow:     20000,
-		govStagLBD:    12.0,
-		govStagGlue:   0.05,
-		govStagWin:    3,
-		govStagBase:   20,
-		govSpiralPDec: 8.0, // Det6: deep unguided cascade threshold for geo->Luby flip
+		govWindow:             20000,
+		govStagLBD:            12.0,
+		govStagGlue:           0.05,
+		govStagWin:            3,
+		govStagBase:           20,
+		govSpiralPDec:         8.0, // Det6: deep unguided cascade threshold for geo->Luby flip
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
 		restartGlucoseMinConflicts: 50,  // Start Glucose restarts early
@@ -916,24 +846,9 @@ func (s *CDCLSolver) SetAdaptPropDecDeepGate(limit, gate int) {
 	s.adaptPropDecDeepGate = gate
 }
 
-// SetGovernorParams overrides the runtime search-governor tuning knobs
-// (Detector 1 cascade-grind and Detector 3 wander). Used for parameter sweeps.
-func (s *CDCLSolver) SetGovernorParams(grindBase int, grindPDec float64, grindConf int, wanderDecC, wanderGlue float64, window int) {
-	if grindBase >= 1 {
-		s.govGrindBase = grindBase
-	}
-	if grindPDec > 0 {
-		s.govGrindPDec = grindPDec
-	}
-	if grindConf > 0 {
-		s.govGrindConf = grindConf
-	}
-	if wanderDecC > 0 {
-		s.govWanderDecC = wanderDecC
-	}
-	if wanderGlue >= 0 {
-		s.govWanderGlue = wanderGlue
-	}
+// SetGovernorWindow sets the conflict-window scope (in conflicts) for the
+// runtime search-governor evaluation cadence (Detector 4 / Detector 6).
+func (s *CDCLSolver) SetGovernorWindow(window int) {
 	if window > 0 {
 		s.govWindow = window
 	}
@@ -1102,19 +1017,45 @@ func (s *CDCLSolver) SetVivifyPeriod(p int) {
 }
 
 // SetInprocess enables (period>0) in-processing: re-simplify the original
-// clause DB (subsumption + bounded VE) at restart boundaries every `period`
-// conflicts at level 0. budget is the per-round BVE resolvent cap (0=unlimited).
+// clause DB (subsumption + bounded VE) at level 0. period is both the master
+// switch and the INITIAL conflict cadence; the cadence then adapts to measured
+// yield (productive rounds tighten, unproductive rounds back off). budget is
+// the per-round BVE resolvent cap (0=unlimited).
 func (s *CDCLSolver) SetInprocess(period, budget int) {
 	s.inprocessPeriod = period
+	s.inprocessGapCur = period
 	if budget > 0 {
 		s.inprocessBudget = budget
 	}
 }
 
-// SetInprocessMinYield sets the per-round elimination threshold below which
-// in-processing stalls (stops scheduling future rounds). 0 = disable the gate.
+// SetInprocessMinYield sets the per-round yield (subsumed+strengthened+
+// eliminated) threshold: below it the adaptive cadence backs off (lengthens
+// the gap), at/above it the cadence tightens. 0 = disable the yield gate.
 func (s *CDCLSolver) SetInprocessMinYield(y int) {
 	s.inprocessMinYield = y
+}
+
+// SetInprocessMinUnits sets the minimum number of NEW root-level units since the
+// last round required to justify firing an in-processing round (trigger A).
+func (s *CDCLSolver) SetInprocessMinUnits(n int) {
+	if n > 0 {
+		s.inprocessMinUnits = n
+	}
+}
+
+// SetInprocessGapRange sets the adaptive cadence floor/ceiling (min/max
+// conflicts between rounds). Setting min==max disables adaptation.
+func (s *CDCLSolver) SetInprocessGapRange(minV, maxV int) {
+	if minV > 0 {
+		s.inprocessGapMin = minV
+	}
+	if maxV >= minV && maxV > 0 {
+		s.inprocessGapMax = maxV
+	}
+	if s.inprocessGapCur > 0 && s.inprocessGapCur < s.inprocessGapMin {
+		s.inprocessGapCur = s.inprocessGapMin
+	}
 }
 
 // SetDBCapFactor manually scales the learned-DB deletion target (1.0 = baseline).
@@ -1123,12 +1064,6 @@ func (s *CDCLSolver) SetDBCapFactor(f float64) {
 		f = 1.0
 	}
 	s.dbCapFactor = f
-}
-
-// SetGovernorDB enables/disables Detector 5 (per-instance self-correcting DB
-// reduction). Default off (bit-identical baseline with dbCapFactor=1.0).
-func (s *CDCLSolver) SetGovernorDB(on bool) {
-	s.govDbEnabled = on
 }
 
 // SetParityParams gates XOR/parity preprocessing (-parity, default ON). maxArity
@@ -1495,8 +1430,8 @@ func (s *CDCLSolver) printStats() {
 		s.Log("c Avg LBD:       %d\n", stats.AvgLBD)
 	}
 	s.logDiagnostics()
-	s.Log("c Restarts:      %s (last segment %d conf/1kdec, %d glue)\n",
-		s.restartReasonSummary(), int(s.restartSegProdRatio), s.restartSegGlueCount)
+	s.Log("c Restarts:      %s (last segment %d glue)\n",
+		s.restartReasonSummary(), s.restartSegGlueCount)
 	s.Log("c \n")
 
 	// When -stats is enabled without -verbose, emit a compact final summary to
@@ -1558,16 +1493,16 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | govdb: act=%v steps=%d rev=%d grow=%d cap=%.2f | parity: rows=%d units=%d bins=%d pfr=%d | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | move: recast=%d hintMiss=%d scanLits=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | parity: rows=%d units=%d bins=%d pfr=%d 	 | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | inprocess: rounds=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | move: recast=%d hintMiss=%d scanLits=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
-		s.govDbActive, s.govDbSteps, s.govDbReverts, s.govDbGrows, s.govDbFinalFactor,
 		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityRounds,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
+		s.inprocessRoundsRun,
 		s.uipFallbackCount,
 		s.blitFastHits, s.binarySlow, s.generalSlow, s.generalMoves,
 		s.moveReallocCast, s.moveHintMiss, s.moveScanLits,
@@ -1648,13 +1583,13 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.totalLbdCount > 0 {
 		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg=%.0f/1kdec glue=%d\n",
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg-glue=%d\n",
 		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, glueRatio, shrunk,
 		s.branchBumpScheme, s.branchInitMode,
 		minRate,
 		s.bigMinimizeHits, s.bigMinimizeCalls,
-		s.restartReasonSummary(), s.restartSegProdRatio, s.restartSegGlueCount)
+		s.restartReasonSummary(), s.restartSegGlueCount)
 }
 
 // elapsedSec returns seconds since the public Solve entry set solveStartNs.
@@ -3391,17 +3326,10 @@ func (s *CDCLSolver) shouldRestart() bool {
 			}
 		}
 
-		// Fall back to Luby sequence (configurable base), scaled by an adaptive
-		// gear. The raw Luby sequence alone oscillates back to short segments
-		// (1,1,2,1,1,2,4,...) forever, so on flat-high-LBD instances where
-		// Glucose can never fire (EMA ≈ avg), the fallback throttles search into
-		// a permanent cycle of frequent shallow restarts, never letting it go
-		// deep. Raising the gear (rarer restarts) on such grinders lets deep
-		// search develop. Gear = 1.0 reproduces baseline exactly; it is moved
-		// only by the behavioral governor in restart(). Bounded via
-		// maxAdaptiveRestartGear so it can never starve diversification.
+		// Fall back to Luby sequence (configurable base). The raw Luby sequence
+		// oscillates back to short segments (1,1,2,1,1,2,4,...) forever.
 		lubyValue := luby(s.lubyIndex + 1)
-		threshold := float64(lubyValue*s.restartBase) * s.adaptiveRestartGear
+		threshold := float64(lubyValue * s.restartBase)
 
 		if float64(s.conflicts-s.restartCount) >= threshold {
 			s.restartReasons[1]++ // luby
@@ -3555,15 +3483,28 @@ func (s *CDCLSolver) simplifyOriginalDB() bool {
 		elim = vr
 	}
 
-	// Yield gate: if this round removed essentially nothing (BVE saturated or
-	// unproductive), stop scheduling future in-process rounds — the materialize
-	// + scan + watch-rebuild overhead is then pure cost. Reset on a productive
-	// round so a later stored-yield instance can resume.
+	// Yield-based adaptive cadence (C): adjust the conflict gap for the NEXT
+	// round from this round's yield (subsumed + strengthened + eliminated,
+	// i.e. actual formula reduction). A productive round tightens the cadence
+	// (fire again sooner), a low-yield round backs it off toward inprocessGapMax
+	// (effectively stopping) without a hard latch, so a formula that becomes
+	// unit-rich again can resume. Yield reuses roundYield (subsumed+
+	// strengthened+eliminated).
 	roundYield := subSubsumed + subStrengthened + elim
-	if roundYield < s.inprocessMinYield {
-		s.inprocessStalled = true
-	} else {
-		s.inprocessStalled = false
+	if s.inprocessGapCur > 0 {
+		if roundYield >= s.inprocessMinYield {
+			if s.inprocessGapCur/2 < s.inprocessGapMin {
+				s.inprocessGapCur = s.inprocessGapMin
+			} else {
+				s.inprocessGapCur /= 2
+			}
+		} else if s.inprocessGapMin > 0 && s.inprocessGapMin != s.inprocessGapMax {
+			if s.inprocessGapCur*2 > s.inprocessGapMax {
+				s.inprocessGapCur = s.inprocessGapMax
+			} else {
+				s.inprocessGapCur *= 2
+			}
+		}
 	}
 
 	s.cnf.RebuildLiteralPool()
@@ -3579,6 +3520,39 @@ func (s *CDCLSolver) simplifyOriginalDB() bool {
 	return false
 }
 
+// inprocessDue reports whether an in-processing round is due at the current
+// point. Combines trigger A (enough NEW root-level units discovered since the
+// last round — the causal condition: formula changes unlock reductions) with
+// the adaptive conflict gap C (inprocessGapCur, driven by yield), and the
+// static dense-binary exclusion. It is deliberately not a bare conflict-period
+// check: firing the expensive materialize+scan+rebuild only on real reductions
+// amortizes the cost.
+func (s *CDCLSolver) inprocessDue() bool {
+	return s.inprocessPeriod > 0 && !s.inprocessExcluded && s.inprocessGapCur > 0 &&
+		s.conflicts >= s.conflictsAtLastInprocess+s.inprocessGapCur &&
+		s.rootUnitsLearned-s.unitsAtLastInprocess >= s.inprocessMinUnits
+}
+
+// runInprocess executes one in-processing round. Caller must already be at
+// level 0 (either a scheduled restart — co-schedule D — or an on-demand
+// cancelUntil(0) from the loop fallback). Returns true if the formula became
+// UNSAT. Updates the last-round snapshot and the governor's segment counters
+// (this level-0 reset wasn't a scheduled restart).
+func (s *CDCLSolver) runInprocess() bool {
+	s.inprocessRoundsRun++
+	s.Log("c [inprocess] round %d: conflicts=%d newUnits=%d gap=%d\n",
+		s.inprocessRoundsRun, s.conflicts, s.rootUnitsLearned-s.unitsAtLastInprocess, s.inprocessGapCur)
+	if s.simplifyOriginalDB() {
+		return true
+	}
+	s.conflictsAtLastInprocess = s.conflicts
+	s.unitsAtLastInprocess = s.rootUnitsLearned
+	s.restartSegStartConf = s.conflicts
+	s.restartSegStartDec = s.decisions
+	s.restartSegStartGlue = int(s.glueLearned)
+	return false
+}
+
 func (s *CDCLSolver) restart() bool {
 	s.unitsDirty = true // Restart clears all assignments; units need re-propagation
 	s.Log("c [verbose] Restart #%d at conflict %d\n", s.lubyIndex+1, s.conflicts)
@@ -3589,52 +3563,14 @@ func (s *CDCLSolver) restart() bool {
 	// per decision (dense cascades). Both extremes are signals the governor can
 	// use. Segments with no decisions (preprocessing) yield a neutral 0.
 	segDec := s.decisions - s.restartSegStartDec
-	segConf := s.conflicts - s.restartSegStartConf
-	if segDec > 0 {
-		s.restartSegProdRatio = float64(segConf) * 1000.0 / float64(segDec)
-	} else {
-		s.restartSegProdRatio = 0.0
-	}
 	s.restartSegGlueCount = int(s.glueLearned) - s.restartSegStartGlue
 	if s.verbose {
-		s.Log("c [verbose] segment: %d conflicts / %d decisions = %.1f conflicts/1kdec, %d glue learned\n",
-			s.conflicts-s.restartSegStartConf, segDec, s.restartSegProdRatio, s.restartSegGlueCount)
+		s.Log("c [verbose] segment: %d conflicts / %d decisions, %d glue learned\n",
+			s.conflicts-s.restartSegStartConf, segDec, s.restartSegGlueCount)
 	}
 	s.restartSegStartConf = s.conflicts
 	s.restartSegStartDec = s.decisions
 	s.restartSegStartGlue = int(s.glueLearned)
-
-	// Adaptive restart gear governor. Advance only when BOTH hold:
-	//   1. The search has passed the uniform conflict horizon
-	//      (restartPatienceConflicts) without a result — the default schedule
-	//      has demonstrably failed to converge, so deepening is justified.
-	//      Instances that solve within an ordinary budget never reach this.
-	//   2. There has been NO Glucose ever and no glue learned in this segment —
-	//      the flat-LBD grinder signature where the LBD-Glucose restart is
-	//      dead (rphp: zero glue, zero Glucose, grinds past 300K conflicts).
-	// Decay back to 1.0 whenever Glucose or glue activity appears, since those
-	// instances need their frequent diversification preserved.
-	s.restartSegTotalConflicts += uint64(segConf)
-	s.restartSegSteps++
-	if s.adaptiveRestartGear < maxAdaptiveRestartGear {
-		if s.restartSegTotalConflicts > restartPatienceConflicts &&
-			s.restartReasons[0] == 0 && s.restartSegGlueCount == 0 {
-			s.adaptiveRestartGear += 0.5
-			if s.adaptiveRestartGear > maxAdaptiveRestartGear {
-				s.adaptiveRestartGear = maxAdaptiveRestartGear
-			}
-			if s.verbose {
-				s.Log("c [governor] flat-LBD grind: advancing gear -> %.1f\n", s.adaptiveRestartGear)
-			}
-		} else if s.restartReasons[0] > 0 || s.restartSegSteps > 8 {
-			// Any Glucose activity, or a well-settled instance without sign of
-			// grind, pulls the gear back toward baseline diversification.
-			s.adaptiveRestartGear -= 0.5
-			if s.adaptiveRestartGear < 1.0 {
-				s.adaptiveRestartGear = 1.0
-			}
-		}
-	}
 
 	// VSIDS activity is NOT reset on restart. Standard CDCL solvers (MiniSat,
 	// Glucose) preserve activity across restarts — it is the solver's memory of
@@ -3771,6 +3707,17 @@ func (s *CDCLSolver) restart() bool {
 		s.compactLearnedClauses()
 		s.compactPending = false
 		s.qhead = 0
+	}
+
+	// In-processing co-schedule (D): we are at level 0 with no clause in use as
+	// a reason, sharing this restart's already-paid reset/watch-rebuild. Firing
+	// here (rather than only forcing a level-0 cancelUntil in the loop) amortizes
+	// the materialize+simplify cost over the restart's existing level-0 work. The
+	// loop fallback still handles long restart-free stretches.
+	if s.inprocessDue() {
+		if s.runInprocess() {
+			return true // UNSAT detected
+		}
 	}
 
 	// Vivification cadence, decoupled from the restart index. Under the old
@@ -4310,7 +4257,8 @@ func (s *CDCLSolver) addLearnedBinaryToBIG(l0, l1 cnf.Literal) {
 // (fewer removals found), never soundness.
 func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 	litIdx := cnf.LitToIndex(lit)
-	if litIdx >= len(s.bigAdjOff)-1 {		return false
+	if litIdx >= len(s.bigAdjOff)-1 {
+		return false
 	}
 	s.bigBfsEpoch++
 	if s.bigBfsEpoch == 0 {
@@ -4391,31 +4339,21 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			return UNKNOWN
 		}
 
-		// In-processing: re-simplify the ORIGINAL clause DB on a predictable
-		// rolling >= conflict-gap cadence, INDEPENDENT of restarts. Level-0 is
-		// the true safety requirement (no clause in use as a reason) and is
-		// reached on demand via cancelUntil(0) rather than a scheduled restart
-		// (which carries Luby/geometric/phase bookkeeping we do not want).
-		// Gated OFF by default (inprocessPeriod=0) until proven net-positive; a
-		// future classifier may enable it per-instance like preprocessing. Two
-		// runtime/static classifiers further limit it: dense-binary exclusion
-		// (destructive BVE) and a yield gate (stops after a low-yield round).
-		if s.inprocessPeriod > 0 && !s.inprocessExcluded && !s.inprocessStalled &&
-			s.conflicts >= s.conflictsAtLastInprocess+s.inprocessPeriod {
+		// In-processing fallback (D): the primary firing site is co-scheduled at
+		// restart boundaries (see restart()), sharing the existing level-0 reset.
+		// This loop fallback fires on a long RESTART-FREE stretch when the
+		// trigger (A: enough new root units since last round) AND the adaptive
+		// conflict gap (C) are both satisfied, forcing a level-0 reset on demand.
+		// Level-0 is the true safety requirement (no clause in use as a reason).
+		// Gated OFF by default (inprocessPeriod=0) until proven net-positive.
+		if s.inprocessDue() {
 			if s.level > 0 {
 				s.cancelUntil(0)
 			}
-			if s.simplifyOriginalDB() {
+			if s.runInprocess() {
 				s.printStats()
 				return UNSAT
 			}
-			s.conflictsAtLastInprocess = s.conflicts
-			// This level-0 reset wasn't a scheduled restart, so keep the
-			// governor's segment-productivity measurement honest by resetting
-			// its segment-start counters.
-			s.restartSegStartConf = s.conflicts
-			s.restartSegStartDec = s.decisions
-			s.restartSegStartGlue = int(s.glueLearned)
 			continue
 		}
 
@@ -6420,6 +6358,7 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 		if len(literals) == 1 {
 			s.unitsDirty = true
 			s.unitLearnedList = append(s.unitLearnedList, learnedIdx)
+			s.rootUnitsLearned++ // trigger A: newly-discovered root fact
 		}
 
 		// VSIDS bump
