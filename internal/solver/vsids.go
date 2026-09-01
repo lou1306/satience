@@ -107,8 +107,7 @@ func (h *vsidsHeap) init(heapPos []int) {
 }
 
 // VSIDS implements the VSIDS (Variable State Independent Decaying Sum) heuristic
-// with optional LRB (Learning Rate Based) conflict participation tracking
-// and LBD-based activity (variables in low-LBD clauses get higher activity)
+// with LBD-based activity (variables in low-LBD clauses get higher activity)
 //
 // Decay factor tuning:
 // - Starts at 0.95 (aggressive decay to explore variables quickly)
@@ -561,9 +560,9 @@ func (v *VSIDS) selectVariable(assignments []Assignment) uint32 {
 }
 
 // selectVariableWithPhase returns the unassigned variable with highest activity
-// and the phase to assign (true=positive, false=negative) based on saved phase
-// Uses LRB (conflict participation) if enabled, otherwise VSIDS (activity) with heap
-// Can also use LBD-based bonus (variables in low-LBD clauses prioritized)
+// and the phase to assign (true=positive, false=negative) based on saved phase.
+// Uses VSIDS activity with heap and the LBD-based bonus (variables in low-LBD
+// clauses prioritized).
 func (v *VSIDS) selectVariableWithPhase(assignments []Assignment) (uint32, bool) {
 	bestVar := v.selectVariableWithHeap(assignments)
 

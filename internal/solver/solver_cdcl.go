@@ -308,7 +308,6 @@ type CDCLSolver struct {
 	bigLearnCap       int
 	bigLearnEnabled   bool
 	bigLearnFlag      bool   // off by default: enabling shifts search trajectory (net wall-time regression on the suite)
-	bigLearnAdded     uint64 // diagnostic: learned-binary edges added
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
 	// increments). The queue is reused across calls (sliced to [:0]).
@@ -396,7 +395,6 @@ type CDCLSolver struct {
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for conflict-cadence gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
-	subsumptionPeriodSet       bool    // True if SetSubsumptionPeriod was called (skip adaptive override)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
 	inprocessPeriod            int     // Master in-processing switch + initial conflict gap (0=off); cadence is adaptive
@@ -462,9 +460,6 @@ type CDCLSolver struct {
 	// Placed at struct end to avoid shifting hot/warm cache lines (op_15 regression).
 	binaryRatio    float64 // Cached BinaryRatio from classifier
 	useBumpAnalyze bool    // True: bump all touched vars (minisat analyze_toclear); false: bump conflict clause only
-	// True when the user explicitly set useBumpAnalyze via CLI (-ms-analyze),
-	// so classifyInstance should not overwrite it.
-	useBumpAnalyzeOverride bool
 
 	// uniformDefaults neutralizes every per-instance classifier bifurcation to
 	// a single fixed value (see setUniformDefaults / classifyInstance). A/B
@@ -477,13 +472,6 @@ type CDCLSolver struct {
 	// classifier bifurcation neutralized. Isolates whether that single gate
 	// carries the classifier's distributionally-reproducible value.
 	uniformKeepBVE bool
-	// uniformSecondary neutralizes ONLY the "secondary" classifier rules
-	// (size-adaptive subsumption period, useBumpAnalyze gating, and the
-	// random-like preprocessing disable/rescue), KEEPING all the dense-binary
-	// and long-clause gates (skipBVE, skipPolarityPhase, skipSubsumption) and
-	// the adaptive LBD scale classified. Isolates whether the non-dense,
-	// non-long-clause rules are independently removable.
-	uniformSecondary bool
 
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
 	// search start. Consumed by the behavioral governor.
@@ -528,7 +516,7 @@ type CDCLSolver struct {
 	// geometric (geometric-restarts) restarts on a STRUCTURED unguided deep-spiral
 	// signature (chain/ordering-principle-like: weak phase guidance, high flat
 	// LBD, no glue, deep propagation cascade) and switches the restart MECHANISM
-	// to Luby/Glucose, where the base-lowering detectors (Det1/Det4) and recurring
+	// to Luby/Glucose, where the base-lowering detector (Det4) and recurring
 	// short segments can actually rescue the spiral. Geometric deepens unboundedly
 	// (threshold = base·1.5^i) so it can never cut the spiral short.
 	geoFlipFired        bool       // Det6 fired: restart mechanism already flipped to Luby
@@ -982,12 +970,10 @@ func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
 	s.vsids.SetMinisatBumps(enabled)
 }
 
-// SetUseBumpAnalyze forces updateScores-style analyze_toclear behavior:
-// bump all variables touched during 1-UIP analysis (matching MiniSat) instead
-// of bumping only the conflict clause's variables. Pure diagnostic toggle; when
-// true it overrides the classifier's useBumpAnalyze decision for A/B testing.
+// SetUseBumpAnalyze forces MiniSat analyze_toclear behavior: bump all variables
+// touched during 1-UIP analysis instead of bumping only the conflict clause's
+// variables. Pure diagnostic toggle (-ms-analyze). Default (off) is bumpClause-only.
 func (s *CDCLSolver) SetUseBumpAnalyze(enabled bool) {
-	s.useBumpAnalyzeOverride = true
 	s.useBumpAnalyze = enabled
 }
 
@@ -1006,18 +992,15 @@ const uniformLBDScale = 10.0
 func (s *CDCLSolver) SetUniformDefaults(enabled bool) {
 	s.uniformDefaults = enabled
 	if enabled {
-		// Neutralize the skip-* hardening gates and the useBumpAnalyze gating:
-		// everything runs the un-gated path (always attempt BVE/polarity/
-		// subsumption; always bump only the conflict clause, never analyze_toclear).
+		// Neutralize the skip-* hardening gates: everything runs the un-gated
+		// path (always attempt BVE/polarity/subsumption; bumpClause-only).
 		s.skipBVE = false
 		s.skipPolarityPhase = false
 		s.skipSubsumption = false
 		s.inprocessExcluded = false
 		s.useBumpAnalyze = false
-		s.useBumpAnalyzeOverride = true
 		// Fixed subsumption period (no <500-var special case).
 		s.subsumptionPeriod = 100
-		s.subsumptionPeriodSet = true
 		// Fixed LBD bonus scale (no adaptive binaryRatio/numVars formula).
 		s.vsids.SetLBDBonusScale(uniformLBDScale)
 		s.lbdScaleOverride = true
@@ -1038,24 +1021,6 @@ func (s *CDCLSolver) SetUniformKeepBVE(enabled bool) {
 		// structure (it is guarded on uniformKeepBVE below).
 		s.skipBVE = false
 		s.inprocessExcluded = false
-	}
-}
-
-// SetUniformSecondary enables the A/B "secondary-only neutralization" mode.
-// It locks OFF exactly three non-dense-binary / non-long-clause classifier
-// decisions — the size-adaptive subsumption period, the useBumpAnalyze gating,
-// and the random-like preprocessing disable/rescue — while leaving every
-// dense-binary and long-clause gate (skipBVE, skipPolarityPhase, skipSubsumption)
-// and the adaptive LBD scale classified. The setter only flips the two existing
-// override latches (subsumptionPeriodSet, useBumpAnalyzeOverride); the
-// preprocessing override is applied in getAdaptivePreprocessingConfig.
-func (s *CDCLSolver) SetUniformSecondary(enabled bool) {
-	s.uniformSecondary = enabled
-	if enabled {
-		s.subsumptionPeriod = 100
-		s.subsumptionPeriodSet = true
-		s.useBumpAnalyze = false
-		s.useBumpAnalyzeOverride = true
 	}
 }
 
@@ -1272,7 +1237,6 @@ func (s *CDCLSolver) SetPreferTrueCap(n int) {
 // Nth restart). 0 disables subsumption entirely.
 func (s *CDCLSolver) SetSubsumptionPeriod(p int) {
 	s.subsumptionPeriod = p
-	s.subsumptionPeriodSet = true
 }
 
 // SetSubsumptionMinConflictGap sets the minimum number of conflicts that must
@@ -4242,7 +4206,6 @@ func (s *CDCLSolver) buildBIG() {
 	}
 	s.bigLearnEdgeCount = 0
 	s.bigLearnEnabled = s.bigLearnFlag
-	s.bigLearnAdded = 0
 	if !s.bigLearnFlag {
 		s.bigLearnCap = 0
 		return
@@ -4277,7 +4240,6 @@ func (s *CDCLSolver) addLearnedBinaryToBIG(l0, l1 cnf.Literal) {
 	s.bigLearnEdgeCount++
 	s.bigLearnAdj[b^1] = append(s.bigLearnAdj[b^1], int32(a))
 	s.bigLearnEdgeCount++
-	s.bigLearnAdded++
 }
 
 // bigReachableInClause returns true if lit can reach, via forward BIG edges

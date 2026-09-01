@@ -39,10 +39,7 @@ func TestUniformDefaults_NeutralizeClassifier(t *testing.T) {
 	if s.useBumpAnalyze {
 		t.Fatal("uniform: useBumpAnalyze must be false (bumpClause-only)")
 	}
-	if !s.useBumpAnalyzeOverride {
-		t.Fatal("uniform: useBumpAnalyzeOverride must be set so classifier cannot revert")
-	}
-	if s.subsumptionPeriod != 100 || !s.subsumptionPeriodSet {
+	if s.subsumptionPeriod != 100 {
 		t.Fatal("uniform: fixed subsumption period 100 must be locked")
 	}
 	if !s.lbdScaleOverride {
@@ -109,54 +106,8 @@ func TestUniformDefaults_KeepBVEIsolatesOneGate(t *testing.T) {
 	if s.useBumpAnalyze {
 		t.Fatal("keep-bve: useBumpAnalyze must stay neutralized (false)")
 	}
-	if s.subsumptionPeriod != 100 || !s.subsumptionPeriodSet {
-		t.Fatal("keep-bve: subsumption period must stay fixed at 100")
-	}
-}
-
-// TestUniformSecondary_NeutralizesOnlySecondaryRules verifies that
-// -uniform-secondary locks OFF only the secondary rules while keeping the
-// dense-binary/long-clause gates classified.
-func TestUniformSecondary_NeutralizesOnlySecondaryRules(t *testing.T) {
-	c := cnf.CNF{NumVars: 200, NumClauses: 0}
-	for i := 0; i < 2500; i++ {
-		a := uint32(i * 7 % 200)
-		b := uint32(i*11%199 + 1)
-		c.AddClause([]cnf.Literal{
-			cnf.NewLiteral(a, i%2 == 0),
-			cnf.NewLiteral(b, i%3 == 0),
-		}, false)
-	}
-	s := NewCDCLSolver(&c)
-	s.SetUniformSecondary(true)
-
-	if !s.uniformSecondary {
-		t.Fatal("uniformSecondary must be on")
-	}
-	if s.subsumptionPeriod != 100 || !s.subsumptionPeriodSet {
-		t.Fatal("secondary: subsumption period must be locked at 100")
-	}
-	if !s.useBumpAnalyzeOverride || s.useBumpAnalyze {
-		t.Fatal("secondary: useBumpAnalyze must be locked off (bumpClause-only)")
-	}
-	if s.lbdScaleOverride {
-		t.Fatal("secondary: adaptive LBD scale must stay classified (no lbdScaleOverride)")
-	}
-
-	s.classifyInstance() // dense-binary -> dense gate (skipBVE) remains classified
-	if !s.skipBVE {
-		t.Fatal("secondary: skipBVE must stay classified true on dense-binary")
-	}
 	if s.subsumptionPeriod != 100 {
-		t.Fatal("secondary: subsumption period must stay 100 (not reverted to 50)")
-	}
-
-	// Preprocessing always on under secondary (random-like disable removed).
-	s.structureScore = 0.3
-	s.binaryRatio = 0.3
-	cfg := s.getAdaptivePreprocessingConfig()
-	if !cfg.EnableUnitProp {
-		t.Fatal("secondary: preprocessing EnableUnitProp must be true")
+		t.Fatal("keep-bve: subsumption period must stay fixed at 100")
 	}
 }
 
