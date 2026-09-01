@@ -466,6 +466,13 @@ type CDCLSolver struct {
 	// so classifyInstance should not overwrite it.
 	useBumpAnalyzeOverride bool
 
+	// uniformDefaults neutralizes every per-instance classifier bifurcation to
+	// a single fixed value (see setUniformDefaults / classifyInstance). A/B
+	// test infrastructure only: when false, behavior is byte-identical to the
+	// pre-override classified stack. Lets us measure whether the per-instance
+	// classifier gates are net-positive across the heldout distribution.
+	uniformDefaults bool
+
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
 	// search start. Consumed by the behavioral governor.
 	// Placed at struct end with other cold fields to avoid shifting hot/warm
@@ -970,6 +977,39 @@ func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
 func (s *CDCLSolver) SetUseBumpAnalyze(enabled bool) {
 	s.useBumpAnalyzeOverride = true
 	s.useBumpAnalyze = enabled
+}
+
+// uniformLBDScale is the fixed LBD-bonus scale used by the -uniform A/B
+// baseline. Matches the vsids internal default / the adaptive formula's floor:
+// a purely-VSIDS signal with negligible LBD activity guidance (the most
+// conventional, MiniSat-like configuration).
+const uniformLBDScale = 10.0
+
+// SetUniformDefaults enables the A/B "uniform baseline" mode. It forces every
+// per-instance classifier bifurcation in classifyInstance to a single fixed
+// value, leaving only the global defaults (geometric, minisatBumps, governors,
+// DB shrink, etc.) active. Diagnostic/test infrastructure only for measuring
+// whether the per-instance classifier gates are net-positive across the
+// heldout distribution. When false (default) behavior is unchanged.
+func (s *CDCLSolver) SetUniformDefaults(enabled bool) {
+	s.uniformDefaults = enabled
+	if enabled {
+		// Neutralize the skip-* hardening gates and the useBumpAnalyze gating:
+		// everything runs the un-gated path (always attempt BVE/polarity/
+		// subsumption; always bump only the conflict clause, never analyze_toclear).
+		s.skipBVE = false
+		s.skipPolarityPhase = false
+		s.skipSubsumption = false
+		s.inprocessExcluded = false
+		s.useBumpAnalyze = false
+		s.useBumpAnalyzeOverride = true
+		// Fixed subsumption period (no <500-var special case).
+		s.subsumptionPeriod = 100
+		s.subsumptionPeriodSet = true
+		// Fixed LBD bonus scale (no adaptive binaryRatio/numVars formula).
+		s.vsids.SetLBDBonusScale(uniformLBDScale)
+		s.lbdScaleOverride = true
+	}
 }
 
 func (s *CDCLSolver) SetNoLBDBonus(enabled bool) {
@@ -1840,8 +1880,10 @@ func (s *CDCLSolver) classifyInstance() {
 	// override fights the implication structure and sends the search into
 	// thousands of conflicts. Skip it. Sparse binary instances (e.g. 8202af80,
 	// density 24.5) still benefit from the override, so the density threshold
-	// (35) separates the two regimes.
-	s.skipPolarityPhase = structure.BinaryRatio > 0.9 && structure.Density > 35.0
+	// (35) separates the two regimes. Under -uniform (uniformDefaults) these
+	// per-instance gates are disabled: everything runs the un-gated path.
+	if !s.uniformDefaults {
+		s.skipPolarityPhase = structure.BinaryRatio > 0.9 && structure.Density > 35.0
 
 	// BVE is pure overhead on dense binary instances: it hits the resolvent
 	// budget eliminating only 7-14% of variables while spending 4-15s on
@@ -1855,7 +1897,6 @@ func (s *CDCLSolver) classifyInstance() {
 	// but TMO; same class as skipBVE). Exclude the dense-binary/BVE-hostile
 	// class outright so even an enabled in-processing never runs on them.
 	s.inprocessExcluded = s.skipBVE
-
 	// Subsumption is O(clauses × occurrences × clause-length). On very dense
 	// instances (density > 60) the occurrence lists are huge, making each pass
 	// take seconds while the instance often solves in <0.1s without it.
@@ -1864,6 +1905,7 @@ func (s *CDCLSolver) classifyInstance() {
 	// subsumption 0.4s, search 0.01s. The threshold of 60 is above the
 	// highest-density suite instance (32baec6a, density 49).
 	s.skipSubsumption = structure.Density > 60.0
+	} // end uniform-disabled classifier gates
 
 	// Size-adaptive subsumption period. Small instances (numVars < 500)
 	// benefit from period=50 (subsumption fires at restart 50 vs 100); op_18
@@ -1921,6 +1963,15 @@ func (s *CDCLSolver) classifyInstance() {
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
+	// Under -uniform (uniformDefaults) always run the standard unit-prop +
+	// single-pass config, ignoring the random-like disable and the density/50K
+	// recovery rescues. Neutralizes the classifier's preprocessing decision.
+	if s.uniformDefaults {
+		return PreprocessingConfig{
+			EnableUnitProp: true,
+			MaxPasses:      1,
+		}
+	}
 	// Very large instances are industrial / reduction-friendly regardless of the
 	// borderline score: structureScore is tuned on small instances and
 	// under-weights huge regular encodings. E.g. course-timetabling instances at

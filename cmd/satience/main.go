@@ -94,6 +94,7 @@ func run() int {
 	minisatBumps := flag.Bool("minisat-bumps", true, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor). Default on: full-48-rail DEV win with -bump-amount=35 (-6.6% PAR2, net -1 TMO). Disable with -minisat-bumps=false.")
 	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
+	uniformDefaults := flag.Bool("uniform", false, "A/B test arm: neutralize ALL per-instance classifier bifurcations to fixed values (skip-BVE/polarity/subsumption off, bumpClause-only, fixed subsumption period + LBD scale, preprocessing always on); leaves global defaults (geometric, minisatBumps, governors) active")
 	flag.Parse()
 
 	// Collect explicitly-set flags so the behavioral governor knows which CLI
@@ -238,6 +239,9 @@ func run() int {
 	}
 	if *lazyInit {
 		s.SetLazyInit(true)
+	}
+	if *uniformDefaults {
+		s.SetUniformDefaults(true)
 	}
 
 	start := time.Now()
