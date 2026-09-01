@@ -13,7 +13,7 @@ func TestUniformDefaults_NeutralizeClassifier(t *testing.T) {
 	// via classifyInstance.
 	c := cnf.CNF{NumVars: 200, NumClauses: 0}
 	for i := 0; i < 2500; i++ {
-		a := uint32(i*7 % 200)
+		a := uint32(i * 7 % 200)
 		b := uint32(i*11%199 + 1)
 		c.AddClause([]cnf.Literal{
 			cnf.NewLiteral(a, i%2 == 0),
@@ -72,12 +72,54 @@ func TestUniformDefaults_NeutralizeClassifier(t *testing.T) {
 	}
 }
 
+// TestUniformDefaults_KeepBVEIsolatesOneGate verifies that combining
+// -uniform with uniformKeepBVE re-enables ONLY the dense-binary skipBVE gate
+// while leaving every other classifier bifurcation neutralized.
+func TestUniformDefaults_KeepBVEIsolatesOneGate(t *testing.T) {
+	c := cnf.CNF{NumVars: 200, NumClauses: 0}
+	for i := 0; i < 2500; i++ {
+		a := uint32(i * 7 % 200)
+		b := uint32(i*11%199 + 1)
+		c.AddClause([]cnf.Literal{
+			cnf.NewLiteral(a, i%2 == 0),
+			cnf.NewLiteral(b, i%3 == 0),
+		}, false)
+	}
+	s := NewCDCLSolver(&c)
+	s.SetUniformDefaults(true)
+	s.SetUniformKeepBVE(true)
+
+	if !s.uniformDefaults {
+		t.Fatal("uniformDefaults must be on")
+	}
+	s.classifyInstance() // dense-binary (density 12.5, binRatio 1.0) => skipBVE re-derived
+
+	if !s.skipBVE {
+		t.Fatal("keep-bve: skipBVE must be re-derived true on dense-binary instance")
+	}
+	if !s.inprocessExcluded {
+		t.Fatal("keep-bve: inprocessExcluded must follow skipBVE")
+	}
+	if s.skipPolarityPhase {
+		t.Fatal("keep-bve: skipPolarityPhase must stay neutralized (false)")
+	}
+	if s.skipSubsumption {
+		t.Fatal("keep-bve: skipSubsumption must stay neutralized (false)")
+	}
+	if s.useBumpAnalyze {
+		t.Fatal("keep-bve: useBumpAnalyze must stay neutralized (false)")
+	}
+	if s.subsumptionPeriod != 100 || !s.subsumptionPeriodSet {
+		t.Fatal("keep-bve: subsumption period must stay fixed at 100")
+	}
+}
+
 // TestUniformDefaults_DisabledIsNoop verifies the default (flag off) leaves the
 // classifier free to set the per-instance gates.
 func TestUniformDefaults_DisabledIsNoop(t *testing.T) {
 	c := cnf.CNF{NumVars: 200, NumClauses: 0}
 	for i := 0; i < 2500; i++ {
-		a := uint32(i*7 % 200)
+		a := uint32(i * 7 % 200)
 		b := uint32(i*11%199 + 1)
 		c.AddClause([]cnf.Literal{
 			cnf.NewLiteral(a, i%2 == 0),

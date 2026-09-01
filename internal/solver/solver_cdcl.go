@@ -472,6 +472,11 @@ type CDCLSolver struct {
 	// pre-override classified stack. Lets us measure whether the per-instance
 	// classifier gates are net-positive across the heldout distribution.
 	uniformDefaults bool
+	// uniformKeepBVE, in -uniform mode, re-enables ONLY the dense-binary
+	// skip-BVE gate (and its inprocessExclusion) while keeping every other
+	// classifier bifurcation neutralized. Isolates whether that single gate
+	// carries the classifier's distributionally-reproducible value.
+	uniformKeepBVE bool
 
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
 	// search start. Consumed by the behavioral governor.
@@ -1009,6 +1014,23 @@ func (s *CDCLSolver) SetUniformDefaults(enabled bool) {
 		// Fixed LBD bonus scale (no adaptive binaryRatio/numVars formula).
 		s.vsids.SetLBDBonusScale(uniformLBDScale)
 		s.lbdScaleOverride = true
+	}
+}
+
+// SetUniformKeepBVE, when combined with SetUniformDefaults(true), re-enables
+// ONLY the classifier's dense-binary skip-BVE gate (and its inprocess
+// exclusion) while leaving every other bifurcation neutralized. classifyInstance
+// restores skipBVE/inprocessExcluded from the structure metrics here; all the
+// other gates stay locked off by uniformDefaults. Diagnostic/test infrastructure
+// for confirming whether that single gate carries the distributionally-reproducible
+// value of the classifier.
+func (s *CDCLSolver) SetUniformKeepBVE(enabled bool) {
+	s.uniformKeepBVE = enabled
+	if enabled {
+		// Give classifyInstance a clean slate to re-derive the gate from
+		// structure (it is guarded on uniformKeepBVE below).
+		s.skipBVE = false
+		s.inprocessExcluded = false
 	}
 }
 
@@ -1881,9 +1903,10 @@ func (s *CDCLSolver) classifyInstance() {
 	// thousands of conflicts. Skip it. Sparse binary instances (e.g. 8202af80,
 	// density 24.5) still benefit from the override, so the density threshold
 	// (35) separates the two regimes. Under -uniform (uniformDefaults) these
-	// per-instance gates are disabled: everything runs the un-gated path.
+	// per-instance gates are locked off: everything runs the un-gated path.
 	if !s.uniformDefaults {
 		s.skipPolarityPhase = structure.BinaryRatio > 0.9 && structure.Density > 35.0
+	}
 
 	// BVE is pure overhead on dense binary instances: it hits the resolvent
 	// budget eliminating only 7-14% of variables while spending 4-15s on
@@ -1891,21 +1914,27 @@ func (s *CDCLSolver) classifyInstance() {
 	// navigated in <2s by watch-based propagation alone. 8202af80 (density
 	// 24.5, 99.8% binary): 16.7s→1.4s. bb34f22f (density 3.12, 67% binary) is
 	// NOT gated (density ≤ 10) — it's the instance VE was tuned for.
-	s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
-	// In-processing classifier: in-process BVE has HIGH yield on dense-binary
-	// instances yet is destructive to search there (de2b: +2246 eliminations
-	// but TMO; same class as skipBVE). Exclude the dense-binary/BVE-hostile
-	// class outright so even an enabled in-processing never runs on them.
-	s.inprocessExcluded = s.skipBVE
-	// Subsumption is O(clauses × occurrences × clause-length). On very dense
-	// instances (density > 60) the occurrence lists are huge, making each pass
-	// take seconds while the instance often solves in <0.1s without it.
-	// ramlb_6_6 (density 149): subsumption 5s, search 0.03s. kcliquebin_6
-	// (density 298): subsumption 2s, search 0.01s. ramlb_5_5 (density 74):
-	// subsumption 0.4s, search 0.01s. The threshold of 60 is above the
-	// highest-density suite instance (32baec6a, density 49).
-	s.skipSubsumption = structure.Density > 60.0
-	} // end uniform-disabled classifier gates
+	// The gate is the ONE classifier decision kept under -uniform when
+	// uniformKeepBVE is set, to isolate its distributional value.
+	if !s.uniformDefaults || s.uniformKeepBVE {
+		s.skipBVE = structure.BinaryRatio > 0.95 && structure.Density > 10.0
+		// In-processing classifier: in-process BVE has HIGH yield on dense-binary
+		// instances yet is destructive to search there (de2b: +2246 eliminations
+		// but TMO; same class as skipBVE). Exclude the dense-binary/BVE-hostile
+		// class outright so even an enabled in-processing never runs on them.
+		s.inprocessExcluded = s.skipBVE
+	}
+
+	if !s.uniformDefaults {
+		// Subsumption is O(clauses × occurrences × clause-length). On very dense
+		// instances (density > 60) the occurrence lists are huge, making each pass
+		// take seconds while the instance often solves in <0.1s without it.
+		// ramlb_6_6 (density 149): subsumption 5s, search 0.03s. kcliquebin_6
+		// (density 298): subsumption 2s, search 0.01s. ramlb_5_5 (density 74):
+		// subsumption 0.4s, search 0.01s. The threshold of 60 is above the
+		// highest-density suite instance (32baec6a, density 49).
+		s.skipSubsumption = structure.Density > 60.0
+	}
 
 	// Size-adaptive subsumption period. Small instances (numVars < 500)
 	// benefit from period=50 (subsumption fires at restart 50 vs 100); op_18

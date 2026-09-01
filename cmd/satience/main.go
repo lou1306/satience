@@ -95,6 +95,7 @@ func run() int {
 	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
 	uniformDefaults := flag.Bool("uniform", false, "A/B test arm: neutralize ALL per-instance classifier bifurcations to fixed values (skip-BVE/polarity/subsumption off, bumpClause-only, fixed subsumption period + LBD scale, preprocessing always on); leaves global defaults (geometric, minisatBumps, governors) active")
+	uniformKeepBVE := flag.Bool("uniform-keep-bve", false, "A/B test arm: in -uniform mode, re-enable ONLY the dense-binary skip-BVE gate (and its inprocess exclusion); all other classifier bifurcations stay neutralized. Isolates whether that single gate carries the classifier's distributionally-reproducible value.")
 	flag.Parse()
 
 	// Collect explicitly-set flags so the behavioral governor knows which CLI
@@ -242,6 +243,9 @@ func run() int {
 	}
 	if *uniformDefaults {
 		s.SetUniformDefaults(true)
+	}
+	if *uniformKeepBVE {
+		s.SetUniformKeepBVE(true)
 	}
 
 	start := time.Now()
