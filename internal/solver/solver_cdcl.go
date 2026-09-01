@@ -477,6 +477,13 @@ type CDCLSolver struct {
 	// classifier bifurcation neutralized. Isolates whether that single gate
 	// carries the classifier's distributionally-reproducible value.
 	uniformKeepBVE bool
+	// uniformSecondary neutralizes ONLY the "secondary" classifier rules
+	// (size-adaptive subsumption period, useBumpAnalyze gating, and the
+	// random-like preprocessing disable/rescue), KEEPING all the dense-binary
+	// and long-clause gates (skipBVE, skipPolarityPhase, skipSubsumption) and
+	// the adaptive LBD scale classified. Isolates whether the non-dense,
+	// non-long-clause rules are independently removable.
+	uniformSecondary bool
 
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
 	// search start. Consumed by the behavioral governor.
@@ -1031,6 +1038,24 @@ func (s *CDCLSolver) SetUniformKeepBVE(enabled bool) {
 		// structure (it is guarded on uniformKeepBVE below).
 		s.skipBVE = false
 		s.inprocessExcluded = false
+	}
+}
+
+// SetUniformSecondary enables the A/B "secondary-only neutralization" mode.
+// It locks OFF exactly three non-dense-binary / non-long-clause classifier
+// decisions — the size-adaptive subsumption period, the useBumpAnalyze gating,
+// and the random-like preprocessing disable/rescue — while leaving every
+// dense-binary and long-clause gate (skipBVE, skipPolarityPhase, skipSubsumption)
+// and the adaptive LBD scale classified. The setter only flips the two existing
+// override latches (subsumptionPeriodSet, useBumpAnalyzeOverride); the
+// preprocessing override is applied in getAdaptivePreprocessingConfig.
+func (s *CDCLSolver) SetUniformSecondary(enabled bool) {
+	s.uniformSecondary = enabled
+	if enabled {
+		s.subsumptionPeriod = 100
+		s.subsumptionPeriodSet = true
+		s.useBumpAnalyze = false
+		s.useBumpAnalyzeOverride = true
 	}
 }
 
@@ -1936,28 +1961,13 @@ func (s *CDCLSolver) classifyInstance() {
 		s.skipSubsumption = structure.Density > 60.0
 	}
 
-	// Size-adaptive subsumption period. Small instances (numVars < 500)
-	// benefit from period=50 (subsumption fires at restart 50 vs 100); op_18
-	// regresses +1.6s and rand3sat_200 +1.4s with period=100. Large instances
-	// keep period=100. Skipped if the caller explicitly set the period via
-	// SetSubsumptionPeriod (CLI or tests).
-	if !s.subsumptionPeriodSet && s.cnf.NumVars < 500 {
-		s.subsumptionPeriod = 50
-	}
-
-	// Single principled search signal: the analyze_toclear variable-bumping
-	// gate (useBumpAnalyze). VSIDS decay, restartBase, and Glucose restarts are
-	// global (constructor/CLI); the ONLY per-instance decision is whether to
-	// bump all touched vars during conflict analysis (MiniSat analyze_toclear):
-	//   ON  for random / low-structure families (the dominant hard case) —
-	//       brings hard random k-SAT from TMO to ~0.8s on the dev rail.
-	//   OFF for binary-heavy and dense/long-clause structured instances,
-	//       where VSIDS is the sole guidance signal and diluting it across
-	//       all touched vars degrades the search.
-	if !s.useBumpAnalyzeOverride {
-		s.useBumpAnalyze = structure.BinaryRatio <= 0.5 &&
-			(structure.Density < 10.0 || structure.PolarityImbalance > 0.4)
-	}
+	// NOTE: The former size-adaptive subsumption-period (<500 vars -> 50) and
+	// the useBumpAnalyze gate (analyze_toclear for random/low-structure families)
+	// were REMOVED after a fresh-rail 50-draw heldout showed they are
+	// distributionally neutral (variant -uniform-secondary PASSED all 25
+	// families with no new TMO and no median regression). Subsumption period
+	// stays at the CLI/default 100; useBumpAnalyze stays off (bumpClause-only)
+	// unless forced via -ms-analyze. This removes two overfit magic knobs.
 
 	// Classifier telemetry: emit every structural gate decision on stderr so the
 	// audit (and future regression checks) can read all decisions at once,
@@ -1991,55 +2001,14 @@ func (s *CDCLSolver) classifyInstance() {
 
 // getAdaptivePreprocessingConfig returns preprocessing config based on the
 // cached structureScore (set by classifyInstance, which must have run first).
+// Since the -uniform-secondary fresh-rail 50-draw heldout validated that the
+// random-like preprocessing disable and the density/50K rescue are
+// distributionally neutral, preprocessing is now ALWAYS the standard unit-prop
+// single-pass config (all former branches returned this same value except the
+// random-like disable, which is removed). The dense-binary skipBVE /
+// skipPolarityPhase / skipSubsumption gates in preprocessAggressive still gate
+// individual techniques independently.
 func (s *CDCLSolver) getAdaptivePreprocessingConfig() PreprocessingConfig {
-	// Under -uniform (uniformDefaults) always run the standard unit-prop +
-	// single-pass config, ignoring the random-like disable and the density/50K
-	// recovery rescues. Neutralizes the classifier's preprocessing decision.
-	if s.uniformDefaults {
-		return PreprocessingConfig{
-			EnableUnitProp: true,
-			MaxPasses:      1,
-		}
-	}
-	// Very large instances are industrial / reduction-friendly regardless of the
-	// borderline score: structureScore is tuned on small instances and
-	// under-weights huge regular encodings. E.g. course-timetabling instances at
-	// 105-222K vars score only 0.65-0.70 yet BVE eliminates ~27% of variables,
-	// so the score-based "random-like" early-out must not exclude them. A corpus
-	// scan shows the ONLY >50K-var instances with score<0.7 AND binaryRatio<=0.5
-	// are exactly those timetabling instances; true random instances are small
-	// (a few hundred vars) so the size gate never misroutes them into aggressive
-	// preprocessing. Dense-binary large instances are separately protected by
-	// skipBVE.
-	if int(s.cnf.NumVars) > s.preprocessingMaxVars {
-		s.Log("c [preprocessing] Large instance (%d vars) -> enabling aggressive preprocessing\n", s.cnf.NumVars)
-		return PreprocessingConfig{
-			EnableUnitProp: true,
-			MaxPasses:      1,
-		}
-	}
-	// Density rescue: a score<0.7 & binRatio<=0.5 formula with very high
-	// clause/variable density is a structured industrial encoding, not random
-	// k-SAT (random density stays ~<=7, and the uniform-long penalty forces
-	// rand4+/rand3 dense formulas low too). Route it onto preprocessing like a
-	// structured instance. Subsumption/BVE stay gated by their own density/
-	// ratio skip flags inside preprocessAggressive.
-	if s.structuredDensityGate > 0 && s.cnf.NumVars > 0 && float64(s.cnf.NumClauses)/float64(s.cnf.NumVars) >= s.structuredDensityGate {
-		s.Log("c [preprocessing] Density rescue (%.1f >= %.1f) -> structured preprocessing\n",
-			float64(s.cnf.NumClauses)/float64(s.cnf.NumVars), s.structuredDensityGate)
-		return PreprocessingConfig{
-			EnableUnitProp: true,
-			MaxPasses:      1,
-		}
-	}
-	if s.structureScore < 0.7 && s.binaryRatio <= 0.5 {
-		s.Log("c [preprocessing] Random-like instance (score=%.2f) - disabling preprocessing\n", s.structureScore)
-		return PreprocessingConfig{
-			EnableUnitProp: false,
-			MaxPasses:      0,
-		}
-	}
-	s.Log("c [preprocessing] Structured instance (score=%.2f) - enabling unit propagation only\n", s.structureScore)
 	return PreprocessingConfig{
 		EnableUnitProp: true,
 		MaxPasses:      1,

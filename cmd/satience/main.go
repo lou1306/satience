@@ -96,6 +96,7 @@ func run() int {
 	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
 	uniformDefaults := flag.Bool("uniform", false, "A/B test arm: neutralize ALL per-instance classifier bifurcations to fixed values (skip-BVE/polarity/subsumption off, bumpClause-only, fixed subsumption period + LBD scale, preprocessing always on); leaves global defaults (geometric, minisatBumps, governors) active")
 	uniformKeepBVE := flag.Bool("uniform-keep-bve", false, "A/B test arm: in -uniform mode, re-enable ONLY the dense-binary skip-BVE gate (and its inprocess exclusion); all other classifier bifurcations stay neutralized. Isolates whether that single gate carries the classifier's distributionally-reproducible value.")
+	uniformSecondary := flag.Bool("uniform-secondary", false, "A/B test arm: neutralize ONLY the secondary (non-dense-binary, non-long-clause) classifier rules - size-adaptive subsumption period, useBumpAnalyze gating, and random-like preprocessing disable/rescue - while keeping the dense-binary/long-clause gates (skipBVE, skipPolarityPhase, skipSubsumption) and adaptive LBD scale classified. Isolates whether the secondary rules are independently removable.")
 	flag.Parse()
 
 	// Collect explicitly-set flags so the behavioral governor knows which CLI
@@ -246,6 +247,9 @@ func run() int {
 	}
 	if *uniformKeepBVE {
 		s.SetUniformKeepBVE(true)
+	}
+	if *uniformSecondary {
+		s.SetUniformSecondary(true)
 	}
 
 	start := time.Now()

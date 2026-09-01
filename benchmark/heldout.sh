@@ -153,13 +153,18 @@ MATRIX_SIZE=${#MATRIX[@]}
 # used for control and variant (paired). The dev and validation rails use
 # disjoint seed ranges (offset by 1_000_000) so tuning on dev never touches
 # the instances measured on validation.
+# DEV_SEED_BASE / VAL_SEED_BASE allow a FRESH (unburned) distribution: bump
+# these to new disjoint ranges to run a follow-up study after a prior rail was
+# measured, per the held-out partition discipline.
 # ---------------------------------------------------------------------------
+DEV_SEED_BASE="${DEV_SEED_BASE:-0}"
+VAL_SEED_BASE="${VAL_SEED_BASE:-1000000}"
 gen_family_seed() {
     local rail="$1" idx="$2"
     if [ "$rail" = "validation" ]; then
-        echo "$(( 1000000 + idx * 7919 ))"
+        echo "$(( VAL_SEED_BASE + idx * 7919 ))"
     else
-        echo "$(( idx * 7919 ))"
+        echo "$(( DEV_SEED_BASE + idx * 7919 ))"
     fi
 }
 
