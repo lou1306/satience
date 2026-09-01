@@ -9,11 +9,15 @@
 # so a gate/threshold only survives if it generalizes across the distribution
 # rather than keying to specific instance signatures.
 #
-# COMMITMENT: cnfgen families only (combinational/structured). Industrial
-# encodings (planning, verification, timetabling) are NOT covered. This
-# measures distributional robustness over parametric combinational families,
-# not industrial coverage — a narrow static industrial firewall (no-TMO) would
-# need to be layered separately if that coverage is required.
+# COMMITMENT: cnfgen families only. Coverage: combinational (Tseitin, kcolor,
+# kclique), unstructured (random k-SAT), plus dense binary encodings (kcliquebin)
+# and structured orderings (op), with one cnfgen -T majority-encoded rail
+# (tseitin_maj). The encoded rails approximate the translated cardinality/XOR
+# circuits of planning/verification encodings, partially closing the
+# "encoded/industrial-like" gap in a parametric, reproducible way. True
+# industrial instances (from SAT-Competition archives) are still NOT covered;
+# a narrow static industrial firewall (no-TMO) would need to be layered
+# separately if that coverage is required.
 #
 # METHOD
 #   Paired A/B: run CONTROL_BINARY and VARIANT_BINARY on IDENTICAL draws, then
@@ -118,6 +122,21 @@ MATRIX=(
     "kclique5_gnp40|kclique 5 gnp 40 0.2"
     "kclique6_gnp40|kclique 6 gnp 40 0.3"
     "kclique6_gnp50|kclique 6 gnp 50 0.25"
+    # === k-clique BINARY encoding (dense "encoded"/industrial-like rails;
+    #      UNSAT; calc: ~1.7-4.3s across draws at these densities) ===
+    "kcliquebin9_gnp50|kcliquebin 9 gnp 50 0.4"
+    "kcliquebin10_gnp60|kcliquebin 10 gnp 60 0.35"
+    # === Ordering principle (structured UNSAT, ~1s; the op variant-Ramsey
+    #      threshold is intentionally avoided: N just under/over r jumps
+    #      easy<->TMO with no tunable density, so it is not a stable rail) ===
+    "op18|op 18"
+    "op20|op 20"
+    # === Majority-ENCODED Tseitin (an actual cnfgen -T encoding of a
+    #      combinational base; majority/xor encodings resemble the translated
+    #      cardinality circuits of planning/verification encodings, closing
+    #      part of the "encoded/industrial-like" coverage gap in a parametric,
+    #      reproducible way) ===
+    "tseitin_maj_g4|tseitin randomodd grid 4 4 -T maj 3"
     # === Random k-SAT (below/at/above phase transition; cnfgen takes a
     #      clause COUNT, so derive from vars × ratio) ===
     "rand3_50_3.5|randkcnf 3 50 175"
