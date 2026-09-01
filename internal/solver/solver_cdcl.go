@@ -419,7 +419,7 @@ type CDCLSolver struct {
 	veBudget                   int     // Max resolvents for variable elimination (0=unlimited)
 	subsumptionBudget          int     // Max clause-pair comparisons in subsumptionPass (0=unlimited)
 	vivifyPeriod               int     // Master vivification switch (>0 enabled; cadence is conflict-based)
-	vivifyMinConflictGap       int     // Min conflicts between vivify rounds (conflict-based cadence)
+	vivifyMinConflictGap       int     // Conflict-based vivify cadence: min conflicts between rounds. Default high so vivify fires rarely (recovering pre-decouple protective behavior)
 	conflictsAtLastVivify      int     // conflict count at last vivify round (for conflict-cadence gate)
 	vivifyEnabled              bool    // Whether vivification is enabled (adaptive: structured instances only)
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
@@ -719,7 +719,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// thrashing the solver with low-yield rounds. 20000 ensures vivify only
 		// fires on genuinely hard instances (those exceeding ~20K conflicts); easy
 		// instances solve before vivify ever triggers.
-		vivifyMinConflictGap: 20000,
+		vivifyMinConflictGap: 600000,
 		// Learned-clause subsumption: same gating cadence as vivification.
 		// Self-gating via early-return on no binary learned clauses means it
 		// is effectively free on random instances, so it is always enabled.
@@ -3782,6 +3782,12 @@ func (s *CDCLSolver) restart() bool {
 	// level-0 restart boundary, so a true mode-independent cadence should be
 	// conflict-based: fire when vivifyMinConflictGap conflicts have elapsed since
 	// the last round. vivifyPeriod>0 is retained purely as the on/off switch.
+	// The default gap is deliberately high (600000) so vivify fires rarely,
+	// recovering the protective (near-dormant) firing rate of the old gate. A
+	// low/moderate gap re-opens a regression on high-conflict vivify-hostile
+	// instances (30eb, ~483k conflicts): every firing gap that helps the
+	// 274099073/de2b class also fires on it, because it has the highest conflict
+	// count, so no single conflict-cadence value keeps those wins without it.
 	if s.vivifyEnabled && s.vivifyPeriod > 0 &&
 		(s.vivifyMinConflictGap <= 0 || s.conflicts-s.conflictsAtLastVivify >= s.vivifyMinConflictGap) {
 		if s.runVivification() {
