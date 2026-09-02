@@ -2988,6 +2988,16 @@ func (s *CDCLSolver) buildBIG() {
 	}
 	s.bigAdjData = data
 	s.bigAdjOff = off
+	// BIG needs binary-implication edges to traverse: with an empty adjacency
+	// (no original binary clauses) and no learned-binary augmentation enabled,
+	// bigReachableInClause can never return true. Disable BIG up front instead
+	// of paying up to bigHitWindow provably-futile BFS attempts per solve (e.g.
+	// ~50K on random k-SAT, which has zero 2-clauses). Trajectory-neutral: a
+	// zero-hit BIG changes no learned clause, so this is byte-identical to
+	// letting the adaptive hit-rate gate disable it after the window fills.
+	if len(data) == 0 && !s.bigLearnFlag {
+		s.bigDisabled = true
+	}
 	// Learned-binary adjacency: per-literal growable slices supplementing the
 	// static CSR. Heuristically cap total edges to bound memory on grinders;
 	// exceeding the cap only reduces fast-path effectiveness (never soundness).
