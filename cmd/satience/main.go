@@ -40,6 +40,7 @@ func run() int {
 	vivifyPeriod := flag.Int("vivify-period", 200, "Run clause vivification every Nth restart (default=200, 0=disabled)")
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 600000, "Conflict-based vivification cadence: min conflicts between rounds (mode-independent; 0=off). Default high (600k) so vivify fires rarely, recovering the pre-decouple protective behavior and avoiding regression on high-conflict vivify-hostile instances (e.g. 30eb ~483k conflicts)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
+	lsBudget := flag.Int("ls-budget", 1000000, "Learned-subsumption round: max clause-pair comparisons before aborting the round (0=unlimited)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	preferTrueCap := flag.Int("prefer-true-cap", 0, "Learned-clause replacement-scan prefer-true hunt budget (positions to search for a true literal before falling back to the first unassigned; 0=disabled [default: hard DEV-rail sweep showed no net win])")
@@ -90,6 +91,7 @@ func run() int {
 	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
 	structuredDensity := flag.Float64("structured-density", 15.0, "Density at/above which a score<0.7 & binaryRatio<=0.5 instance is rescued onto structured preprocessing (0=disable rescue)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
+	flpOcc := flag.Bool("flp-occ", true, "Probe the most-occurring unassigned variables first in failed-literal probing (default on)")
 	geometricRestarts := flag.Bool("geometric", true, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
 	minisatBumps := flag.Bool("minisat-bumps", true, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor). Default on: full-48-rail DEV win with -bump-amount=35 (-6.6% PAR2, net -1 TMO). Disable with -minisat-bumps=false.")
 	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
@@ -202,6 +204,7 @@ func run() int {
 	s.SetVivifyPeriod(*vivifyPeriod)
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
 	s.SetSubsumptionPeriod(*subsumptionPeriod)
+	s.SetLearnedSubBudget(*lsBudget)
 	s.SetRandomPhaseRate(*randomPhaseRate)
 	s.SetInprocess(*inprocessPeriod, *inprocessBudget)
 	s.SetInprocessMinUnits(*inprocessMinUnits)
@@ -229,6 +232,7 @@ func run() int {
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)
 	}
+	s.SetFLPOccurrenceOrder(*flpOcc)
 	if *geometricRestarts {
 		s.SetGeometricRestarts(true)
 	}

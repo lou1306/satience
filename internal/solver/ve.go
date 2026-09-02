@@ -841,8 +841,20 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 
 	checkedCount := 0
 	results := s.tmpLearnedSubResults[:0]
+	// Composite comparison budget (A/B, -ls-budget): counts each binary-candidate
+	// clause-pair inspected in BOTH the forward-subsumption and strengthening
+	// inner loops, so a dense binary-learned region with huge occurrence lists
+	// cannot blow past the checkedCount clause cap into a costly scan. 0 =
+	// unlimited (historical behavior). Checked at the outer-loop top (like
+	// checkedCount), so at most one clause's worth of comparisons overshoots and
+	// the per-clause seenLit cleanup stays intact before aborting the round.
+	comparisons := 0
+	compBudget := s.learnedSubBudget
 
 	for i := 0; i < s.learnedCapacity; i++ {
+		if compBudget > 0 && comparisons >= compBudget {
+			break
+		}
 		size := int(s.learnedLoc[i].Size)
 		if size <= 2 {
 			continue
@@ -884,6 +896,9 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 		isSubsumed := false
 		if bestIdx >= 0 {
 			for _, di := range occ[bestIdx] {
+				if compBudget > 0 {
+					comparisons++
+				}
 				if di == i {
 					continue
 				}
@@ -934,6 +949,9 @@ func (s *CDCLSolver) runLearnedSubsumption() bool {
 
 			strengthenedHere := false
 			for _, di := range occ[negLIdx] {
+				if compBudget > 0 {
+					comparisons++
+				}
 				if di == i {
 					continue
 				}

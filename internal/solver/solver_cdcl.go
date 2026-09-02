@@ -26,6 +26,7 @@ import (
 	"os"
 	"runtime"
 	"satience/internal/cnf"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -395,6 +396,7 @@ type CDCLSolver struct {
 	subsumptionPeriod          int     // Run subsumption every Nth restart (0=disabled, default 100)
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
+	learnedSubBudget           int     // Learned-subsumption round: max clause-pair comparisons BEFORE aborting the round (0=unlimited, current behavior). A/B toggle.
 	inprocessPeriod            int     // Master in-processing switch + initial conflict gap (0=off); cadence is adaptive
 	inprocessBudget            int     // BVE resolvent budget per in-processing round (0 = unlimited)
 	inprocessMinYield          int     // Per-round yield (subsumed+strengthened+eliminated) below which the adaptive cadence backs off
@@ -412,6 +414,7 @@ type CDCLSolver struct {
 	skipPolarityPhase          bool
 	occurrenceWeight           float64
 	skipVSIDSInit              bool
+	flpOccOrder                bool // Probe most-occurring vars first in failed-literal probing (A/B; default off = ascending index)
 	geometricRestarts          bool
 	geometricRestartThreshold  float64 // Cached threshold for geometricRestarts (= restartBase × 1.5^lubyIndex)
 	lazyInit                   *lazyInitState
@@ -960,6 +963,14 @@ func (s *CDCLSolver) SetSkipVSIDSInit(skip bool) {
 	s.skipVSIDSInit = skip
 }
 
+// SetFLPOccurrenceOrder enables occurrence-ordered failed-literal probing
+// (-flp-occ): probe the most-occurring unassigned vars first instead of
+// ascending index order, so the fixed probe budget is not wasted on low-index
+// unconstrained variables. A/B toggle; default off = historical ascending order.
+func (s *CDCLSolver) SetFLPOccurrenceOrder(enabled bool) {
+	s.flpOccOrder = enabled
+}
+
 func (s *CDCLSolver) SetGeometricRestarts(enabled bool) {
 	s.geometricRestarts = enabled
 }
@@ -1235,6 +1246,15 @@ func (s *CDCLSolver) SetPreferTrueCap(n int) {
 // Nth restart). 0 disables subsumption entirely.
 func (s *CDCLSolver) SetSubsumptionPeriod(p int) {
 	s.subsumptionPeriod = p
+}
+
+// SetLearnedSubBudget sets the max clause-pair comparisons per learned-
+// subsumption round (-ls-budget). 0 = unlimited (historical behavior).
+func (s *CDCLSolver) SetLearnedSubBudget(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.learnedSubBudget = n
 }
 
 // SetSubsumptionMinConflictGap sets the minimum number of conflicts that must
@@ -2202,7 +2222,46 @@ func (s *CDCLSolver) failedLiteralProbing() SolveResult {
 
 	s.probeTrail = s.probeTrail[:0]
 
-	for v := uint32(0); v < s.cnf.NumVars && probed < budget; v++ {
+	// Probe order: default probes variables in ascending index order, so the
+	// fixed probe budget (2000) is spent on low-index vars even when they are
+	// unconstrained. With -flp-occ, order unassigned vars by DESCENDING
+	// occurrence count (most-constrained/most likely to yield a failed literal
+	// first), with ascending index as the deterministic tiebreak. The candidate
+	// set is fixed up front: tmpAssigned only marks root-assigned vars and never
+	// changes during probing (probed vars are toggled and restored), so the
+	// pre-sorted order is stable. Sorting uses occ (total per-literal occurrence
+	// lists); a var's count = len(occ[2v]) + len(occ[2v+1]).
+	var probeOrder []uint32
+	if s.flpOccOrder {
+		type vc struct{ v, n int }
+		cands := make([]vc, 0, numVars)
+		for v := 0; v < numVars; v++ {
+			if tmpAssigned[v] {
+				continue
+			}
+			cands = append(cands, vc{v: v, n: len(occ[v*2]) + len(occ[v*2+1])})
+		}
+		sort.SliceStable(cands, func(i, j int) bool {
+			if cands[i].n != cands[j].n {
+				return cands[i].n > cands[j].n
+			}
+			return cands[i].v < cands[j].v
+		})
+		probeOrder = make([]uint32, len(cands))
+		for i, c := range cands {
+			probeOrder[i] = uint32(c.v)
+		}
+	} else {
+		probeOrder = make([]uint32, 0, numVars)
+		for v := uint32(0); v < s.cnf.NumVars; v++ {
+			probeOrder = append(probeOrder, v)
+		}
+	}
+
+	for _, v := range probeOrder {
+		if probed >= budget {
+			break
+		}
 		if tmpAssigned[v] {
 			continue
 		}
