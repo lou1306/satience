@@ -259,7 +259,9 @@ func derivedBinaryKey(a, b cnf.Literal) string {
 // reusing that inversion, by exhaustive enumeration over the family support.
 //
 // For each detected row with support S (size d <= verifyParityMaxArity) it
-// gathers the clauses whose variable support is exactly S and checks that:
+// looks up the clauses whose variable support is exactly S in the fams grouping
+// built by detectParityRows (threaded through, avoiding a second scan) and
+// checks that:
 //   - exactly 2^(d-1) of the 2^d assignments satisfy all those clauses (the
 //     family is complete), and
 //   - every satisfying assignment has the SAME true-count parity, and
@@ -267,31 +269,7 @@ func derivedBinaryKey(a, b cnf.Literal) string {
 //
 // Returns false if any family fails, in which case callers must not derive or
 // trust any parity consequence (see analyzeParity).
-func (s *CDCLSolver) verifyParityRows(rows []parityRow) bool {
-	// Group original clauses by their (variable-ordered) support so each family
-	// is checked against exactly the clauses that gave rise to its row.
-	type gClause struct {
-		lits []cnf.Literal
-	}
-	fams := make(map[string][]gClause)
-	for i := range s.cnf.Clauses {
-		lits := s.cnf.Clauses[i].Literals
-		d := len(lits)
-		if d < 3 || d > verifyParityMaxArity {
-			continue
-		}
-		sup := make([]uint32, 0, d)
-		for _, l := range lits {
-			sup = append(sup, l.Var())
-		}
-		for i := 1; i < len(sup); i++ {
-			for j := i; j > 0 && sup[j] < sup[j-1]; j-- {
-				sup[j], sup[j-1] = sup[j-1], sup[j]
-			}
-		}
-		fams[supportKey(sup)] = append(fams[supportKey(sup)], gClause{lits: lits})
-	}
-
+func (s *CDCLSolver) verifyParityRows(rows []parityRow, fams map[string][][]cnf.Literal) bool {
 	for _, r := range rows {
 		d := len(r.vars)
 		if d < 3 || d > verifyParityMaxArity {
@@ -313,7 +291,7 @@ func (s *CDCLSolver) verifyParityRows(rows []parityRow) bool {
 			satAll := true
 			for _, cl := range clauses {
 				cok := false
-				for _, l := range cl.lits {
+				for _, l := range cl {
 					iv := varIndex[l.Var()]
 					assigned := (mask>>iv)&1 == 1
 					if l.IsNegated() != assigned {
@@ -368,7 +346,7 @@ func (s *CDCLSolver) analyzeParity() SolveResult {
 	if s.parityMaxArity > parityMaxArityMax {
 		s.parityMaxArity = parityMaxArityMax
 	}
-	rows, ok := s.detectParityRows()
+	rows, fams, ok := s.detectParityRows()
 	if !ok {
 		// detectParityRows currently always returns ok=true (see there); this
 		// path is retained for future use and would signal UNSAT directly.
@@ -383,7 +361,7 @@ func (s *CDCLSolver) analyzeParity() SolveResult {
 	// detectParityRows `!p` inversion. A wrong row constant, fed into Gaussian
 	// elimination, can produce a false UNSAT via g.unsat, so on any mismatch we
 	// refuse to derive anything rather than risk it.
-	if !s.verifyParityRows(rows) {
+	if !s.verifyParityRows(rows, fams) {
 		s.Log("c [parity] verifyParityRows failed -> skipping parity derivation (no risk of false UNSAT)\n")
 		return UNKNOWN
 	}
@@ -453,12 +431,19 @@ func (s *CDCLSolver) addDerivedParityClauses(g *gaussState) {
 // support, and emits a parity row for every support carrying a COMPLETE parity
 // family (2^(d-1) clauses over d vars whose polarity patterns are exactly one
 // XOR equation). ok=false signals UNSAT (unused here; reserved).
-func (s *CDCLSolver) detectParityRows() ([]parityRow, bool) {
+func (s *CDCLSolver) detectParityRows() ([]parityRow, map[string][][]cnf.Literal, bool) {
 	type entry struct {
 		support []uint32
 		code    int
 	}
 	groups := make(map[string][]entry)
+	// fams groups each clause's literals by (sorted) support key. Built in the
+	// same single pass as groups and threaded through to verifyParityRows so the
+	// soundness oracle does not re-scan and re-group all clauses a second time.
+	// Only supports with d <= parityMaxArity are present; verify only consults
+	// supports of detected rows and skips d > verifyParityMaxArity (<= parityMaxArity),
+	// so every support it needs is present.
+	fams := make(map[string][][]cnf.Literal)
 
 	for i := range s.cnf.Clauses {
 		clause := s.cnf.Clauses[i].Literals
@@ -486,6 +471,7 @@ func (s *CDCLSolver) detectParityRows() ([]parityRow, bool) {
 			}
 		}
 		groups[key] = append(groups[key], entry{support: sup, code: cod})
+		fams[key] = append(fams[key], clause)
 	}
 
 	rows := make([]parityRow, 0)
@@ -512,7 +498,7 @@ func (s *CDCLSolver) detectParityRows() ([]parityRow, bool) {
 		// contradiction.
 		rows = append(rows, parityRow{vars: es[0].support, parity: !p})
 	}
-	return rows, true
+	return rows, fams, true
 }
 
 func supportKey(sup []uint32) string {

@@ -71,7 +71,7 @@ func TestDetectParityRows_ThreeXorGate(t *testing.T) {
 		lits = append(lits, c[:]...)
 		s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: lits})
 	}
-	rows, ok := s.detectParityRows()
+	rows, _, ok := s.detectParityRows()
 	if !ok {
 		t.Fatal("detectParityRows returned UNSAT")
 	}
@@ -156,7 +156,7 @@ func TestVerifyParityRows(t *testing.T) {
 	clauses := xorFamilyClauses([]uint32{1, 2, 3}, false)
 	s := mustSolver(t, clauses)
 
-	rows, ok := s.detectParityRows()
+	rows, fams, ok := s.detectParityRows()
 	if !ok || len(rows) != 1 {
 		t.Fatalf("expected exactly one detected parity row, got %d (ok=%v)", len(rows), ok)
 	}
@@ -164,13 +164,13 @@ func TestVerifyParityRows(t *testing.T) {
 	if rows[0].parity {
 		t.Fatalf("detector reported wrong base constant (want false)")
 	}
-	if !s.verifyParityRows(rows) {
+	if !s.verifyParityRows(rows, fams) {
 		t.Fatalf("verifyParityRows rejected a correct row constant")
 	}
 
 	// The `!p` sign error: pass the SAME family but with the constant inverted.
 	bad := []parityRow{{vars: []uint32{1, 2, 3}, parity: true}}
-	if s.verifyParityRows(bad) {
+	if s.verifyParityRows(bad, fams) {
 		t.Fatalf("verifyParityRows did NOT catch an inverted (!p) parity constant")
 	}
 }

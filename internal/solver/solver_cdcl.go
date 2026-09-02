@@ -1906,16 +1906,13 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// to the DB as consequences; unit-propagation below then assigns them. Only
 	// for structured instances (EnableUnitProp path). Runs after equiv so binary
 	// equivalences are already factored out.
-	added := false
 	if parityResult := s.analyzeParity(); parityResult != UNKNOWN {
 		s.printStats()
 		return parityResult
 	}
 	if s.parityEnabled && (s.parityBinaries > 0 || s.parityUnits > 0) {
 		s.cnf.RebuildLiteralPool()
-		added = true
 	}
-	_ = added
 
 	// For large instances, bound preprocessing with literal-visit/resolvent budgets.
 	// Must be set BEFORE BVE and unit propagation so the budgets actually apply.
