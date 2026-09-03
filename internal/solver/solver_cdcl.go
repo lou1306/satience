@@ -3681,11 +3681,16 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
 
-	// CHB/LRB: bump only the LEARNED-clause variables (not every touched var —
-	// over-bumping saturates CHB scores toward 1 and collapses discrimination)
-	// and advance the heuristic counters. Branching off vsids (nil/VSIDS) is a
-	// no-op.
-	if s.branch != nil && s.branch.mode != branchVSIDS && len(s.tmpLearnedLits) > 0 {
+	// CHB/LRB: bump the variables that drive the branching score and advance the
+	// heuristic counters. Bump-set differs by heuristic: CHB bumps only the
+	// minimized LEARNED-clause vars (over-bumping saturates its move-toward-1
+	// score and collapses discrimination); LRB counts EVERY resolution-involved
+	// var (tmpTouchedVars) — that full conflict-participation set is its
+	// learning-rate signal, and its moving-average update is immune to
+	// over-bumping. Branching off vsids (nil/VSIDS) is a no-op.
+	if s.branch != nil && s.branch.mode == branchLRB {
+		s.branchBump(s.tmpTouchedVars)
+	} else if s.branch != nil && s.branch.mode == branchCHB && len(s.tmpLearnedLits) > 0 {
 		s.tmpBranchVars = s.tmpBranchVars[:0]
 		for _, lit := range s.tmpLearnedLits {
 			s.tmpBranchVars = append(s.tmpBranchVars, lit.Var())

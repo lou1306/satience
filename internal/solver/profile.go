@@ -45,9 +45,17 @@ func ProfileFor(mode int) Profile {
 		ChbSweepPeriod:      1024,
 	}
 	switch mode {
-	case branchCHB, branchLRB:
-		// Mirrors vsids for now; tuned after DEV-rail measurement.
+	case branchCHB:
+		// Mirrors vsids for now; CHB's failure mode (score saturation) is
+		// orthogonal to restarts, so keep the frozen restart defaults.
 		return vsids
+	case branchLRB:
+		// LRB's conflict-rate signal is co-designed with conflict/LBD-adaptive
+		// restarts, not the geometric scheme tuned for VSIDS (confirmed: LRB
+		// jumps TMO->parity on hard UNSAT with -geometric=false).
+		lrb := vsids
+		lrb.Geometric = false
+		return lrb
 	default:
 		return vsids
 	}
