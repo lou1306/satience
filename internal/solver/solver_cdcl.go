@@ -505,6 +505,14 @@ type CDCLSolver struct {
 	parityUnits     int  // diagnostic: derived unit clauses
 	parityBinaries  int  // diagnostic: derived binary clauses appended
 	parityRounds    int  // diagnostic: in-loop parity re-derivations that fired (P4 fixpoint)
+	// Persistent cross-pass dedup of derived parity consequences. Derivation is
+	// add-only and re-derived on every preprocessing fixpoint pass, so without
+	// these the SAME units/binaries would be re-appended on each pass. Keyed on
+	// derivedBinaryKey (binaries) / variable index (units); allocated lazily on
+	// first derive and kept for the whole solve so a consequence is appended at
+	// most once regardless of how many passes re-derive it.
+	parityDerivedBinaries map[string]struct{}
+	parityDerivedUnits    map[uint32]struct{}
 
 	// Governor tuning knobs (CLI-exposed for sweeps; defaults match the
 	// empirically-tuned governor). See governor.go.
@@ -1910,8 +1918,6 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// so we classify on the original instance to get the true structure score.
 	// This ensures structured instances like bb34f22f (score 0.73 pre-equiv) get
 	// the structured config instead of being misclassified after equiv changes ratios.
-	config := s.getAdaptivePreprocessingConfig()
-	ppMark("adaptive config")
 
 	// SCC-based equivalence detection (all instances, sound).
 	// Runs before the size gate: O(V+E) and can significantly reduce instance
@@ -1924,7 +1930,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 	// XOR/parity precondition (sound, add-only; -parity, gated). Detect parity
 	// families and derive units/binary equivalences via GF(2) Gaussian, appended
 	// to the DB as consequences; unit-propagation below then assigns them. Only
-	// for structured instances (EnableUnitProp path). Runs after equiv so binary
+	// for structured instances. Runs after equiv so binary
 	// equivalences are already factored out.
 	if parityResult := s.analyzeParity(); parityResult != UNKNOWN {
 		s.printStats()
@@ -1943,8 +1949,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 			s.cnf.NumVars, s.cnf.NumClauses, s.unitPropBudget, s.veBudget)
 	}
 
-	// Bound subsumption's O(n²)-ish clause-pair scans adaptively. Subsumption
-	// only runs on structured instances (config.EnableUnitProp). Small instances
+	// Bound subsumption's O(n²)-ish clause-pair scans adaptively. Small instances
 	// keep unlimited behavior (proven tuning); larger ones get a budget scaled
 	// to the original literal count so heavy long-clause processing stays
 	// bounded instead of dominating the whole run (e.g. stone_3_tree12 was ~69%
@@ -1971,7 +1976,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// Subsumption pass (forward subsumption + self-subsumption/strengthening).
 		// Skipped on very dense instances (skipSubsumption) where O(n²) cost is
 		// pure overhead — the instance solves faster without it.
-		if config.EnableUnitProp && !s.skipSubsumption {
+		if !s.skipSubsumption {
 			subSubsumed, subStrengthened := s.subsumptionPass()
 			if subSubsumed > 0 || subStrengthened > 0 {
 				s.Log("c [preprocessing] Subsumption pass %d: %d clauses subsumed, %d strengthened\n", pass+1, subSubsumed, subStrengthened)
@@ -1992,7 +1997,16 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// (x∨A)×(¬x∨B) pairs, discarding tautological resolvents. Only eliminates
 		// when it reduces clause count. Model reconstruction by trying x=true/x=false.
 		// Skipped on dense binary instances (skipBVE) where it is pure overhead.
-		if config.EnableUnitProp && !s.skipBVE {
+		// skipAssigned=false: PREPROCESSING may eliminate already-assigned (pure-
+		// literal / unit) variables. This is sound: BVE preserves the solution set
+		// over remaining vars, and reconstructEliminatedVars overwrites the elimi-
+		// nated var's value with the resolution-determined one that satisfies its
+		// stored clauses (so it never "fights" a stale prior assignment). In-
+		// processing (simplifyOriginalDB) instead passes true to conservatively
+		// skip assigned vars (see restart.go) because there the reduced formula is
+		// immediately re-searched and skirting reason-clause complications is
+		// preferable to the reconstruction cost.
+		if !s.skipBVE {
 			veResult := s.boundedVarElimination(false)
 			if veResult < 0 {
 				s.printStats()
@@ -2009,10 +2023,8 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		}
 
 		// Unit propagation
-		if config.EnableUnitProp {
-			if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
-				return unitResult
-			}
+		if unitResult := s.unitPropagationPreprocess(); unitResult != UNKNOWN {
+			return unitResult
 		}
 		ppMark("unit propagation")
 

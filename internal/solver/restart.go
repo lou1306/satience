@@ -523,13 +523,17 @@ func (s *CDCLSolver) simplifyOriginalDB() bool {
 	if s.hasEmptyClause() {
 		return true
 	}
+	// In-processing (unlike preprocessing, which passes skipAssigned=false) uses
+	// skipAssigned=true: never eliminate a currently-assigned (level-0 unit) var.
+	// The reduced formula is immediately re-searched and reconstruction of an
+	// eliminated-but-assigned var would fight the existing level-0 assignment, so
+	// conservatively skip it. See the preprocessing note in preprocessAggressive.
 	elim := 0
 	if vr := s.boundedVarElimination(true); vr < 0 {
 		return true
 	} else if vr > 0 {
 		elim = vr
 	}
-
 	// Yield-based adaptive cadence (C): adjust the conflict gap for the NEXT
 	// round from this round's yield (subsumed + strengthened + eliminated,
 	// i.e. actual formula reduction). A productive round tightens the cadence

@@ -330,7 +330,6 @@ func (s *CDCLSolver) verifyParityRows(rows []parityRow, fams map[string][][]cnf.
 	return true
 }
 
-
 // Gaussian elimination, and appends derived unit/binary clauses to the DB.
 // Returns UNSAT on a parity contradiction, else UNKNOWN. SOUND and ADD-ONLY.
 func (s *CDCLSolver) analyzeParity() SolveResult {
@@ -380,23 +379,37 @@ func (s *CDCLSolver) analyzeParity() SolveResult {
 	g.finalize()
 
 	s.parityRowsFound += len(rows)
-	s.parityUnits += len(g.units)
 	s.addDerivedParityClauses(g)
 	s.Log("c [parity] rows=%d units=%d binaries=%d\n", len(rows), len(g.units), s.parityBinaries)
 	return UNKNOWN
 }
 
 // addDerivedParityClauses appends derived units and binaries to the original
-// DB, skipping duplicates, capped by parityBudget. Units added as unit clauses
-// are then assigned by the existing unit-propagation preprocessing stage.
+// DB, skipping duplicates, capped by parityBudget. Derived consequences are
+// deduped PERSISTENTLY across all fixpoint passes (parityDerivedUnits by
+// variable, parityDerivedBinaries by normalized signature) so a unit/binary is
+// appended at most once per solve even though the same family is re-derived on
+// every pass. Units added as unit clauses are then assigned by the existing
+// unit-propagation preprocessing stage.
 func (s *CDCLSolver) addDerivedParityClauses(g *gaussState) {
 	if s.parityBudget <= 0 {
 		return
 	}
-	seen := make(map[string]bool, len(g.binars))
+	if s.parityDerivedUnits == nil {
+		s.parityDerivedUnits = make(map[uint32]struct{}, len(g.units))
+	}
+	if s.parityDerivedBinaries == nil {
+		s.parityDerivedBinaries = make(map[string]struct{}, len(g.binars)/2)
+	}
 	for _, lit := range g.units {
+		v := lit.Var()
+		if _, ok := s.parityDerivedUnits[v]; ok {
+			continue // already derived and appended in a prior pass
+		}
+		s.parityDerivedUnits[v] = struct{}{}
 		s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: []cnf.Literal{lit}})
 		s.cnf.NumClauses++
+		s.parityUnits++
 	}
 	added := 0
 	for i := 0; i < len(g.binars); i += 2 {
@@ -415,10 +428,10 @@ func (s *CDCLSolver) addDerivedParityClauses(g *gaussState) {
 			// bits, so x∨y and y∨x (and the same pair of normally-polar vars) are
 			// never double-added and no 32-bit overflow can collapse distinct rows.
 			k := derivedBinaryKey(x, y)
-			if seen[k] {
+			if _, ok := s.parityDerivedBinaries[k]; ok {
 				continue
 			}
-			seen[k] = true
+			s.parityDerivedBinaries[k] = struct{}{}
 			s.cnf.Clauses = append(s.cnf.Clauses, cnf.Clause{Literals: []cnf.Literal{x, y}})
 			s.cnf.NumClauses++
 			added++
