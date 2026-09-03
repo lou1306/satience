@@ -41,6 +41,7 @@ func run() int {
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 600000, "Conflict-based vivification cadence: min conflicts between rounds (mode-independent; 0=off). Default high (600k) so vivify fires rarely, recovering the pre-decouple protective behavior and avoiding regression on high-conflict vivify-hostile instances (e.g. 30eb ~483k conflicts)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
 	lsBudget := flag.Int("ls-budget", 1000000, "Learned-subsumption round: max clause-pair comparisons before aborting the round (0=unlimited)")
+	branch := flag.String("branch", "vsids", "Variable-selection heuristic: vsids (default), chb, or lrb (alternate conflict-history/learning-rate branching; A/B against vsids on the broad held-out rail)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	preferTrueCap := flag.Int("prefer-true-cap", 0, "Learned-clause replacement-scan prefer-true hunt budget (positions to search for a true literal before falling back to the first unassigned; 0=disabled [default: hard DEV-rail sweep showed no net win])")
@@ -205,6 +206,14 @@ func run() int {
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
 	s.SetSubsumptionPeriod(*subsumptionPeriod)
 	s.SetLearnedSubBudget(*lsBudget)
+	switch *branch {
+	case "chb":
+		s.SetBranch(1)
+	case "lrb":
+		s.SetBranch(2)
+	default:
+		s.SetBranch(0)
+	}
 	s.SetRandomPhaseRate(*randomPhaseRate)
 	s.SetInprocess(*inprocessPeriod, *inprocessBudget)
 	s.SetInprocessMinUnits(*inprocessMinUnits)

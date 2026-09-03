@@ -105,6 +105,7 @@ func (s *CDCLSolver) backtrack() bool {
 		}
 		s.unassignVar(varIdx)
 		s.vsids.onUnassign(varIdx)
+		s.branchOnUnassign(varIdx)
 	}
 	if unitVarUnassigned {
 		s.unitsDirty = true
@@ -273,6 +274,7 @@ func (s *CDCLSolver) restart() bool {
 	// NOT restored by onUnassign (restart doesn't call it). Force a rebuild
 	// to fix all entries with current scores.
 	s.vsids.heapValid = false
+	s.branchInvalidate()
 
 	// Reset restart counters
 	s.lubyIndex++

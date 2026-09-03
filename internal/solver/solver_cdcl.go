@@ -159,11 +159,12 @@ type CDCLSolver struct {
 	trailPos         []int // trailPos[varIdx] = position in trail (-1 if not on trail); O(1) lookup for 1-UIP fallback
 	level            int
 	vsids            *VSIDS
-	numUnassigned    int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	watchLists       [][]cnf.Watch // watchLists[lit] = general (size>=3) clauses watching lit
-	watchListsBinary [][]cnf.Watch // watchListsBinary[lit] = binary (size==2) clauses watching lit
-	qhead            int           // Watched literals: next trail index to process
-	litTrue          []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
+	branch           *branchHeuristic // CHB/LRB alternative to VSIDS (nil when -branch=vsids)
+	numUnassigned    int              // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
+	watchLists       [][]cnf.Watch    // watchLists[lit] = general (size>=3) clauses watching lit
+	watchListsBinary [][]cnf.Watch    // watchListsBinary[lit] = binary (size==2) clauses watching lit
+	qhead            int              // Watched literals: next trail index to process
+	litTrue          []bool           // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
 	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
@@ -327,6 +328,7 @@ type CDCLSolver struct {
 	tmpResolvedVars     []uint32      // Track which variables were resolved (for fast reset)
 	tmpTouchedVars      []uint32      // Track which variables were modified (for fast reset)
 	tmpLearnedLits      []cnf.Literal // Reusable buffer for learned clause literals
+	tmpBranchVars       []uint32      // Scratch: learned-clause variables fed to CHB/LRB bump
 	tmpMinSeenVars      []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 
@@ -642,6 +644,7 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpTouchedVars:    make([]uint32, 0, formula.NumVars),
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:   make([]cnf.Literal, 0, 256),
+		tmpBranchVars:    make([]uint32, 0, 32),
 		tmpMinSeenVars:   make([]uint32, 0, 256),
 		tmpVivifyResults: make([]vivifyResult, 0, 64),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
@@ -2950,6 +2953,7 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
+	s.branchSeedFromVSIDS()   // start CHB/LRB from the same activity as VSIDS
 }
 
 // buildBIG builds the binary implication graph from original binary clauses.
@@ -3489,7 +3493,12 @@ func (s *CDCLSolver) decide() bool {
 	// Standard CDCL: no random decisions, no diversification overrides.
 	var varIdx uint32
 	var phase bool
-	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments)
+	if s.branch != nil && s.branch.mode != branchVSIDS {
+		varIdx = s.branchSelect(s.assignments)
+		phase = s.assignments[varIdx].SavedPhase
+	} else {
+		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments)
+	}
 
 	// SAFETY CHECK: Ensure variable is unassigned before deciding.
 	// A stale heap entry can slip through; fall back to linear scan.
@@ -3671,6 +3680,18 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
+
+	// CHB/LRB: bump only the LEARNED-clause variables (not every touched var —
+	// over-bumping saturates CHB scores toward 1 and collapses discrimination)
+	// and advance the heuristic counters. Branching off vsids (nil/VSIDS) is a
+	// no-op.
+	if s.branch != nil && s.branch.mode != branchVSIDS && len(s.tmpLearnedLits) > 0 {
+		s.tmpBranchVars = s.tmpBranchVars[:0]
+		for _, lit := range s.tmpLearnedLits {
+			s.tmpBranchVars = append(s.tmpBranchVars, lit.Var())
+		}
+		s.branchBump(s.tmpBranchVars)
+	}
 
 	// B2: Adaptively shrink clause DB when average LBD is consistently high.
 	// High-LBD clauses rarely propagate; a smaller DB keeps only the lowest-LBD
