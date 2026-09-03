@@ -1,4 +1,4 @@
-.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout heldout-broad debug test test-verbose test-race vet lint bench clean install profile help
+.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout heldout-broad heldout-industrial debug test test-verbose test-race vet lint bench clean install profile help
 
 # Default target: build release solver binary
 all: satience
@@ -41,6 +41,15 @@ heldout:
 # BROAD distributional held-out gate (harder/larger distribution + aggregate
 # acceptance). See benchmark/heldout_broad.sh. Uses $CONTROL_BINARY/$VARIANT_BINARY.
 heldout-broad:
+	bash benchmark/heldout_broad.sh
+
+# INDUSTRIAL-only held-out gate over the fixed GBD archive (SHAs in
+# benchmark/gbd_instances.list), verdicts cross-checked vs minisat.
+# Uses $CONTROL_BINARY/$VARIANT_BINARY (+ optional MINISAT_BIN, JOBS, TIMEOUT).
+heldout-industrial:
+	CONTROL_BINARY="$${CONTROL_BINARY:?set CONTROL_BINARY}" VARIANT_BINARY="$${VARIANT_BINARY:?set VARIANT_BINARY}" \
+	INDUSTRIAL_DIR="$(CURDIR)/benchmark/gbd_instances" INDUSTRIAL_LIST="$(CURDIR)/benchmark/gbd_instances.list" \
+	MINISAT_BIN="$${MINISAT_BIN:-minisat}" DEV_ITERATIONS=0 VALIDATION_ITERATIONS=0 \
 	bash benchmark/heldout_broad.sh
 
 # Go native parser fuzz (no external deps)
