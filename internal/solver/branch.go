@@ -41,18 +41,30 @@ type branchHeuristic struct {
 	varIdxs    []uint32  // heap: variable at each position
 	heapPos    []int     // var -> heap position (-1 = absent)
 	heapValid  bool
+	// Tunable parameters (promoted from constants so the per-heuristic profile
+	// and DEV tuning can set them).
+	chbDecayBase   float64 // CHB recency decay base (pow(base, gap))
+	lrbEwmaAlpha   float64 // LRB EWMA weight for the accumulated epoch
+	lrbMergePeriod uint64  // LRB: conflicts between score merges
+	chbSweepPeriod uint64  // CHB: global score decay sweep interval (conflicts)
 }
 
 const (
-	chbDecayBase   = 0.9 // CHB recency decay base (pow(base, gap))
-	lrbEwmaAlpha   = 0.9 // LRB EWMA weight for the accumulated epoch
-	lrbMergePeriod = 8192
-	chbSweepPeriod = 1024 // CHB: global score decay sweep interval (conflicts)
+	defaultChbDecayBase   = 0.9
+	defaultLrbEwmaAlpha   = 0.9
+	defaultLrbMergePeriod = 8192
+	defaultChbSweepPeriod = 1024
 )
 
 // initBranch allocates the per-variable arrays for the chosen mode.
 func (s *CDCLSolver) initBranch(mode int) {
-	b := &branchHeuristic{mode: mode}
+	b := &branchHeuristic{
+		mode:           mode,
+		chbDecayBase:   defaultChbDecayBase,
+		lrbEwmaAlpha:   defaultLrbEwmaAlpha,
+		lrbMergePeriod: defaultLrbMergePeriod,
+		chbSweepPeriod: defaultChbSweepPeriod,
+	}
 	n := int(s.cnf.NumVars)
 	b.scores = make([]float64, n)
 	b.heapPos = make([]int, n)
@@ -65,6 +77,27 @@ func (s *CDCLSolver) initBranch(mode int) {
 		b.conf = make([]uint64, n)
 	}
 	s.branch = b
+}
+
+// SetBranchParams tunes the CHB/LRB heuristic scalars. A zero value in any
+// field leaves it at its default. Used by the per-heuristic profile and DEV.
+func (s *CDCLSolver) SetBranchParams(chbDecay, lrbAlpha float64, lrbMerge, chbSweep uint64) {
+	b := s.branch
+	if b == nil {
+		return
+	}
+	if chbDecay > 0 {
+		b.chbDecayBase = chbDecay
+	}
+	if lrbAlpha > 0 {
+		b.lrbEwmaAlpha = lrbAlpha
+	}
+	if lrbMerge > 0 {
+		b.lrbMergePeriod = lrbMerge
+	}
+	if chbSweep > 0 {
+		b.chbSweepPeriod = chbSweep
+	}
 }
 
 // buildHeap rebuilds the branch-score max-heap over all variables from their
@@ -217,14 +250,14 @@ func (s *CDCLSolver) branchBump(vars []uint32) {
 	}
 	if b.mode == branchCHB {
 		b.step++
-		if b.step%chbSweepPeriod == 0 {
+		if b.step%b.chbSweepPeriod == 0 {
 			// Global time-decay: inactive variables lose score over time so a
 			// variable never bumped still eventually drops below active ones.
 			// Multiplying every score by a constant PRESERVES their relative
 			// order (heap stays valid); crucially `last` is NOT reset, so the
 			// recency gap step-last[v] remains meaningful across sweeps.
 			for i := range b.scores {
-				b.scores[i] *= chbDecayBase
+				b.scores[i] *= b.chbDecayBase
 			}
 			b.heapValid = false // all scores changed; rebuild on next selection
 		}
@@ -233,7 +266,7 @@ func (s *CDCLSolver) branchBump(vars []uint32) {
 				continue
 			}
 			gap := b.step - b.last[v]
-			decay := math.Pow(chbDecayBase, float64(gap))
+			decay := math.Pow(b.chbDecayBase, float64(gap))
 			b.scores[v] = decay*b.scores[v] + (1 - decay)
 			b.last[v] = b.step
 		}
@@ -244,9 +277,9 @@ func (s *CDCLSolver) branchBump(vars []uint32) {
 				b.conf[v]++
 			}
 		}
-		if b.epochCount >= lrbMergePeriod {
+		if b.epochCount >= b.lrbMergePeriod {
 			for i := range b.scores {
-				b.scores[i] = lrbEwmaAlpha*b.scores[i] + float64(b.conf[i])
+				b.scores[i] = b.lrbEwmaAlpha*b.scores[i] + float64(b.conf[i])
 				b.conf[i] = 0
 			}
 			b.epochCount = 0
@@ -327,6 +360,19 @@ func (s *CDCLSolver) branchSeedFromVSIDS() {
 		b.conf[i] = 0
 	}
 	b.heapValid = false
+}
+
+// BranchMode maps a heuristic name to its mode constant, defaulting to VSIDS
+// for unknown/empty names.
+func BranchMode(name string) int {
+	switch name {
+	case "chb":
+		return branchCHB
+	case "lrb":
+		return branchLRB
+	default:
+		return branchVSIDS
+	}
 }
 
 // SetBranch selects the variable-selection heuristic: branchVSIDS (default),
