@@ -53,8 +53,15 @@ func ProfileFor(mode int) Profile {
 		// LRB's conflict-rate signal is co-designed with conflict/LBD-adaptive
 		// restarts, not the geometric scheme tuned for VSIDS (confirmed: LRB
 		// jumps TMO->parity on hard UNSAT with -geometric=false).
+		//
+		// Search-heavy retune (branch_dev.sh, tight-paired vs vsids): the faithful
+		// LRB with the default merge=8192 is ~36% SLOWER than VSIDS; raising the
+		// merge period to 32768 flips it to ~24% FASTER, reproducibly across
+		// (merge=32768, alpha 0.9/0.98) — well above the noise floor. alpha adds
+		// little, so keep the default alpha. Bake the winning merge period in.
 		lrb := vsids
 		lrb.Geometric = false
+		lrb.LrbMergePeriod = 32768
 		return lrb
 	default:
 		return vsids
