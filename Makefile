@@ -1,4 +1,4 @@
-.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout debug test test-verbose test-race vet lint bench clean install profile help
+.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout heldout-broad debug test test-verbose test-race vet lint bench clean install profile help
 
 # Default target: build release solver binary
 all: satience
@@ -37,6 +37,11 @@ fuzz-structured:
 #      MEDIAN_REGRESS_PCT=5, NOISE_FLOOR=0.25
 heldout:
 	bash benchmark/heldout.sh
+
+# BROAD distributional held-out gate (harder/larger distribution + aggregate
+# acceptance). See benchmark/heldout_broad.sh. Uses $CONTROL_BINARY/$VARIANT_BINARY.
+heldout-broad:
+	bash benchmark/heldout_broad.sh
 
 # Go native parser fuzz (no external deps)
 fuzz-parser:

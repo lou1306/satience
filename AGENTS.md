@@ -69,6 +69,47 @@ rail. Re-tuning after a VALIDATION failure and re-running burns the validation
 distribution. Coverage is cnfgen combinational/structured families only
 (k-SAT, Tseitin, kcolor, kclique); industrial encodings are NOT covered.
 
+### BROAD held-out gate (`benchmark/heldout_broad.sh`) — for changes that need
+a harder, larger distribution than `heldout.sh` can see
+
+The fast-suite + `heldout.sh` rails are dominated by tiny (50-300 var) instances
+the solver already solves in ~2s, so most improvements are unmeasurable there
+(cold paths like FLP/in-processing/subsumption never fire; large-scale behavior
+never manifests). `heldout_broad.sh` measures a harder, broader rail so a change
+has real headroom:
+
+- **Tier 1 (cnfgen, reproducible):** large random k-SAT (1000-2000 vars, near
+  the phase transition — FLP budget binds, big BVE/matrices) + large structured
+  (Tseitin grids/gnd, pigeonhole, k-color, binary k-clique).
+- **Tier 2 (industrial, optional):** fixed SAT-competition/verification
+  instances via `INDUSTRIAL_DIR` + `INDUSTRIAL_LIST`; verdicts cross-checked
+  against minisat.
+
+**Aggregate / expectation acceptance (differs from `heldout.sh`'s per-family
+all-pass veto, which rejects any redistributive-but-better change).** A variant
+is accepted on the VALIDATION rail iff: (1) every solved instance's verdict
+matches control (and minisat on the industrial tier) — mismatches are a hard
+FAIL; (2) geometric-mean PAR2 improves by >= `ACCEPT_IMPROVE_PCT` (default 5%);
+(3) new-TMO fraction (control solved / variant TMO) <= `NEWTMO_MAX_FRAC` (0.10);
+(4) regression fraction (variant >`REGRESS_MAX_PCT` slower above the noise
+floor) <= `REGRESS_MAX_FRAC` (0.15). Redistribution across families is allowed:
+a change that helps many and hurts a bounded few is landable. This is what
+unblocks genuinely better-but-redistributive heuristics (the entire point of
+adding this rail). Small-N runs are directional only — run at default
+`VALIDATION_ITERATIONS` for the decision; identical-control noise is ~1-2% at
+moderate N, so 5% is a safe threshold. See `benchmark/heldout_broad.sh`.
+
+```bash
+CONTROL_BINARY=/tmp/ctl VARIANT_BINARY=/tmp/var ./benchmark/heldout_broad.sh
+# env: DEV_ITERATIONS VALIDATION_ITERATIONS TIMEOUT JOBS ACCEPT_IMPROVE_PCT
+#      NEWTMO_MAX_FRAC REGRESS_MAX_FRAC REGRESS_MAX_PCT NOISE_FLOOR
+#      INDUSTRIAL_DIR INDUSTRIAL_LIST MINISAT_BIN
+# A/B example:
+#   go build -o /tmp/ctl ./cmd/satience
+#   go build -o /tmp/var ./cmd/satience
+#   CONTROL_BINARY=/tmp/ctl VARIANT_BINARY=/tmp/var make heldout-broad
+```
+
 ### Held-out env vars
 - `CONTROL_BINARY` / `VARIANT_BINARY` — the two binaries to A/B (paired on identical draws)
 - `DEV_ITERATIONS` — draws/family on the tuning rail (default 10)
