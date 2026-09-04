@@ -58,6 +58,8 @@ func (s *CDCLSolver) maybeAdaptSearch() {
 	}
 
 	s.detector4LbdStagnation(winLBD, glueRatio)
+	// Graduated-mode only: back off the Det4 lowering after sustained improvement.
+	s.detector4Recovery(winLBD, glueRatio)
 }
 
 // maybeGeoSpiral is the Det6 evaluation path driven by a CONFLICT-WINDOW cadence
@@ -131,28 +133,109 @@ func (s *CDCLSolver) maybeGeoSpiral() {
 //     phase saving provides strong guidance. Guard: require weak phase guidance
 //     (PolarityImbalance < 0.4).
 //   - Already-frequent-restart instances (binary-heavy) need no further lowering.
-func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
-	if s.govStagFired {
+//
+// govStaticBand applies the severity-weighted static-guard relaxation (Option B).
+// Returns (relaxed, reject): relax=true when the instance violates a HARD static
+// discriminator (PolImb>=0.4 or structureScore<0.7) but is within the soft
+// relaxed bound — the caller must then require a clearly more severe spiral.
+// reject=true is a hard refusal (beyond the soft bound). With the default soft
+// bounds equal to the hard ones, the relaxed band is empty and no instance is
+// ever admitted that the legacy guards rejected.
+func (s *CDCLSolver) govStaticBand() (relaxed, reject bool) {
+	const hardPolImb = 0.4
+	const hardStruct = 0.7
+	if s.polarityImbalance >= hardPolImb {
+		if s.polarityImbalance >= s.govStagRelaxPolImb {
+			return false, true
+		}
+		relaxed = true
+	}
+	if s.structureScore < hardStruct {
+		if s.structureScore < s.govStagRelaxStruct {
+			return false, true
+		}
+		relaxed = true
+	}
+	return relaxed, false
+}
+
+// applyDet4Graduated performs a GRADUATED (not one-shot) restartBase lowering:
+// step down toward govStagBase by govStagStep while stagnation persists, saving
+// the original base for recovery. Bounded by govStagBase so it never undercuts
+// the intended floor. The permanent-jump legacy path is used instead unless
+// govStagGraduated is enabled.
+func (s *CDCLSolver) applyDet4Graduated(winLBD, minLBD, glueRatio, bar float64) {
+	if !s.govSaveBaseSet {
+		s.govSaveBase = s.restartBase
+		s.govSaveBaseSet = true
+	}
+	if s.restartBase > s.govStagBase {
+		next := int(float64(s.restartBase) / s.govStagStep)
+		if next < s.govStagBase {
+			next = s.govStagBase
+		}
+		s.restartBase = next
+	}
+	s.govImproveCnt = 0 // stagnation persists; clear any recovery streak
+	s.Log("c [governor] Det4 grad: win LBD=%.1f (min %.1f bar %.1f) glue=%.3f -> restartBase -> %d (saved %d)\n",
+		winLBD, minLBD, bar, glueRatio, s.restartBase, s.govSaveBase)
+}
+
+// detector4Recovery backs the graduated Det4 lowering back UP toward the saved
+// original after govStagRecoverWin consecutive windows show the correction is
+// working (LBD dropped below the bar OR glue has reappeared). Once fully
+// recovered the save is cleared so a future, genuinely new stagnation re-saves.
+// No-op unless graduated mode is enabled.
+func (s *CDCLSolver) detector4Recovery(winLBD, glueRatio float64) {
+	if !s.govStagGraduated || !s.govSaveBaseSet {
 		return
 	}
-	// Long-clause + high-PolImb structural guards (see comment above).
+	improving := winLBD < s.govStagLBD || glueRatio >= s.govStagGlue
+	if !improving {
+		return // still stagnant — hold the current (lowered) base
+	}
+	s.govImproveCnt++
+	if s.govImproveCnt < s.govStagRecoverWin {
+		return
+	}
+	up := int(float64(s.restartBase) * s.govStagStep)
+	if up >= s.govSaveBase {
+		up = s.govSaveBase
+		s.govSaveBaseSet = false // full recovery; future spirals re-save
+	}
+	s.restartBase = up
+	s.govImproveCnt = 0
+	s.Log("c [governor] Det4 grad recovery: LBD=%.1f glue=%.3f -> restartBase -> %d\n", winLBD, glueRatio, s.restartBase)
+}
+
+func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
+	// Legacy mode: a fire is one-way (govStagFired). Graduated mode allows
+	// re-evaluation so it can step further down while stagnation persists.
+	if !s.govStagGraduated && s.govStagFired {
+		return
+	}
+	// Long-clause + user-override guards stay hard: flat-LBD is genuine structure
+	// on long-clause-dominated instances, and an explicit -restart-base is the
+	// user's call.
 	if s.longClauseRatio > 0.8 {
 		return
 	}
-	if s.polarityImbalance >= 0.4 {
-		return
-	}
-	// Structured-only guard. Random k-SAT / phase-transition instances
-	// (structureScore < 0.7) also show sustained high-LBD + no glue, but they are
-	// deliberately tuned for DEEP search (restartBase=100, Glucose) and lowering
-	// the base to 20 breaks them (30eb4ef4: TMO with Det4, instant without).
-	// Det4 targets the STRUCTURED unguided-spiral signature only.
-	if s.structureScore < 0.7 {
-		return
-	}
-	// Respect explicit CLI restart-base.
 	if s.flagSet("restart-base") {
 		return
+	}
+	// Severity-weighted static bands: a relaxed-band instance (violating a hard
+	// static discriminator but within the soft bound) must clear a higher bar.
+	relaxed, reject := s.govStaticBand()
+	if reject {
+		return
+	}
+	bar := s.govStagLBD
+	winReq := s.govStagWin
+	glueBar := s.govStagGlue
+	if relaxed {
+		bar += s.govStagSeverExtra
+		winReq += s.govStagSeverWin
+		glueBar *= 0.5
 	}
 
 	// Record this window's avgLBD (ring buffer); compute stagnation over history.
@@ -161,21 +244,22 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 	if s.govLbdHistN < len(s.govLbdHist) {
 		s.govLbdHistN++
 	}
-	if s.govLbdHistN < s.govStagWin {
+	if s.govLbdHistN < winReq {
 		return // not enough windows yet
 	}
 
 	// Stagnation = every recent window avgLBD is HIGH and NONE shows meaningful
-	// improvement. Compute the min over the last govStagWin windows.
-	need := s.govStagWin
+	// improvement. Compute the min over the last winReq+ windows (bounded by the
+	// ring buffer length).
+	need := winReq
 	minLBD := 1e18
+	highCount := 0
 	ll := s.govLbdHistN
 	if ll > len(s.govLbdHist) {
 		ll = len(s.govLbdHist)
 	}
-	highCount := 0
 	for i := 0; i < ll; i++ {
-		if s.govLbdHist[i] >= s.govStagLBD {
+		if s.govLbdHist[i] >= bar {
 			highCount++
 		}
 		if s.govLbdHist[i] < minLBD {
@@ -185,10 +269,14 @@ func (s *CDCLSolver) detector4LbdStagnation(winLBD, glueRatio float64) {
 	if highCount < need {
 		return // not consistently high LBD
 	}
-	if glueRatio >= s.govStagGlue {
+	if glueRatio >= glueBar {
 		return // there IS glue guidance — not unguided
 	}
 
+	if s.govStagGraduated {
+		s.applyDet4Graduated(winLBD, minLBD, glueRatio, bar)
+		return
+	}
 	s.govStagFired = true
 	save := s.restartBase
 	s.restartBase = s.govStagBase
@@ -219,24 +307,30 @@ func (s *CDCLSolver) detector6GeoSpiral(winLBD, glueRatio, propsPerDec float64) 
 	if !s.geometricRestarts || s.geoFlipFired {
 		return
 	}
-	// Structured-only gate (mirrors Det4's guard: excludes random k-SAT rails).
-	if s.structureScore < 0.7 {
+	// Severity-weighted static bands: a relaxed-band instance must clear a higher
+	// LBD bar AND a deeper cascade than the base signature.
+	relaxed, reject := s.govStaticBand()
+	if reject {
 		return
 	}
-	// Weak phase guidance required — strong polarity saving guides deep search.
-	if s.polarityImbalance >= 0.4 {
-		return
+	lbdBar := s.govStagLBD
+	winReq := s.govStagWin
+	pdecBar := s.govSpiralPDec
+	if relaxed {
+		lbdBar += s.govStagSeverExtra
+		winReq += s.govStagSeverWin
+		pdecBar += 2.0 // relaxed-band cascades must still be genuinely deep
 	}
 	if glueRatio >= s.govStagGlue {
 		return
 	}
-	// Ring-buffer this window's avgLBD; require govStagWin consecutive windows.
+	// Ring-buffer this window's avgLBD; require winReq consecutive windows.
 	s.govSpiralHist[s.govSpiralIdx] = winLBD
 	s.govSpiralIdx = (s.govSpiralIdx + 1) % len(s.govSpiralHist)
 	if s.govSpiralN < len(s.govSpiralHist) {
 		s.govSpiralN++
 	}
-	if s.govSpiralN < s.govStagWin {
+	if s.govSpiralN < winReq {
 		return
 	}
 	minLBD, maxLBD := 1e18, 0.0
@@ -249,11 +343,11 @@ func (s *CDCLSolver) detector6GeoSpiral(winLBD, glueRatio, propsPerDec float64) 
 		}
 	}
 	// Stagnation: consistently high and flat (no meaningful LBD improvement).
-	if maxLBD < s.govStagLBD || maxLBD-minLBD > 6.0 {
+	if maxLBD < lbdBar || maxLBD-minLBD > 6.0 {
 		return
 	}
 	// Deep unguided cascade — distinguishes op-like spirals from shallow solves.
-	if propsPerDec < s.govSpiralPDec {
+	if propsPerDec < pdecBar {
 		return
 	}
 

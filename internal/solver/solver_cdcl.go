@@ -523,6 +523,25 @@ type CDCLSolver struct {
 	govStagGlue float64 // Det4: max window glue ratio to qualify as stagnation (default 0.05)
 	govStagWin  int     // Det4: consecutive windows with no LBD improvement to confirm (default 3)
 	govStagBase int     // Det4: target restartBase when stagnation fires (default 20)
+	// Severity-weighted static-guard relaxation + graduated/reversible action
+	// (Option B; defaults preserve the empirically-tuned legacy behavior):
+	//   relaxed static bands let the detectors fire on a class that violates a
+	//   HARD static discriminator (PolImb>=0.4 / structureScore<0.7) ONLY when
+	//   the dynamic spiral is clearly more severe; graduated lowering steps
+	//   restartBase down toward govStagBase instead of slamming it, and recovers
+	//   back toward the saved original when a later window shows improvement.
+	// Bands are empty (relax == hard) and graduated is off by default, so the
+	// legacy one-shot jump to govStagBase is unchanged unless enabled.
+	govStagRelaxPolImb float64 // Det4/6: soft PolImb ceiling (default 0.4 = no relaxed band)
+	govStagRelaxStruct float64 // Det4/6: soft structureScore floor (default 0.7 = no relaxed band)
+	govStagSeverExtra  float64 // Det4/6: extra flat-LBD required to fire inside a relaxed band
+	govStagSeverWin    int     // Det4/6: extra history windows required when relaxed
+	govStagGraduated   bool    // Det4: use graduated+recoverable lowering instead of one-shot jump
+	govStagStep        float64 // Det4: graduated division factor toward govStagBase (>1)
+	govStagRecoverWin  int     // Det4: consecutive improving windows before backing off
+	govSaveBase        int     // Det4 (graduated): restartBase saved before first lowering
+	govSaveBaseSet     bool    // Det4 (graduated): saved base is set
+	govImproveCnt      int     // Det4 (graduated): consecutive improving windows
 	// Det6 (geometric-spiral -> Luby mechanism flip): fires once when running
 	// geometric (geometric-restarts) restarts on a STRUCTURED unguided deep-spiral
 	// signature (chain/ordering-principle-like: weak phase guidance, high flat
@@ -721,6 +740,13 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		govStagGlue:           0.05,
 		govStagWin:            3,
 		govStagBase:           20,
+		govStagRelaxPolImb:    0.4, // = hard bound -> relaxed band empty (off)
+		govStagRelaxStruct:    0.7, // = hard bound -> relaxed band empty (off)
+		govStagSeverExtra:     6.0,
+		govStagSeverWin:       1,
+		govStagGraduated:      false, // off: keep legacy one-shot jump to govStagBase
+		govStagStep:           2.0,
+		govStagRecoverWin:     3,
 		govSpiralPDec:         8.0, // Det6: deep unguided cascade threshold for geo->Luby flip
 		// Restart policy defaults (aggressive Glucose-style for better performance)
 		restartGlucoseRatio:        1.5, // Standard Glucose value (aggressive restarts)
@@ -894,6 +920,44 @@ func (s *CDCLSolver) SetGovernorDet4Params(stagLBD, stagGlue float64, stagWin, s
 func (s *CDCLSolver) SetGovernorSpiralPDec(pdec float64) {
 	if pdec > 0 {
 		s.govSpiralPDec = pdec
+	}
+}
+
+// SetGovernorRelaxStatics configures the severity-weighted static-guard
+// relaxation (Option B). relaxPolImb is the soft PolImb ceiling and relaxStruct
+// the soft structureScore floor; when non-default they open a relaxed band (see
+// governor.go). Defaults equal the hard bounds, so the band is empty by default.
+func (s *CDCLSolver) SetGovernorRelaxStatics(relaxPolImb, relaxStruct float64) {
+	if relaxPolImb >= 0.4 && relaxPolImb <= 1.0 {
+		s.govStagRelaxPolImb = relaxPolImb
+	}
+	if relaxStruct >= 0.0 && relaxStruct <= 0.7 {
+		s.govStagRelaxStruct = relaxStruct
+	}
+}
+
+// SetGovernorSeverity sets the relaxed-band severity requirement (extra flat-LBD
+// and extra history windows that a relaxed-band instance must clear to fire).
+func (s *CDCLSolver) SetGovernorSeverity(extra float64, win int) {
+	if extra >= 0 {
+		s.govStagSeverExtra = extra
+	}
+	if win >= 0 {
+		s.govStagSeverWin = win
+	}
+}
+
+// SetGovernorGraduated enables the graduated + recoverable Det4 lowering. When
+// enabled, a stagnation fire STEPs restartBase down toward govStagBase (not a
+// permanent jump) and, on govStagRecoverWin consecutive improving windows, backs
+// off toward the saved original. Skipped (legacy one-shot) when false (default).
+func (s *CDCLSolver) SetGovernorGraduated(enabled bool, step float64, recoverWin int) {
+	s.govStagGraduated = enabled
+	if step > 1.0 {
+		s.govStagStep = step
+	}
+	if recoverWin >= 1 {
+		s.govStagRecoverWin = recoverWin
 	}
 }
 
