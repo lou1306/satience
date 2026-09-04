@@ -97,13 +97,6 @@ func run() int {
 	govStagWin := flag.Int("gov-stag-win", 3, "Governor Det4: consecutive windows with no LBD improvement to confirm")
 	govStagBase := flag.Int("gov-stag-base", 20, "Governor Det4: target restartBase when LBD-stagnation fires")
 	govSpiralPDec := flag.Float64("gov-spiral-pdec", 8.0, "Governor Det6: min props/dec to flip geometric->Luby on a structured unguided deep spiral")
-	govRelaxPolImb := flag.Float64("gov-stag-relax-polimb", 0.4, "Governor: soft PolImb ceiling opening a severity-weighted relaxed band (0.4=off/current)")
-	govRelaxStruct := flag.Float64("gov-stag-relax-struct", 0.7, "Governor: soft structureScore floor opening a severity-weighted relaxed band (0.7=off/current)")
-	govSeverExtra := flag.Float64("gov-stag-sever-extra", 6.0, "Governor: extra flat-LBD required to fire inside a relaxed static band")
-	govSeverWin := flag.Int("gov-stag-sever-win", 1, "Governor: extra history windows required to fire inside a relaxed static band")
-	govGraduated := flag.Bool("gov-stag-graduated", false, "Governor Det4: graduated+recoverable restartBase lowering instead of one-shot jump")
-	govStep := flag.Float64("gov-stag-step", 2.0, "Governor Det4 (graduated): division factor stepping restartBase toward gov-stag-base")
-	govRecoverWin := flag.Int("gov-stag-recover-win", 3, "Governor Det4 (graduated): consecutive improving windows before backing off")
 	// VSIDS parameters
 	initialDecay := flag.Float64("initial-decay", 0.95, "VSIDS initial decay factor (default=0.95, MiniSat-equivalent)")
 	maxDecay := flag.Float64("max-decay", 0.95, "VSIDS maximum decay factor (default=0.95, fixed)")
@@ -223,9 +216,6 @@ func run() int {
 	s.SetAdaptPropDecDeepGate(*adaptPropDecLimit, *adaptPropDecDeepGate)
 	s.SetGovernorDet4Params(*govStagLBD, *govStagGlue, *govStagWin, *govStagBase)
 	s.SetGovernorSpiralPDec(*govSpiralPDec)
-	s.SetGovernorRelaxStatics(*govRelaxPolImb, *govRelaxStruct)
-	s.SetGovernorSeverity(*govSeverExtra, *govSeverWin)
-	s.SetGovernorGraduated(*govGraduated, *govStep, *govRecoverWin)
 	s.SetGovernorWindow(*govWindow)
 	s.SetAdaptivePhaseFlipRate(*adaptivePhaseFlip)
 
