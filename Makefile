@@ -1,4 +1,4 @@
-.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout heldout-broad heldout-industrial debug test test-verbose test-race vet lint bench clean install profile help
+.PHONY: all satience fuzz fuzz-random fuzz-structured fuzz-parser fuzz-property fuzz-all heldout heldout-broad heldout-industrial governor-dev debug test test-verbose test-race vet lint bench clean install profile help
 
 # Default target: build release solver binary
 all: satience
@@ -51,6 +51,14 @@ heldout-industrial:
 	INDUSTRIAL_DIR="$(CURDIR)/benchmark/gbd_instances" INDUSTRIAL_LIST="$(CURDIR)/benchmark/gbd_instances.list" \
 	MINISAT_BIN="$${MINISAT_BIN:-minisat}" DEV_ITERATIONS=0 VALIDATION_ITERATIONS=0 \
 	bash benchmark/heldout_broad.sh
+
+# Governor-targeted DEV rail: ordering-principle family where the search-governor
+# (Det4/Det6) demonstrably matters (governor ON solves op_16..24 in ~0.7-6s;
+# OFF TMOs). Use to validate a governor change on its actual failure class.
+# Uses $CONTROL_BINARY/$VARIANT_BINARY (+ optional CRUN_ARGS/VRUN_ARGS, FOP_SEEDS,
+# TIMEOUT, JOBS).
+governor-dev:
+	bash benchmark/governor_dev.sh
 
 # Go native parser fuzz (no external deps)
 fuzz-parser:
