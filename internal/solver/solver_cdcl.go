@@ -62,8 +62,8 @@ const (
 	// Debugging thresholds.
 	DebugConflictLimit = 100 // Verbose debug output for first N conflicts
 
-	// maxCheckPerRound caps the number of clauses examined per inprocessing round
-	// (vivification and learned subsumption), bounding per-call cost.
+	// maxCheckPerRound caps the number of clauses examined per simplification
+	// round (vivification and learned subsumption), bounding per-call cost.
 	maxCheckPerRound = 2000
 
 	// Watch.ClauseIdx bit encoding:
@@ -159,12 +159,11 @@ type CDCLSolver struct {
 	trailPos         []int // trailPos[varIdx] = position in trail (-1 if not on trail); O(1) lookup for 1-UIP fallback
 	level            int
 	vsids            *VSIDS
-	branch           *branchHeuristic // CHB/LRB alternative to VSIDS (nil when -branch=vsids)
-	numUnassigned    int              // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
-	watchLists       [][]cnf.Watch    // watchLists[lit] = general (size>=3) clauses watching lit
-	watchListsBinary [][]cnf.Watch    // watchListsBinary[lit] = binary (size==2) clauses watching lit
-	qhead            int              // Watched literals: next trail index to process
-	litTrue          []bool           // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
+	numUnassigned    int           // Count of unassigned variables (O(1) allAssigned/hasUnassigned)
+	watchLists       [][]cnf.Watch // watchLists[lit] = general (size>=3) clauses watching lit
+	watchListsBinary [][]cnf.Watch // watchListsBinary[lit] = binary (size==2) clauses watching lit
+	qhead            int           // Watched literals: next trail index to process
+	litTrue          []bool        // Cached assigned-and-true bitmap (varIdx*2 + negated); blit fast path reads this instead of decoding literal + loading assignments[]
 
 	// ===== WARM FIELDS (per-conflict / per-restart) =====
 	preprocessTrail []uint32 // Permanent preprocessing assignments (Level 0, never cleared/backtracked)
@@ -222,14 +221,12 @@ type CDCLSolver struct {
 	restartSegStartDec  int    // decisions at the start of the current restart segment
 	restartSegGlueCount int    // glue clauses learned in the current segment
 	restartSegStartGlue int    // glueLearned at the start of the current segment
-	// Branch-quality telemetry (instrumentation): which VSIDS bump scheme and
-	// init mode were actually in effect. 1=analyze_toclear (bump all touched),
-	// 0=bumpClause only; initMode 1=clause/occurrence-weighted, 0=zero-init.
-	branchBumpScheme int
-	branchInitMode   int
-	lbdSum           int
-	lbdCount         int
-	emaLBD           float64 // Exponential moving average of LBD (smooth restart signal)
+	// Branch-quality telemetry (instrumentation): which VSIDS init mode was in
+	// effect. initMode 1=clause/occurrence-weighted, 0=zero-init (-skip-vsids-init).
+	branchInitMode int
+	lbdSum         int
+	lbdCount       int
+	emaLBD         float64 // Exponential moving average of LBD (smooth restart signal)
 	// B2: Cumulative LBD accumulator (NOT reset on restart, unlike lbdSum/lbdCount).
 	// Used to detect consistently high-LBD instances and shrink the clause DB.
 	totalLbdSum   uint64
@@ -298,16 +295,6 @@ type CDCLSolver struct {
 	bigWinHits int    // #hits currently present in the ring
 	bigWinFull bool   // ring has been fully populated at least once
 
-	// bigLearnAdj augments the static original-binary BIG with implication
-	// edges from LEARNED binary clauses. Learned clauses are permanent logical
-	// consequences of the formula, so edges are never removed after addition
-	// (even if the clause is later deleted) — resolution over them is always
-	// sound. Per-literal growable slices; bigLearnEdgeCount/cap bound memory.
-	bigLearnAdj       [][]int32
-	bigLearnEdgeCount int
-	bigLearnCap       int
-	bigLearnEnabled   bool
-	bigLearnFlag      bool // off by default: enabling shifts search trajectory (net wall-time regression on the suite)
 	// BIG BFS state for transitive clause minimization. Per-literal epoch stamps
 	// avoid re-zeroing the visited array on each minimization call (epoch just
 	// increments). The queue is reused across calls (sliced to [:0]).
@@ -328,7 +315,6 @@ type CDCLSolver struct {
 	tmpResolvedVars     []uint32      // Track which variables were resolved (for fast reset)
 	tmpTouchedVars      []uint32      // Track which variables were modified (for fast reset)
 	tmpLearnedLits      []cnf.Literal // Reusable buffer for learned clause literals
-	tmpBranchVars       []uint32      // Scratch: learned-clause variables fed to CHB/LRB bump
 	tmpMinSeenVars      []uint32      // Vars marked in tmpSeenVar during minimization (for fast cleanup)
 	conflictClauseBuf   cnf.Clause    // Pre-allocated conflict clause (avoids per-conflict heap alloc)
 
@@ -399,18 +385,7 @@ type CDCLSolver struct {
 	subsumptionMinConflictGap  int     // Min conflicts between subsumption rounds (0=restart-based only)
 	conflictsAtLastSubsumption int     // conflict count at last subsumption round (for gap gate)
 	learnedSubBudget           int     // Learned-subsumption round: max clause-pair comparisons BEFORE aborting the round (0=unlimited, current behavior). A/B toggle.
-	inprocessPeriod            int     // Master in-processing switch + initial conflict gap (0=off); cadence is adaptive
-	inprocessBudget            int     // BVE resolvent budget per in-processing round (0 = unlimited)
-	inprocessMinYield          int     // Per-round yield (subsumed+strengthened+eliminated) below which the adaptive cadence backs off
-	inprocessMinUnits          int     // Min NEW root-level units since the last round required to justify a fire (trigger A)
-	inprocessGapCur            int     // Current adaptive conflict cadence (initialize = inprocessPeriod)
-	inprocessGapMin            int     // Adaptive floor for inprocessGapCur (high-yield rounds tighten toward this)
-	inprocessGapMax            int     // Adaptive ceiling (low-yield rounds back off to this, effectively stopping)
 	rootUnitsLearned           int     // Monotonic counter: size-1 learned clauses stored (root facts discovered)
-	unitsAtLastInprocess       int     // rootUnitsLearned snapshot at the last in-processing round
-	inprocessExcluded          bool    // True when a static classifier (dense-binary) says in-processing is destructive here
-	inprocessRoundsRun         uint64  // diagnostic: in-processing rounds actually executed
-	conflictsAtLastInprocess   int     // conflict count at last in-processing round (for gap gate)
 	skipSubsumption            bool
 	skipBVE                    bool
 	skipPolarityPhase          bool
@@ -419,7 +394,6 @@ type CDCLSolver struct {
 	flpOccOrder                bool // Probe most-occurring vars first in failed-literal probing (A/B; default off = ascending index)
 	geometricRestarts          bool
 	geometricRestartThreshold  float64 // Cached threshold for geometricRestarts (= restartBase × 1.5^lubyIndex)
-	lazyInit                   *lazyInitState
 	// Cached classifier output (set in getAdaptivePreprocessingConfig). Used by
 	// initVSIDSOccurrenceBonus to gate the polarity-based initial phase: the
 	// occurrence-based phase is trajectory-sensitive and helps some instances
@@ -461,20 +435,7 @@ type CDCLSolver struct {
 
 	// Cached classifier output (set once in classifyInstance, read occasionally).
 	// Placed at struct end to avoid shifting hot/warm cache lines (op_15 regression).
-	binaryRatio    float64 // Cached BinaryRatio from classifier
-	useBumpAnalyze bool    // True: bump all touched vars (minisat analyze_toclear); false: bump conflict clause only
-
-	// uniformDefaults neutralizes every per-instance classifier bifurcation to
-	// a single fixed value (see setUniformDefaults / classifyInstance). A/B
-	// test infrastructure only: when false, behavior is byte-identical to the
-	// pre-override classified stack. Lets us measure whether the per-instance
-	// classifier gates are net-positive across the heldout distribution.
-	uniformDefaults bool
-	// uniformKeepBVE, in -uniform mode, re-enables ONLY the dense-binary
-	// skip-BVE gate (and its inprocessExclusion) while keeping every other
-	// classifier bifurcation neutralized. Isolates whether that single gate
-	// carries the classifier's distributionally-reproducible value.
-	uniformKeepBVE bool
+	binaryRatio float64 // Cached BinaryRatio from classifier
 
 	// glueLearned counts learned clauses with LBD ≤ 2 (glue clauses) since
 	// search start. Consumed by the behavioral governor.
@@ -541,17 +502,6 @@ type CDCLSolver struct {
 	govSpiralStartProps uint64     // Det6: window-delta start (propagations)
 	govSpiralStartLbd   uint64     // Det6: window-delta start (LBD sum)
 	govSpiralStartLbdC  uint64     // Det6: window-delta start (LBD count)
-}
-
-// lazyInitState holds lazy init detection state. Heap-allocated only when
-// -lazy-init is enabled, keeping CDCLSolver's hot cache lines unchanged.
-type lazyInitState struct {
-	done            bool
-	emaLBDSnapshots []float64
-	avgLBDThreshold float64
-	glueRateLimit   float64
-	minConflicts    int
-	trendWindow     int
 }
 
 // resolveCandidate is used in learnClause for tracking resolution candidates
@@ -644,7 +594,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		tmpTouchedVars:    make([]uint32, 0, formula.NumVars),
 		// P1: Increased buffer capacity from 64 to 256 to handle larger learned clauses
 		tmpLearnedLits:   make([]cnf.Literal, 0, 256),
-		tmpBranchVars:    make([]uint32, 0, 32),
 		tmpMinSeenVars:   make([]uint32, 0, 256),
 		tmpVivifyResults: make([]vivifyResult, 0, 64),
 		// Clause deletion buffers - pre-allocate to maxLearned to avoid reallocation
@@ -686,11 +635,6 @@ func NewCDCLSolver(formula *cnf.CNF) *CDCLSolver {
 		// is effectively free on random instances, so it is always enabled.
 		subsumptionPeriod:         100,
 		subsumptionMinConflictGap: 20000,
-		inprocessBudget:           2000000,
-		inprocessMinYield:         100,
-		inprocessMinUnits:         16,
-		inprocessGapMin:           5000,
-		inprocessGapMax:           200000,
 		// Runtime decay adaptation: first check after 500-conflict warmup.
 		govNextConflict:      500,
 		randomPhaseRate:      0,
@@ -990,73 +934,8 @@ func (s *CDCLSolver) SetMinisatBumps(enabled bool) {
 	s.vsids.SetMinisatBumps(enabled)
 }
 
-// SetUseBumpAnalyze forces MiniSat analyze_toclear behavior: bump all variables
-// touched during 1-UIP analysis instead of bumping only the conflict clause's
-// variables. Pure diagnostic toggle (-ms-analyze). Default (off) is bumpClause-only.
-func (s *CDCLSolver) SetUseBumpAnalyze(enabled bool) {
-	s.useBumpAnalyze = enabled
-}
-
-// uniformLBDScale is the fixed LBD-bonus scale used by the -uniform A/B
-// baseline. Matches the vsids internal default / the adaptive formula's floor:
-// a purely-VSIDS signal with negligible LBD activity guidance (the most
-// conventional, MiniSat-like configuration).
-const uniformLBDScale = 10.0
-
-// SetUniformDefaults enables the A/B "uniform baseline" mode. It forces every
-// per-instance classifier bifurcation in classifyInstance to a single fixed
-// value, leaving only the global defaults (geometric, minisatBumps, governors,
-// DB shrink, etc.) active. Diagnostic/test infrastructure only for measuring
-// whether the per-instance classifier gates are net-positive across the
-// heldout distribution. When false (default) behavior is unchanged.
-func (s *CDCLSolver) SetUniformDefaults(enabled bool) {
-	s.uniformDefaults = enabled
-	if enabled {
-		// Neutralize the skip-* hardening gates: everything runs the un-gated
-		// path (always attempt BVE/polarity/subsumption; bumpClause-only).
-		s.skipBVE = false
-		s.skipPolarityPhase = false
-		s.skipSubsumption = false
-		s.inprocessExcluded = false
-		s.useBumpAnalyze = false
-		// Fixed subsumption period (no <500-var special case).
-		s.subsumptionPeriod = 100
-		// Fixed LBD bonus scale (no adaptive binaryRatio/numVars formula).
-		s.vsids.SetLBDBonusScale(uniformLBDScale)
-		s.lbdScaleOverride = true
-	}
-}
-
-// SetUniformKeepBVE, when combined with SetUniformDefaults(true), re-enables
-// ONLY the classifier's dense-binary skip-BVE gate (and its inprocess
-// exclusion) while leaving every other bifurcation neutralized. classifyInstance
-// restores skipBVE/inprocessExcluded from the structure metrics here; all the
-// other gates stay locked off by uniformDefaults. Diagnostic/test infrastructure
-// for confirming whether that single gate carries the distributionally-reproducible
-// value of the classifier.
-func (s *CDCLSolver) SetUniformKeepBVE(enabled bool) {
-	s.uniformKeepBVE = enabled
-	if enabled {
-		// Give classifyInstance a clean slate to re-derive the gate from
-		// structure (it is guarded on uniformKeepBVE below).
-		s.skipBVE = false
-		s.inprocessExcluded = false
-	}
-}
-
 func (s *CDCLSolver) SetNoLBDBonus(enabled bool) {
 	s.vsids.SetUseLBD(!enabled)
-}
-
-func (s *CDCLSolver) SetLazyInit(enabled bool) {
-	if enabled {
-		s.lazyInit = &lazyInitState{
-			avgLBDThreshold: 12.0,
-			glueRateLimit:   0.05,
-			minConflicts:    50,
-			trendWindow:     3,
-		}
-	}
 }
 
 // SetMinimizeMaxDepth sets the maximum recursion depth for recursive clause
@@ -1086,48 +965,6 @@ func (s *CDCLSolver) SetMinimizeLBDGate(n int) {
 // 0 disables vivification entirely.
 func (s *CDCLSolver) SetVivifyPeriod(p int) {
 	s.vivifyPeriod = p
-}
-
-// SetInprocess enables (period>0) in-processing: re-simplify the original
-// clause DB (subsumption + bounded VE) at level 0. period is both the master
-// switch and the INITIAL conflict cadence; the cadence then adapts to measured
-// yield (productive rounds tighten, unproductive rounds back off). budget is
-// the per-round BVE resolvent cap (0=unlimited).
-func (s *CDCLSolver) SetInprocess(period, budget int) {
-	s.inprocessPeriod = period
-	s.inprocessGapCur = period
-	if budget > 0 {
-		s.inprocessBudget = budget
-	}
-}
-
-// SetInprocessMinYield sets the per-round yield (subsumed+strengthened+
-// eliminated) threshold: below it the adaptive cadence backs off (lengthens
-// the gap), at/above it the cadence tightens. 0 = disable the yield gate.
-func (s *CDCLSolver) SetInprocessMinYield(y int) {
-	s.inprocessMinYield = y
-}
-
-// SetInprocessMinUnits sets the minimum number of NEW root-level units since the
-// last round required to justify firing an in-processing round (trigger A).
-func (s *CDCLSolver) SetInprocessMinUnits(n int) {
-	if n > 0 {
-		s.inprocessMinUnits = n
-	}
-}
-
-// SetInprocessGapRange sets the adaptive cadence floor/ceiling (min/max
-// conflicts between rounds). Setting min==max disables adaptation.
-func (s *CDCLSolver) SetInprocessGapRange(minV, maxV int) {
-	if minV > 0 {
-		s.inprocessGapMin = minV
-	}
-	if maxV >= minV && maxV > 0 {
-		s.inprocessGapMax = maxV
-	}
-	if s.inprocessGapCur > 0 && s.inprocessGapCur < s.inprocessGapMin {
-		s.inprocessGapCur = s.inprocessGapMin
-	}
 }
 
 // SetDBCapFactor manually scales the learned-DB deletion target (1.0 = baseline).
@@ -1225,13 +1062,6 @@ func (s *CDCLSolver) recordBigOutcome(hit bool) {
 		s.Log("c [BIG] sliding-window gate: last %d attempts hit-rate %.2f%% < %.1f%% -> disabling BIG\n",
 			w, 100*float64(s.bigWinHits)/float64(w), 100*s.bigMinHitRate)
 	}
-}
-
-// SetBigLearn enables the learned-binary BIG augmentation for transitive
-// minimization. Stricter minimization (BIG hits +) but shifts search trajectory
-// with net wall-time regression on the suite — off by default (A/B only).
-func (s *CDCLSolver) SetBigLearn(on bool) {
-	s.bigLearnFlag = on
 }
 
 // SetStructuredDensityGate sets the density at/below which a score<0.7 &
@@ -1573,16 +1403,15 @@ func (s *CDCLSolver) printFinalStats() {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | parity: rows=%d units=%d bins=%d pfr=%d 	 | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | inprocess: rounds=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | move: recast=%d hintMiss=%d scanLits=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
+	fmt.Fprintf(os.Stderr, "c [final] t=%.2fs conflicts=%d decisions=%d props=%d props/dec=%.1f moves=%d learned=%d/%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f%s | br=init=%d | min: rate=%.1f%% | BIG: calls=%d hits=%d score=%.2f brat=%.2f | parity: rows=%d units=%d bins=%d pfr=%d 	 | vivify: rounds=%d | subsump: rounds=%d sub=%d str=%d | uip-fallback=%d | tiers: blitF=%d bin=%d gen=%d(mov=%d) | move: recast=%d hintMiss=%d scanLits=%d | hist=[%d %d %d %d %d %d] live=[%d %d %d %d %d %d] live>10=%d\n",
 		s.elapsedSec(), s.conflicts, s.decisions, s.propagations, propsPerDec, s.numWatchMoves,
 		s.learnedActiveCount, s.maxLearned, s.emaLBD, avgLBD, totalAvgLBD, shrunk,
-		s.branchBumpScheme, s.branchInitMode,
+		s.branchInitMode,
 		minRate,
 		s.bigMinimizeCalls, s.bigMinimizeHits, s.structureScore, s.binaryRatio,
 		s.parityRowsFound, s.parityUnits, s.parityBinaries, s.parityRounds,
 		s.vivifyRoundsRun,
 		s.subsumptionRoundsRun, s.subsumptionClausesSubsumed, s.subsumptionClausesStrengthened,
-		s.inprocessRoundsRun,
 		s.uipFallbackCount,
 		s.blitFastHits, s.binarySlow, s.generalSlow, s.generalMoves,
 		s.moveReallocCast, s.moveHintMiss, s.moveScanLits,
@@ -1663,10 +1492,10 @@ func (s *CDCLSolver) printPeriodicStats() {
 	if s.totalLbdCount > 0 {
 		glueRatio = float64(s.glueLearned) / float64(s.totalLbdCount)
 	}
-	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | br=bump=%d/init=%d | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg-glue=%d\n",
+	fmt.Fprintf(os.Stderr, "c [stats] t=%.2fs conflicts=%d level=%d decisions=%d props=%d props/dec=%.1f learned=%d emaLBD=%.1f avgLBD=%.1f totAvgLBD=%.1f glue=%.3f%s | br=init=%d | min: rate=%.1f%% | BIG: hits=%d/%d | restarts[%s] seg-glue=%d\n",
 		s.elapsedSec(), s.conflicts, s.level, s.decisions, s.propagations, propsPerDec,
 		s.learnedActiveCount, s.emaLBD, avgLBD, totalAvgLBD, glueRatio, shrunk,
-		s.branchBumpScheme, s.branchInitMode,
+		s.branchInitMode,
 		minRate,
 		s.bigMinimizeHits, s.bigMinimizeCalls,
 		s.restartReasonSummary(), s.restartSegGlueCount)
@@ -1698,12 +1527,6 @@ type InstanceStructure struct {
 	// uniform-long structured families from random k-SAT so the uniform-long
 	// random penalty (longSizeVaried) does not misroute them to random handling.
 	RegularOccurrence bool
-}
-
-// PreprocessingConfig controls which preprocessing techniques are enabled
-type PreprocessingConfig struct {
-	EnableUnitProp bool
-	MaxPasses      int
 }
 
 // hasEmptyClause returns true if any original clause has zero literals,
@@ -2004,11 +1827,7 @@ func (s *CDCLSolver) preprocessAggressive() SolveResult {
 		// literal / unit) variables. This is sound: BVE preserves the solution set
 		// over remaining vars, and reconstructEliminatedVars overwrites the elimi-
 		// nated var's value with the resolution-determined one that satisfies its
-		// stored clauses (so it never "fights" a stale prior assignment). In-
-		// processing (simplifyOriginalDB) instead passes true to conservatively
-		// skip assigned vars (see restart.go) because there the reduced formula is
-		// immediately re-searched and skirting reason-clause complications is
-		// preferable to the reconstruction cost.
+		// stored clauses (so it never "fights" a stale prior assignment).
 		if !s.skipBVE {
 			veResult := s.boundedVarElimination(false)
 			if veResult < 0 {
@@ -2677,43 +2496,6 @@ func luby(i int) int {
 	}
 }
 
-// injectOccurrenceBonus resets VSIDS activity to zero, then injects an
-// occurrence-based prior: variables appearing in more original clauses get
-// higher activity. The bump is scaled relative to current varInc so it's
-// competitive with future conflict bumps. Used by lazy init to recreate
-// the init-on state mid-search after a bad trajectory is detected.
-func (s *CDCLSolver) injectOccurrenceBonus() {
-	// Reset VSIDS activity to clear bad trajectory accumulation, then inject
-	// occurrence-based prior.
-	s.vsids.ResetActivity()
-
-	occurrences := make([]int, s.cnf.NumVars)
-	maxOcc := 0
-	for _, clause := range s.cnf.Clauses {
-		for _, lit := range clause.Literals {
-			occurrences[lit.Var()]++
-		}
-	}
-	for _, occ := range occurrences {
-		if occ > maxOcc {
-			maxOcc = occ
-		}
-	}
-	if maxOcc == 0 {
-		return
-	}
-
-	// Scale: bump = occurrenceWeight × varInc × (occ/maxOcc).
-	// The most-occurring var gets occurrenceWeight × varInc (comparable to
-	// one conflict bump). Less-occurring vars get proportionally less.
-	scale := s.occurrenceWeight * s.vsids.varInc / float64(maxOcc)
-	for i := range s.assignments {
-		if s.assignments[i].Level < 0 {
-			s.vsids.activity[i] += float64(occurrences[i]) * scale
-		}
-	}
-}
-
 func (s *CDCLSolver) unitPropagationPreprocess() SolveResult {
 	// FIX: Do NOT clear existing assignments (from pure literal elimination, etc.)
 	// Only reset trail and propagate NEW unit clauses from current state
@@ -2953,7 +2735,6 @@ func (s *CDCLSolver) initVSIDSOccurrenceBonus() {
 		}
 	}
 	s.vsids.heapValid = false // Force heap rebuild
-	s.branchSeedFromVSIDS()   // start CHB/LRB from the same activity as VSIDS
 }
 
 // buildBIG builds the binary implication graph from original binary clauses.
@@ -3005,58 +2786,15 @@ func (s *CDCLSolver) buildBIG() {
 	s.bigAdjData = data
 	s.bigAdjOff = off
 	// BIG needs binary-implication edges to traverse: with an empty adjacency
-	// (no original binary clauses) and no learned-binary augmentation enabled,
-	// bigReachableInClause can never return true. Disable BIG up front instead
-	// of paying up to bigHitWindow provably-futile BFS attempts per solve (e.g.
-	// ~50K on random k-SAT, which has zero 2-clauses). Trajectory-neutral: a
-	// zero-hit BIG changes no learned clause, so this is byte-identical to
-	// letting the adaptive hit-rate gate disable it after the window fills.
-	if len(data) == 0 && !s.bigLearnFlag {
+	// (no original binary clauses), bigReachableInClause can never return true.
+	// Disable BIG up front instead of paying up to bigHitWindow provably-futile
+	// BFS attempts per solve (e.g. ~50K on random k-SAT, which has zero
+	// 2-clauses). Trajectory-neutral: a zero-hit BIG changes no learned clause,
+	// so this is byte-identical to letting the adaptive hit-rate gate disable it
+	// after the window fills.
+	if len(data) == 0 {
 		s.bigDisabled = true
 	}
-	// Learned-binary adjacency: per-literal growable slices supplementing the
-	// static CSR. Heuristically cap total edges to bound memory on grinders;
-	// exceeding the cap only reduces fast-path effectiveness (never soundness).
-	s.bigLearnAdj = nil
-	if s.bigLearnFlag {
-		s.bigLearnAdj = make([][]int32, numLits)
-	}
-	s.bigLearnEdgeCount = 0
-	s.bigLearnEnabled = s.bigLearnFlag
-	if !s.bigLearnFlag {
-		s.bigLearnCap = 0
-		return
-	}
-	cap := 4_000_000
-	if edgeCap := 32 * numLits; edgeCap > cap {
-		cap = edgeCap
-	}
-	if cap > 16_000_000 {
-		cap = 16_000_000
-	}
-	s.bigLearnCap = cap
-}
-
-// addLearnedBinaryToBIG registers the implication edges of a newly-learned
-// binary clause (l0 ∨ l1): ¬l0 → l1 and ¬l1 → l0. Sound to retain forever even
-// after the clause is deleted because learned clauses are permanent logical
-// consequences of the formula; resolution over them stays valid.
-func (s *CDCLSolver) addLearnedBinaryToBIG(l0, l1 cnf.Literal) {
-	if !s.bigLearnEnabled || s.bigLearnAdj == nil {
-		return
-	}
-	a := cnf.LitToIndex(l0)
-	b := cnf.LitToIndex(l1)
-	if a == b || a == b^1 {
-		return
-	}
-	if s.bigLearnEdgeCount >= s.bigLearnCap {
-		return // cap reached — stop growing (effectiveness only)
-	}
-	s.bigLearnAdj[a^1] = append(s.bigLearnAdj[a^1], int32(b))
-	s.bigLearnEdgeCount++
-	s.bigLearnAdj[b^1] = append(s.bigLearnAdj[b^1], int32(a))
-	s.bigLearnEdgeCount++
 }
 
 // bigReachableInClause returns true if lit can reach, via forward BIG edges
@@ -3112,7 +2850,6 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 		maxVisited = 16
 	}
 	visitedCount := 0
-	bigLearnAdj := s.bigLearnAdj
 	for head < len(q) && !found {
 		cur := q[head]
 		head++
@@ -3136,13 +2873,6 @@ func (s *CDCLSolver) bigReachableInClause(lit cnf.Literal) bool {
 		for i := start; i < end && !found; i++ {
 			found = process(int(bigAdjData[i]))
 		}
-		if !found && bigLearnAdj != nil && cur < len(bigLearnAdj) && len(bigLearnAdj[cur]) > 0 {
-			for _, m := range bigLearnAdj[cur] {
-				if found = process(int(m)); found {
-					break
-				}
-			}
-		}
 	}
 	s.bigBfsQueue = q
 	return found
@@ -3165,24 +2895,6 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 			s.Log("c [verbose] Iteration limit reached (%d)\n", s.maxIter)
 			s.printStats()
 			return UNKNOWN
-		}
-
-		// In-processing fallback (D): the primary firing site is co-scheduled at
-		// restart boundaries (see restart()), sharing the existing level-0 reset.
-		// This loop fallback fires on a long RESTART-FREE stretch when the
-		// trigger (A: enough new root units since last round) AND the adaptive
-		// conflict gap (C) are both satisfied, forcing a level-0 reset on demand.
-		// Level-0 is the true safety requirement (no clause in use as a reason).
-		// Gated OFF by default (inprocessPeriod=0) until proven net-positive.
-		if s.inprocessDue() {
-			if s.level > 0 {
-				s.cancelUntil(0)
-			}
-			if s.runInprocess() {
-				s.printStats()
-				return UNSAT
-			}
-			continue
 		}
 
 		// Det6: geometric->Luby rest-mechanism flip on conflict-window cadence
@@ -3223,7 +2935,7 @@ func (s *CDCLSolver) cdclLoop() SolveResult {
 
 			if s.shouldRestart() {
 				if s.restart() {
-					// UNSAT detected during restart/inprocessing
+					// UNSAT detected during restart
 					s.printStats()
 					return UNSAT
 				}
@@ -3327,10 +3039,7 @@ func (s *CDCLSolver) SolveWithResult() SolveResult {
 	// Count unassigned variables for O(1) allAssigned/hasUnassigned checks.
 	// Also initialize litTrue cache from preprocessing assignments.
 	s.numUnassigned = 0
-	// Branch-quality telemetry: record the effective bump scheme and init mode.
-	if s.useBumpAnalyze {
-		s.branchBumpScheme = 1
-	}
+	// Branch-quality telemetry: record the effective VSIDS init mode.
 	if s.skipVSIDSInit {
 		s.branchInitMode = 0
 	} else {
@@ -3493,12 +3202,7 @@ func (s *CDCLSolver) decide() bool {
 	// Standard CDCL: no random decisions, no diversification overrides.
 	var varIdx uint32
 	var phase bool
-	if s.branch != nil && s.branch.mode != branchVSIDS {
-		varIdx = s.branchSelect(s.assignments)
-		phase = s.assignments[varIdx].SavedPhase
-	} else {
-		varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments)
-	}
+	varIdx, phase = s.vsids.selectVariableWithPhase(s.assignments)
 
 	// SAFETY CHECK: Ensure variable is unassigned before deciding.
 	// A stale heap entry can slip through; fall back to linear scan.
@@ -3680,23 +3384,6 @@ func (s *CDCLSolver) handleConflict(conflictClause *cnf.Clause) {
 	// Learn clause using 1-UIP analysis and get backjump level
 	bjLevel := s.learnClause(conflictLits)
 	s.backjumpLevel = bjLevel
-
-	// CHB/LRB: bump the variables that drive the branching score and advance the
-	// heuristic counters. Bump-set differs by heuristic: CHB bumps only the
-	// minimized LEARNED-clause vars (over-bumping saturates its move-toward-1
-	// score and collapses discrimination); LRB counts EVERY resolution-involved
-	// var (tmpTouchedVars) — that full conflict-participation set is its
-	// learning-rate signal, and its moving-average update is immune to
-	// over-bumping. Branching off vsids (nil/VSIDS) is a no-op.
-	if s.branch != nil && s.branch.mode == branchLRB {
-		s.branchBump(s.tmpTouchedVars)
-	} else if s.branch != nil && s.branch.mode == branchCHB && len(s.tmpLearnedLits) > 0 {
-		s.tmpBranchVars = s.tmpBranchVars[:0]
-		for _, lit := range s.tmpLearnedLits {
-			s.tmpBranchVars = append(s.tmpBranchVars, lit.Var())
-		}
-		s.branchBump(s.tmpBranchVars)
-	}
 
 	// B2: Adaptively shrink clause DB when average LBD is consistently high.
 	// High-LBD clauses rarely propagate; a smaller DB keeps only the lowest-LBD

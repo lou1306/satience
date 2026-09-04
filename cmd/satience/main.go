@@ -17,42 +17,9 @@ func main() {
 	os.Exit(run())
 }
 
-// branchNameFromArgs scans raw CLI args for `-branch`/`--branch` (both `=val`
-// and space-separated forms) and returns the heuristic name, or "" if unset.
-// Needed before flag.Parse so coupled flags can be given profile defaults.
-func branchNameFromArgs(args []string) string {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "-branch" || a == "--branch" {
-			if i+1 < len(args) {
-				return args[i+1]
-			}
-			return ""
-		}
-		const eq = "-branch="
-		const eq2 = "--branch="
-		if len(a) > len(eq) && (a[:len(eq)] == eq || a[:len(eq2)] == eq2) {
-			idx := len(eq)
-			if a[:len(eq2)] == eq2 {
-				idx = len(eq2)
-			}
-			return a[idx:]
-		}
-	}
-	return ""
-}
-
 func run() int {
 	// P4: Reduce GC pressure by increasing GC target percentage
 	debug.SetGCPercent(150)
-
-	// Resolve the branch heuristic BEFORE defining the coupled flags so their
-	// defaults come from the heuristic's parameter profile. Go flag semantics
-	// then implement "implicit profile + explicit override": -branch=lrb alone
-	// loads the LRB profile defaults, while an explicitly-passed flag overrides
-	// just that field. See solver.ProfileFor.
-	branchMode := solver.BranchMode(branchNameFromArgs(os.Args[1:]))
-	profile := solver.ProfileFor(branchMode)
 
 	model := flag.Bool("model", false, "Print satisfying assignment")
 	verify := flag.Bool("verify", false, "Verify model is correct (implies -model)")
@@ -74,18 +41,13 @@ func run() int {
 	vivifyMinConflictGap := flag.Int("vivify-min-gap", 600000, "Conflict-based vivification cadence: min conflicts between rounds (mode-independent; 0=off). Default high (600k) so vivify fires rarely, recovering the pre-decouple protective behavior and avoiding regression on high-conflict vivify-hostile instances (e.g. 30eb ~483k conflicts)")
 	subsumptionPeriod := flag.Int("subsumption-period", 100, "Run learned-clause subsumption every Nth restart (default=100, 0=disabled)")
 	lsBudget := flag.Int("ls-budget", 1000000, "Learned-subsumption round: max clause-pair comparisons before aborting the round (0=unlimited)")
-	branch := flag.String("branch", "vsids", "Variable-selection heuristic: vsids (default), chb, or lrb (alternate conflict-history/learning-rate branching; A/B against vsids on the broad held-out rail)")
-	branchChbDecay := flag.Float64("chb-decay", profile.ChbDecayBase, "CHB recency decay base (0 keeps profile default)")
-	branchLrbAlpha := flag.Float64("lrb-alpha", profile.LrbEwmaAlpha, "LRB EWMA weight for the accumulated epoch (0 keeps profile default)")
-	branchLrbMerge := flag.Uint64("lrb-merge", profile.LrbMergePeriod, "LRB conflicts between score merges (0 keeps profile default)")
-	branchChbSweep := flag.Uint64("chb-sweep", profile.ChbSweepPeriod, "CHB global score decay sweep interval (0 keeps profile default)")
 	randomPhaseRate := flag.Float64("random-phase-rate", 0.0, "Probability of flipping saved phase per decision (default=0.0, 0=disabled)")
 	restartPhaseFlip := flag.Float64("restart-phase-flip", 0.0, "Probability of flipping each saved phase on restart (default=0.0, 0=disabled)")
 	preferTrueCap := flag.Int("prefer-true-cap", 0, "Learned-clause replacement-scan prefer-true hunt budget (positions to search for a true literal before falling back to the first unassigned; 0=disabled [default: hard DEV-rail sweep showed no net win])")
 	// Restart policy parameters (coupled flags: defaults come from the heuristic profile)
-	restartBase := flag.Int("restart-base", profile.RestartBase, "Luby restart sequence base multiplier")
-	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", profile.RestartGlucoseRatio, "Glucose restart when LBD > ratio × avg (classifier/adaptive governor may adjust)")
-	restartGlucoseMin := flag.Int("restart-glucose-min", profile.RestartGlucoseMin, "Min conflicts before Glucose restarts")
+	restartBase := flag.Int("restart-base", 200, "Luby restart sequence base multiplier")
+	restartGlucoseRatio := flag.Float64("restart-glucose-ratio", 10.0, "Glucose restart when LBD > ratio × avg (classifier/adaptive governor may adjust)")
+	restartGlucoseMin := flag.Int("restart-glucose-min", 10, "Min conflicts before Glucose restarts")
 	restartPropsDecLimit := flag.Int("restart-props-dec", 100, "Tier-1 restart when props/dec exceeds this (cascade-bound, 0=disabled)")
 	adaptPropDecLimit := flag.Int("restart-props-deep-limit", 20, "Tier-2 low props/dec threshold for deep-search escape")
 	adaptPropDecDeepGate := flag.Int("restart-props-deep", 85, "Tier-2 deep-search escape fires when conflict level exceeds this (0=disabled)")
@@ -118,24 +80,14 @@ func run() int {
 	dbShrinkFloorMult := flag.Int("db-shrink-mult", 3, "Shrink floor = numVars × multiplier (default 3)")
 	dbMaxLen := flag.Int("db-max-len", 25, "reduceDB length gate: evict clauses strictly longer than this first on binary-heavy formulas (0 = disabled)")
 	occurrenceWeight := flag.Float64("occurrence-weight", 0.5, "Occurrence bonus weight for VSIDS init (default 0.5)")
-	inprocessPeriod := flag.Int("inprocess", profile.InprocessPeriod, "Re-simplify the ORIGINAL clause DB (subsumption+BVE) at level 0 when due: initial conflict cadence (adaptive) and master switch (in-processing; 0=off, default)")
-	inprocessBudget := flag.Int("inprocess-budget", 2000000, "BVE resolvent budget per in-processing round (0=unlimited)")
-	inprocessMinUnits := flag.Int("inprocess-min-units", 16, "Min NEW root-level units since the last round required to fire in-processing (trigger A)")
-	inprocessGapMin := flag.Int("inprocess-gap-min", profile.InprocessGapMin, "Adaptive in-processing cadence floor (productive rounds tighten to here)")
-	inprocessGapMax := flag.Int("inprocess-gap-max", profile.InprocessGapMax, "Adaptive in-processing cadence ceiling (low-yield rounds back off to here)")
 	bigBfs := flag.Int("big-bfs", 16, "Per-call BIG transitive-minimization BFS node budget (default 16)")
 	bigHitWindow := flag.Int64("big-hit-window", 50000, "Adaptive BIG gate: sliding-window length for hit-rate gate (0=never; default 50000)")
 	bigMinHitRate := flag.Float64("big-min-hit-rate", 0.05, "Disable BIG when recent hit-rate falls below this fraction (0=0-hit-only)")
-	bigLearn := flag.Bool("big-learn", false, "Add learned binary clauses to the BIG for stronger transitive minimization (A/B; net wall-time regression, default off)")
 	structuredDensity := flag.Float64("structured-density", 15.0, "Density at/above which a score<0.7 & binaryRatio<=0.5 instance is rescued onto structured preprocessing (0=disable rescue)")
 	skipVSIDSInit := flag.Bool("skip-vsids-init", false, "Skip clause-length and occurrence VSIDS initialization (zero init, like MiniSat)")
 	flpOcc := flag.Bool("flp-occ", true, "Probe the most-occurring unassigned variables first in failed-literal probing (default on)")
-	geometricRestarts := flag.Bool("geometric", profile.Geometric, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
+	geometricRestarts := flag.Bool("geometric", true, "Use geometric restarts (restartBase * 1.5^idx, like MiniSat's -no-luby). Default on: distributional held-out gate PASS (all cnfgen families, no new TMO) and broad hard-cnfgen PAR2 win. Set -geometric=false to use the Glucose-adaptive + Luby fallback instead.")
 	minisatBumps := flag.Bool("minisat-bumps", true, "Use MiniSat-style equal VSIDS bumps (no clause-length weighting, no minBump floor). Default on: full-48-rail DEV win with -bump-amount=35 (-6.6% PAR2, net -1 TMO). Disable with -minisat-bumps=false.")
-	msAnalyze := flag.Bool("ms-analyze", false, "Force analyze_toclear bumping (bump all touched vars, like MiniSat) for A/B testing")
-	lazyInit := flag.Bool("lazy-init", false, "Detect bad trajectory and inject occurrence-based VSIDS bump (reactive init for zero-init mode)")
-	uniformDefaults := flag.Bool("uniform", false, "A/B test arm: neutralize ALL per-instance classifier bifurcations to fixed values (skip-BVE/polarity/subsumption off, bumpClause-only, fixed subsumption period + LBD scale, preprocessing always on); leaves global defaults (geometric, minisatBumps, governors) active")
-	uniformKeepBVE := flag.Bool("uniform-keep-bve", false, "A/B test arm: in -uniform mode, re-enable ONLY the dense-binary skip-BVE gate (and its inprocess exclusion); all other classifier bifurcations stay neutralized. Isolates whether that single gate carries the classifier's distributionally-reproducible value.")
 	flag.Parse()
 
 	// Collect explicitly-set flags so the behavioral governor knows which CLI
@@ -243,15 +195,7 @@ func run() int {
 	s.SetVivifyMinConflictGap(*vivifyMinConflictGap)
 	s.SetSubsumptionPeriod(*subsumptionPeriod)
 	s.SetLearnedSubBudget(*lsBudget)
-	// Branch heuristic + its scalar profile. Mode comes from the parsed -branch
-	// flag (matching the pre-scan used to pick the profile); explicit knob flags
-	// override the profile via the set-if-nonzero SetBranchParams.
-	s.SetBranch(solver.BranchMode(*branch))
-	s.SetBranchParams(*branchChbDecay, *branchLrbAlpha, *branchLrbMerge, *branchChbSweep)
 	s.SetRandomPhaseRate(*randomPhaseRate)
-	s.SetInprocess(*inprocessPeriod, *inprocessBudget)
-	s.SetInprocessMinUnits(*inprocessMinUnits)
-	s.SetInprocessGapRange(*inprocessGapMin, *inprocessGapMax)
 	s.SetRestartPhaseFlipRate(*restartPhaseFlip)
 	s.SetPreferTrueCap(*preferTrueCap)
 	s.SetStatsInterval(*statsInterval)
@@ -268,9 +212,6 @@ func run() int {
 	s.SetBigBfsBudget(*bigBfs)
 	s.SetBigHitWindow(*bigHitWindow)
 	s.SetBigMinHitRate(*bigMinHitRate)
-	if *bigLearn {
-		s.SetBigLearn(true)
-	}
 	s.SetStructuredDensityGate(*structuredDensity)
 	if *skipVSIDSInit {
 		s.SetSkipVSIDSInit(true)
@@ -281,18 +222,6 @@ func run() int {
 	}
 	if *minisatBumps {
 		s.SetMinisatBumps(true)
-	}
-	if *msAnalyze {
-		s.SetUseBumpAnalyze(true)
-	}
-	if *lazyInit {
-		s.SetLazyInit(true)
-	}
-	if *uniformDefaults {
-		s.SetUniformDefaults(true)
-	}
-	if *uniformKeepBVE {
-		s.SetUniformKeepBVE(true)
 	}
 
 	start := time.Now()

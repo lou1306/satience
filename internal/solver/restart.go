@@ -1,12 +1,8 @@
 package solver
 
-import (
-	"satience/internal/cnf"
-)
-
-// Restart policy, level-0 reset, backtracking, and the in-processing/vivify/
-// subsumption co-scheduling at restart boundaries. Split out of solver_cdcl.go
-// for structure; same CDCLSolver state, no behavior change.
+// Restart policy, level-0 reset, backtracking, and the vivify/subsumption
+// co-scheduling at restart boundaries. Split out of solver_cdcl.go for
+// structure; same CDCLSolver state, no behavior change.
 
 // backtrack backtracks (or backjumps) to a lower decision level
 // Returns false if backtracking to level 0 (UNSAT)
@@ -105,7 +101,6 @@ func (s *CDCLSolver) backtrack() bool {
 		}
 		s.unassignVar(varIdx)
 		s.vsids.onUnassign(varIdx)
-		s.branchOnUnassign(varIdx)
 	}
 	if unitVarUnassigned {
 		s.unitsDirty = true
@@ -146,76 +141,6 @@ func (s *CDCLSolver) propagateAssertingLiteral() {
 
 	propLevel := s.level
 	s.assignLiteralByClause(literals[0], propLevel, -learnedIdx-5)
-}
-
-// maybeLazyInit detects when the search has locked onto a bad trajectory and
-// injects an occurrence-based VSIDS bump to escape it. This is the reactive
-// counterpart to initVSIDSOccurrenceBonus: instead of always injecting an init
-// prior (which creates trajectory sensitivity), it injects only when the search
-// is demonstrably stuck. One-shot (li.done).
-//
-// Only active when skipVSIDSInit is true — when static init is already applied,
-// the occurrence signal is already in VSIDS activity, and injecting more just
-// amplifies the prior harmfully. Lazy init is a REPLACEMENT for static init,
-// not a supplement.
-//
-// Detection requires ALL of:
-//   - Enough data: totalLbdCount > li.minConflicts
-//   - High avg LBD: totalAvgLBD > li.avgLBDThreshold (consistently bad learned clauses)
-//   - Low glue rate: glueLearned/totalLbdCount < li.glueRateLimit (no tight implication chains)
-//   - Flat/increasing LBD trend: emaLBD hasn't improved across the last li.trendWindow restarts
-//
-// The trend check distinguishes "bad trajectory" (stuck, not improving) from
-// "legitimately hard instance" (slow but improving — LBD trend is downward).
-func (s *CDCLSolver) maybeLazyInit() {
-	li := s.lazyInit
-
-	// Snapshot emaLBD at each restart for trend analysis.
-	li.emaLBDSnapshots = append(li.emaLBDSnapshots, s.emaLBD)
-
-	// Size guard: occurrence-based priors are most informative for small
-	// instances where the search space is compact. For large instances,
-	// the occurrence distribution adds noise — skip injection.
-	if s.cnf.NumVars > 2000 {
-		li.done = true
-		return
-	}
-
-	// Need enough data for stable metrics.
-	if s.totalLbdCount < uint64(li.minConflicts) {
-		return
-	}
-
-	// Condition 1: high average LBD (consistently bad learned clauses).
-	totalAvgLBD := float64(s.totalLbdSum) / float64(s.totalLbdCount)
-	if totalAvgLBD <= li.avgLBDThreshold {
-		return
-	}
-
-	// Condition 2: low glue rate (no tight implication chains found).
-	glueRate := float64(s.glueLearned) / float64(s.totalLbdCount)
-	if glueRate >= li.glueRateLimit {
-		return
-	}
-
-	// Condition 3: flat or increasing LBD trend across recent restarts.
-	// The search isn't learning — emaLBD is not going down.
-	n := len(li.emaLBDSnapshots)
-	if n < li.trendWindow+1 {
-		return // not enough snapshots yet
-	}
-	oldest := li.emaLBDSnapshots[n-li.trendWindow-1]
-	newest := li.emaLBDSnapshots[n-1]
-	// Trend must be flat or increasing (not improving by more than 5%).
-	if newest < oldest*0.95 {
-		return // improving — don't interfere
-	}
-
-	// Bad trajectory detected. Inject occurrence-based VSIDS bump.
-	s.Log("c [lazy-init] Bad trajectory detected: avgLBD=%.1f, glueRate=%.3f, emaLBD %.1f→%.1f (flat/increasing)\n",
-		totalAvgLBD, glueRate, oldest, newest)
-	s.injectOccurrenceBonus()
-	li.done = true
 }
 
 func (s *CDCLSolver) restart() bool {
@@ -274,7 +199,6 @@ func (s *CDCLSolver) restart() bool {
 	// NOT restored by onUnassign (restart doesn't call it). Force a rebuild
 	// to fix all entries with current scores.
 	s.vsids.heapValid = false
-	s.branchInvalidate()
 
 	// Reset restart counters
 	s.lubyIndex++
@@ -375,17 +299,6 @@ func (s *CDCLSolver) restart() bool {
 		s.qhead = 0
 	}
 
-	// In-processing co-schedule (D): we are at level 0 with no clause in use as
-	// a reason, sharing this restart's already-paid reset/watch-rebuild. Firing
-	// here (rather than only forcing a level-0 cancelUntil in the loop) amortizes
-	// the materialize+simplify cost over the restart's existing level-0 work. The
-	// loop fallback still handles long restart-free stretches.
-	if s.inprocessDue() {
-		if s.runInprocess() {
-			return true // UNSAT detected
-		}
-	}
-
 	// Vivification cadence, decoupled from the restart index. Under the old
 	// schedule (lubyIndex % vivifyPeriod == 0 AND the conflict gap), vivify was
 	// keyed to a flat restart counter that grows ~logarithmically with conflicts
@@ -444,133 +357,7 @@ func (s *CDCLSolver) restart() bool {
 		s.maybeAdaptSearch()
 	}
 
-	// Lazy init: detect bad trajectory and inject occurrence-based VSIDS bump.
-	// Only fires when skipVSIDSInit is true — checked here to avoid the
-	// function call overhead when lazy init is enabled but skipVSIDSInit is not.
-	if s.lazyInit != nil && !s.lazyInit.done && s.skipVSIDSInit {
-		s.maybeLazyInit()
-	}
-
 	return false // No UNSAT detected
-}
-
-// runInprocess executes one in-processing round. Caller must already be at
-// level 0 (either a scheduled restart — co-schedule D — or an on-demand
-// cancelUntil(0) from the loop fallback). Returns true if the formula became
-// UNSAT. Updates the last-round snapshot and the governor's segment counters
-// (this level-0 reset wasn't a scheduled restart).
-func (s *CDCLSolver) runInprocess() bool {
-	s.inprocessRoundsRun++
-	s.Log("c [inprocess] round %d: conflicts=%d newUnits=%d gap=%d\n",
-		s.inprocessRoundsRun, s.conflicts, s.rootUnitsLearned-s.unitsAtLastInprocess, s.inprocessGapCur)
-	if s.simplifyOriginalDB() {
-		return true
-	}
-	s.conflictsAtLastInprocess = s.conflicts
-	s.unitsAtLastInprocess = s.rootUnitsLearned
-	s.restartSegStartConf = s.conflicts
-	s.restartSegStartDec = s.decisions
-	s.restartSegStartGlue = int(s.glueLearned)
-	return false
-}
-
-// inprocessDue reports whether an in-processing round is due at the current
-// point. Combines trigger A (enough NEW root-level units discovered since the
-// last round — the causal condition: formula changes unlock reductions) with
-// the adaptive conflict gap C (inprocessGapCur, driven by yield), and the
-// static dense-binary exclusion. It is deliberately not a bare conflict-period
-// check: firing the expensive materialize+scan+rebuild only on real reductions
-// amortizes the cost.
-func (s *CDCLSolver) inprocessDue() bool {
-	return s.inprocessPeriod > 0 && !s.inprocessExcluded && s.inprocessGapCur > 0 &&
-		s.conflicts >= s.conflictsAtLastInprocess+s.inprocessGapCur &&
-		s.rootUnitsLearned-s.unitsAtLastInprocess >= s.inprocessMinUnits
-}
-
-// simplifyOriginalDB re-runs original-clause simplification (subsumption +
-// bounded VE) at a level-0 restart boundary, then rebuilds the original-clause
-// SoA (literal pool + locs), rebuilds watches, and re-propagates unit clauses.
-// In-processing makes the (otherwise preprocessing-only) reduction available to
-// instances whose formula changes as search discovers unit clauses. Returns
-// true if the formula became UNSAT.
-func (s *CDCLSolver) simplifyOriginalDB() bool {
-	if s.cnf.NumClauses == 0 {
-		return false
-	}
-	// Materialize the original clause DB into slice form (it is nil during
-	// search; parser + pre-processing consumed it into the SoA pool/locs).
-	pool := s.cnf.GetLiteralPool()
-	locs := s.cnf.GetOriginalClauseLocs()
-	clauses := make([]cnf.Clause, 0, len(locs))
-	for i := range locs {
-		off := int(locs[i].Offset)
-		sz := int(locs[i].Size)
-		if sz == 0 {
-			continue
-		}
-		lits := make([]cnf.Literal, sz)
-		copy(lits, pool[off:off+sz])
-		clauses = append(clauses, cnf.Clause{Literals: lits})
-	}
-	s.cnf.Clauses = clauses
-	s.cnf.NumClauses = len(clauses)
-
-	saveBudget := s.veBudget
-	if s.inprocessBudget > 0 {
-		s.veBudget = s.inprocessBudget
-	}
-	defer func() { s.veBudget = saveBudget; s.cnf.Clauses = nil }()
-
-	subSubsumed, subStrengthened := s.subsumptionPass()
-	if s.hasEmptyClause() {
-		return true
-	}
-	// In-processing (unlike preprocessing, which passes skipAssigned=false) uses
-	// skipAssigned=true: never eliminate a currently-assigned (level-0 unit) var.
-	// The reduced formula is immediately re-searched and reconstruction of an
-	// eliminated-but-assigned var would fight the existing level-0 assignment, so
-	// conservatively skip it. See the preprocessing note in preprocessAggressive.
-	elim := 0
-	if vr := s.boundedVarElimination(true); vr < 0 {
-		return true
-	} else if vr > 0 {
-		elim = vr
-	}
-	// Yield-based adaptive cadence (C): adjust the conflict gap for the NEXT
-	// round from this round's yield (subsumed + strengthened + eliminated,
-	// i.e. actual formula reduction). A productive round tightens the cadence
-	// (fire again sooner), a low-yield round backs it off toward inprocessGapMax
-	// (effectively stopping) without a hard latch, so a formula that becomes
-	// unit-rich again can resume. Yield reuses roundYield (subsumed+
-	// strengthened+eliminated).
-	roundYield := subSubsumed + subStrengthened + elim
-	if s.inprocessGapCur > 0 {
-		if roundYield >= s.inprocessMinYield {
-			if s.inprocessGapCur/2 < s.inprocessGapMin {
-				s.inprocessGapCur = s.inprocessGapMin
-			} else {
-				s.inprocessGapCur /= 2
-			}
-		} else if s.inprocessGapMin > 0 && s.inprocessGapMin != s.inprocessGapMax {
-			if s.inprocessGapCur*2 > s.inprocessGapMax {
-				s.inprocessGapCur = s.inprocessGapMax
-			} else {
-				s.inprocessGapCur *= 2
-			}
-		}
-	}
-
-	s.cnf.RebuildLiteralPool()
-	s.originalUnitClauses = precomputeOriginalUnitClauses(s.cnf)
-
-	// Rebuild watches (original + learned) and re-propagate level-0 units so
-	// the reduced formula is fully consistent before search resumes.
-	s.watchInitialized = false
-	s.initWatches()
-	if s.propagateOriginalUnitsAndActivateWatches() {
-		return true
-	}
-	return false
 }
 
 func (s *CDCLSolver) cancelUntil(level int) {

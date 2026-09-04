@@ -18,9 +18,6 @@ import (
 // scanSize: entries per synthesis. Move fraction is swept.
 const scanSize = 4000000
 
-// moveFraction variants (fraction of entries that "move", i.e. are deleted).
-var moveFractions = []float64{0.0, 0.1, 0.25, 0.5, 0.8}
-
 var scanSink uint64
 
 // swapWithLast settles a literal's watch list using swap-with-last deletion

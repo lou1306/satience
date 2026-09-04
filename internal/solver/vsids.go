@@ -419,44 +419,14 @@ func (v *VSIDS) bumpClause(literals []cnf.Literal) {
 	}
 }
 
-// bumpAnalyze bumps all variables touched during 1-UIP conflict analysis
-// (both learned clause variables and intermediate resolved variables).
-// This matches minisat's analyze_toclear: every variable that appeared
-// during conflict analysis gets a bump. The total activity injected per
-// conflict equals varInc (same as bumpClause), distributed across all
-// touched variables rather than concentrated on conflict clause vars only.
-func (v *VSIDS) bumpAnalyze(vars []uint32) {
-	if len(vars) == 0 {
-		return
-	}
-	if v.minisatBumps {
-		for _, varIdx := range vars {
-			v.bumpLarge(varIdx, v.varInc)
-		}
-	} else {
-		bumpAmount := v.varInc / float64(len(vars))
-		if minBump := v.varInc * 0.04; bumpAmount < minBump {
-			bumpAmount = minBump
-		}
-		for _, varIdx := range vars {
-			v.bumpLarge(varIdx, bumpAmount)
-		}
-	}
-	v.conflictCount++
-
-	if v.conflictCount%v.refreshInterval == 0 {
-		v.heapValid = false
-	}
-}
-
 // decay implements O(1) activity decay (MiniSat varInc trick).
 // Instead of scaling all activity[i] by decayFactor (O(n) scan + O(n) heap
 // rebuild), we grow varInc: varInc /= decayFactor. Bumps add varInc, so
 // recent bumps are naturally larger than old ones. The heap key
 // (activity + lbdBonus) doesn't change on decay, so the heap stays valid.
 // Periodic rescaling prevents varInc from overflowing float64 precision.
-// conflictCount is incremented in bumpAnalyze (called in learnClause before
-// decay in handleConflict), so decay must NOT increment it again.
+// conflictCount is incremented in the caller (in learnClause before decay in
+// handleConflict), so decay must NOT increment it again.
 func (v *VSIDS) decay(assignments []Assignment) {
 	// Gradually increase decay factor toward max
 	if v.decayFactor < v.maxDecayFactor {

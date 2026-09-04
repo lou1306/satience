@@ -286,13 +286,6 @@ func (s *CDCLSolver) storeLearnedClause(lbd int) bool {
 		learnedIdx := s.learnedCapacity - 1
 		literals := s.getLearnedClauseLiterals(learnedIdx)
 		s.lastLearnedClauseIdx = learnedIdx
-		// Register learned binary clauses into the dynamic BIG for stronger
-		// transitive minimization (sound even after deletion — see
-		// addLearnedBinaryToBIG).
-		if len(literals) == 2 && !s.bigDisabled {
-			s.addLearnedBinaryToBIG(literals[0], literals[1])
-		}
-
 		// Store watch indices for all clauses to maintain array consistency
 		if len(literals) >= 2 {
 			var idx0, idx1 int
@@ -368,18 +361,12 @@ func (s *CDCLSolver) learnClause(conflictLits []cnf.Literal) int {
 
 	currentCount := s.runOneUIPResolution(conflictLits)
 
-	// Bump variables touched during 1-UIP analysis. bumpAnalyze (minisat
-	// analyze_toclear) bumps ALL touched variables including intermediate
-	// resolved vars; bumpClause bumps only the conflict clause vars. bumpAnalyze
-	// is gated to default-decay instances — under aggressive decay (0.30→0.60)
-	// the fast varInc growth flattens the VSIDS signal when distributed across
+	// Bump the conflict clause's variables (bumpClause-only scheme; the
+	// MiniSat-style analyze_toclear alternative was an A/B toggle and was not
+	// adopted — here it was removed, so this is always bumpClause).
 	// Must run before the currentCount != 1 early return so degenerate
 	// conflicts still bump involved variables.
-	if s.useBumpAnalyze {
-		s.vsids.bumpAnalyze(s.tmpTouchedVars)
-	} else {
-		s.vsids.bumpClause(conflictLits)
-	}
+	s.vsids.bumpClause(conflictLits)
 
 	// NOTE: currentCount != 1 means we do NOT have a genuine 1-UIP asserting
 	// clause, so we skip learning and backjump conservatively:
